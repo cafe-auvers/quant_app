@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import datetime as dt
 from typing import Optional, Set
-from zoneinfo import ZoneInfo
 
+from zoneinfo import ZoneInfo
 
 KST_ZONE = ZoneInfo("Asia/Seoul")
 MARKET_DATA_READY_TIME_KST = dt.time(7, 0)
@@ -32,9 +32,9 @@ def _easter_sunday(year: int) -> dt.date:
     g = (b - f + 1) // 3
     h = (19 * a + b - d - g + 15) % 30
     i, k = divmod(c, 4)
-    l = (32 + 2 * e + 2 * i - h - k) % 7
-    m = (a + 11 * h + 22 * l) // 451
-    month, day = divmod(114 + h + l - 7 * m, 31)
+    correction = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * correction) // 451
+    month, day = divmod(114 + h + correction - 7 * m, 31)
     return dt.date(year, month, day + 1)
 
 

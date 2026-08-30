@@ -1,23 +1,25 @@
 from __future__ import annotations
 
 import datetime as dt
-import html
-import json
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote
-from zoneinfo import ZoneInfo
+from typing import List, Optional
 
 import pandas as pd
-from PyQt5.QtCore import Qt, QThread, QTimer, QUrl
-from PyQt5.QtGui import QColor, QKeySequence
-from PyQt5.QtWidgets import (QComboBox, QDialog, QDialogButtonBox, QDockWidget,
-                             QFormLayout, QGroupBox, QHBoxLayout,
-                             QKeySequenceEdit, QLabel, QLineEdit, QListWidget,
-                             QListWidgetItem, QMenu, QMessageBox, QProgressBar,
-                             QPushButton, QScrollArea, QShortcut, QSizePolicy,
-                             QSlider, QSpinBox, QSplitter, QTabWidget,
-                             QTextBrowser, QTextEdit, QVBoxLayout, QWidget)
+from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtWidgets import (
+    QComboBox,
+    QDialog,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QTextBrowser,
+    QVBoxLayout,
+    QWidget,
+)
+from zoneinfo import ZoneInfo
 
 try:
     from PyQt5.QtWebEngineWidgets import QWebEngineView
@@ -28,47 +30,21 @@ try:
 except ImportError:
     QWebChannel = None
 
-from src.api.kis_account_snapshot_dual import (KisEnvironment,
-                                               discover_account_profiles,
-                                               load_config)
-from src.core.order_state import (OPEN_ORDER_STATUSES, BrokerOrder,
-                                  OrderIntent, OrderSide, OrderStatus)
 from src.core.scanner import ComparisonOperator, ScanRule, StockScanner
-from src.core.watchlist import (BuylistItem, BuylistManager, TradePlan,
-                                TradePlanManager, Watchlist)
-from src.services.app_state import (SCANNER_SETUPS_FILE, SETTINGS_FILE,
-                                    load_buylist_state,
-                                    load_chart_drawings_state,
-                                    load_scanner_setups_state,
-                                    load_tab_options_state,
-                                    load_trade_plans_state,
-                                    load_watchlist_state, save_app_state)
-from src.services.historical_refresh_control import (MODE_1D, MODE_1H,
-                                                     is_refresh_running,
-                                                     launch_refresh,
-                                                     read_status,
-                                                     reconcile_stale_status,
-                                                     terminate_refresh)
-from src.services.intraday_data_service import (format_intraday_source_label,
-                                                load_best_intraday_history)
-from src.services.order_ledger import (append_order, find_open_orders,
-                                       has_open_order, load_order_ledger,
-                                       save_order_ledger, update_order)
-from src.ui.chart_bridge import ChartBridge
-from src.ui.dialogs import AddFilterDialog, SettingsDialog
-from src.ui.filter_catalog import (DEFAULT_SCANNER_SETUPS, DEFAULT_SETTINGS,
-                                   DEFAULT_TAB_OPTIONS, FILTER_CATALOG,
-                                   SCANNER_METRICS_LABELS)
-from src.ui.workers import (FxRateWorker, IntradayFetchWorker, KisAccountWorker,
-                            KisOrderWorker, KisStartupAccountsWorker,
-                            OrderReconciliationWorker, ScannerWorker)
-from src.utils.data_loader import (_extract_symbol_history,
-                                   download_price_history)
-from src.utils.intraday_helpers import \
-    extract_latest_opening_bar as _extract_latest_opening_bar
-from src.utils.intraday_helpers import intraday_cache_needs_backfill
-from src.utils.intraday_helpers import utcnow_naive as _utcnow_naive
-from src.utils.storage import load_json, save_json
+from src.services.app_state import SCANNER_SETUPS_FILE
+from src.services.historical_refresh_control import (
+    MODE_1D,
+    MODE_1H,
+    is_refresh_running,
+    launch_refresh,
+    read_status,
+    reconcile_stale_status,
+    terminate_refresh,
+)
+from src.ui.dialogs import AddFilterDialog
+from src.ui.filter_catalog import SCANNER_METRICS_LABELS
+from src.ui.workers import ScannerWorker
+from src.utils.storage import save_json
 
 REFERENCE_SYMBOL = "SPY"
 KST_ZONE = ZoneInfo("Asia/Seoul")
@@ -576,36 +552,7 @@ class ScannerMixin:
         self.scanner_setup_name_input.setText(setup_name)
 
         # Load rules
-        rules = setup.get("rules")
-        if not rules:
-            # Generate from basic fields for backward compatibility
-            rules = [
-                {
-                    "attribute": "volume",
-                    "operator": ">=",
-                    "threshold": setup.get("min_volume", 40000.0),
-                },
-                {
-                    "attribute": "dollar_volume",
-                    "operator": ">=",
-                    "threshold": setup.get("min_dollar_volume", 35000.0),
-                },
-                {
-                    "attribute": "adr_20",
-                    "operator": ">=",
-                    "threshold": setup.get("min_adr", 2.4),
-                },
-                {
-                    "attribute": "growth_rank_1m",
-                    "operator": ">=",
-                    "threshold": setup.get("min_growth_rank", 97.04),
-                },
-                {
-                    "attribute": "trend_intensity",
-                    "operator": ">=",
-                    "threshold": setup.get("min_trend_intensity", 90.0),
-                },
-            ]
+        rules = self._rules_for_scanner_setup(setup)
         self.load_scanner_rules(rules)
 
         self.scanner_results = list(

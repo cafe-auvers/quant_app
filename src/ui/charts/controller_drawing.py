@@ -6,9 +6,9 @@ import datetime as dt
 import json
 import math
 from typing import Any, List
-from zoneinfo import ZoneInfo
 
 from PyQt5.QtWidgets import QMessageBox
+from zoneinfo import ZoneInfo
 
 try:
     from PyQt5.QtWebEngineWidgets import QWebEngineView
@@ -57,6 +57,15 @@ class ChartsDrawingMixin:
         if split_view is not None and split_view.isVisible():
             views.append(split_view)
         return [view for view in views if view is not None]
+
+    def _active_web_views(self) -> List[Any]:
+        if QWebEngineView is None:
+            return []
+        return [
+            view
+            for view in self._active_chart_command_views()
+            if isinstance(view, QWebEngineView)
+        ]
 
     def _active_chart_symbol(self) -> str:
         if (
@@ -142,12 +151,7 @@ class ChartsDrawingMixin:
                 "Plot a symbol before setting a breakout price.",
             )
             return
-        active_views = self._active_chart_command_views()
-        web_views = [
-            view
-            for view in active_views
-            if QWebEngineView is not None and isinstance(view, QWebEngineView)
-        ]
+        web_views = self._active_web_views()
         if web_views:
             web_views[0].setFocus()
             buttons = self._active_chart_buttons()
@@ -191,12 +195,7 @@ class ChartsDrawingMixin:
                 self, "No chart symbol", "Plot a symbol before drawing on the chart."
             )
             return
-        active_views = self._active_chart_command_views()
-        web_views = [
-            view
-            for view in active_views
-            if QWebEngineView is not None and isinstance(view, QWebEngineView)
-        ]
+        web_views = self._active_web_views()
         if web_views:
             web_views[0].setFocus()
             buttons = self._active_chart_buttons()
@@ -232,12 +231,7 @@ class ChartsDrawingMixin:
             or self.tabs.currentWidget() is not self.tradingview_widget
         ):
             return
-        active_views = self._active_chart_command_views()
-        web_views = [
-            view
-            for view in active_views
-            if QWebEngineView is not None and isinstance(view, QWebEngineView)
-        ]
+        web_views = self._active_web_views()
         for view in web_views:
             view.page().runJavaScript(
                 "window.disableLineToolMode && window.disableLineToolMode();",
@@ -253,22 +247,26 @@ class ChartsDrawingMixin:
         self.append_log("TradingView line tool disabled.")
 
     def enable_tradingview_line_tool_mode(self) -> None:
+        self._enable_tradingview_line_tool_mode(
+            missing_symbol_message="Load a symbol before drawing on the chart.",
+            unavailable_message="Line tool requires PyQtWebEngine chart view.",
+        )
+
+    def _enable_tradingview_line_tool_mode(
+        self,
+        *,
+        missing_symbol_message: str,
+        unavailable_message: str,
+    ) -> None:
         if (
             not hasattr(self, "tabs")
             or self.tabs.currentWidget() is not self.tradingview_widget
         ):
             return
         if not self._active_chart_symbol():
-            QMessageBox.information(
-                self, "No chart symbol", "Load a symbol before drawing on the chart."
-            )
+            QMessageBox.information(self, "No chart symbol", missing_symbol_message)
             return
-        active_views = self._active_chart_command_views()
-        web_views = [
-            view
-            for view in active_views
-            if QWebEngineView is not None and isinstance(view, QWebEngineView)
-        ]
+        web_views = self._active_web_views()
         if web_views:
             web_views[0].setFocus()
             self.tradingview_line_tool_active = True
@@ -295,52 +293,13 @@ class ChartsDrawingMixin:
                 "TradingView line tool enabled. Click a line to edit it, or click empty space to draw."
             )
         else:
-            self.append_log("Line tool requires PyQtWebEngine chart view.")
+            self.append_log(unavailable_message)
 
     def enable_tradingview_edit_mode(self) -> None:
-        if (
-            not hasattr(self, "tabs")
-            or self.tabs.currentWidget() is not self.tradingview_widget
-        ):
-            return
-        if not self._active_chart_symbol():
-            QMessageBox.information(
-                self, "No chart symbol", "Load a symbol before editing drawings."
-            )
-            return
-        active_views = self._active_chart_command_views()
-        web_views = [
-            view
-            for view in active_views
-            if QWebEngineView is not None and isinstance(view, QWebEngineView)
-        ]
-        if web_views:
-            web_views[0].setFocus()
-            self.tradingview_line_tool_active = True
-            settings = self.__dict__.get("settings") or {}
-            shortcuts = (
-                settings.get("shortcuts", {}) if isinstance(settings, dict) else {}
-            )
-            t_key = shortcuts.get("set_target", "T")
-            self._set_button_state(
-                getattr(self, "tradingview_line_tool_button", None),
-                "Line Tool Active",
-                active=True,
-            )
-            self._set_button_state(
-                getattr(self, "tradingview_set_target_button", None),
-                f"Set Breakout Price ({t_key})",
-            )
-            for view in web_views:
-                view.page().runJavaScript(
-                    "window.enableLineToolMode && window.enableLineToolMode();",
-                    lambda result: None,
-                )
-            self.append_log(
-                "TradingView line tool enabled. Click a line to edit it, or click empty space to draw."
-            )
-        else:
-            self.append_log("Edit mode requires PyQtWebEngine chart view.")
+        self._enable_tradingview_line_tool_mode(
+            missing_symbol_message="Load a symbol before editing drawings.",
+            unavailable_message="Edit mode requires PyQtWebEngine chart view.",
+        )
 
     def enable_chart_erase_mode(self) -> None:
         if not self._active_chart_symbol():
@@ -348,12 +307,7 @@ class ChartsDrawingMixin:
                 self, "No chart symbol", "Plot a symbol before erasing drawings."
             )
             return
-        active_views = self._active_chart_command_views()
-        web_views = [
-            view
-            for view in active_views
-            if QWebEngineView is not None and isinstance(view, QWebEngineView)
-        ]
+        web_views = self._active_web_views()
         if web_views:
             web_views[0].setFocus()
             buttons = self._active_chart_buttons()
@@ -539,14 +493,12 @@ class ChartsDrawingMixin:
             existing_tf,
         }.issubset(shared_daily_hourly_timeframes):
             return True
-        if (
-            requested_tf == "1D"
-            or existing_tf == "1D"
-            or not self._is_intraday_drawing_timeframe(requested_tf)
-            or not self._is_intraday_drawing_timeframe(existing_tf)
-        ):
-            return False
-        return True
+        return (
+            requested_tf != "1D"
+            and existing_tf != "1D"
+            and self._is_intraday_drawing_timeframe(requested_tf)
+            and self._is_intraday_drawing_timeframe(existing_tf)
+        )
 
     def _active_chart_drawing_timeframe(self) -> str:
         # ``MainWindow.__new__`` is used by pure controller tests. Accessing a

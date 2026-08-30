@@ -25,6 +25,7 @@ isn't sufficient to shut this PC down.
 """
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import hmac
 import os
@@ -142,10 +143,8 @@ def main() -> int:
         _log("WARNING: REMOTE_CONTROL_TOKEN is not set in .env -- all SHUTDOWN requests will be denied until it is.")
     with _Server(("0.0.0.0", PORT), _Handler) as server:
         _log(f"Listening on 0.0.0.0:{PORT}")
-        try:
+        with contextlib.suppress(KeyboardInterrupt):
             server.serve_forever()
-        except KeyboardInterrupt:
-            pass
     return 0
 
 

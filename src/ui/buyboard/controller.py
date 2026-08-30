@@ -9,23 +9,23 @@ Buy Today / exits / stops before market open or while it is pull-only.
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass, replace
 import datetime as dt
 import logging
-from queue import Empty, Queue
 import time
+from dataclasses import dataclass, replace
+from queue import Empty, Queue
 from typing import Optional
 
 from PyQt5.QtCore import QThread, pyqtSignal
 from sqlalchemy.exc import SQLAlchemyError
 
+from src.core import execution_config
 from src.core.board_workflow import (
     AnyBoardCommand,
     BoardActionContext,
     BoardCardProjection,
     BoardProjectionContext,
 )
-from src.core import execution_config
 from src.core.execution_config import is_buyboard_engine_enabled
 from src.core.runtime_readiness import RuntimeDeviceState
 from src.core.trade_card_state import (
@@ -85,10 +85,11 @@ class BuyboardProjectionWorker(QThread):
         started_at = time.perf_counter()
         request = self.request
         try:
-            from .columns import BOARD_COLUMN_ORDER
             from src.services.trade_card_bootstrap import (
                 bootstrap_trade_cards_from_current_state,
             )
+
+            from .columns import BOARD_COLUMN_ORDER
 
             current_revision = None
             if request.revision_only:
@@ -1196,8 +1197,6 @@ class BuyboardMixin:
             )
 
     def refresh_buyboard(self, *, revision_only: bool = False) -> None:
-        from .board import populate_buyboard_columns
-
         if bool(self.__dict__.get("_database_shutting_down", False)):
             return
         if int(self.__dict__.get("_buyboard_interaction_depth", 0) or 0) > 0:

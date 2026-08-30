@@ -47,15 +47,15 @@ from src.core.account_broker_snapshot import AccountBrokerSnapshot, Reconciliati
 from src.core.board_workflow import BoardActionContext
 from src.core.execution_config import is_buyboard_engine_enabled
 from src.core.execution_mode import ExecutionLease, ExecutionSource
+from src.core.execution_order_record import ExecutionOrderStatus
 from src.core.execution_queue import ExecutionQueueItem
 from src.core.exit_policy import market_session_date
-from src.core.runtime_readiness import EngineReadiness, RuntimeDeviceState
-from src.core.execution_order_record import ExecutionOrderStatus
 from src.core.order_state import OrderSide
 from src.core.release_identity import (
     current_release_identity,
     require_approved_release_identity,
 )
+from src.core.runtime_readiness import EngineReadiness, RuntimeDeviceState
 from src.core.trade_card_state import (
     BoardStatus,
     EntryRuntimeStatus,
@@ -64,15 +64,26 @@ from src.core.trade_card_state import (
     has_durable_execution_evidence,
 )
 from src.services import buyboard_runtime as buyboard_runtime_module
-from src.services import capital_reservation_repository
-from src.services import discovered_external_order_repository
-from src.services import execution_order_repository
+from src.services import (
+    capital_reservation_repository,
+    discovered_external_order_repository,
+    execution_order_repository,
+)
 from src.services import trade_card_repository as repo
 from src.services.account_reconciliation import (
     AccountReconciliationResult,
     ReconciliationAlertSeverity,
     ReconciliationCommandType,
     run_account_reconciliation_pass,
+)
+from src.services.controlled_live_policy import (
+    live_entry_card_allowed,
+    require_controlled_live_configuration,
+)
+from src.services.execution_authority import (
+    ExecutionAuthority,
+    LeaseExpiredError,
+    LeaseHandle,
 )
 from src.services.execution_command_gateway import (
     AmbiguousPostBrokerPersistenceError,
@@ -84,43 +95,38 @@ from src.services.execution_command_gateway import (
     build_guarded_execution_gateway,
 )
 from src.services.execution_command_repository import DuplicateCommandError
-from src.services.execution_order_repository import fetch_execution_order
-from src.services.execution_authority import ExecutionAuthority, LeaseExpiredError, LeaseHandle
 from src.services.execution_lease_protocol import DefaultExecutionLeaseProtocol
-from src.services.kis_request_scheduler import KisRequestScheduler
-from src.services.kis_request_boundary import install_process_kis_request_scheduler
-from src.services.controlled_live_policy import (
-    live_entry_card_allowed,
-    require_controlled_live_configuration,
-)
-from src.utils.market_calendar import is_regular_session_open
+from src.services.execution_order_repository import fetch_execution_order
 from src.services.external_alerting import (
     CriticalAlertType,
     ExternalAlertingService,
 )
-from src.services.schema_migration import (
-    MigrationPhase,
-    SchemaMigrationManager,
-)
-from src.utils.redaction import scrub_sensitive_text
-from src.utils.device_identity import detect_local_device_kind
+from src.services.kis_realtime_market_data import StopRule, SubscriptionPriority
+from src.services.kis_request_boundary import install_process_kis_request_scheduler
+from src.services.kis_request_scheduler import KisRequestScheduler
 from src.services.runtime_device_state_repository import (
     publish_runtime_device_state_transition,
     refresh_runtime_device_state,
     require_compatible_runtime_schema,
     save_runtime_device_state,
 )
+from src.services.schema_migration import (
+    MigrationPhase,
+    SchemaMigrationManager,
+)
 from src.services.state_sync import (
     LocalDeviceRole,
     get_main_device,
     get_synced_state_revisions,
 )
-from src.services.kis_realtime_market_data import StopRule, SubscriptionPriority
 from src.services.stop_change_coordinator import stop_change_coordinator_for
 from src.services.trade_card_orb_bridge import (
     TradeCardOrbEvaluator,
     queue_has_execution_order_lock,
 )
+from src.utils.device_identity import detect_local_device_kind
+from src.utils.market_calendar import is_regular_session_open
+from src.utils.redaction import scrub_sensitive_text
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +144,27 @@ _QUOTE_SUBSCRIBED_STATUSES = {
 # ORB is an active-session entry concern.  Watchlist and Buylist remain
 # planning-only and retain only their configured breakout target.
 _ORB_SYNCED_STATUSES = {BoardStatus.BUY_TODAY}
+_ORB_PLAN_STATE_FIELDS = (
+    "board_status",
+    "board_status_updated_at",
+    "name",
+    "breakout_price",
+    "entry_runtime_status",
+    "entry_trigger",
+    "entry_orb_high",
+    "entry_orb_low",
+    "stop_adr",
+    "risk_percent",
+    "planned_quantity",
+    "target_position_quantity",
+    "entry_block_reason",
+    "selected_orb_window",
+    "buy_today_note",
+)
+
+
+def _orb_plan_state(card: TradeCardState) -> tuple:
+    return tuple(getattr(card, field) for field in _ORB_PLAN_STATE_FIELDS)
 
 
 def _buy_today_session_is_current(
@@ -1329,7 +1356,7 @@ class BuyboardRuntimeWorker(QThread):
         if callable(configure):
             configure(trade_priorities={}, quote_priorities={})
         else:
-            subscribed = getattr(market_data, "subscribed_symbols", lambda: [])
+            subscribed = getattr(market_data, "subscribed_symbols", list)
             symbols = list(subscribed())
             if symbols:
                 market_data.unsubscribe(symbols)
@@ -2779,7 +2806,7 @@ class BuyboardRuntimeWorker(QThread):
             else:
                 connected = bool(market_data.is_connected())
                 symbols = [symbol] if symbol else list(
-                    getattr(market_data, "subscribed_symbols", lambda: [])()
+                    getattr(market_data, "subscribed_symbols", list)()
                 )
                 symbol_ready = getattr(market_data, "is_symbol_execution_ready", None)
                 quotes_fresh = bool(
@@ -3263,46 +3290,13 @@ class BuyboardRuntimeWorker(QThread):
                     "Current-session ORB plan is unavailable",
                 )
                 continue
-            before = (
-                card.board_status,
-                card.board_status_updated_at,
-                card.name,
-                card.breakout_price,
-                card.entry_runtime_status,
-                card.entry_trigger,
-                card.entry_orb_high,
-                card.entry_orb_low,
-                card.stop_adr,
-                card.risk_percent,
-                card.planned_quantity,
-                card.target_position_quantity,
-                card.entry_block_reason,
-                card.selected_orb_window,
-                card.buy_today_note,
-            )
+            before = _orb_plan_state(card)
             self._orb_evaluator.update_card(card, item)
-            after = (
-                card.board_status,
-                card.board_status_updated_at,
-                card.name,
-                card.breakout_price,
-                card.entry_runtime_status,
-                card.entry_trigger,
-                card.entry_orb_high,
-                card.entry_orb_low,
-                card.stop_adr,
-                card.risk_percent,
-                card.planned_quantity,
-                card.target_position_quantity,
-                card.entry_block_reason,
-                card.selected_orb_window,
-                card.buy_today_note,
-            )
             # Live price/timestamp are observation data, not a durable state
             # transition.  Keep them current in memory, and include their
             # latest values whenever a plan/status field really changes, but
             # never write a full TradeCard JSON row for price-only movement.
-            if before != after:
+            if before != _orb_plan_state(card):
                 changed.append(card)
         return changed
 
@@ -3491,7 +3485,7 @@ class BuyboardRuntimeWorker(QThread):
 
         rotated = False
         symbols = set(by_symbol) | self._market_stop_symbols
-        subscribed = getattr(self.runtime.market_data, "subscribed_symbols", lambda: [])
+        subscribed = getattr(self.runtime.market_data, "subscribed_symbols", list)
         symbols.update(subscribed())
         for symbol in symbols:
             if replace_rules(symbol, by_symbol.get(symbol, [])) is not None:

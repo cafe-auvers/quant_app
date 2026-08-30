@@ -1,28 +1,32 @@
 from __future__ import annotations
 
 import datetime as dt
-import html
-import json
 import math
 import os
 import sys
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote
-from zoneinfo import ZoneInfo
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
-from PyQt5.QtCore import Qt, QThread, QTimer, QUrl, pyqtSignal
-from PyQt5.QtGui import QColor, QDoubleValidator, QKeySequence
-from PyQt5.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,
-                             QComboBox, QDialog, QDialogButtonBox, QDockWidget, QFormLayout,
-                             QGroupBox, QHBoxLayout, QHeaderView,
-                             QKeySequenceEdit, QLabel, QLineEdit, QListWidget,
-                             QListWidgetItem, QMenu, QMessageBox, QProgressBar,
-                             QPushButton, QScrollArea, QShortcut, QSizePolicy,
-                             QSlider, QSpinBox, QSplitter, QTableWidget,
-                             QTableWidgetItem, QTabWidget, QTextBrowser,
-                             QTextEdit, QVBoxLayout, QWidget)
+from PyQt5.QtCore import QThread, QTimer, pyqtSignal
+from PyQt5.QtGui import QDoubleValidator
+from PyQt5.QtWidgets import (
+    QAbstractItemView,
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
+)
+from zoneinfo import ZoneInfo
 
 try:
     from PyQt5.QtWebEngineWidgets import QWebEngineView
@@ -33,55 +37,25 @@ try:
 except ImportError:
     QWebChannel = None
 
-from src.api.kis_account_snapshot_dual import (KisEnvironment,
-                                               discover_account_profiles,
-                                               load_config)
-from src.core.orb import (calculate_orb_range, evaluate_orb_entry_signal,
-                          resample_intraday_bars)
-from src.core.order_state import (OPEN_ORDER_STATUSES, BrokerOrder,
-                                  OrderIntent, OrderSide, OrderStatus)
-from src.core.scanner import ComparisonOperator, ScanRule, StockScanner
-from src.core.watchlist import (BuylistItem, BuylistManager, TradePlan,
-                                TradePlanManager, Watchlist)
-from src.risk.position_sizer import PositionSizer
-from src.services.app_state import (SCANNER_SETUPS_FILE, SETTINGS_FILE,
-                                    load_buylist_state,
-                                    load_chart_drawings_state,
-                                    load_scanner_setups_state,
-                                    load_tab_options_state,
-                                    load_trade_plans_state,
-                                    load_watchlist_state, save_app_state)
-from src.services.intraday_data_service import (format_intraday_source_label,
-                                                load_best_intraday_history)
-from src.services.order_ledger import (append_order, find_open_orders,
-                                       has_open_order, load_order_ledger,
-                                       save_order_ledger, update_order)
+import contextlib
+
+from src.api.kis_account_snapshot_dual import (
+    KisEnvironment,
+    discover_account_profiles,
+    load_config,
+)
 from src.services.repository_sync import (
     SYNC_RESULT_ENV,
     RepositoryStatus,
     inspect_repository,
     launch_sync_helper,
 )
-from src.ui.chart_bridge import ChartBridge
-from src.ui.dialogs import AddFilterDialog, SettingsDialog
-from src.ui.filter_catalog import (DEFAULT_SCANNER_SETUPS, DEFAULT_SETTINGS,
-                                   DEFAULT_TAB_OPTIONS, FILTER_CATALOG,
-                                   SCANNER_METRICS_LABELS)
-from src.ui.workers import (FxRateWorker, IntradayBulkFetchWorker,
-                            IntradayFetchWorker, KisAccountWorker,
-                            KisOrderWorker, KisStartupAccountsWorker,
-                            OrderReconciliationWorker, ScannerWorker)
+from src.ui.workers import FxRateWorker, KisAccountWorker, KisStartupAccountsWorker
 from src.utils.config import ROOT_DIR
-from src.utils.data_loader import (_extract_symbol_history,
-                                   download_price_history,
-                                   get_default_universe)
-from src.utils.intraday_helpers import \
-    extract_latest_opening_bar as _extract_latest_opening_bar
-from src.utils.intraday_helpers import intraday_cache_needs_backfill
-from src.utils.intraday_helpers import utcnow_naive as _utcnow_naive
-from src.utils.market_calendar import (expected_latest_market_data_date,
-                                       previous_nyse_trading_day)
-from src.utils.storage import load_json, save_json
+from src.utils.market_calendar import (
+    expected_latest_market_data_date,
+    previous_nyse_trading_day,
+)
 
 REFERENCE_SYMBOL = "SPY"
 KST_ZONE = ZoneInfo("Asia/Seoul")
@@ -875,10 +849,8 @@ class DashboardMixin:
                 if sym and sym not in seen_syms:
                     seen_syms.add(sym)
                     ovrs_count += 1
-                    try:
+                    with contextlib.suppress(TypeError, ValueError):
                         ovrs_pnl_usd += float(h.get("profit_loss") or 0)
-                    except (TypeError, ValueError):
-                        pass
 
         # Breakdown line
         pnl_sign = "+" if ovrs_pnl_usd >= 0 else ""

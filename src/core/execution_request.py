@@ -19,9 +19,9 @@ generate or persist that identity; it only carries it.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import re
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from src.core.execution_mode import ExecutionSource
@@ -55,6 +55,29 @@ def derive_execution_client_order_id(
     return f"{prefix}-{digest}"
 
 
+def _normalize_cancel_request(request: object) -> None:
+    values = {
+        "client_order_id": str(getattr(request, "client_order_id", "") or "").strip(),
+        "cancel_command_id": str(getattr(request, "cancel_command_id", "") or "").strip(),
+        "environment": str(getattr(request, "environment", "") or "").upper(),
+        "account_no": str(getattr(request, "account_no", "") or ""),
+        "strategy_instance_id": str(
+            getattr(request, "strategy_instance_id", "") or ""
+        ),
+        "emergency": bool(getattr(request, "emergency", False)),
+        "protective_entry_completion": bool(
+            getattr(request, "protective_entry_completion", False)
+        ),
+        "symbol": str(getattr(request, "symbol", "") or "").upper(),
+        "broker_order_id": str(getattr(request, "broker_order_id", "") or ""),
+        "quantity": max(0, int(getattr(request, "quantity", 0) or 0)),
+        "side": str(getattr(request, "side", "") or "").upper(),
+        "exchange": str(getattr(request, "exchange", "NASD") or "NASD").upper(),
+    }
+    for name, value in values.items():
+        object.__setattr__(request, name, value)
+
+
 @dataclass(frozen=True, eq=False)
 class CancelIntent:
     """Complete, restart-replayable context for a tracked cancellation."""
@@ -75,22 +98,7 @@ class CancelIntent:
     exchange: str = "NASD"
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "client_order_id", str(self.client_order_id or "").strip())
-        object.__setattr__(self, "cancel_command_id", str(self.cancel_command_id or "").strip())
-        object.__setattr__(self, "environment", str(self.environment or "").upper())
-        object.__setattr__(self, "account_no", str(self.account_no or ""))
-        object.__setattr__(self, "strategy_instance_id", str(self.strategy_instance_id or ""))
-        object.__setattr__(self, "emergency", bool(self.emergency))
-        object.__setattr__(
-            self,
-            "protective_entry_completion",
-            bool(self.protective_entry_completion),
-        )
-        object.__setattr__(self, "symbol", str(self.symbol or "").upper())
-        object.__setattr__(self, "broker_order_id", str(self.broker_order_id or ""))
-        object.__setattr__(self, "quantity", max(0, int(self.quantity or 0)))
-        object.__setattr__(self, "side", str(self.side or "").upper())
-        object.__setattr__(self, "exchange", str(self.exchange or "NASD").upper())
+        _normalize_cancel_request(self)
 
     def __eq__(self, other: object) -> bool:
         if isinstance(other, str):
@@ -243,22 +251,7 @@ class CancelExecutionRequest:
     exchange: str = "NASD"
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "client_order_id", str(self.client_order_id or "").strip())
-        object.__setattr__(self, "cancel_command_id", str(self.cancel_command_id or "").strip())
-        object.__setattr__(self, "environment", str(self.environment or "").upper())
-        object.__setattr__(self, "account_no", str(self.account_no or ""))
-        object.__setattr__(self, "strategy_instance_id", str(self.strategy_instance_id or ""))
-        object.__setattr__(self, "emergency", bool(self.emergency))
-        object.__setattr__(
-            self,
-            "protective_entry_completion",
-            bool(self.protective_entry_completion),
-        )
-        object.__setattr__(self, "symbol", str(self.symbol or "").upper())
-        object.__setattr__(self, "broker_order_id", str(self.broker_order_id or ""))
-        object.__setattr__(self, "quantity", max(0, int(self.quantity or 0)))
-        object.__setattr__(self, "side", str(self.side or "").upper())
-        object.__setattr__(self, "exchange", str(self.exchange or "NASD").upper())
+        _normalize_cancel_request(self)
 
 
 @dataclass(frozen=True)

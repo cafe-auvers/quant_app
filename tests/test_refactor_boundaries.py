@@ -54,6 +54,7 @@ def test_account_and_order_reconciliation_workers_keep_separate_state(
         client_order_id="client-1",
         execution_policy="REGULAR_LIMIT",
     )
+
     class ReconciliationBroker:
         def __init__(self):
             self.position_calls = []
@@ -84,9 +85,7 @@ def test_account_and_order_reconciliation_workers_keep_separate_state(
 
     assert account_results == [{"kind": "account"}]
     assert account_errors == []
-    assert reconciliation_results == [
-        ([open_order], {"kind": "reconciliation"})
-    ]
+    assert reconciliation_results == [([open_order], {"kind": "reconciliation"})]
     assert reconciliation_errors == []
     assert reconciliation_broker.position_calls == [
         {"environment": "PROD", "account_no": "12345678-01"}
@@ -160,9 +159,7 @@ def test_scanner_worker_uses_database_where_query_for_configured_rules(monkeypat
         min_growth_rank=0,
         min_trend_intensity=0,
         scanner_rules_by_setup={
-            "Live": [
-                {"attribute": "volume", "operator": ">=", "threshold": 100_000}
-            ]
+            "Live": [{"attribute": "volume", "operator": ">=", "threshold": 100_000}]
         },
     )
     worker.finished_scan.connect(
@@ -181,9 +178,7 @@ def test_scanner_worker_uses_database_where_query_for_configured_rules(monkeypat
     ]
     assert completions[0][0] == []
     assert completions[0][1]["database_filtered"] is True
-    assert completions[0][1]["results_by_setup"] == {
-        "Live": [{"symbol": "AAPL"}]
-    }
+    assert completions[0][1]["results_by_setup"] == {"Live": [{"symbol": "AAPL"}]}
     assert completions[0][1]["funnels_by_setup"] == {
         "Live": {"universe_count": 2, "rule_counts": [1]}
     }
@@ -191,16 +186,19 @@ def test_scanner_worker_uses_database_where_query_for_configured_rules(monkeypat
 
 def test_database_init_worker_never_raises_connection_errors_into_the_ui(monkeypatch):
     import src.ui.main_window as main_window
+    import src.ui.database_workers as database_workers
 
     monkeypatch.setattr(
-        main_window,
+        database_workers,
         "resolve_data_engine",
         lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("offline")),
     )
     results = []
     worker = main_window.DatabaseInitWorker()
     worker.initialized.connect(
-        lambda engine, source, pc_engine, error: results.append((engine, source, pc_engine, error))
+        lambda engine, source, pc_engine, error: results.append(
+            (engine, source, pc_engine, error)
+        )
     )
 
     worker.run()
@@ -210,6 +208,7 @@ def test_database_init_worker_never_raises_connection_errors_into_the_ui(monkeyp
 
 def test_database_init_worker_routes_to_pc_without_opening_local_mirror(monkeypatch):
     import src.ui.main_window as main_window
+    import src.ui.database_workers as database_workers
     import src.infrastructure.database.mirror_engine as mirror_engine
     import src.infrastructure.database.mirror_reconciliation as mirror_reconciliation
 
@@ -218,9 +217,10 @@ def test_database_init_worker_routes_to_pc_without_opening_local_mirror(monkeypa
     report = SimpleNamespace(success=True, errors=())
     resolve_calls = []
     monkeypatch.setattr(
-        main_window,
+        database_workers,
         "resolve_data_engine",
-        lambda **kwargs: resolve_calls.append(kwargs) or SimpleNamespace(
+        lambda **kwargs: resolve_calls.append(kwargs)
+        or SimpleNamespace(
             engine=pc_engine,
             source="pc",
             pc_engine=pc_engine,
@@ -236,9 +236,7 @@ def test_database_init_worker_routes_to_pc_without_opening_local_mirror(monkeypa
     results = []
     worker = main_window.DatabaseInitWorker()
     worker.initialized.connect(
-        lambda engine, source, pc, error: results.append(
-            (engine, source, pc, error)
-        )
+        lambda engine, source, pc, error: results.append((engine, source, pc, error))
     )
 
     worker.run()
@@ -251,12 +249,13 @@ def test_database_init_worker_routes_to_pc_without_opening_local_mirror(monkeypa
 
 def test_database_init_worker_respects_disabled_local_mirror_on_pc(monkeypatch):
     import src.ui.main_window as main_window
+    import src.ui.database_workers as database_workers
     import src.infrastructure.database.mirror_engine as mirror_engine
     import src.infrastructure.database.mirror_reconciliation as mirror_reconciliation
 
     pc_engine = object()
     monkeypatch.setattr(
-        main_window,
+        database_workers,
         "resolve_data_engine",
         lambda **_kwargs: SimpleNamespace(
             engine=pc_engine,
@@ -282,9 +281,7 @@ def test_database_init_worker_respects_disabled_local_mirror_on_pc(monkeypatch):
     results = []
     worker = main_window.DatabaseInitWorker()
     worker.initialized.connect(
-        lambda engine, source, pc, error: results.append(
-            (engine, source, pc, error)
-        )
+        lambda engine, source, pc, error: results.append((engine, source, pc, error))
     )
 
     worker.run()
@@ -297,6 +294,7 @@ def test_database_init_worker_does_not_wait_for_backup_reconciliation(
     monkeypatch,
 ):
     import src.ui.main_window as main_window
+    import src.ui.database_workers as database_workers
     import src.infrastructure.database.mirror_engine as mirror_engine
     import src.infrastructure.database.mirror_reconciliation as mirror_reconciliation
 
@@ -307,7 +305,7 @@ def test_database_init_worker_does_not_wait_for_backup_reconciliation(
         errors=("daily history mismatch",),
     )
     monkeypatch.setattr(
-        main_window,
+        database_workers,
         "resolve_data_engine",
         lambda **_kwargs: SimpleNamespace(
             engine=pc_engine,
@@ -324,9 +322,7 @@ def test_database_init_worker_does_not_wait_for_backup_reconciliation(
     results = []
     worker = main_window.DatabaseInitWorker()
     worker.initialized.connect(
-        lambda engine, source, pc, error: results.append(
-            (engine, source, pc, error)
-        )
+        lambda engine, source, pc, error: results.append((engine, source, pc, error))
     )
 
     worker.run()
@@ -337,13 +333,14 @@ def test_database_init_worker_does_not_wait_for_backup_reconciliation(
 
 def test_database_init_worker_never_starts_backup_reconciliation(monkeypatch):
     import src.ui.main_window as main_window
+    import src.ui.database_workers as database_workers
     import src.infrastructure.database.mirror_engine as mirror_engine
     import src.infrastructure.database.mirror_reconciliation as mirror_reconciliation
 
     pc_engine = object()
     local_engine = object()
     monkeypatch.setattr(
-        main_window,
+        database_workers,
         "resolve_data_engine",
         lambda **_kwargs: SimpleNamespace(
             engine=pc_engine,
@@ -355,16 +352,12 @@ def test_database_init_worker_never_starts_backup_reconciliation(monkeypatch):
     monkeypatch.setattr(
         mirror_reconciliation,
         "reconcile_local_mirror_with_pc",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            RuntimeError("sync exploded")
-        ),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("sync exploded")),
     )
     results = []
     worker = main_window.DatabaseInitWorker()
     worker.initialized.connect(
-        lambda engine, source, pc, error: results.append(
-            (engine, source, pc, error)
-        )
+        lambda engine, source, pc, error: results.append((engine, source, pc, error))
     )
 
     worker.run()
@@ -399,9 +392,7 @@ def test_completed_daily_fallback_refresh_starts_queued_hourly_refresh(monkeypat
         def run_all_scanners(self, **kwargs):
             self.scanner_starts += 1
 
-    monkeypatch.setattr(
-        scanner_mixin, "is_refresh_running", lambda mode: (False, {})
-    )
+    monkeypatch.setattr(scanner_mixin, "is_refresh_running", lambda mode: (False, {}))
     window = Window()
 
     window._handle_refresh_terminal_status(
@@ -484,9 +475,7 @@ def test_laptop_startup_checks_hourly_freshness_only_for_mirrored_scope(
     class Window:
         def __init__(self):
             self.logs = []
-            self.watchlist = SimpleNamespace(
-                items=[SimpleNamespace(symbol="AAPL")]
-            )
+            self.watchlist = SimpleNamespace(items=[SimpleNamespace(symbol="AAPL")])
             self.buylist_manager = SimpleNamespace(items=[])
             self.scanner_results = [{"symbol": "MSFT"}]
             self.scanner_results_by_setup = {}
@@ -507,17 +496,13 @@ def test_laptop_startup_checks_hourly_freshness_only_for_mirrored_scope(
     monkeypatch.setattr(
         main_window,
         "local_mirror_is_stale",
-        lambda _engine, _expected, *, tickers: calls.setdefault(
-            "daily", list(tickers)
-        )
+        lambda _engine, _expected, *, tickers: calls.setdefault("daily", list(tickers))
         and False,
     )
     monkeypatch.setattr(
         main_window,
         "local_mirror_hourly_is_stale",
-        lambda _engine, _expected, *, tickers: calls.setdefault(
-            "hourly", list(tickers)
-        )
+        lambda _engine, _expected, *, tickers: calls.setdefault("hourly", list(tickers))
         and False,
     )
 
@@ -592,10 +577,16 @@ def test_app_state_save_preserves_json_shapes(tmp_path, monkeypatch):
     monkeypatch.setattr(app_state, "WATCHLIST_FILE", tmp_path / "watchlist.json")
     monkeypatch.setattr(app_state, "BUYLIST_FILE", tmp_path / "buylist.json")
     monkeypatch.setattr(app_state, "TRADE_PLANS_FILE", tmp_path / "trade_plans.json")
-    monkeypatch.setattr(app_state, "SCANNER_SETUPS_FILE", tmp_path / "scanner_setups.json")
-    monkeypatch.setattr(app_state, "CHART_DRAWINGS_FILE", tmp_path / "chart_drawings.json")
+    monkeypatch.setattr(
+        app_state, "SCANNER_SETUPS_FILE", tmp_path / "scanner_setups.json"
+    )
+    monkeypatch.setattr(
+        app_state, "CHART_DRAWINGS_FILE", tmp_path / "chart_drawings.json"
+    )
     monkeypatch.setattr(app_state, "TAB_OPTIONS_FILE", tmp_path / "tab_options.json")
-    monkeypatch.setattr(app_state, "STATE_METADATA_FILE", tmp_path / "state_metadata.json")
+    monkeypatch.setattr(
+        app_state, "STATE_METADATA_FILE", tmp_path / "state_metadata.json"
+    )
 
     scanner_setups = {"Setup 1": {"rules": []}}
     chart_drawings = {"AAPL": []}
@@ -612,9 +603,16 @@ def test_app_state_save_preserves_json_shapes(tmp_path, monkeypatch):
     assert thread.daemon is False
     thread.join(timeout=2)
 
-    assert json.loads((tmp_path / "watchlist.json").read_text()) == {"name": "Default", "items": []}
+    assert json.loads((tmp_path / "watchlist.json").read_text()) == {
+        "name": "Default",
+        "items": [],
+    }
     assert json.loads((tmp_path / "buylist.json").read_text()) == {"items": []}
     assert json.loads((tmp_path / "trade_plans.json").read_text()) == {"plans": []}
-    assert json.loads((tmp_path / "scanner_setups.json").read_text()) == {"setups": scanner_setups}
+    assert json.loads((tmp_path / "scanner_setups.json").read_text()) == {
+        "setups": scanner_setups
+    }
     assert json.loads((tmp_path / "chart_drawings.json").read_text()) == chart_drawings
-    assert json.loads((tmp_path / "tab_options.json").read_text()) == {"tabs": tab_options}
+    assert json.loads((tmp_path / "tab_options.json").read_text()) == {
+        "tabs": tab_options
+    }

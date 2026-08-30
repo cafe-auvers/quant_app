@@ -16,7 +16,6 @@ from sqlalchemy.engine import Engine
 
 from src.core.market_alignment import (
     ALIGNMENT_BENCHMARK,
-    ALIGNMENT_FEATURE_VERSION,
     DEFAULT_ALIGNMENT_CONFIG,
     AlignmentConfig,
     ContextResult,
@@ -57,7 +56,6 @@ from src.infrastructure.database.repositories.scanner import (
 )
 from src.utils.config import ROOT_DIR
 from src.utils.market_calendar import expected_latest_market_data_date
-
 
 logger = logging.getLogger(__name__)
 DEFAULT_MARKET_PULSE_CONFIG_PATH = (

@@ -12,7 +12,7 @@ from typing import Callable, Dict, List, Optional
 
 from PyQt5.QtCore import QMimeData, Qt
 from PyQt5.QtGui import QDrag
-from PyQt5.QtWidgets import QAbstractItemView, QListWidget, QListWidgetItem, QMenu
+from PyQt5.QtWidgets import QAbstractItemView, QListWidget, QListWidgetItem
 
 from src.core.board_workflow import (
     BoardCardProjection,

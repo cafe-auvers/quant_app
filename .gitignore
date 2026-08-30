@@ -23,6 +23,8 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+.mypy_cache/
+.ruff_cache/
 
 # IDE
 .vscode/
@@ -71,6 +73,10 @@ data/logs/
 # Logs
 *.log
 logs/
+
+# Local archive (keep the policy document, not archived workstation files)
+/archive/*
+!/archive/README.md
 
 # Tests
 .pytest_cache/

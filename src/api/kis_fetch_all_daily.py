@@ -24,9 +24,9 @@ except ModuleNotFoundError:  # Keep direct script execution usable.
     from src.utils.config import DATA_DIR
 
 try:
-    from src.api.kis_config import KIS_BASE_URL, KIS_APP_KEY, KIS_APP_SECRET
+    from src.api.kis_config import KIS_APP_KEY, KIS_APP_SECRET, KIS_BASE_URL
 except ImportError:
-    from kis_config import KIS_BASE_URL, KIS_APP_KEY, KIS_APP_SECRET
+    from kis_config import KIS_APP_KEY, KIS_APP_SECRET, KIS_BASE_URL
 
 
 REQUEST_SLEEP_SEC = 0.08
@@ -381,10 +381,11 @@ def load_watchlist_symbols(path: Path = DATA_DIR / "watchlist.json") -> List[str
     items = data.get("items", [])
     if not isinstance(items, list):
         return []
-    symbols = []
-    for item in items:
-        if isinstance(item, dict) and item.get("symbol"):
-            symbols.append(str(item["symbol"]).strip().upper())
+    symbols = [
+        str(item["symbol"]).strip().upper()
+        for item in items
+        if isinstance(item, dict) and item.get("symbol")
+    ]
     return list(dict.fromkeys(symbol for symbol in symbols if symbol))
 
 

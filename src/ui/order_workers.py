@@ -6,6 +6,8 @@ from typing import Any, Callable, List, Optional
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
+from src.core.execution_mode import ExecutionSource
+from src.core.exit_execution_command import ExitExecutionCommand
 from src.core.order_state import (
     REGULAR_LIMIT_EXECUTION,
     RESERVED_MOO_EXECUTION,
@@ -13,8 +15,6 @@ from src.core.order_state import (
     OrderIntent,
     OrderSide,
 )
-from src.core.execution_mode import ExecutionSource
-from src.core.exit_execution_command import ExitExecutionCommand
 from src.risk.pre_trade import PreTradeRiskDecision
 from src.services.broker import Broker, KisBroker
 from src.services.event_journal import record_event
@@ -92,18 +92,18 @@ class KisOrderWorker(QThread):
                 request_submit,
             )
 
-            shared_kwargs = dict(
-                gateway=self.broker,
-                pre_trade_risk_decision=self.pre_trade_risk_decision,
-                strategy_id=self.strategy_id,
-                plan_id=self.plan_id,
-                event_recorder=self.event_recorder,
-                signal_payload=self.signal_payload,
-                signal_event_type=self.signal_event_type,
-                execution_authority=self.execution_authority,
-                execution_lease=self.execution_lease,
-                lease_engine=self.lease_engine,
-            )
+            shared_kwargs = {
+                "gateway": self.broker,
+                "pre_trade_risk_decision": self.pre_trade_risk_decision,
+                "strategy_id": self.strategy_id,
+                "plan_id": self.plan_id,
+                "event_recorder": self.event_recorder,
+                "signal_payload": self.signal_payload,
+                "signal_event_type": self.signal_event_type,
+                "execution_authority": self.execution_authority,
+                "execution_lease": self.execution_lease,
+                "lease_engine": self.lease_engine,
+            }
             if self.exit_command is not None:
                 result = request_exit_submit(
                     source=ExecutionSource.LEGACY_BUY_DASHBOARD,

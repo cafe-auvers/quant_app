@@ -45,7 +45,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from enum import Enum
@@ -191,10 +191,8 @@ def _exclusive_token_cache_lock(path: Path) -> Iterator[None]:
             except Exception:
                 os.close(descriptor)
                 descriptor = None
-                try:
+                with suppress(OSError):
                     lock_path.unlink()
-                except OSError:
-                    pass
                 raise
         except FileExistsError:
             try:
@@ -202,10 +200,8 @@ def _exclusive_token_cache_lock(path: Path) -> Iterator[None]:
             except OSError:
                 stale = False
             if stale:
-                try:
+                with suppress(OSError):
                     lock_path.unlink()
-                except OSError:
-                    pass
                 continue
             if time.monotonic() >= deadline:
                 raise KisApiError("Timed out waiting for the KIS token-cache lock.")
@@ -215,10 +211,8 @@ def _exclusive_token_cache_lock(path: Path) -> Iterator[None]:
         yield
     finally:
         os.close(descriptor)
-        try:
+        with suppress(OSError):
             lock_path.unlink()
-        except OSError:
-            pass
 
 
 def _atomic_write_token_cache(path: Path, payload: Dict[str, Any]) -> None:
@@ -241,10 +235,8 @@ def _atomic_write_token_cache(path: Path, payload: Dict[str, Any]) -> None:
         os.replace(temporary_path, path)
         _restrict_file_to_current_user(path)
     except Exception:
-        try:
+        with suppress(OSError):
             temporary_path.unlink()
-        except OSError:
-            pass
         raise
 
 

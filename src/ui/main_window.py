@@ -1,5 +1,6 @@
 """Main application window for the stock dashboard."""
 
+import contextlib
 import datetime as dt
 import logging
 import math
@@ -11,119 +12,174 @@ import tempfile
 import threading
 import time
 import webbrowser
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from zoneinfo import ZoneInfo
 
 import pandas as pd
 from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal, pyqtSlot
 from PyQt5.QtGui import QKeySequence
-from PyQt5.QtWidgets import (QApplication, QComboBox, QDialog, QHBoxLayout,
-                             QLabel, QLineEdit, QMainWindow, QMessageBox,
-                             QProgressBar, QPushButton, QSizePolicy, QStyle,
-                             QSystemTrayIcon, QTabWidget, QTextEdit,
-                             QVBoxLayout, QWidget)
+from PyQt5.QtWidgets import (
+    QApplication,
+    QComboBox,
+    QDialog,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QSizePolicy,
+    QStyle,
+    QSystemTrayIcon,
+    QTabWidget,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
+from zoneinfo import ZoneInfo
 
 try:
     from PyQt5.QtWebEngineWidgets import QWebEngineView
 except ImportError:
     QWebEngineView = None
 
-from src.core.order_state import (BrokerOrder, OrderIntent, OrderSide,
-                                  OrderStatus)
 from src.core import execution_config
-from src.core.runtime_readiness import EngineReadiness, RuntimeDeviceState
+from src.core.order_state import BrokerOrder, OrderIntent, OrderSide, OrderStatus
+from src.core.runtime_readiness import RuntimeDeviceState
 from src.core.scanner import StockScanner
 from src.core.watchlist import BuylistManager, TradePlanManager, Watchlist
-from src.infrastructure.database.mirror_engine import resolve_data_engine
 from src.infrastructure.database.coordination_engine import (
     coordination_database_configured,
-    init_coordination_engine,
 )
 from src.infrastructure.database.mirror_freshness import (
-    local_mirror_hourly_is_stale, local_mirror_is_stale)
+    local_mirror_hourly_is_stale,
+    local_mirror_is_stale,
+)
 from src.infrastructure.database.operational_engine import (
     init_local_operational_engine,
 )
+from src.infrastructure.database.settings import REFERENCE_SYMBOL
 from src.risk.orb_position import configure_orb_settings
 from src.services import trading_state
-from src.services.app_state import (EXECUTION_QUEUE_FILE, SETTINGS_FILE,
-                                    SaveResult, StateReconcileResult,
-                                    activate_device_as_main,
-                                    auto_claim_main_device_if_stale,
-                                    get_state_save_manager, load_buylist_state,
-                                    load_chart_drawings_state,
-                                    load_scanner_setups_state,
-                                    load_tab_options_state,
-                                    load_trade_plans_state,
-                                    load_watchlist_state,
-                                    publish_handoff_snapshot,
-                                    publish_trading_plan,
-                                    reconcile_state_with_remote,
-                                    release_main_device_and_demote,
-                                    save_app_state, should_auto_claim_main)
-from src.services.cloud_backup import (restore_state_directory,
-                                       restore_state_files)
-from src.services.controlled_live_policy import controlled_live_symbols
+from src.services.app_state import (
+    EXECUTION_QUEUE_FILE,
+    SETTINGS_FILE,
+    SaveResult,
+    StateReconcileResult,
+    get_state_save_manager,
+    load_buylist_state,
+    load_chart_drawings_state,
+    load_scanner_setups_state,
+    load_tab_options_state,
+    load_trade_plans_state,
+    load_watchlist_state,
+    publish_handoff_snapshot,
+    reconcile_state_with_remote,
+    release_main_device_and_demote,
+    save_app_state,
+    should_auto_claim_main,
+)
+from src.services.cloud_backup import restore_state_directory, restore_state_files
 from src.services.execution_authority import ExecutionAuthority, LeaseHandle
 from src.services.handoff_reconciliation import reset_runtime_only_order_flags
-from src.services.historical_refresh_control import (MODE_1D, MODE_1H,
-                                                     is_refresh_running,
-                                                     read_status,
-                                                     reconcile_stale_status)
-from src.services.market_pulse import MarketPulseService
-from src.services.order_ledger import (append_order, find_open_orders,
-                                       has_open_order, load_order_ledger,
-                                       merge_orders, save_order_ledger,
-                                       update_order)
-from src.services.runtime_status import (
-    record_runtime_heartbeat,
-    safe_mark_runtime_process_stopped,
+from src.services.historical_refresh_control import (
+    MODE_1D,
+    MODE_1H,
+    is_refresh_running,
+    read_status,
+    reconcile_stale_status,
 )
+from src.services.market_pulse import MarketPulseService
+from src.services.order_ledger import (
+    append_order,
+    find_open_orders,
+    has_open_order,
+    load_order_ledger,
+    merge_orders,
+    save_order_ledger,
+    update_order,
+)
+from src.services.runtime_status import safe_mark_runtime_process_stopped
 from src.services.sleep_readiness import write_sleep_readiness_snapshot
 from src.services.state_sync import (
-    LocalDeviceRole,
     SCANNER_SETUPS_KEY,
     SETTINGS_KEY,
-    get_coordination_status_snapshot,
+    LocalDeviceRole,
     get_live_trading_control,
     live_trading_control_block_reason,
     live_trading_control_is_effective,
     load_local_device_role,
-    set_operator_control,
-    set_live_trading_control,
 )
-from src.ui.buylist import BuylistMixin
 from src.ui.buyboard import BuyboardMixin
+from src.ui.buylist import BuylistMixin
 from src.ui.charts.controller import ChartsControllerMixin
 from src.ui.charts.renderer import ChartsRenderMixin
-from src.ui.controllers import (AccountController, BuylistController,
-                                BuylistExecutionController,
-                                ChartDataController, ScannerController)
-from src.ui.dialogs import (BackupEnvDialog, RestoreBackupDialog,
-                            RestoreEnvDialog, SettingsDialog)
-from src.ui.filter_catalog import (DEFAULT_SCANNER_SETUPS, DEFAULT_SETTINGS,
-                                   DEFAULT_TAB_OPTIONS)
+from src.ui.controllers import (
+    AccountController,
+    BuylistController,
+    BuylistExecutionController,
+    ChartDataController,
+    ScannerController,
+)
+from src.ui.coordination_workers import (
+    ControlOwnerUpdate,
+    ControlOwnerWorker,
+    LiveTradingControlWorker,
+    PlanPublishWorker,
+    StateSyncWorker,
+    control_runtime_identity_available as _control_runtime_identity_available,
+    control_target_role_from_records as _control_target_role_from_records,
+)
+from src.ui.database_workers import (
+    CoordinationDatabaseInitWorker,
+    CoordinationRuntimeHeartbeatWorker,
+    DatabaseInitWorker,
+    DatabaseRecoveryOutcome,
+    DatabaseRecoveryWorker,
+    LocalMirrorSyncWorker,
+    MarketDataStatusResult,
+    MarketDataStatusWorker,
+)
+from src.ui.dialogs import (
+    BackupEnvDialog,
+    RestoreBackupDialog,
+    RestoreEnvDialog,
+    SettingsDialog,
+)
+from src.ui.filter_catalog import (
+    DEFAULT_SCANNER_SETUPS,
+    DEFAULT_SETTINGS,
+    DEFAULT_TAB_OPTIONS,
+)
 from src.ui.health import HealthPanelMixin
-from src.ui.mixins.dashboard_mixin import DashboardMixin
+from src.ui.market_pulse import MarketPulseMixin
 from src.ui.mixins.chart_command_routing_mixin import ChartCommandRoutingMixin
+from src.ui.mixins.dashboard_mixin import DashboardMixin
 from src.ui.mixins.planning_support_mixin import PlanningSupportMixin
 from src.ui.mixins.scanner_mixin import ScannerMixin
 from src.ui.mixins.sidebar_mixin import SidebarMixin
 from src.ui.mixins.watchlist_actions_mixin import WatchlistActionsMixin
-from src.ui.market_pulse import MarketPulseMixin
 from src.ui.orb_settings_dialog import OrbSettingsDialog
 from src.ui.order_workers import HandoffReconciliationWorker
+from src.ui.readiness_presenter import (
+    BuyboardReadinessDisplay,
+    buyboard_readiness_display as _buyboard_readiness_display,
+    live_execution_status_text as _live_execution_status_text,
+)
 from src.ui.workers import PcRemoteStatusWorker
 from src.utils.config import DATA_DIR, ROOT_DIR, get_env_value
 from src.utils.data_loader import get_default_universe
 from src.utils.device_identity import detect_local_device_kind, runtime_device_kind
-from src.utils.intraday_helpers import \
-    extract_latest_opening_bar as _extract_latest_opening_bar
-from src.utils.market_calendar import (expected_latest_market_data_date,
-                                       is_regular_session_open,
-                                       seconds_until_nyse_regular_session_open)
+from src.utils.intraday_helpers import (
+    extract_latest_opening_bar as _extract_latest_opening_bar,
+)
+from src.utils.market_calendar import (
+    expected_latest_market_data_date,
+    is_regular_session_open,
+    nyse_holidays,
+    seconds_until_nyse_regular_session_open,
+)
 from src.utils.storage import load_json, save_json
 
 __all__ = [
@@ -142,7 +198,6 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-REFERENCE_SYMBOL = "SPY"
 KST_ZONE = ZoneInfo("Asia/Seoul")
 US_MARKET_ZONE = ZoneInfo("America/New_York")
 MARKET_DATA_READY_TIME_KST = dt.time(7, 0)
@@ -152,762 +207,6 @@ KIS_DAILY_CHART_FAILURE_COOLDOWN_SECONDS = 30 * 60
 WORKER_SHUTDOWN_TIMEOUT_MS = 30_000
 US_MARKET_OPEN_TIME = dt.time(9, 30)
 US_MARKET_CLOSE_TIME = dt.time(16, 0)
-
-_STANDBY_GATE_LABELS = {
-    "startup_reconciliation_complete": "initial broker reconciliation",
-    "account_reconciliation_fresh": "fresh broker account snapshot",
-    "websocket_connected": "KIS WebSocket connection",
-    "critical_trade_subscriptions_acked": "trade subscription acknowledgements",
-    "critical_quote_subscriptions_acked": "quote subscription acknowledgements",
-    "accumulator_draining_within_budget": "sustained market-data queue delay",
-    "database_writable": "local Kanban operational state writable",
-}
-
-
-@dataclass(frozen=True)
-class BuyboardReadinessDisplay:
-    completed: int
-    total: int
-    label: str
-    tooltip: str
-    indeterminate: bool = False
-
-
-def _format_readiness_eta(seconds: float) -> str:
-    remaining = max(0, int(seconds))
-    days, remainder = divmod(remaining, 86_400)
-    hours, remainder = divmod(remainder, 3_600)
-    minutes, seconds = divmod(remainder, 60)
-    prefix = f"{days}d " if days else ""
-    return f"{prefix}{hours:02d}:{minutes:02d}:{seconds:02d}"
-
-
-def _live_execution_status_text(enabled: bool, *, engine=None) -> str:
-    """Describe both the shared switch and the configured broker envelope."""
-
-    switch = "Enabled" if bool(enabled) else "Disabled"
-    mode = str(execution_config.KIS_LIVE_EXECUTION_MODE or "DISABLED").upper()
-    if mode != "CONTROLLED_LIVE":
-        return f"{switch} ({mode})"
-    symbols = ",".join(controlled_live_symbols(engine=engine)) or "none"
-    cap = float(execution_config.KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL or 0.0)
-    return (
-        f"{switch} (CONTROLLED_LIVE active cards: {symbols}, "
-        f"max ${cap:,.2f}/entry)"
-    )
-
-
-def _per_symbol_quote_guard_detail(
-    readiness: EngineReadiness,
-    *,
-    regular_session_open: bool,
-    seconds_until_open: Optional[float],
-) -> str:
-    if readiness.critical_quotes_fresh:
-        return ""
-    detail = (
-        "Per-symbol execution guard: symbols without a fresh execution-grade "
-        "quote remain individually blocked; overall board readiness is unchanged."
-    )
-    if not regular_session_open and seconds_until_open is not None:
-        detail += f" Market opens in {_format_readiness_eta(seconds_until_open)}."
-    return detail
-
-
-def _buyboard_readiness_display(
-    readiness: EngineReadiness,
-    *,
-    device_state: RuntimeDeviceState,
-    reconciliation_accounts: Tuple[str, ...] = (),
-    regular_session_open: bool = False,
-    seconds_until_open: Optional[float] = None,
-    auto_claim_enabled: bool = False,
-    is_main_device: bool = False,
-    single_session_handoff_ready: bool = False,
-) -> BuyboardReadinessDisplay:
-    """Project the authoritative readiness predicate into operator language."""
-
-    checks = readiness.standby_check_results
-    completed = readiness.standby_checks_completed
-    total = len(checks)
-    blockers = readiness.standby_blockers
-    blocked_labels = tuple(_STANDBY_GATE_LABELS[item] for item in blockers)
-    quote_guard_detail = _per_symbol_quote_guard_detail(
-        readiness,
-        regular_session_open=regular_session_open,
-        seconds_until_open=seconds_until_open,
-    )
-
-    if device_state == RuntimeDeviceState.ACTIVE:
-        tooltip_parts = [
-            "Startup readiness is latched while the worker remains ACTIVE.",
-            "Every broker mutation is revalidated for its account, symbol, and action.",
-        ]
-        if blocked_labels:
-            tooltip_parts.append(
-                "Current action guards: " + ", ".join(blocked_labels)
-            )
-        if quote_guard_detail:
-            tooltip_parts.append(quote_guard_detail)
-        return BuyboardReadinessDisplay(
-            total,
-            total,
-            f"Buy Board readiness {total}/{total} — ACTIVE; "
-            "broker mutations remain guarded by Live Trading",
-            " | ".join(tooltip_parts),
-        )
-    elif single_session_handoff_ready:
-        return BuyboardReadinessDisplay(
-            total,
-            total,
-            f"Buy Board readiness {total}/{total} â€” STANDBY_READY; "
-            "KIS WebSocket transfers with Execution Owner",
-            "KIS permits one realtime socket for this app key. The current "
-            "ACTIVE executor still has a healthy feed; this device has passed "
-            "database and broker reconciliation and will remain execution-closed "
-            "until its own socket connects after the fenced owner transfer.",
-        )
-    elif reconciliation_accounts:
-        accounts = ", ".join(reconciliation_accounts)
-        reason = f"final broker reconciliation for {accounts} (ETA unavailable)"
-        return BuyboardReadinessDisplay(
-            completed,
-            total,
-            f"Buy Board startup — {reason}",
-            "A live broker query is in progress. Its completion time depends on KIS response latency.",
-            indeterminate=True,
-        )
-    elif not readiness.startup_reconciliation_complete:
-        reason = "initial broker reconciliation (ETA unavailable)"
-        return BuyboardReadinessDisplay(
-            completed,
-            total,
-            f"Buy Board startup — {reason}",
-            "Startup cannot become ready until every configured account has been reconciled.",
-            indeterminate=True,
-        )
-    elif len(blocked_labels) > 1:
-        reason = f"{len(blocked_labels)} checks pending: " + "; ".join(
-            blocked_labels
-        )
-    elif not readiness.database_writable:
-        reason = "waiting for the local Kanban operational store"
-    elif not readiness.account_reconciliation_fresh:
-        reason = "waiting for a fresh broker account snapshot"
-    elif not readiness.websocket_connected:
-        reason = "connecting to the KIS WebSocket"
-    elif not readiness.critical_trade_subscriptions_acked:
-        reason = "waiting for KIS trade-subscription ACKs"
-    elif not readiness.critical_quote_subscriptions_acked:
-        reason = "waiting for KIS quote-subscription ACKs"
-    elif not readiness.accumulator_draining_within_budget:
-        reason = "market-data queue missed its drain budget three times"
-    elif device_state == RuntimeDeviceState.STANDBY_READY:
-        reason = (
-            "STANDBY_READY; automatic PC claim is armed"
-            if auto_claim_enabled
-            else "STANDBY_READY; use this device as Main"
-        )
-    elif readiness.standby_ready:
-        reason = (
-            "Main lease held; per-symbol execution guards active"
-            if is_main_device
-            else "publishing final readiness confirmation"
-        )
-    else:
-        reason = "checking execution dependencies"
-
-    passed_labels = tuple(
-        _STANDBY_GATE_LABELS[field_name]
-        for field_name, passed in checks
-        if passed
-    )
-    tooltip_parts = []
-    if passed_labels:
-        tooltip_parts.append("Passed: " + ", ".join(passed_labels))
-    if blocked_labels:
-        tooltip_parts.append("Waiting: " + ", ".join(blocked_labels))
-    if quote_guard_detail:
-        tooltip_parts.append(quote_guard_detail)
-    tooltip_parts.append(
-        "Automatic PC claim is enabled."
-        if auto_claim_enabled
-        else "Automatic execution-owner claim is disabled."
-    )
-    return BuyboardReadinessDisplay(
-        completed,
-        total,
-        f"Buy Board readiness {completed}/{total} — {reason}",
-        " | ".join(tooltip_parts),
-    )
-
-
-class DatabaseInitWorker(QThread):
-    """Use a fast PC connection check, falling back locally only if needed."""
-
-    initialized = pyqtSignal(object, str, object, str)
-
-    def run(self) -> None:
-        try:
-            # PC schema setup belongs to historical refresh/migration jobs.
-            # Dashboard startup needs only a successful connection probe.
-            resolution = resolve_data_engine(ensure_pc_schema=False)
-            self.initialized.emit(
-                resolution.engine, resolution.source, resolution.pc_engine, ""
-            )
-        except Exception as exc:
-            # resolve_data_engine normally returns a "none" resolution on
-            # optional-db failures, but the UI must also remain usable if an
-            # unexpected driver error escapes it.
-            self.initialized.emit(None, "none", None, str(exc))
-
-
-class CoordinationDatabaseInitWorker(QThread):
-    """Connect/provision the tiny Internet coordination store off the UI thread."""
-
-    initialized = pyqtSignal(object, str)
-
-    def run(self) -> None:
-        if not coordination_database_configured():
-            self.initialized.emit(None, "")
-            return
-        try:
-            engine = init_coordination_engine(ensure_schema=True, raise_on_error=True)
-            self.initialized.emit(engine, "")
-        except Exception as exc:  # credentials/endpoints must never reach UI logs
-            logger.debug(
-                "Coordination database initialization failed: %s", type(exc).__name__
-            )
-            self.initialized.emit(
-                None,
-                "The configured shared coordination database could not be reached. "
-                "Verify its SQL endpoint, TLS CA, username, password, and Internet connection.",
-            )
-
-
-class CoordinationRuntimeHeartbeatWorker(QThread):
-    """Publish this local ``main.py`` process to shared coordination."""
-
-    def __init__(self, engine, *, hostname: str, parent=None) -> None:
-        super().__init__(parent)
-        self.engine = engine
-        self.hostname = str(hostname or "").strip()
-
-    def run(self) -> None:
-        try:
-            record_runtime_heartbeat(self.engine, hostname=self.hostname)
-        except Exception as exc:  # the independent DB probes own user notices
-            logger.debug(
-                "Coordination runtime heartbeat failed: %s", type(exc).__name__
-            )
-
-
-@dataclass(frozen=True)
-class MarketDataStatusResult:
-    """Slow market-cache freshness and watermarks resolved off the GUI thread."""
-
-    engine: object
-    latest_daily: object = None
-    latest_hourly: object = None
-    expected_date: object = None
-    daily_is_stale: Optional[bool] = None
-    hourly_is_stale: Optional[bool] = None
-    error: str = ""
-
-
-class MarketDataStatusWorker(QThread):
-    """Read market-cache watermarks without freezing the dashboard."""
-
-    completed = pyqtSignal(object)
-
-    def __init__(
-        self,
-        engine,
-        tickers: Optional[List[str]] = None,
-        hourly_tickers: Optional[List[str]] = None,
-        universe_limit: Optional[int] = None,
-    ) -> None:
-        super().__init__()
-        self.engine = engine
-        self.tickers = list(tickers or []) or None
-        self.hourly_tickers = list(hourly_tickers or []) or None
-        self.universe_limit = universe_limit
-
-    def run(self) -> None:
-        try:
-            from src.infrastructure.database.repositories.market_bars import \
-                get_latest_hourly_price_history_timestamp
-            from src.infrastructure.database.repositories.market_watermarks import \
-                get_latest_price_history_date
-
-            tickers = self.tickers
-            if tickers is None:
-                tickers = get_default_universe(max_symbols=self.universe_limit)
-            hourly_tickers = self.hourly_tickers or tickers
-            expected_date = expected_latest_market_data_date()
-            result = MarketDataStatusResult(
-                engine=self.engine,
-                latest_daily=get_latest_price_history_date(self.engine),
-                # The local mirror intentionally contains a scoped hourly
-                # subset. SPY is its always-present freshness canary and its
-                # primary-key lookup avoids a multi-million-row global MAX.
-                latest_hourly=get_latest_hourly_price_history_timestamp(
-                    self.engine,
-                    symbol=(
-                        REFERENCE_SYMBOL
-                        if self.hourly_tickers is not None
-                        else None
-                    ),
-                ),
-                expected_date=expected_date,
-                daily_is_stale=local_mirror_is_stale(
-                    self.engine, expected_date, tickers=tickers
-                ),
-                hourly_is_stale=local_mirror_hourly_is_stale(
-                    self.engine, expected_date, tickers=hourly_tickers
-                ),
-            )
-        except Exception as exc:
-            result = MarketDataStatusResult(engine=self.engine, error=str(exc))
-        self.completed.emit(result)
-
-
-@dataclass(frozen=True)
-class DatabaseRecoveryOutcome:
-    engine: object
-    success: bool
-    error: str = ""
-
-
-class DatabaseRecoveryWorker(QThread):
-    """Verify PC MySQL connectivity without waiting for the local backup."""
-
-    recovered = pyqtSignal(object, int)
-
-    def __init__(
-        self,
-        generation: int,
-        pc_engine=None,
-    ) -> None:
-        super().__init__()
-        self.generation = int(generation)
-        self.pc_engine = pc_engine
-
-    def run(self) -> None:
-        from sqlalchemy import text
-
-        from src.infrastructure.database.engine import init_mysql_engine
-
-        engine = self.pc_engine
-        try:
-            if engine is None:
-                engine = init_mysql_engine(
-                    log_unavailable=False,
-                    ensure_schema=False,
-                )
-            if engine is None:
-                outcome = DatabaseRecoveryOutcome(
-                    None, False, error="PC MySQL is no longer reachable."
-                )
-            elif self.isInterruptionRequested():
-                outcome = DatabaseRecoveryOutcome(
-                    engine, False, error="Database connection check was interrupted."
-                )
-            else:
-                with engine.connect() as conn:
-                    conn.execute(text("SELECT 1"))
-                outcome = DatabaseRecoveryOutcome(engine, True)
-        except Exception as exc:
-            logger.exception("Runtime MySQL recovery failed unexpectedly")
-            outcome = DatabaseRecoveryOutcome(engine, False, error=str(exc))
-        self.recovered.emit(outcome, self.generation)
-
-
-class LocalMirrorSyncWorker(QThread):
-    """Best-effort, silent PC -> laptop local-mirror top-up in the background."""
-
-    completed = pyqtSignal(dict, str, bool, int)
-    progress = pyqtSignal(str, int, int, int)
-
-    def __init__(
-        self,
-        pc_engine,
-        local_engine,
-        hourly_symbols: Optional[List[str]] = None,
-        *,
-        generation: int = 0,
-    ) -> None:
-        super().__init__()
-        self.pc_engine = pc_engine
-        self.local_engine = local_engine
-        self.hourly_symbols = (
-            None if hourly_symbols is None else list(hourly_symbols)
-        )
-        self.generation = int(generation)
-
-    def run(self) -> None:
-        from src.infrastructure.database.mirror_copy import \
-            sync_local_mirror_from_pc_checkpointed
-        from src.infrastructure.database.mirror_engine import \
-            init_local_mirror_engine
-
-        try:
-            if self.local_engine is None:
-                self.local_engine = init_local_mirror_engine()
-            if self.local_engine is None:
-                raise RuntimeError("The local data mirror is unavailable.")
-            written = sync_local_mirror_from_pc_checkpointed(
-                self.pc_engine,
-                self.local_engine,
-                hourly_symbols=self.hourly_symbols,
-                progress_callback=lambda phase, current, total: self.progress.emit(
-                    phase,
-                    current,
-                    total,
-                    self.generation,
-                ),
-                cancellation_callback=self.isInterruptionRequested,
-            )
-            self.completed.emit(written, "", False, self.generation)
-        except Exception as exc:
-            self.completed.emit({}, str(exc), False, self.generation)
-
-
-class StateSyncWorker(QThread):
-    """Reconcile shared state without blocking the Qt event loop."""
-
-    completed = pyqtSignal(object, int)
-
-    def __init__(
-        self,
-        engine,
-        role: LocalDeviceRole,
-        save_lock: threading.Lock,
-        *,
-        activate: bool = False,
-        ownership_only_when_main: bool = False,
-        generation: int = 0,
-        auto_claim: bool = False,
-        expected_owner_device_id: str = "",
-        expected_standby_generation: int = 0,
-        require_runtime_ready_claim: bool = False,
-        metadata_path=None,
-    ) -> None:
-        super().__init__()
-        self.engine = engine
-        self.role = role
-        self.save_lock = save_lock
-        self.activate = activate
-        self.ownership_only_when_main = ownership_only_when_main
-        self.generation = int(generation)
-        # Automatic cross-machine handoff: claims via the fenced
-        # claim_main_device_if_stale primitive (re-verifying the expected
-        # owner + heartbeat staleness atomically) instead of the plain
-        # manual-activation path. See should_auto_claim_main /
-        # auto_claim_main_device_if_stale in src/services/app_state.py.
-        self.auto_claim = auto_claim
-        self.expected_owner_device_id = expected_owner_device_id
-        self.expected_standby_generation = int(expected_standby_generation or 0)
-        self.require_runtime_ready_claim = bool(require_runtime_ready_claim)
-        self.metadata_path = metadata_path
-
-    def run(self) -> None:
-        try:
-            if self.auto_claim:
-                result = auto_claim_main_device_if_stale(
-                    self.engine,
-                    self.role,
-                    expected_owner_device_id=self.expected_owner_device_id,
-                    save_lock=self.save_lock,
-                    expected_standby_generation=self.expected_standby_generation,
-                    metadata_path=self.metadata_path,
-                )
-            elif self.activate:
-                result = activate_device_as_main(
-                    self.engine,
-                    self.role,
-                    save_lock=self.save_lock,
-                    expected_standby_generation=self.expected_standby_generation,
-                    metadata_path=self.metadata_path,
-                )
-            else:
-                result = reconcile_state_with_remote(
-                    self.engine,
-                    self.role,
-                    save_lock=self.save_lock,
-                    ownership_only_when_main=self.ownership_only_when_main,
-                    allow_unprepared_claim=not self.require_runtime_ready_claim,
-                    metadata_path=self.metadata_path,
-                )
-        except Exception as exc:
-            logger.exception("State sync worker failed")
-            result = StateReconcileResult(
-                errors=[f"State sync failed: {exc}"],
-                local_role=self.role,
-            )
-        coordination_status = get_coordination_status_snapshot(self.engine)
-        control_result = coordination_status.live_trading
-        if control_result.success and control_result.control is not None:
-            result.live_trading_enabled = live_trading_control_is_effective(
-                control_result.control
-            )
-            result.live_trading_revision = control_result.control.revision
-        else:
-            result.live_trading_error = (
-                control_result.error
-                or "Could not read shared live-trading control."
-            )
-        operator_result = coordination_status.operator_control
-        if operator_result.success:
-            result.operator_control = operator_result.control
-        else:
-            result.operator_control_error = (
-                operator_result.error
-                or "Could not read shared operator-control ownership."
-            )
-        if not result.state_revisions:
-            result.state_revisions = coordination_status.state_revisions
-        try:
-            from src.services.runtime_device_state_repository import (
-                list_runtime_device_states,
-            )
-            from src.services.operator_commands import list_operator_commands
-
-            result.runtime_devices = list_runtime_device_states(self.engine)
-            result.operator_commands = list_operator_commands(
-                self.engine, limit=10
-            )
-        except Exception:
-            logger.debug(
-                "Could not read runtime device/command status", exc_info=True
-            )
-            result.runtime_devices = []
-            result.operator_commands = []
-        result.last_verified_at = dt.datetime.now(dt.timezone.utc)
-        self.completed.emit(result, self.generation)
-
-
-class LiveTradingControlWorker(QThread):
-    """Persist one global kill-switch action without blocking the Qt thread."""
-
-    completed = pyqtSignal(object)
-
-    def __init__(self, engine, role: LocalDeviceRole, enabled: bool) -> None:
-        super().__init__()
-        self.engine = engine
-        self.role = role
-        self.enabled = bool(enabled)
-
-    def run(self) -> None:
-        self.completed.emit(
-            set_live_trading_control(
-                self.engine,
-                self.role,
-                self.enabled,
-            )
-        )
-
-
-@dataclass(frozen=True)
-class ControlOwnerUpdate:
-    control: str
-    success: bool
-    target_label: str
-    result: object = None
-    error: str = ""
-
-
-def _control_runtime_identity_available(
-    record, *, now: Optional[dt.datetime] = None
-) -> bool:
-    """Accept only a fresh runtime identity that can participate in control."""
-
-    state = getattr(record, "state", "")
-    state_value = str(getattr(state, "value", state) or "").upper()
-    if state_value not in {
-        RuntimeDeviceState.STARTING.value,
-        RuntimeDeviceState.STANDBY.value,
-        RuntimeDeviceState.STANDBY_READY.value,
-        RuntimeDeviceState.ACTIVE.value,
-    }:
-        return False
-    updated_at = getattr(record, "updated_at", None)
-    if not isinstance(updated_at, dt.datetime):
-        return False
-    if updated_at.tzinfo is None:
-        updated_at = updated_at.replace(tzinfo=dt.timezone.utc)
-    reference = now or dt.datetime.now(dt.timezone.utc)
-    age_seconds = (reference - updated_at.astimezone(dt.timezone.utc)).total_seconds()
-    return (
-        -5.0
-        <= age_seconds
-        <= execution_config.COORDINATION_DEVICE_HEARTBEAT_MAX_AGE_SECONDS
-    )
-
-
-def _control_target_role_from_records(
-    records, target_label: str
-) -> Optional[LocalDeviceRole]:
-    candidates = [
-        record
-        for record in records
-        if _control_runtime_identity_available(record)
-        if runtime_device_kind(record.hostname, record.details) == target_label
-    ]
-    if not candidates:
-        return None
-    record = max(candidates, key=lambda item: item.updated_at)
-    return LocalDeviceRole(
-        device_id=record.device_id,
-        hostname=record.hostname,
-        is_main=False,
-    )
-
-
-class ControlOwnerWorker(QThread):
-    """Switch either owner without blocking the Qt event loop."""
-
-    completed = pyqtSignal(object)
-
-    def __init__(
-        self,
-        engine,
-        initiated_by: LocalDeviceRole,
-        *,
-        control: str,
-        target: Optional[LocalDeviceRole],
-        target_label: str,
-    ) -> None:
-        super().__init__()
-        self.engine = engine
-        self.initiated_by = initiated_by
-        self.control = str(control)
-        self.target = target
-        self.target_label = str(target_label)
-
-    def run(self) -> None:
-        try:
-            target = self.target
-            if target is None and self.target_label != "Locked":
-                from src.services.runtime_device_state_repository import (
-                    list_runtime_device_states,
-                )
-
-                records = list_runtime_device_states(self.engine)
-                target = _control_target_role_from_records(
-                    records,
-                    self.target_label,
-                )
-                if target is None:
-                    identity_exists = any(
-                        runtime_device_kind(record.hostname, record.details)
-                        == self.target_label
-                        for record in records
-                    )
-                    error = (
-                        f"The {self.target_label} runtime is registered, but its "
-                        "heartbeat is stale or its process state is not eligible. "
-                        "Keep main.py running and verify Buy Board readiness."
-                        if identity_exists
-                        else (
-                            f"No {self.target_label} runtime identity is registered "
-                            "in shared coordination. Start main.py on that device."
-                        )
-                    )
-                    self.completed.emit(
-                        ControlOwnerUpdate(
-                            control=self.control,
-                            success=False,
-                            target_label=self.target_label,
-                            error=error,
-                        )
-                    )
-                    return
-            if (
-                target is not None
-                and target.device_id == self.initiated_by.device_id
-            ):
-                # This worker is executing inside the selected local main.py
-                # process, so refresh its proof immediately instead of making
-                # a user action race the periodic heartbeat timer. Remote
-                # targets must still publish their own independent heartbeat.
-                record_runtime_heartbeat(
-                    self.engine,
-                    hostname=target.hostname,
-                )
-            if self.control == "operator":
-                result = set_operator_control(
-                    self.engine,
-                    self.initiated_by,
-                    target,
-                )
-                success = bool(result.success)
-                error = str(result.error or "")
-            else:
-                from src.services.control_ownership import switch_execution_owner
-
-                if target is None:
-                    raise ValueError("Execution Owner cannot be Locked")
-                result = switch_execution_owner(
-                    self.engine,
-                    initiated_by=self.initiated_by,
-                    target_device_id=target.device_id,
-                )
-                success = bool(result.success)
-                error = str(result.error or "")
-        except Exception as exc:
-            logger.exception("Control-owner switch failed")
-            result = None
-            success = False
-            error = str(exc)
-        self.completed.emit(
-            ControlOwnerUpdate(
-                control=self.control,
-                success=success,
-                target_label=self.target_label,
-                result=result,
-                error=error,
-            )
-        )
-
-
-class PlanPublishWorker(QThread):
-    """Publish a copied planning snapshot and verify its shared revisions."""
-
-    completed = pyqtSignal(object)
-
-    def __init__(
-        self,
-        engine,
-        role: LocalDeviceRole,
-        payloads: tuple,
-        execution_queue: Dict[str, Any],
-        *,
-        metadata_path,
-        market_is_open: bool,
-    ) -> None:
-        super().__init__()
-        self.engine = engine
-        self.role = role
-        self.payloads = payloads
-        self.execution_queue = dict(execution_queue)
-        self.metadata_path = metadata_path
-        self.market_is_open = bool(market_is_open)
-
-    def run(self) -> None:
-        watchlist, buylist, trade_plans = self.payloads[:3]
-        self.completed.emit(
-            publish_trading_plan(
-                self.engine,
-                self.role,
-                watchlist,
-                buylist,
-                trade_plans,
-                self.execution_queue,
-                market_is_open=self.market_is_open,
-                metadata_path=self.metadata_path,
-            )
-        )
 
 
 class MainWindow(
@@ -1052,9 +351,10 @@ class MainWindow(
         # machine, so a copied config can't silently arm this elsewhere. The
         # laptop deliberately never auto-reclaims on startup. Execution
         # ownership can still be transferred explicitly with the owner controls.
-        self._auto_claim_main_enabled = self._handoff_env_flag_true(
-            "AUTO_CLAIM_MAIN_ON_HANDOFF"
-        ) and self._expected_auto_claim_hostname_matches()
+        self._auto_claim_main_enabled = (
+            self._handoff_env_flag_true("AUTO_CLAIM_MAIN_ON_HANDOFF")
+            and self._expected_auto_claim_hostname_matches()
+        )
         self.handoff_reconciliation_worker = None
         self._handoff_generation = 0
         self._state_sync_auto_claim = False
@@ -1136,9 +436,7 @@ class MainWindow(
         self.kis_daily_chart_unavailable_key: str = ""
         self.kis_daily_chart_last_error: str = ""
         self.state_save_manager = get_state_save_manager()
-        self.state_save_manager.metadata_file = (
-            self._execution_state_metadata_path()
-        )
+        self.state_save_manager.metadata_file = self._execution_state_metadata_path()
         self.state_save_manager.set_engine(
             self._execution_state_engine(),
             device_id=self.state_sync_role.device_id,
@@ -1227,12 +525,9 @@ class MainWindow(
         attribute retain the historical local-engine seam.
         """
 
-        if (
-            "pc_db_engine" not in self.__dict__
-            or (
-                not self.__dict__.get("_qt_base_initialized", False)
-                and self.__dict__.get("pc_db_engine") is None
-            )
+        if "pc_db_engine" not in self.__dict__ or (
+            not self.__dict__.get("_qt_base_initialized", False)
+            and self.__dict__.get("pc_db_engine") is None
         ):
             return self.__dict__.get("operational_db_engine")
         if self.__dict__.get("_coordination_database_configured", False):
@@ -1258,15 +553,12 @@ class MainWindow(
             return bool(self.__dict__.get("_operational_database_ready", True))
         if engine is self.__dict__.get("coordination_db_engine"):
             return bool(self.__dict__.get("_coordination_database_ready", False))
-        return bool(
-            self.__dict__.get("_pc_database_ready", engine is not None)
-        )
+        return bool(self.__dict__.get("_pc_database_ready", engine is not None))
 
     def _using_local_operational_authority(self) -> bool:
         engine = self._execution_state_engine()
         return bool(
-            engine is not None
-            and engine is self.__dict__.get("operational_db_engine")
+            engine is not None and engine is self.__dict__.get("operational_db_engine")
         )
 
     def _execution_state_generation(self) -> int:
@@ -1294,7 +586,10 @@ class MainWindow(
         if self.__dict__.get("_database_shutting_down", False):
             return
         self._start_coordination_database_initialization()
-        if self.database_init_worker is not None and self.database_init_worker.isRunning():
+        if (
+            self.database_init_worker is not None
+            and self.database_init_worker.isRunning()
+        ):
             return
         worker = DatabaseInitWorker()
         self.database_init_worker = worker
@@ -1321,14 +616,12 @@ class MainWindow(
             if engine is not None:
                 engine.dispose()
             return
-        configured = bool(
-            self.__dict__.get("_coordination_database_configured", False)
-        )
+        configured = bool(self.__dict__.get("_coordination_database_configured", False))
         self.coordination_db_engine = engine
         self._coordination_database_ready = bool(configured and engine is not None)
-        self._coordination_transition_generation = int(
-            self.__dict__.get("_coordination_transition_generation", 0) or 0
-        ) + 1
+        self._coordination_transition_generation = (
+            int(self.__dict__.get("_coordination_transition_generation", 0) or 0) + 1
+        )
         if not configured:
             return
         if engine is None:
@@ -1337,9 +630,7 @@ class MainWindow(
             self._initial_state_sync_complete = False
             self._bind_remote_state_engine(None, is_main_device=False)
             notice = error or "Shared coordination database is unavailable."
-            if notice != self.__dict__.get(
-                "_last_coordination_database_notice", ""
-            ):
+            if notice != self.__dict__.get("_last_coordination_database_notice", ""):
                 self.append_log(notice)
             self._last_coordination_database_notice = notice
             return
@@ -1370,9 +661,7 @@ class MainWindow(
         self._last_coordination_database_notice = ""
         self._start_state_sync()
         self._sync_buyboard_runtime_worker()
-        if self.tabs.currentWidget() is self.__dict__.get(
-            "daily_summary_widget"
-        ):
+        if self.tabs.currentWidget() is self.__dict__.get("daily_summary_widget"):
             self._refresh_daily_summary()
 
     def _start_coordination_runtime_heartbeat(self, *, force: bool = False) -> None:
@@ -1401,9 +690,7 @@ class MainWindow(
         if worker is not None:
             return
         now = time.monotonic()
-        last_attempt = self.__dict__.get(
-            "_last_coordination_runtime_heartbeat_attempt"
-        )
+        last_attempt = self.__dict__.get("_last_coordination_runtime_heartbeat_attempt")
         cadence = float(execution_config.COORDINATION_DEVICE_HEARTBEAT_SECONDS)
         if (
             not force
@@ -1430,10 +717,8 @@ class MainWindow(
                 if candidate is None or id(candidate) in disposed:
                     continue
                 disposed.add(id(candidate))
-                try:
+                with contextlib.suppress(Exception):
                     candidate.dispose()
-                except Exception:
-                    pass
             return
         self.db_engine = engine
         self.pc_db_engine = pc_engine
@@ -1450,9 +735,8 @@ class MainWindow(
         if market_pulse_service is not None:
             market_pulse_service.set_engine(engine)
         self._pc_database_ready = bool(source == "pc" and pc_engine is not None)
-        if (
-            not self._using_local_operational_authority()
-            and not self.__dict__.get("_coordination_database_configured", False)
+        if not self._using_local_operational_authority() and not self.__dict__.get(
+            "_coordination_database_configured", False
         ):
             self._pc_database_coordination_ready = False
         self._last_pc_database_probe_ready = self._pc_database_ready
@@ -1540,10 +824,9 @@ class MainWindow(
 
     @pyqtSlot(object)
     def _on_market_data_status_completed(self, result: MarketDataStatusResult) -> None:
-        if (
-            self.__dict__.get("_database_shutting_down", False)
-            or result.engine is not self.__dict__.get("db_engine")
-        ):
+        if self.__dict__.get(
+            "_database_shutting_down", False
+        ) or result.engine is not self.__dict__.get("db_engine"):
             return
         if result.error:
             self._cached_market_data_status = "Unavailable"
@@ -1571,6 +854,7 @@ class MainWindow(
                     f"Daily {daily_status}; 1H latest {hourly_text} UTC"
                 )
         if not result.error:
+
             def freshness_state(value: Optional[bool]) -> str:
                 if value is True:
                     return "stale"
@@ -1595,10 +879,9 @@ class MainWindow(
 
     def _sync_active_pc_to_local_mirror(self) -> None:
         """Periodically preserve the active PC database for sudden failover."""
-        if (
-            self.__dict__.get("db_engine_source", "none") != "pc"
-            or not self.__dict__.get("_pc_database_ready", False)
-        ):
+        if self.__dict__.get(
+            "db_engine_source", "none"
+        ) != "pc" or not self.__dict__.get("_pc_database_ready", False):
             return
         try:
             if any(is_refresh_running(mode)[0] for mode in (MODE_1D, MODE_1H)):
@@ -1644,8 +927,7 @@ class MainWindow(
         self, pc_engine, *, log_completion: bool = True
     ) -> None:
         """Start a disposable PC-authoritative laptop backup off the UI thread."""
-        from src.infrastructure.database.mirror_engine import \
-            _local_mirror_enabled
+        from src.infrastructure.database.mirror_engine import _local_mirror_enabled
 
         if self.__dict__.get("_database_shutting_down", False):
             return
@@ -1731,7 +1013,7 @@ class MainWindow(
         for prefix, template in phase_prefixes.items():
             marker = f"{prefix}: "
             if phase.startswith(marker):
-                table_name = phase[len(marker):]
+                table_name = phase[len(marker) :]
                 return template.format(
                     table=table_labels.get(table_name, table_name.replace("_", " "))
                 )
@@ -1787,11 +1069,9 @@ class MainWindow(
         total: int,
         generation: int,
     ) -> None:
-        if (
-            self.__dict__.get("_database_shutting_down", False)
-            or generation
-            != self.__dict__.get("_database_transition_generation", 0)
-        ):
+        if self.__dict__.get(
+            "_database_shutting_down", False
+        ) or generation != self.__dict__.get("_database_transition_generation", 0):
             return
         friendly_phase = self._friendly_local_mirror_phase(str(phase or "Working"))
         self._local_mirror_progress_phase = friendly_phase
@@ -1839,10 +1119,8 @@ class MainWindow(
             self._local_mirror_engine = worker_local_engine
         if self.__dict__.get("_database_shutting_down", False):
             return
-        if (
-            generation is not None
-            and generation
-            != self.__dict__.get("_database_transition_generation", 0)
+        if generation is not None and generation != self.__dict__.get(
+            "_database_transition_generation", 0
         ):
             return
         total = sum(written.values())
@@ -1876,7 +1154,9 @@ class MainWindow(
             )
             QTimer.singleShot(5000, self._clear_local_mirror_progress_if_finished)
         if total and self.__dict__.get("_local_mirror_sync_log_completion", True):
-            self.append_log(f"Local data mirror updated ({total} row(s)) for offline fallback.")
+            self.append_log(
+                f"Local data mirror updated ({total} row(s)) for offline fallback."
+            )
 
     def _clear_local_mirror_progress_if_finished(self) -> None:
         if self.__dict__.get("_local_mirror_progress_phase") != "complete":
@@ -1933,9 +1213,7 @@ class MainWindow(
         except Exception:
             logger.exception("Could not load default universe for staleness check")
             tickers = None
-        daily_is_stale = local_mirror_is_stale(
-            engine, expected_date, tickers=tickers
-        )
+        daily_is_stale = local_mirror_is_stale(engine, expected_date, tickers=tickers)
         hourly_tickers = MainWindow._relevant_hourly_symbols(self)
         hourly_is_stale = local_mirror_hourly_is_stale(
             engine, expected_date, tickers=hourly_tickers
@@ -1950,9 +1228,7 @@ class MainWindow(
             ),
         )
 
-    def _finish_local_mirror_startup(
-        self, result: MarketDataStatusResult
-    ) -> None:
+    def _finish_local_mirror_startup(self, result: MarketDataStatusResult) -> None:
         """Prompt or scan using an already-computed background result."""
 
         if result.error:
@@ -2051,8 +1327,7 @@ class MainWindow(
             and (activate or auto_claim)
             and expected_standby_generation <= 0
             and not (
-                allow_local_bootstrap
-                and self._using_local_operational_authority()
+                allow_local_bootstrap and self._using_local_operational_authority()
             )
         ):
             self.append_log(
@@ -2082,14 +1357,15 @@ class MainWindow(
             require_runtime_ready_claim=(
                 runtime_claim_required
                 and not (
-                    allow_local_bootstrap
-                    and self._using_local_operational_authority()
+                    allow_local_bootstrap and self._using_local_operational_authority()
                 )
             ),
             metadata_path=self._execution_state_metadata_path(),
         )
         self.state_sync_worker = worker
-        self._state_sync_action = "activate" if (activate or auto_claim) else "reconcile"
+        self._state_sync_action = (
+            "activate" if (activate or auto_claim) else "reconcile"
+        )
         self._state_sync_auto_claim = auto_claim
         worker.completed.connect(self._on_state_sync_completed)
         self._track_worker("state_sync_worker", worker)
@@ -2109,9 +1385,7 @@ class MainWindow(
         if not self._execution_state_ready():
             return
         execution_engine = self._execution_state_engine()
-        live_trading_error = str(
-            getattr(result, "live_trading_error", "") or ""
-        )
+        live_trading_error = str(getattr(result, "live_trading_error", "") or "")
         live_trading_enabled = getattr(result, "live_trading_enabled", None)
         if not live_trading_error and live_trading_enabled is not None:
             trading_state.set_trading_enabled(bool(live_trading_enabled))
@@ -2132,9 +1406,7 @@ class MainWindow(
                     f"mutations fail closed: {live_notice}"
                 )
             elif self.__dict__.get("_last_live_trading_notice", ""):
-                self.append_log(
-                    "Shared live-trading control is reachable again."
-                )
+                self.append_log("Shared live-trading control is reachable again.")
         self._last_live_trading_notice = live_notice
         if self.__dict__.get("trading_enabled_button") is not None:
             self._refresh_trading_enabled_widget()
@@ -2163,9 +1435,7 @@ class MainWindow(
             )
         self._current_lease_token = result.lease_token if result.is_main_device else ""
         self._current_lease_epoch = (
-            int(getattr(result, "lease_epoch", 0) or 0)
-            if result.is_main_device
-            else 0
+            int(getattr(result, "lease_epoch", 0) or 0) if result.is_main_device else 0
         )
         if result.main_device_hostname:
             self._last_main_device_hostname = result.main_device_hostname
@@ -2205,16 +1475,12 @@ class MainWindow(
             self.trade_manager = self._load_trade_plans()
         if SETTINGS_KEY in updated_keys:
             self.settings = load_json(SETTINGS_FILE, DEFAULT_SETTINGS)
-            orb_settings = configure_orb_settings(
-                self.settings.get("orb_settings")
-            )
+            orb_settings = configure_orb_settings(self.settings.get("orb_settings"))
             self.settings["orb_settings"] = orb_settings.to_dict()
             apply_shortcuts = getattr(self, "_apply_shortcuts", None)
             if callable(apply_shortcuts):
                 apply_shortcuts()
-            buffer_input = self.__dict__.get(
-                "buyboard_orb_buffer_pct_input"
-            )
+            buffer_input = self.__dict__.get("buyboard_orb_buffer_pct_input")
             if buffer_input is not None:
                 try:
                     buffer_percent = float(
@@ -2250,9 +1516,7 @@ class MainWindow(
         if updated_keys.intersection({"watchlist", "buylist"}):
             # The tab is retired, but Watchlist/Buylist remain lightweight
             # sidebar sources and must immediately reflect pulled state.
-            refresh_planning = getattr(
-                self, "_update_watchlist_action_surfaces", None
-            )
+            refresh_planning = getattr(self, "_update_watchlist_action_surfaces", None)
             if callable(refresh_planning):
                 refresh_planning()
             else:
@@ -2325,10 +1589,10 @@ class MainWindow(
                             else "."
                         )
                     )
-                    claim_kwargs = dict(
-                        auto_claim=True,
-                        expected_owner_device_id=expected_owner_device_id,
-                    )
+                    claim_kwargs = {
+                        "auto_claim": True,
+                        "expected_owner_device_id": expected_owner_device_id,
+                    }
                     if runtime_claim_required:
                         claim_kwargs["expected_standby_generation"] = generation
                     self._start_state_sync(**claim_kwargs)
@@ -2418,10 +1682,9 @@ class MainWindow(
         # projection with an indeterminate activation message.
         if not runtime_active:
             state_sync_worker = self.__dict__.get("state_sync_worker")
-            if (
-                self.__dict__.get("_state_sync_action") == "activate"
-                and self._background_worker_running(state_sync_worker)
-            ):
+            if self.__dict__.get(
+                "_state_sync_action"
+            ) == "activate" and self._background_worker_running(state_sync_worker):
                 return BuyboardReadinessDisplay(
                     8,
                     8,
@@ -2471,16 +1734,12 @@ class MainWindow(
             )
         try:
             readiness = worker.engine_readiness(include_device_state=False)
-            display_readiness = getattr(
-                worker, "readiness_for_operator_display", None
-            )
+            display_readiness = getattr(worker, "readiness_for_operator_display", None)
             if callable(display_readiness):
                 readiness = display_readiness(readiness)
             market_open = is_regular_session_open()
             until_open = (
-                None
-                if market_open
-                else seconds_until_nyse_regular_session_open()
+                None if market_open else seconds_until_nyse_regular_session_open()
             )
             return _buyboard_readiness_display(
                 readiness,
@@ -2561,9 +1820,7 @@ class MainWindow(
         # label as "ETA unavailable" while the bar still shows how many of the
         # overall readiness gates have passed.
         progress_bar.setRange(0, 100)
-        progress_bar.setValue(
-            int((display.completed * 100) / max(1, display.total))
-        )
+        progress_bar.setValue(int((display.completed * 100) / max(1, display.total)))
         progress_label.setText(display.label)
         progress_label.setToolTip(display.tooltip)
         self._buyboard_readiness_progress_active = True
@@ -2599,9 +1856,7 @@ class MainWindow(
             self._save_buylist_state()
             self.populate_buylist_dashboard()
 
-        worker = HandoffReconciliationWorker(
-            self.buylist_manager, environment="PROD"
-        )
+        worker = HandoffReconciliationWorker(self.buylist_manager, environment="PROD")
         self.handoff_reconciliation_worker = worker
         worker.finished_reconciliation.connect(
             lambda outcome, gen=generation: self._on_post_claim_reconciliation_finished(
@@ -2632,9 +1887,7 @@ class MainWindow(
                 f"published ({persistence_error}). Retrying in 30s."
             )
             if self.state_sync_role.is_main:
-                QTimer.singleShot(
-                    30_000, self._retry_post_claim_handoff_if_still_main
-                )
+                QTimer.singleShot(30_000, self._retry_post_claim_handoff_if_still_main)
             return
         self._last_handoff_blocked_symbols = tuple(outcome.blocked_symbols)
         if outcome.ok:
@@ -2896,7 +2149,9 @@ class MainWindow(
                 # considered healthy" -- checking only "not in
                 # startup_reconciliation_errors" treated an account that
                 # was never processed as cleanly reconciled.
-                reconciled = getattr(worker, "startup_reconciled_accounts", None) or set()
+                reconciled = (
+                    getattr(worker, "startup_reconciled_accounts", None) or set()
+                )
                 if account_no not in reconciled:
                     return False
                 if account_no in errors:
@@ -2956,9 +2211,7 @@ class MainWindow(
                 "locked",
             }
             if worker is not None and worker.isRunning():
-                configure_sync = getattr(
-                    worker, "set_cross_device_operator_sync", None
-                )
+                configure_sync = getattr(worker, "set_cross_device_operator_sync", None)
                 if callable(configure_sync):
                     configure_sync(cross_device_operator_sync)
                 if bool(getattr(worker, "_standby_only", False)) == standby_only:
@@ -2971,8 +2224,8 @@ class MainWindow(
                 worker.requestInterruption()
                 return
 
-            from src.ui.buyboard.runtime_worker import BuyboardRuntimeWorker
             from src.services.external_alerting import build_external_alerting_service
+            from src.ui.buyboard.runtime_worker import BuyboardRuntimeWorker
 
             lease_kwargs = self._current_execution_lease_kwargs()
             if role.is_main and lease_kwargs.get("execution_authority") is None:
@@ -3018,7 +2271,9 @@ class MainWindow(
             new_worker.board_changed.connect(self.refresh_buyboard)
             new_worker.error_occurred.connect(self.append_log)
             new_worker.alert.connect(
-                lambda message: self._show_critical_notification("Buy Board Alert", message)
+                lambda message: self._show_critical_notification(
+                    "Buy Board Alert", message
+                )
             )
             self._track_worker("_buyboard_runtime_worker", new_worker)
             self._buyboard_runtime_worker = new_worker
@@ -3618,16 +2873,15 @@ class MainWindow(
                 }
 
                 if "rules" in values and isinstance(values["rules"], list):
-                    normalized_rules = []
-                    for r in values["rules"]:
-                        if isinstance(r, dict) and "attribute" in r:
-                            normalized_rules.append(
-                                {
-                                    "attribute": str(r.get("attribute")),
-                                    "operator": str(r.get("operator", ">=")),
-                                    "threshold": r.get("threshold", ""),
-                                }
-                            )
+                    normalized_rules = [
+                        {
+                            "attribute": str(rule.get("attribute")),
+                            "operator": str(rule.get("operator", ">=")),
+                            "threshold": rule.get("threshold", ""),
+                        }
+                        for rule in values["rules"]
+                        if isinstance(rule, dict) and "attribute" in rule
+                    ]
                     setup_data["rules"] = normalized_rules
                 else:
                     setup_data["rules"] = [
@@ -3721,9 +2975,10 @@ class MainWindow(
                 "The dashboard is not downloading market data for trading. "
                 "Wait for the Laptop backup progress line to finish, then close again.",
             )
-        task_names = ", ".join(
-            type(worker).__name__ for worker in unfinished_workers
-        ) or "unknown task"
+        task_names = (
+            ", ".join(type(worker).__name__ for worker in unfinished_workers)
+            or "unknown task"
+        )
         return (
             "Background task running",
             "A background task is still stopping safely.\n\n"
@@ -3847,9 +3102,7 @@ class MainWindow(
             return
 
         safe_mark_runtime_process_stopped(
-            self._execution_state_engine()
-            if self._execution_state_ready()
-            else None
+            self._execution_state_engine() if self._execution_state_ready() else None
         )
         super().closeEvent(event)
 
@@ -3877,9 +3130,8 @@ class MainWindow(
             self.append_log(f"Execution ownership retained: {decision.reason}")
             return False
         runtime_worker = self.__dict__.get("_buyboard_runtime_worker")
-        if (
-            runtime_worker is not None
-            and not bool(getattr(runtime_worker, "shutdown_prepared", False))
+        if runtime_worker is not None and not bool(
+            getattr(runtime_worker, "shutdown_prepared", False)
         ):
             self.append_log(
                 "Execution ownership retained: Buy Board journal/final "
@@ -3920,9 +3172,7 @@ class MainWindow(
             expected_lease_token=str(
                 self.__dict__.get("_current_lease_token", "") or ""
             ),
-            expected_lease_epoch=int(
-                self.__dict__.get("_current_lease_epoch", 0) or 0
-            ),
+            expected_lease_epoch=int(self.__dict__.get("_current_lease_epoch", 0) or 0),
             disable_remote_writer=lambda: self._bind_remote_state_engine(
                 execution_engine, is_main_device=False
             ),
@@ -3936,11 +3186,11 @@ class MainWindow(
             # failed local demotion make the live process believe otherwise.
             self.state_sync_role = owning_role
             try:
-                self._bind_remote_state_engine(
-                    execution_engine, is_main_device=True
-                )
+                self._bind_remote_state_engine(execution_engine, is_main_device=True)
             except Exception:
-                logger.exception("Could not restore remote writer after release failure")
+                logger.exception(
+                    "Could not restore remote writer after release failure"
+                )
             if release_error:
                 self.append_log(f"Execution-owner release failed: {release_error}")
         return released
@@ -4055,13 +3305,13 @@ class MainWindow(
             # The legacy ledger also contains old SIM/test orders.  They are
             # intentionally retained for audit/history, but can never be live
             # production exposure and must not block a PROD lease release.
-            for order in find_open_orders(
-                self.__dict__.get("order_ledger", []) or [],
-                environment="PROD",
-            ):
-                working.append(
-                    f"{getattr(order, 'account_no', '')}/{order.symbol} legacy order"
+            working.extend(
+                f"{getattr(order, 'account_no', '')}/{order.symbol} legacy order"
+                for order in find_open_orders(
+                    self.__dict__.get("order_ledger", []) or [],
+                    environment="PROD",
                 )
+            )
             return ShutdownExposure(
                 open_positions=tuple(positions),
                 working_orders=tuple(working),
@@ -4090,9 +3340,7 @@ class MainWindow(
         successor = None
         engine = self._execution_state_engine()
         role = self.__dict__.get("state_sync_role")
-        outgoing_lease_epoch = int(
-            self.__dict__.get("_current_lease_epoch", 0) or 0
-        )
+        outgoing_lease_epoch = int(self.__dict__.get("_current_lease_epoch", 0) or 0)
         if engine is not None and role is not None and outgoing_lease_epoch > 0:
             try:
                 candidate = find_standby_successor(
@@ -4213,10 +3461,8 @@ class MainWindow(
         cleared = getattr(self, attribute_name, None) is worker
         if cleared:
             setattr(self, attribute_name, None)
-        try:
+        with contextlib.suppress(AttributeError, RuntimeError):
             worker.deleteLater()
-        except (AttributeError, RuntimeError):
-            pass
 
     def _setup_tabs(self):
         """Set up the tab views."""
@@ -4293,7 +3539,9 @@ class MainWindow(
         file_menu.addSeparator()
         backup_env_action = file_menu.addAction("Backup .env to Cloud (Encrypted)...")
         backup_env_action.triggered.connect(self.show_backup_env_dialog)
-        restore_env_action = file_menu.addAction("Restore .env from Cloud (Encrypted)...")
+        restore_env_action = file_menu.addAction(
+            "Restore .env from Cloud (Encrypted)..."
+        )
         restore_env_action.triggered.connect(self.show_restore_env_dialog)
         file_menu.addSeparator()
         exit_action = file_menu.addAction("Exit")
@@ -4301,9 +3549,7 @@ class MainWindow(
 
         tools_menu = menubar.addMenu("Tools")
         self.chart_settings_action = tools_menu.addAction("Chart Settings")
-        self.chart_settings_action.triggered.connect(
-            self.show_chart_settings_dialog
-        )
+        self.chart_settings_action.triggered.connect(self.show_chart_settings_dialog)
         self.orb_settings_action = tools_menu.addAction("ORB Settings")
         self.orb_settings_action.triggered.connect(self.show_orb_settings_dialog)
         tools_menu.addSeparator()
@@ -4462,8 +3708,7 @@ class MainWindow(
         locked = trading_state.is_trading_locked_disabled()
         enabled = trading_state.is_trading_enabled()
         control_configured = bool(
-            "operational_db_engine" in self.__dict__
-            or "pc_db_engine" in self.__dict__
+            "operational_db_engine" in self.__dict__ or "pc_db_engine" in self.__dict__
         )
         shared_available = bool(
             self.__dict__.get("_shared_live_trading_available", False)
@@ -4597,8 +3842,7 @@ class MainWindow(
         effective = live_trading_control_is_effective(result.control)
         trading_state.set_trading_enabled(effective)
         self._shared_live_trading_available = bool(
-            self._execution_state_engine() is not None
-            and self._execution_state_ready()
+            self._execution_state_engine() is not None and self._execution_state_ready()
         )
         self._shared_live_trading_revision = result.control.revision
 
@@ -4672,7 +3916,9 @@ class MainWindow(
             self._on_publish_trading_plan_clicked
         )
         owner_layout.addWidget(self.publish_trading_plan_button)
-        self.control_ownership_status = QLabel("Control owners: verifying shared state...")
+        self.control_ownership_status = QLabel(
+            "Control owners: verifying shared state..."
+        )
         self.control_ownership_status.setWordWrap(True)
         self.control_ownership_status.setStyleSheet(
             "font-size: 11px; color: #555; padding-left: 8px;"
@@ -4744,9 +3990,7 @@ class MainWindow(
     def _control_runtime_identity_available(record) -> bool:
         return _control_runtime_identity_available(record)
 
-    def _control_identity_kind(
-        self, *, device_id: str = "", hostname: str = ""
-    ) -> str:
+    def _control_identity_kind(self, *, device_id: str = "", hostname: str = "") -> str:
         records = list(self.__dict__.get("_runtime_device_records", ()) or ())
         exact = [
             record
@@ -4757,8 +4001,7 @@ class MainWindow(
             record
             for record in records
             if hostname
-            and str(record.hostname).strip().lower()
-            == str(hostname).strip().lower()
+            and str(record.hostname).strip().lower() == str(hostname).strip().lower()
         ]
         if candidates:
             record = max(candidates, key=lambda item: item.updated_at)
@@ -4768,8 +4011,7 @@ class MainWindow(
             (device_id and str(role.device_id) == str(device_id))
             or (
                 hostname
-                and str(role.hostname).strip().lower()
-                == str(hostname).strip().lower()
+                and str(role.hostname).strip().lower() == str(hostname).strip().lower()
             )
         ):
             return detect_local_device_kind(role.hostname)
@@ -4838,7 +4080,9 @@ class MainWindow(
             )
             self.append_log(update.error or "Control-owner switch was blocked.")
             return
-        label = "Execution Owner" if update.control == "execution" else "Operator Control"
+        label = (
+            "Execution Owner" if update.control == "execution" else "Operator Control"
+        )
         self.append_log(f"{label} changed to {update.target_label}.")
         self._start_state_sync()
 
@@ -4864,9 +4108,9 @@ class MainWindow(
             ).upper()
             if status != "BUY_TODAY":
                 continue
-            environment = str(
-                getattr(card, "environment", "") or "PROD"
-            ).strip().upper()
+            environment = (
+                str(getattr(card, "environment", "") or "PROD").strip().upper()
+            )
             symbol = str(getattr(card, "symbol", "") or "").strip().upper()
             if symbol:
                 cards_by_environment.setdefault(environment, {})[symbol] = card
@@ -5066,19 +4310,13 @@ class MainWindow(
             return "unknown"
         if bool(getattr(control, "locked", True)):
             return "locked"
-        operator_device_id = str(
-            getattr(control, "device_id", "") or ""
-        ).strip()
+        operator_device_id = str(getattr(control, "device_id", "") or "").strip()
         executor_device_id = str(
             self.__dict__.get("_cached_execution_owner_device_id", "") or ""
         ).strip()
         if not operator_device_id or not executor_device_id:
             return "unknown"
-        return (
-            "split"
-            if operator_device_id != executor_device_id
-            else "same"
-        )
+        return "split" if operator_device_id != executor_device_id else "same"
 
     def _operator_executor_sync_required(self) -> bool:
         return self._operator_executor_sync_mode() == "split"
@@ -5115,9 +4353,7 @@ class MainWindow(
                     timer.start()
 
         runtime = self.__dict__.get("_buyboard_runtime_worker")
-        configure_runtime = getattr(
-            runtime, "set_cross_device_operator_sync", None
-        )
+        configure_runtime = getattr(runtime, "set_cross_device_operator_sync", None)
         if callable(configure_runtime):
             configure_runtime(mode == "split")
 
@@ -5139,18 +4375,14 @@ class MainWindow(
             self._operator_executor_sync_control = result.operator_control
         self._cached_operator_control_verified_at = result.last_verified_at
         self._runtime_device_records = tuple(result.runtime_devices or ())
-        executor_device_id = str(
-            getattr(result, "main_device_id", "") or ""
-        ).strip()
+        executor_device_id = str(getattr(result, "main_device_id", "") or "").strip()
         if not executor_device_id and bool(getattr(result, "is_main_device", False)):
             role = self.__dict__.get("state_sync_role")
-            executor_device_id = str(
-                getattr(role, "device_id", "") or ""
-            ).strip()
+            executor_device_id = str(getattr(role, "device_id", "") or "").strip()
         if not executor_device_id:
-            executor_hostname = str(
-                getattr(result, "main_device_hostname", "") or ""
-            ).strip().lower()
+            executor_hostname = (
+                str(getattr(result, "main_device_hostname", "") or "").strip().lower()
+            )
             matching_records = [
                 record
                 for record in self._runtime_device_records
@@ -5167,9 +4399,7 @@ class MainWindow(
                         dt.datetime.min.replace(tzinfo=dt.timezone.utc),
                     ),
                 )
-                executor_device_id = str(
-                    getattr(newest, "device_id", "") or ""
-                ).strip()
+                executor_device_id = str(getattr(newest, "device_id", "") or "").strip()
         if executor_device_id or not list(getattr(result, "errors", ()) or ()):
             self._cached_execution_owner_device_id = executor_device_id
         self._apply_operator_executor_sync_cadence()
@@ -5209,7 +4439,8 @@ class MainWindow(
             readiness[kind] = "Yes" if ready else "No"
             if not ready:
                 readiness_reason[kind] = str(
-                    record.details.get("executor_not_ready_reason") or record.state.value
+                    record.details.get("executor_not_ready_reason")
+                    or record.state.value
                 )
         revisions = dict(result.state_revisions or {})
         verified = result.last_verified_at
@@ -5342,57 +4573,8 @@ class MainWindow(
 
     @staticmethod
     def _nyse_holidays(year: int) -> set:
-        """Return the set of NYSE observed holiday dates for the given year."""
-
-        def nearest_weekday(d: dt.date) -> dt.date:
-            if d.weekday() == 5:  # Saturday → Friday
-                return d - dt.timedelta(days=1)
-            if d.weekday() == 6:  # Sunday → Monday
-                return d + dt.timedelta(days=1)
-            return d
-
-        def easter(y: int) -> dt.date:
-            # Anonymous Gregorian algorithm
-            a = y % 19
-            b, c = divmod(y, 100)
-            d, e = divmod(b, 4)
-            f = (b + 8) // 25
-            g = (b - f + 1) // 3
-            h = (19 * a + b - d - g + 15) % 30
-            i, k = divmod(c, 4)
-            l = (32 + 2 * e + 2 * i - h - k) % 7
-            m = (a + 11 * h + 22 * l) // 451
-            month, day = divmod(114 + h + l - 7 * m, 31)
-            return dt.date(y, month, day + 1)
-
-        def nth_weekday(y: int, month: int, weekday: int, n: int) -> dt.date:
-            first = dt.date(y, month, 1)
-            delta = (weekday - first.weekday()) % 7
-            return first + dt.timedelta(days=delta + 7 * (n - 1))
-
-        def last_weekday(y: int, month: int, weekday: int) -> dt.date:
-            last = dt.date(y, month + 1, 1) - dt.timedelta(days=1)
-            delta = (last.weekday() - weekday) % 7
-            return last - dt.timedelta(days=delta)
-
-        holidays = {
-            nearest_weekday(dt.date(year, 1, 1)),  # New Year's Day
-            nth_weekday(year, 1, 0, 3),  # MLK Day (3rd Monday Jan)
-            nth_weekday(year, 2, 0, 3),  # Presidents' Day (3rd Monday Feb)
-            easter(year) - dt.timedelta(days=2),  # Good Friday
-            last_weekday(year, 5, 0),  # Memorial Day (last Monday May)
-            nearest_weekday(dt.date(year, 6, 19)),  # Juneteenth
-            nearest_weekday(dt.date(year, 7, 4)),  # Independence Day
-            nth_weekday(year, 9, 0, 1),  # Labor Day (1st Monday Sep)
-            nth_weekday(year, 11, 3, 4),  # Thanksgiving (4th Thursday Nov)
-            nearest_weekday(dt.date(year, 12, 25)),  # Christmas
-        }
-        # New Year's Day observed in the following year when Jan 1 is Saturday
-        if (
-            dt.date(year, 12, 31).weekday() == 6
-        ):  # Dec 31 is Sunday → Jan 1 next year is Monday
-            holidays.add(dt.date(year, 12, 31))
-        return holidays
+        """Backward-compatible UI wrapper around the shared market calendar."""
+        return nyse_holidays(year)
 
     def update_market_countdown_status(self) -> None:
         """Update the market status countdown label (US Market hours)."""
@@ -5528,13 +4710,9 @@ class MainWindow(
             text_color = "#b42318"
             tooltip = "No usable market-data database is currently connected."
 
-        dot.setStyleSheet(
-            f"border-radius: 5px; background-color: {dot_color};"
-        )
+        dot.setStyleSheet(f"border-radius: 5px; background-color: {dot_color};")
         label.setText(text_value)
-        label.setStyleSheet(
-            f"font-size: 13px; font-weight: bold; color: {text_color};"
-        )
+        label.setStyleSheet(f"font-size: 13px; font-weight: bold; color: {text_color};")
         dot.setToolTip(tooltip)
         label.setToolTip(tooltip)
 
@@ -5590,7 +4768,9 @@ class MainWindow(
         local_engine = self.__dict__.get("_local_mirror_engine")
         if local_engine is None:
             from src.infrastructure.database.mirror_engine import (
-                _local_mirror_enabled, init_local_mirror_engine)
+                _local_mirror_enabled,
+                init_local_mirror_engine,
+            )
 
             if _local_mirror_enabled():
                 local_engine = init_local_mirror_engine()
@@ -5647,15 +4827,13 @@ class MainWindow(
         self.db_engine_source = "pc"
         self.db_enabled = True
         self._pc_database_ready = True
-        if (
-            not self._using_local_operational_authority()
-            and not self.__dict__.get("_coordination_database_configured", False)
+        if not self._using_local_operational_authority() and not self.__dict__.get(
+            "_coordination_database_configured", False
         ):
             self._pc_database_coordination_ready = False
         self._last_pc_database_probe_ready = True
-        if (
-            not self._using_local_operational_authority()
-            and not self.__dict__.get("_coordination_database_configured", False)
+        if not self._using_local_operational_authority() and not self.__dict__.get(
+            "_coordination_database_configured", False
         ):
             self._initial_state_sync_complete = False
         self._cached_market_data_status = None
@@ -5716,19 +4894,15 @@ class MainWindow(
         engine = outcome.engine
         self._database_reconciliation_in_progress = False
         self._update_database_source_indicator()
-        current_generation = self.__dict__.get(
-            "_database_transition_generation", 0
-        )
+        current_generation = self.__dict__.get("_database_transition_generation", 0)
         if (
             self.__dict__.get("_database_shutting_down", False)
             or generation != current_generation
             or not self.__dict__.get("_last_pc_database_probe_ready", False)
         ):
             if engine is not None:
-                try:
+                with contextlib.suppress(Exception):
                     engine.dispose()
-                except Exception:
-                    pass
             return
         if not outcome.success or engine is None:
             if engine is not None:
@@ -5752,10 +4926,8 @@ class MainWindow(
                 "database and retrying automatically."
             )
             if self.__dict__.get("pc_db_engine") is not engine:
-                try:
+                with contextlib.suppress(Exception):
                     engine.dispose()
-                except Exception:
-                    pass
 
     def _configure_coordination_fallback_timers(
         self,
@@ -5875,9 +5047,8 @@ class MainWindow(
                 refresh(revision_only=True)
 
     def _drain_remote_coordination_sync(self) -> None:
-        if (
-            self.__dict__.get("_database_shutting_down", False)
-            or not self.__dict__.get("_remote_coordination_sync_pending", False)
+        if self.__dict__.get("_database_shutting_down", False) or not self.__dict__.get(
+            "_remote_coordination_sync_pending", False
         ):
             return
         worker = self.__dict__.get("state_sync_worker")
@@ -5894,9 +5065,8 @@ class MainWindow(
     def _process_internal_coordination_pulse(self) -> None:
         """Route local dirty generations without issuing a database query."""
 
-        if (
-            self.__dict__.get("_database_shutting_down", False)
-            or not self.__dict__.get("_coordination_database_ready", False)
+        if self.__dict__.get("_database_shutting_down", False) or not self.__dict__.get(
+            "_coordination_database_ready", False
         ):
             return
         engine = self.__dict__.get("coordination_db_engine")
@@ -5912,9 +5082,7 @@ class MainWindow(
         )
 
         kind = detect_local_device_kind(getattr(role, "hostname", platform.node()))
-        change = stage_local_coordination_change(
-            engine, device_id=role.device_id
-        )
+        change = stage_local_coordination_change(engine, device_id=role.device_id)
         if kind == "PC":
             if change.event_id and publish_outbound_change_pulse(
                 change.event_id, tables=change.tables
@@ -5922,10 +5090,8 @@ class MainWindow(
                 acknowledge_local_change_event(engine, change.event_id)
             inbound_event = read_inbound_change_event()
             inbound_event_id = inbound_event.event_id
-            if (
-                inbound_event_id
-                and inbound_event_id
-                != self.__dict__.get("_last_inbound_coordination_event_id", "")
+            if inbound_event_id and inbound_event_id != self.__dict__.get(
+                "_last_inbound_coordination_event_id", ""
             ):
                 self._last_inbound_coordination_event_id = inbound_event_id
                 if mark_remote_coordination_change(
@@ -5971,9 +5137,7 @@ class MainWindow(
         if (
             role is not None
             and execution_engine is not None
-            and detect_local_device_kind(
-                getattr(role, "hostname", platform.node())
-            )
+            and detect_local_device_kind(getattr(role, "hostname", platform.node()))
             == "Laptop"
         ):
             from src.services.coordination_change_pulse import (
@@ -6013,9 +5177,7 @@ class MainWindow(
             return
 
         listener_on = status.listener_status == PcStatus.ON
-        remote_poll_backoff_safe = self._coordination_remote_poll_backoff_safe(
-            status
-        )
+        remote_poll_backoff_safe = self._coordination_remote_poll_backoff_safe(status)
         peer_confirmed_off = self._coordination_peer_confirmed_off(status)
         execution_engine = (
             self._execution_state_engine()
@@ -6033,9 +5195,7 @@ class MainWindow(
         # fallback.  It is also safe while the peer is confirmed off: local
         # DML remains dirty-pulse driven, and the frequent status probe flips
         # this back as soon as the peer returns.
-        set_change_notifications_available(
-            execution_engine, remote_poll_backoff_safe
-        )
+        set_change_notifications_available(execution_engine, remote_poll_backoff_safe)
         set_remote_peer_confirmed_off(execution_engine, peer_confirmed_off)
         self._configure_coordination_fallback_timers(
             remote_poll_backoff_safe,
@@ -6044,22 +5204,19 @@ class MainWindow(
         delivered_event_id = str(
             getattr(status, "coordination_notification_event_id", "") or ""
         )
-        if bool(
-            getattr(status, "coordination_notification_delivered", False)
-        ) and delivered_event_id:
+        if (
+            bool(getattr(status, "coordination_notification_delivered", False))
+            and delivered_event_id
+        ):
             acknowledge_local_change_event(execution_engine, delivered_event_id)
         role = self.__dict__.get("state_sync_role")
-        remote_event_id = str(
-            getattr(status, "coordination_change_event_id", "") or ""
-        )
+        remote_event_id = str(getattr(status, "coordination_change_event_id", "") or "")
         remote_event_tables = tuple(
             getattr(status, "coordination_change_tables", ()) or ()
         )
         if (
             role is not None
-            and detect_local_device_kind(
-                getattr(role, "hostname", platform.node())
-            )
+            and detect_local_device_kind(getattr(role, "hostname", platform.node()))
             == "Laptop"
             and execution_engine is not None
             and remote_event_id
@@ -6076,9 +5233,7 @@ class MainWindow(
         db_ready = bool(status.database_ready)
         self._main_availability_probe_complete = True
         self._main_availability_probe_database_ready = db_ready
-        previous_main_app_active = self.__dict__.get(
-            "_last_pc_main_app_active"
-        )
+        previous_main_app_active = self.__dict__.get("_last_pc_main_app_active")
         self._last_pc_database_probe_ready = db_ready
         if "db_engine_source" in self.__dict__:
             try:
@@ -6094,13 +5249,11 @@ class MainWindow(
                     self._switch_to_runtime_local_mirror()
             except Exception:
                 logger.exception("Runtime database transition failed")
-                try:
+                with contextlib.suppress(Exception):
                     self.append_log(
                         "Automatic database transition encountered an error; "
                         "the dashboard will keep retrying in the background."
                     )
-                except Exception:
-                    pass
         self._pc_is_on = db_ready or listener_on
         self._pc_remote_control_available = listener_on
 
@@ -6108,7 +5261,9 @@ class MainWindow(
             dot.setStyleSheet("border-radius: 5px; background-color: #26a69a;")  # green
             label.setText("PC: On")
         elif listener_on:
-            dot.setStyleSheet("border-radius: 5px; background-color: #ffb300;")  # yellow
+            dot.setStyleSheet(
+                "border-radius: 5px; background-color: #ffb300;"
+            )  # yellow
             label.setText("PC: On (DB unavailable)")
         else:
             dot.setStyleSheet("border-radius: 5px; background-color: #f23645;")  # red
@@ -6159,7 +5314,9 @@ class MainWindow(
             if listener_on:
                 button.setEnabled(True)
                 button.setText("Turn Off")
-                button.setToolTip("Ask the PC's remote-control listener to shut down safely.")
+                button.setToolTip(
+                    "Ask the PC's remote-control listener to shut down safely."
+                )
             elif self._pc_is_on:
                 button.setEnabled(False)
                 button.setText("Remote Control Offline")
@@ -6191,7 +5348,8 @@ class MainWindow(
         url = os.getenv("PC_WAKE_URL", "").strip()
         if not url:
             QMessageBox.warning(
-                self, "Not configured",
+                self,
+                "Not configured",
                 "PC_WAKE_URL is not set in .env (e.g. http://your-router-ddns-host:PORT/).",
             )
             return
@@ -6496,7 +5654,9 @@ class MainWindow(
         """File > Backup .env to Cloud (Encrypted) -- manual, passphrase-gated."""
         dialog = BackupEnvDialog(self)
         if dialog.exec_() == QDialog.Accepted:
-            self.append_log("Encrypted .env backup written to cloud backup destination.")
+            self.append_log(
+                "Encrypted .env backup written to cloud backup destination."
+            )
 
     def show_restore_env_dialog(self) -> None:
         """File > Restore .env from Cloud (Encrypted) -- manual, passphrase-gated."""

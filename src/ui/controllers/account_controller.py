@@ -20,9 +20,9 @@ class AccountController(WindowController):
         """Return a selected profile's account only when it matches the environment."""
         if not isinstance(profile, dict):
             return ""
-        profile_environment = str(
-            profile.get("environment") or environment or ""
-        ).strip().upper()
+        profile_environment = (
+            str(profile.get("environment") or environment or "").strip().upper()
+        )
         if profile_environment != str(environment or "").strip().upper():
             return ""
         return str(profile.get("account_no") or "").strip()
@@ -68,9 +68,10 @@ class AccountController(WindowController):
         return ""
 
     def refresh_trade_account_size(self) -> None:
+        window = self.window
         profile = (
-            self.trade_kis_account_combo.currentData()
-            if hasattr(self, "trade_kis_account_combo")
+            window.trade_kis_account_combo.currentData()
+            if hasattr(window, "trade_kis_account_combo")
             else None
         )
         if not profile:
@@ -78,54 +79,63 @@ class AccountController(WindowController):
                 self.window, "No KIS account", "Select a configured KIS account first."
             )
             return
-        if self.kis_startup_worker is not None and self.kis_startup_worker.isRunning():
+        if (
+            window.kis_startup_worker is not None
+            and window.kis_startup_worker.isRunning()
+        ):
             QMessageBox.information(
                 self.window,
                 "KIS preload running",
                 "Startup KIS account preload is still running.",
             )
             return
-        if self.kis_account_worker is not None and self.kis_account_worker.isRunning():
+        if (
+            window.kis_account_worker is not None
+            and window.kis_account_worker.isRunning()
+        ):
             QMessageBox.information(
                 self.window, "KIS refresh running", "A KIS refresh is already running."
             )
             return
 
-        environment = self.trade_kis_environment_combo.currentText()
-        self.append_log(
+        environment = window.trade_kis_environment_combo.currentText()
+        window.append_log(
             f"Fetching {profile.get('label', environment)} account value..."
         )
         requested_profile = dict(profile)
-        self.kis_account_worker = KisAccountWorker(
+        window.kis_account_worker = KisAccountWorker(
             environment=environment,
             include_domestic=True,
             include_overseas=True,
             account_no=requested_profile.get("account_no"),
         )
-        self.kis_account_worker.finished_snapshot.connect(
-            lambda snapshot, requested=requested_profile: self._on_trade_account_snapshot_finished(
+        window.kis_account_worker.finished_snapshot.connect(
+            lambda snapshot,
+            requested=requested_profile: window._on_trade_account_snapshot_finished(
                 snapshot, requested
             )
         )
-        self.kis_account_worker.error_occurred.connect(
-            lambda error, requested=requested_profile: self._on_trade_account_snapshot_error(
+        window.kis_account_worker.error_occurred.connect(
+            lambda error,
+            requested=requested_profile: window._on_trade_account_snapshot_error(
                 error, requested
             )
         )
-        self._track_worker("kis_account_worker", self.kis_account_worker)
-        self.kis_account_worker.start()
+        window._track_worker("kis_account_worker", window.kis_account_worker)
+        window.kis_account_worker.start()
 
     def sync_positions_from_kis(
         self, snapshots: Optional[Dict[Any, dict]] = None
     ) -> int:
         """Sync held buylist positions to real KIS account holdings when snapshots are available."""
-        if not hasattr(self, "buylist_manager"):
+        window = self.window
+        if not hasattr(window, "buylist_manager"):
             return 0
 
         snapshot_map = (
             snapshots
             if snapshots is not None
-            else getattr(self, "kis_account_snapshots", {})
+            else getattr(window, "kis_account_snapshots", {})
         )
         if not isinstance(snapshot_map, dict):
             return 0
@@ -147,12 +157,12 @@ class AccountController(WindowController):
                     account_no
                 )
 
-            for holding in self._buylist_snapshot_holdings(snapshot):
+            for holding in window._buylist_snapshot_holdings(snapshot):
                 symbol = str(holding.get("symbol", "")).strip().upper()
-                quantity = self._buylist_to_float(holding.get("quantity"))
+                quantity = window._buylist_to_float(holding.get("quantity"))
                 if not symbol or quantity <= 0:
                     continue
-                average_price = self._buylist_to_float(holding.get("average_price"))
+                average_price = window._buylist_to_float(holding.get("average_price"))
                 holdings_key = (environment, account_no, symbol)
                 # KIS can repeat a symbol across exchange sections.  Keep the
                 # largest quantity for this one account, never a value selected
@@ -161,7 +171,7 @@ class AccountController(WindowController):
                     holdings_by_key[holdings_key] = (quantity, average_price)
 
         changed = 0
-        for item in self.buylist_manager.items:
+        for item in window.buylist_manager.items:
             symbol = str(getattr(item, "symbol", "")).strip().upper()
             environment = str(getattr(item, "environment", "") or "PROD").upper()
             account_no = self._account_no_for_buylist_item(item, environment)
@@ -176,7 +186,7 @@ class AccountController(WindowController):
                 if len(accounts) == 1:
                     account_no = next(iter(accounts))
                 elif len(accounts) > 1:
-                    self.append_log(
+                    window.append_log(
                         f"[Buylist/{environment}] Skipped KIS sync for {symbol}: "
                         "no account is assigned and multiple account snapshots are loaded."
                     )
@@ -184,8 +194,9 @@ class AccountController(WindowController):
 
             holding = holdings_by_key.get((environment, account_no, symbol))
             if holding is None:
-                account_was_fetched = account_no in snapshot_accounts_by_environment.get(
-                    environment, set()
+                account_was_fetched = (
+                    account_no
+                    in snapshot_accounts_by_environment.get(environment, set())
                 )
                 old_shares = max(0, int(getattr(item, "shares_held", 0) or 0))
                 old_status = str(getattr(item, "monitoring_status", "") or "")
@@ -198,16 +209,15 @@ class AccountController(WindowController):
                     "PARTIAL_EXIT_RESERVED",
                     "SELL_RESERVED",
                 }
-                if (
-                    account_was_fetched
-                    and (old_shares > 0 or old_status.upper() in position_statuses)
+                if account_was_fetched and (
+                    old_shares > 0 or old_status.upper() in position_statuses
                 ):
                     item.shares_held = 0
                     item.position_percent = 0.0
                     item.monitoring_status = "SOLD"
                     item._buy_order_pending = False
                     changed += 1
-                    self.append_log(
+                    window.append_log(
                         f"[Buylist/{environment}] KIS confirms {symbol} is flat in "
                         f"account {account_no}; cleared stale {old_shares}-share position."
                     )
@@ -219,7 +229,7 @@ class AccountController(WindowController):
                 continue
 
             old_shares = int(getattr(item, "shares_held", 0) or 0)
-            old_avg = self._buylist_to_float(getattr(item, "avg_cost", 0.0))
+            old_avg = window._buylist_to_float(getattr(item, "avg_cost", 0.0))
             old_status = str(getattr(item, "monitoring_status", ""))
             old_account_no = str(getattr(item, "kis_account_no", "") or "").strip()
 
@@ -230,8 +240,8 @@ class AccountController(WindowController):
             if not getattr(item, "buy_date", None):
                 item.buy_date = dt.datetime.now(US_MARKET_ZONE)
             item._buy_order_pending = False
-            if self._is_execution_queue_buylist_item(item):
-                manager = self._ensure_execution_queue_manager()
+            if window._is_execution_queue_buylist_item(item):
+                manager = window._ensure_execution_queue_manager()
                 queue_item = (
                     manager.get_item(symbol, environment)
                     if hasattr(manager, "get_item")
@@ -242,7 +252,7 @@ class AccountController(WindowController):
                         symbol, order_status="FILLED", environment=environment
                     )
                     item.status = (
-                        self._execution_queue_status_for_buylist_item(item)
+                        window._execution_queue_status_for_buylist_item(item)
                         or item.status
                     )
             if item.monitoring_status in {
@@ -266,12 +276,12 @@ class AccountController(WindowController):
                 or old_account_no != item.kis_account_no
             ):
                 changed += 1
-                self.append_log(
+                window.append_log(
                     f"[Buylist/{environment}] Synced {symbol} from KIS account {account_no or '<unknown>'}: "
                     f"shares {old_shares} -> {item.shares_held}, avg ${old_avg:.2f} -> ${item.avg_cost:.2f}."
                 )
 
         if changed:
-            self._save_buylist_state()
-            self.populate_buylist_dashboard()
+            window._save_buylist_state()
+            window.populate_buylist_dashboard()
         return changed

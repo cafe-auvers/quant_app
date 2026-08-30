@@ -27,6 +27,7 @@ backups) -- there's no value in an old copy of rotated-out credentials.
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import logging
 import os
@@ -87,10 +88,8 @@ def _atomic_write(dest: Path, data: bytes) -> None:
         tmp_dest.replace(dest)
     except Exception:
         if tmp_dest is not None:
-            try:
+            with contextlib.suppress(OSError):
                 tmp_dest.unlink(missing_ok=True)
-            except OSError:
-                pass
         raise
 
 

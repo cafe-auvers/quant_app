@@ -14,8 +14,7 @@ import logging
 import threading
 import weakref
 from dataclasses import asdict, dataclass
-from typing import Any, Iterable, Optional, Sequence
-from zoneinfo import ZoneInfo
+from typing import Any, Optional, Sequence
 
 from sqlalchemy import (
     Column,
@@ -31,6 +30,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
+from zoneinfo import ZoneInfo
 
 from src.core.execution_order_record import ExecutionOrderStatus
 from src.core.exit_policy import market_session_date, market_session_date_from_value

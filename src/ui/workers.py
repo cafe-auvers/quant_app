@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import time
 from typing import List, Optional
@@ -11,13 +12,21 @@ from PyQt5.QtCore import QThread, pyqtSignal
 
 from src.api.kis_account_snapshot_dual import fetch_account_snapshot
 from src.infrastructure.database.repositories.market_bars import (
-    prune_intraday_history, save_intraday_history_to_db)
-from src.services.intraday_data_service import (fetch_intraday_with_fallback,
-                                                load_best_intraday_history)
+    prune_intraday_history,
+    save_intraday_history_to_db,
+)
+from src.services.intraday_data_service import (
+    fetch_intraday_with_fallback,
+    load_best_intraday_history,
+)
 from src.services.intraday_provider import IntradayInterval, IntradayRequest
-from src.ui.order_workers import (HandoffReconciliationWorker,
-                                  KisOrderCancelWorker, KisOrderQueryWorker,
-                                  KisOrderWorker, OrderReconciliationWorker)
+from src.ui.order_workers import (
+    HandoffReconciliationWorker,
+    KisOrderCancelWorker,
+    KisOrderQueryWorker,
+    KisOrderWorker,
+    OrderReconciliationWorker,
+)
 from src.utils.data_loader import _extract_symbol_history, download_price_history
 from src.utils.intraday_helpers import intraday_cache_needs_backfill
 from src.utils.intraday_helpers import utcnow_naive as _utcnow_naive
@@ -261,15 +270,13 @@ class IntradayFetchWorker(QThread):
     def _download_with_retries(
         symbol: str, days: int, attempts: int = 3
     ) -> pd.DataFrame:
-        from src.services.yfinance_intraday_provider import \
-            _download_5m_with_retries
+        from src.services.yfinance_intraday_provider import _download_5m_with_retries
 
         return _download_5m_with_retries(symbol, days, attempts=attempts)
 
     @staticmethod
     def _download_opening_1m_bar(symbol: str) -> pd.DataFrame:
-        from src.services.yfinance_intraday_provider import \
-            _download_opening_1m_bar
+        from src.services.yfinance_intraday_provider import _download_opening_1m_bar
 
         return _download_opening_1m_bar(symbol)
 
@@ -506,9 +513,11 @@ class PcRemoteStatusWorker(QThread):
             check_pc_listener,
             notify_pc_coordination_change,
         )
-        from src.services.runtime_status import (database_server_hostname,
-                                                 get_runtime_process_status,
-                                                 record_runtime_heartbeat)
+        from src.services.runtime_status import (
+            database_server_hostname,
+            get_runtime_process_status,
+            record_runtime_heartbeat,
+        )
 
         def probe_listener():
             try:
@@ -577,10 +586,8 @@ class PcRemoteStatusWorker(QThread):
                 main_app_last_seen_seconds = None
 
         if owns_engine and engine is not None:
-            try:
+            with contextlib.suppress(Exception):
                 engine.dispose()
-            except Exception:
-                pass
 
         self.finished_status.emit(
             PcServiceStatus(

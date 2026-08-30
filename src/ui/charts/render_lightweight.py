@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import html
 import json
-import math
 from typing import Any, Iterable, List, Mapping, Optional
 
 import pandas as pd
 
 from src.core.chart_fundamentals import (
-    EarningsEvent, EarningsLinePoint, StockProfile, UpcomingEarnings, canonical_symbol)
+    EarningsEvent,
+    EarningsLinePoint,
+    StockProfile,
+    UpcomingEarnings,
+    canonical_symbol,
+)
 from src.core.market_alignment import MarketAlignmentSnapshot
 
 try:
@@ -22,6 +26,12 @@ try:
 except ImportError:
     QWebChannel = None
 
+from .models import normalize_chart_interaction_settings
+from .render_alignment import (
+    MARKET_ALIGNMENT_OVERLAY_CSS,
+    MARKET_ALIGNMENT_OVERLAY_JS,
+    build_market_alignment_overlay,
+)
 from .render_assets import _lightweight_charts_script_tag
 from .render_drawing_assets import (
     DRAWING_TIMEFRAME_SYNC_JS,
@@ -30,18 +40,12 @@ from .render_drawing_assets import (
     snap_intraday_drawing_time,
 )
 from .render_earnings_assets import EARNINGS_CHART_CSS, EARNINGS_EVENT_RUNTIME_JS
+from .render_fundamentals import build_fundamental_render_payload
 from .render_measurement_assets import (
     RIGHT_DRAG_MEASUREMENT_CSS,
     RIGHT_DRAG_MEASUREMENT_JS,
 )
-from .render_alignment import (
-    MARKET_ALIGNMENT_OVERLAY_CSS,
-    MARKET_ALIGNMENT_OVERLAY_JS,
-    build_market_alignment_overlay,
-)
-from .render_fundamentals import build_fundamental_render_payload
 from .render_metrics import ChartRenderMetricsMixin
-from .models import normalize_chart_interaction_settings
 from .render_primitives import ChartRenderPrimitivesMixin
 from .render_viewport import default_visible_bar_count
 
@@ -542,59 +546,62 @@ class ChartLightweightRenderMixin:
                         chartBridge = channel.objects.chartBridge;
                     }});
                 }}
-                const chart = LightweightCharts.createChart(container, {{
-                    autoSize: true,
-                    layout: {{
-                        background: {{ type: 'solid', color: '#0f1419' }},
-                        textColor: '#9ca3af'
-                    }},
-                    grid: {{
-                        vertLines: {{ color: '#1f2937' }},
-                        horzLines: {{ color: '#1f2937' }}
-                    }},
-                    rightPriceScale: {{ borderColor: '#374151' }},
-                    localization: {{
-                        timeFormatter: (time) => {{
-                            if (typeof time === 'string') return time;
-                            if (typeof time !== 'number') {{
-                                const y = time.year || '', mo = String(time.month || '').padStart(2,'0'), d = String(time.day || '').padStart(2,'0');
-                                return `${{y}}-${{mo}}-${{d}}`;
-                            }}
-                            const d = new Date((time + 32400) * 1000);
-                            const yyyy = d.getUTCFullYear(), mm = String(d.getUTCMonth()+1).padStart(2,'0'), dd = String(d.getUTCDate()).padStart(2,'0');
-                            const h = String(d.getUTCHours()).padStart(2,'0'), m = String(d.getUTCMinutes()).padStart(2,'0');
-                            return `${{yyyy}}-${{mm}}-${{dd}} ${{h}}:${{m}} KST`;
-                        }}
-                    }},
-                    timeScale: {{
-                        borderColor: '#374151',
-                        timeVisible: {time_visible},
-                        fixLeftEdge: false,
-                        fixRightEdge: false,
-                        rightOffset: 40,
-                        rightBarStaysOnScroll: false,
-                        tickMarkFormatter: (time, tickMarkType) => {{
-                            const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-                            if (typeof time === 'number') {{
+                function chartOptions() {{
+                    return {{
+                        autoSize: true,
+                        layout: {{
+                            background: {{ type: 'solid', color: '#0f1419' }},
+                            textColor: '#9ca3af'
+                        }},
+                        grid: {{
+                            vertLines: {{ color: '#1f2937' }},
+                            horzLines: {{ color: '#1f2937' }}
+                        }},
+                        rightPriceScale: {{ borderColor: '#374151' }},
+                        localization: {{
+                            timeFormatter: (time) => {{
+                                if (typeof time === 'string') return time;
+                                if (typeof time !== 'number') {{
+                                    const y = time.year || '', mo = String(time.month || '').padStart(2,'0'), d = String(time.day || '').padStart(2,'0');
+                                    return `${{y}}-${{mo}}-${{d}}`;
+                                }}
                                 const d = new Date((time + 32400) * 1000);
-                                if (tickMarkType === 0) return String(d.getUTCFullYear());
-                                if (tickMarkType === 1) return months[d.getUTCMonth()];
-                                if (tickMarkType === 2) return String(d.getUTCDate());
-                                return String(d.getUTCHours()).padStart(2,'0') + ':' + String(d.getUTCMinutes()).padStart(2,'0');
+                                const yyyy = d.getUTCFullYear(), mm = String(d.getUTCMonth()+1).padStart(2,'0'), dd = String(d.getUTCDate()).padStart(2,'0');
+                                const h = String(d.getUTCHours()).padStart(2,'0'), m = String(d.getUTCMinutes()).padStart(2,'0');
+                                return `${{yyyy}}-${{mm}}-${{dd}} ${{h}}:${{m}} KST`;
                             }}
-                            let y, mo, dy;
-                            if (typeof time === 'string') {{
-                                const p = time.split('-'); y = p[0]; mo = parseInt(p[1]); dy = parseInt(p[2]);
-                            }} else {{
-                                y = time.year; mo = time.month; dy = time.day;
+                        }},
+                        timeScale: {{
+                            borderColor: '#374151',
+                            timeVisible: {time_visible},
+                            fixLeftEdge: false,
+                            fixRightEdge: false,
+                            rightOffset: 40,
+                            rightBarStaysOnScroll: false,
+                            tickMarkFormatter: (time, tickMarkType) => {{
+                                const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+                                if (typeof time === 'number') {{
+                                    const d = new Date((time + 32400) * 1000);
+                                    if (tickMarkType === 0) return String(d.getUTCFullYear());
+                                    if (tickMarkType === 1) return months[d.getUTCMonth()];
+                                    if (tickMarkType === 2) return String(d.getUTCDate());
+                                    return String(d.getUTCHours()).padStart(2,'0') + ':' + String(d.getUTCMinutes()).padStart(2,'0');
+                                }}
+                                let y, mo, dy;
+                                if (typeof time === 'string') {{
+                                    const p = time.split('-'); y = p[0]; mo = parseInt(p[1]); dy = parseInt(p[2]);
+                                }} else {{
+                                    y = time.year; mo = time.month; dy = time.day;
+                                }}
+                                if (tickMarkType === 0) return String(y);
+                                if (tickMarkType === 1) return months[(mo || 1) - 1] || String(mo);
+                                return String(mo).padStart(2,'0') + '-' + String(dy).padStart(2,'0');
                             }}
-                            if (tickMarkType === 0) return String(y);
-                            if (tickMarkType === 1) return months[(mo || 1) - 1] || String(mo);
-                            return String(mo).padStart(2,'0') + '-' + String(dy).padStart(2,'0');
-                        }}
-                    }},
-                    crosshair: {{ mode: LightweightCharts.CrosshairMode.Normal }}
-                }});
+                        }},
+                        crosshair: {{ mode: LightweightCharts.CrosshairMode.Normal }}
+                    }};
+                }}
+                const chart = LightweightCharts.createChart(container, chartOptions());
                 const candleSeries = chart.addCandlestickSeries({{
                     upColor: '#0ecb81',
                     downColor: '#ef4444',
@@ -711,59 +718,7 @@ class ChartLightweightRenderMixin:
                 }});
                 let rsChart = null;
                 if (rsPoints.length > 0 && rsContainer) {{
-                    rsChart = LightweightCharts.createChart(rsContainer, {{
-                        autoSize: true,
-                        layout: {{
-                            background: {{ type: 'solid', color: '#0f1419' }},
-                            textColor: '#9ca3af'
-                        }},
-                        grid: {{
-                            vertLines: {{ color: '#1f2937' }},
-                            horzLines: {{ color: '#1f2937' }}
-                        }},
-                        rightPriceScale: {{ borderColor: '#374151' }},
-                        localization: {{
-                            timeFormatter: (time) => {{
-                                if (typeof time === 'string') return time;
-                                if (typeof time !== 'number') {{
-                                    const y = time.year || '', mo = String(time.month || '').padStart(2,'0'), d = String(time.day || '').padStart(2,'0');
-                                    return `${{y}}-${{mo}}-${{d}}`;
-                                }}
-                                const d = new Date((time + 32400) * 1000);
-                                const yyyy = d.getUTCFullYear(), mm = String(d.getUTCMonth()+1).padStart(2,'0'), dd = String(d.getUTCDate()).padStart(2,'0');
-                                const h = String(d.getUTCHours()).padStart(2,'0'), m = String(d.getUTCMinutes()).padStart(2,'0');
-                                return `${{yyyy}}-${{mm}}-${{dd}} ${{h}}:${{m}} KST`;
-                            }}
-                        }},
-                        timeScale: {{
-                            borderColor: '#374151',
-                        timeVisible: {time_visible},
-                        fixLeftEdge: false,
-                        fixRightEdge: false,
-                            rightOffset: 40,
-                            rightBarStaysOnScroll: false,
-                            tickMarkFormatter: (time, tickMarkType) => {{
-                                const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-                                if (typeof time === 'number') {{
-                                    const d = new Date((time + 32400) * 1000);
-                                    if (tickMarkType === 0) return String(d.getUTCFullYear());
-                                    if (tickMarkType === 1) return months[d.getUTCMonth()];
-                                    if (tickMarkType === 2) return String(d.getUTCDate());
-                                    return String(d.getUTCHours()).padStart(2,'0') + ':' + String(d.getUTCMinutes()).padStart(2,'0');
-                                }}
-                                let y, mo, dy;
-                                if (typeof time === 'string') {{
-                                    const p = time.split('-'); y = p[0]; mo = parseInt(p[1]); dy = parseInt(p[2]);
-                                }} else {{
-                                    y = time.year; mo = time.month; dy = time.day;
-                                }}
-                                if (tickMarkType === 0) return String(y);
-                                if (tickMarkType === 1) return months[(mo || 1) - 1] || String(mo);
-                                return String(mo).padStart(2,'0') + '-' + String(dy).padStart(2,'0');
-                            }}
-                        }},
-                        crosshair: {{ mode: LightweightCharts.CrosshairMode.Normal }}
-                    }});
+                    rsChart = LightweightCharts.createChart(rsContainer, chartOptions());
                     const rsBackground = rsChart.addHistogramSeries({{
                         priceFormat: {{ type: 'volume' }},
                         lastValueVisible: false,

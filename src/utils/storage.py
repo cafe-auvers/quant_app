@@ -1,6 +1,7 @@
 """Local JSON persistence helpers."""
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -9,8 +10,6 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict
-
-from src.utils.config import DATA_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -81,10 +80,8 @@ def save_json(path: Path, data: Dict[str, Any]) -> None:
         _retry_on_transient_oserror(lambda: tmp_path.replace(path))
     except Exception:
         if tmp_path is not None and tmp_path.exists():
-            try:
+            with contextlib.suppress(OSError):
                 tmp_path.unlink()
-            except OSError:
-                pass
         raise
 
 

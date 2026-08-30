@@ -8,6 +8,7 @@ small files below and never opens a database connection.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -23,7 +24,6 @@ from sqlalchemy import event
 from sqlalchemy.engine import Engine
 
 from src.utils.config import DATA_DIR
-
 
 OUTBOUND_CHANGE_PULSE_FILE = DATA_DIR / "coordination_change_outbound.json"
 INBOUND_CHANGE_PULSE_FILE = DATA_DIR / "coordination_change_inbound.json"
@@ -399,10 +399,8 @@ def _write_event(
         os.replace(temporary, path)
         return True
     except OSError:
-        try:
+        with contextlib.suppress(OSError):
             temporary.unlink(missing_ok=True)
-        except OSError:
-            pass
         return False
 
 

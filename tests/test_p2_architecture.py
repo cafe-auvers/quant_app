@@ -19,11 +19,9 @@ def _p2_source_files():
 def test_database_facades_are_static_and_point_to_focused_owners(monkeypatch):
     import src.infrastructure.database as database
     import src.utils.db_loader as legacy
-    from src.infrastructure.database import (engine, mirror_copy, refresh,
-                                             schema)
+    from src.infrastructure.database import engine, mirror_copy, refresh, schema
     from src.infrastructure.database.repositories import market_bars, scanner
-    from src.infrastructure.database.settings import \
-        CACHE_QUERY_SYMBOL_CHUNK_SIZE
+    from src.infrastructure.database.settings import CACHE_QUERY_SYMBOL_CHUNK_SIZE
 
     assert legacy is not database
     assert legacy.validate_mysql_identifier is database.validate_mysql_identifier
@@ -45,9 +43,17 @@ def test_buylist_compatibility_module_exports_the_static_composite():
     assert legacy is not buylist
     assert legacy.BuylistMixin is buylist.BuylistMixin
     assert "BuylistViewMixin" in buylist.BuylistMixin._build_buylist_tab.__qualname__
-    assert "BuylistActionsMixin" in buylist.BuylistMixin._open_orders_for_buylist_item.__qualname__
-    assert "BuylistMonitoringMixin" in buylist.BuylistMixin._run_buylist_monitor_cycle.__qualname__
-    assert "BuylistOrdersMixin" in buylist.BuylistMixin._submit_kis_buy_order.__qualname__
+    assert (
+        "BuylistActionsMixin"
+        in buylist.BuylistMixin._open_orders_for_buylist_item.__qualname__
+    )
+    assert (
+        "BuylistMonitoringMixin"
+        in buylist.BuylistMixin._run_buylist_monitor_cycle.__qualname__
+    )
+    assert (
+        "BuylistOrdersMixin" in buylist.BuylistMixin._submit_kis_buy_order.__qualname__
+    )
 
 
 def test_core_exit_policy_owns_buylist_decisions():
@@ -71,6 +77,49 @@ def test_core_exit_policy_owns_buylist_decisions():
     assert BuylistController.completed_daily_close_rows(rows, before_close) == [
         (dt.date(2026, 8, 12), 100.0)
     ]
+
+
+def test_window_controllers_do_not_proxy_the_main_window_namespace():
+    from src.ui.controllers.base import WindowController
+
+    window = SimpleNamespace(shared_value="window")
+    controller = WindowController(window)
+
+    assert controller.window is window
+    assert not hasattr(controller, "shared_value")
+
+    controller.local_value = "controller"
+    assert controller.local_value == "controller"
+    assert not hasattr(window, "local_value")
+
+
+def test_main_window_does_not_implement_infrastructure_workers():
+    import src.ui.coordination_workers as coordination_workers
+    import src.ui.database_workers as database_workers
+    import src.ui.main_window as main_window
+
+    tree = ast.parse(
+        (ROOT / "src" / "ui" / "main_window.py").read_text(encoding="utf-8")
+    )
+    qthread_classes = [
+        node.name
+        for node in tree.body
+        if isinstance(node, ast.ClassDef)
+        and any(
+            isinstance(base, ast.Name) and base.id == "QThread" for base in node.bases
+        )
+    ]
+
+    assert qthread_classes == []
+    assert main_window.DatabaseInitWorker is database_workers.DatabaseInitWorker
+    assert main_window.StateSyncWorker is coordination_workers.StateSyncWorker
+
+    for module_path in (
+        ROOT / "src" / "ui" / "database_workers.py",
+        ROOT / "src" / "ui" / "coordination_workers.py",
+        ROOT / "src" / "ui" / "readiness_presenter.py",
+    ):
+        assert "src.ui.main_window" not in module_path.read_text(encoding="utf-8")
 
 
 def test_chart_compatibility_modules_export_static_composites_and_models():
@@ -121,10 +170,13 @@ def test_chart_interaction_settings_are_explicit_and_deterministic():
     assert shortcuts["draw_line"] == "D"
     assert "unknown_action" not in shortcuts
     assert pan_step_bars == 7
-    assert normalize_chart_interaction_settings(
-        {"shortcuts": "invalid", "chart_pan_step_bars": 0},
-        renderer="lightweight",
-    )[1] == 1
+    assert (
+        normalize_chart_interaction_settings(
+            {"shortcuts": "invalid", "chart_pan_step_bars": 0},
+            renderer="lightweight",
+        )[1]
+        == 1
+    )
 
 
 def test_p2_modules_use_no_wildcard_or_runtime_module_mutation():
@@ -145,7 +197,9 @@ def test_p2_modules_use_no_wildcard_or_runtime_module_mutation():
                 ):
                     violations.append(f"{path}: globals().update")
             if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
-                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                targets = (
+                    node.targets if isinstance(node, ast.Assign) else [node.target]
+                )
                 for target in targets:
                     if isinstance(target, ast.Attribute) and target.attr == "__class__":
                         violations.append(f"{path}: __class__ assignment")
@@ -167,7 +221,10 @@ def test_production_code_does_not_depend_on_legacy_database_facade():
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and node.module == "src.utils.db_loader":
+            if (
+                isinstance(node, ast.ImportFrom)
+                and node.module == "src.utils.db_loader"
+            ):
                 violations.append(str(path))
             if isinstance(node, ast.Import):
                 if any(alias.name == "src.utils.db_loader" for alias in node.names):
@@ -197,7 +254,11 @@ def test_layer_dependencies_remain_one_way():
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
             module = node.module if isinstance(node, ast.ImportFrom) else ""
-            names = [alias.name for alias in node.names] if isinstance(node, ast.Import) else []
+            names = (
+                [alias.name for alias in node.names]
+                if isinstance(node, ast.Import)
+                else []
+            )
             if module.startswith(forbidden_render_prefixes) or any(
                 name.startswith(forbidden_render_prefixes) for name in names
             ):
@@ -226,16 +287,16 @@ def test_large_p2_modules_are_split_behind_small_static_composites():
 
     assert (chart_root / "controller.py").stat().st_size < 2_000
     assert (chart_root / "renderer.py").stat().st_size < 2_000
-    assert max(
-        path.stat().st_size
-        for path in chart_root.glob("*.py")
-        if path.name not in {"controller.py", "renderer.py"}
-    ) < 80_000
-    assert (database_root / "mirror.py").stat().st_size < 2_000
     assert (
-        database_root / "repositories" / "market_data.py"
-    ).stat().st_size < 2_000
-    assert max(
-        path.stat().st_size
-        for path in database_root.glob("mirror_*.py")
-    ) < 80_000
+        max(
+            path.stat().st_size
+            for path in chart_root.glob("*.py")
+            if path.name not in {"controller.py", "renderer.py"}
+        )
+        < 80_000
+    )
+    assert (database_root / "mirror.py").stat().st_size < 2_000
+    assert (database_root / "repositories" / "market_data.py").stat().st_size < 2_000
+    assert (
+        max(path.stat().st_size for path in database_root.glob("mirror_*.py")) < 80_000
+    )

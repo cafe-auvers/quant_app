@@ -13,20 +13,37 @@ from src.core.exit_execution_command import (
     exit_execution_policy,
     marketable_exit_limit_price,
 )
-from src.core.order_state import (OPEN_ORDER_STATUSES, REGULAR_LIMIT_EXECUTION,
-                                  RESERVED_MOO_EXECUTION, BrokerOrder,
-                                  OrderIntent, OrderSide, OrderStatus)
-from src.risk.pre_trade import (PreTradeRiskDecision,
-                                assess_orb_entry_candidate,
-                                orb_candidate_plan_id)
+from src.core.order_state import (
+    OPEN_ORDER_STATUSES,
+    REGULAR_LIMIT_EXECUTION,
+    RESERVED_MOO_EXECUTION,
+    BrokerOrder,
+    OrderIntent,
+    OrderSide,
+    OrderStatus,
+)
+from src.risk.pre_trade import (
+    PreTradeRiskDecision,
+    assess_orb_entry_candidate,
+    orb_candidate_plan_id,
+)
 from src.services.event_journal import EventType, record_event
-from src.services.order_ledger import (append_order, find_open_orders,
-                                       has_open_order, load_order_ledger,
-                                       merge_orders, update_order)
+from src.services.order_ledger import (
+    append_order,
+    find_open_orders,
+    has_open_order,
+    load_order_ledger,
+    merge_orders,
+    update_order,
+)
 from src.ui.workers import KisOrderWorker, OrderReconciliationWorker
 
-from .constants import (KST_ZONE, US_MARKET_CLOSE_TIME, US_MARKET_OPEN_TIME,
-                        US_MARKET_ZONE)
+from .constants import (
+    KST_ZONE,
+    US_MARKET_CLOSE_TIME,
+    US_MARKET_OPEN_TIME,
+    US_MARKET_ZONE,
+)
 
 
 class BuylistOrdersMixin:
@@ -62,8 +79,7 @@ class BuylistOrdersMixin:
         if combo is not None:
             return self._selected_trade_account_no_for_environment(environment)
         try:
-            from src.api.kis_account_snapshot_dual import \
-                discover_account_profiles
+            from src.api.kis_account_snapshot_dual import discover_account_profiles
 
             profiles = [
                 p
@@ -252,6 +268,25 @@ class BuylistOrdersMixin:
             return None
         return quantity if quantity > 0 else None
 
+    @staticmethod
+    def _explicit_order_price(*values: object) -> Tuple[Optional[float], bool]:
+        """Return the first valid explicit price and whether any value was invalid."""
+        explicit_price = None
+        invalid = False
+        for value in values:
+            if value is None:
+                continue
+            try:
+                price = float(value or 0.0)
+            except (TypeError, ValueError, OverflowError):
+                invalid = True
+                continue
+            if math.isfinite(price) and price > 0:
+                explicit_price = price
+                break
+            invalid = True
+        return explicit_price, invalid
+
     def _warn_invalid_order_value(self, item, message: str) -> None:
         self.append_log(f"KIS order blocked for {getattr(item, 'symbol', '')}: {message}")
         QMessageBox.warning(self, "Invalid order", message)
@@ -386,20 +421,9 @@ class BuylistOrdersMixin:
                 )
                 return
 
-        explicit_price = None
-        invalid_explicit_price = False
-        for value in (order_price, limit_price):
-            if value is None:
-                continue
-            try:
-                price = float(value or 0.0)
-            except (TypeError, ValueError, OverflowError):
-                invalid_explicit_price = True
-                continue
-            if math.isfinite(price) and price > 0:
-                explicit_price = price
-                break
-            invalid_explicit_price = True
+        explicit_price, invalid_explicit_price = self._explicit_order_price(
+            order_price, limit_price
+        )
         if invalid_explicit_price:
             self._warn_invalid_order_value(
                 item, "Limit price must be a positive finite number."
@@ -561,20 +585,9 @@ class BuylistOrdersMixin:
             )
             return
 
-        explicit_price = None
-        invalid_explicit_price = False
-        for value in (order_price, limit_price):
-            if value is None:
-                continue
-            try:
-                price = float(value or 0.0)
-            except (TypeError, ValueError, OverflowError):
-                invalid_explicit_price = True
-                continue
-            if math.isfinite(price) and price > 0:
-                explicit_price = price
-                break
-            invalid_explicit_price = True
+        explicit_price, invalid_explicit_price = self._explicit_order_price(
+            order_price, limit_price
+        )
         if invalid_explicit_price:
             self._warn_invalid_order_value(
                 item, "Limit price must be a positive finite number."
@@ -582,15 +595,14 @@ class BuylistOrdersMixin:
             return
         if execution_policy == RESERVED_MOO_EXECUTION:
             order_price = 0.0
+        elif explicit_price is not None:
+            order_price = max(0.01, explicit_price)
         else:
-            if explicit_price is not None:
-                order_price = max(0.01, explicit_price)
-            else:
-                market_observation = self._buylist_order_price(item)
-                order_price = marketable_exit_limit_price(
-                    last_price=market_observation,
-                    quote_is_execution_ready=True,
-                )
+            market_observation = self._buylist_order_price(item)
+            order_price = marketable_exit_limit_price(
+                last_price=market_observation,
+                quote_is_execution_ready=True,
+            )
         if (
             execution_policy != RESERVED_MOO_EXECUTION
             and (not math.isfinite(float(order_price)) or order_price <= 0)

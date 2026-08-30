@@ -45,16 +45,16 @@ from sqlalchemy import (
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
-from src.infrastructure.database.coordination_engine import coordination_read_connection
 from src.core.kanban_transitions import (
-    require_single_card_per_symbol,
     migrate_legacy_status_to_board_status,
+    require_single_card_per_symbol,
 )
 from src.core.trade_card_state import (
     PositionRuntimeStatus,
     StopType,
     TradeCardState,
 )
+from src.infrastructure.database.coordination_engine import coordination_read_connection
 from src.utils.config import DATA_DIR
 from src.utils.storage import load_json, save_json
 
@@ -670,7 +670,7 @@ def build_trade_card_migration(
             buffer_pct=float(
                 0.001
                 if getattr(item, "buffer_pct", None) in (None, "")
-                else getattr(item, "buffer_pct")
+                else item.buffer_pct
             ),
             risk_percent=_legacy_buylist_risk_fraction(item),
             position_percent=float(

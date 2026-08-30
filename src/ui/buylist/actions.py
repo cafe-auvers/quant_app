@@ -3,21 +3,33 @@
 from typing import Any, Dict, List, Optional, Tuple
 
 from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtWidgets import (QDialog, QDialogButtonBox, QLabel, QMessageBox,
-                             QSlider, QSpinBox, QTableWidget, QVBoxLayout)
+from PyQt5.QtWidgets import (
+    QDialog,
+    QDialogButtonBox,
+    QLabel,
+    QMessageBox,
+    QSlider,
+    QSpinBox,
+    QTableWidget,
+    QVBoxLayout,
+)
 
 from src.api.kis_order import format_overseas_order_price
-from src.core.order_state import (REGULAR_LIMIT_EXECUTION,
-                                  RESERVED_MOO_EXECUTION, BrokerOrder,
-                                  OrderIntent, OrderSide, OrderStatus)
+from src.core.order_state import (
+    REGULAR_LIMIT_EXECUTION,
+    RESERVED_MOO_EXECUTION,
+    BrokerOrder,
+    OrderIntent,
+    OrderSide,
+    OrderStatus,
+)
 from src.core.stop_change_command import build_stop_change_command
 from src.core.trade_card_state import BoardStatus, StopType
-from src.services.position_manager import compute_breakeven_stop_price
 from src.services.order_ledger import find_open_orders, load_order_ledger
+from src.services.position_manager import compute_breakeven_stop_price
 from src.ui.workers import KisOrderCancelWorker, KisOrderQueryWorker
 
-from .constants import (STOP_LOSS_REPRICE_MIN_DROP_PCT,
-                        STOP_LOSS_SELL_LIMIT_DISCOUNT_PCT)
+from .constants import STOP_LOSS_REPRICE_MIN_DROP_PCT, STOP_LOSS_SELL_LIMIT_DISCOUNT_PCT
 
 
 class BuylistActionsMixin:
@@ -189,41 +201,40 @@ class BuylistActionsMixin:
                     new_status = queue_status or "ORDER_SUBMITTED"
                 else:
                     new_status = queue_status or "BUY_SUBMITTED"
-            else:
-                if order.status in {
-                    OrderStatus.CANCELLED,
-                    OrderStatus.REJECTED,
-                    OrderStatus.EXPIRED,
-                }:
-                    new_status = (
-                        "BOUGHT"
-                        if int(getattr(item, "shares_held", 0) or 0) > 0
-                        else "WATCHING"
-                    )
-                elif order.status == OrderStatus.CANCEL_REQUESTED:
-                    new_status = "SELL_SUBMITTED"
-                elif (
-                    getattr(order, "execution_policy", REGULAR_LIMIT_EXECUTION)
-                    == RESERVED_MOO_EXECUTION
-                    and order.intent
-                    in {
-                        OrderIntent.PARTIAL_EXIT,
-                        OrderIntent.PARTIAL_TAKE_PROFIT,
-                    }
-                ):
-                    new_status = "PARTIAL_EXIT_RESERVED"
-                elif (
-                    getattr(order, "execution_policy", REGULAR_LIMIT_EXECUTION)
-                    == RESERVED_MOO_EXECUTION
-                ):
-                    new_status = "SELL_RESERVED"
-                elif order.intent in {
+            elif order.status in {
+                OrderStatus.CANCELLED,
+                OrderStatus.REJECTED,
+                OrderStatus.EXPIRED,
+            }:
+                new_status = (
+                    "BOUGHT"
+                    if int(getattr(item, "shares_held", 0) or 0) > 0
+                    else "WATCHING"
+                )
+            elif order.status == OrderStatus.CANCEL_REQUESTED:
+                new_status = "SELL_SUBMITTED"
+            elif (
+                getattr(order, "execution_policy", REGULAR_LIMIT_EXECUTION)
+                == RESERVED_MOO_EXECUTION
+                and order.intent
+                in {
                     OrderIntent.PARTIAL_EXIT,
                     OrderIntent.PARTIAL_TAKE_PROFIT,
-                }:
-                    new_status = "PARTIAL_EXIT_SUBMITTED"
-                else:
-                    new_status = "SELL_SUBMITTED"
+                }
+            ):
+                new_status = "PARTIAL_EXIT_RESERVED"
+            elif (
+                getattr(order, "execution_policy", REGULAR_LIMIT_EXECUTION)
+                == RESERVED_MOO_EXECUTION
+            ):
+                new_status = "SELL_RESERVED"
+            elif order.intent in {
+                OrderIntent.PARTIAL_EXIT,
+                OrderIntent.PARTIAL_TAKE_PROFIT,
+            }:
+                new_status = "PARTIAL_EXIT_SUBMITTED"
+            else:
+                new_status = "SELL_SUBMITTED"
 
             if getattr(item, "monitoring_status", "") != new_status:
                 item.monitoring_status = new_status

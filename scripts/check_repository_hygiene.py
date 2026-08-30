@@ -2,10 +2,9 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path, PurePosixPath
 import subprocess
 import sys
-
+from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parents[1]
 _FORBIDDEN_EXACT = {
@@ -32,14 +31,14 @@ def forbidden_tracked_paths(paths: list[str]) -> tuple[str, ...]:
             normalized = normalized[2:]
         path = PurePosixPath(normalized)
         lowered = normalized.lower()
-        if lowered in _FORBIDDEN_EXACT:
-            forbidden.append(normalized)
-        elif path.suffix.lower() in _FORBIDDEN_SUFFIXES:
-            forbidden.append(normalized)
-        elif lowered.startswith(".secrets/"):
-            forbidden.append(normalized)
-        elif any(
-            part.lower().startswith("pre_restore_backup_") for part in path.parts
+        if (
+            lowered in _FORBIDDEN_EXACT
+            or path.suffix.lower() in _FORBIDDEN_SUFFIXES
+            or lowered.startswith(".secrets/")
+            or any(
+                part.lower().startswith("pre_restore_backup_")
+                for part in path.parts
+            )
         ):
             forbidden.append(normalized)
     return tuple(sorted(set(forbidden)))

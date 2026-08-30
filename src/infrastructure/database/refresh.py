@@ -8,16 +8,21 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 import pandas as pd
 from sqlalchemy.engine import Engine
 
-from src.utils.data_loader import (_extract_symbol_history,
-                                   download_price_history)
+from src.utils.data_loader import (
+    _symbols_with_downloaded_history as _symbols_with_history,
+)
+from src.utils.data_loader import download_price_history
 from src.utils.market_calendar import expected_latest_market_data_date
 
 from .formatting import _format_elapsed, _format_eta
 from .repositories.market_bars import (
     save_universe_history_batch_to_db,
-    save_universe_hourly_history_batch_to_db)
+    save_universe_hourly_history_batch_to_db,
+)
 from .repositories.market_watermarks import (
-    get_latest_hourly_price_history_timestamps, get_latest_price_history_dates)
+    get_latest_hourly_price_history_timestamps,
+    get_latest_price_history_dates,
+)
 from .schema import record_symbol_refresh_outcomes
 from .settings import REFERENCE_SYMBOL
 from .sql_helpers import _clean_symbols
@@ -27,29 +32,6 @@ from .time_utils import _utcnow_naive
 def _chunk_symbols(symbols: List[str], chunk_size: int) -> List[List[str]]:
     size = max(1, int(chunk_size or 1))
     return [symbols[index:index + size] for index in range(0, len(symbols), size)]
-
-
-def _symbols_with_history(
-    history: pd.DataFrame,
-    symbols: List[str],
-    required_latest_date: Optional[dt.date] = None,
-) -> List[str]:
-    if history.empty:
-        return []
-    available = []
-    for symbol in symbols:
-        symbol_history = _extract_symbol_history(history, symbol)
-        if symbol_history is None or symbol_history.empty:
-            continue
-        if required_latest_date is not None:
-            try:
-                latest = pd.Timestamp(symbol_history.index.max())
-            except (TypeError, ValueError):
-                continue
-            if pd.isna(latest) or latest.date() < required_latest_date:
-                continue
-        available.append(symbol)
-    return available
 
 
 def _partition_symbols_by_freshness(
@@ -140,6 +122,37 @@ def _sleep_between_batches(batch_sleep: float) -> None:
     time.sleep(batch_sleep + random.uniform(0.0, min(1.0, batch_sleep)))
 
 
+def _download_refresh_batch(
+    batch: List[str],
+    *,
+    period: str,
+    interval: str,
+    threads: int,
+    expected_date: dt.date,
+) -> Tuple[pd.DataFrame, List[str], List[str], List[str]]:
+    history = download_price_history(
+        batch,
+        period=period,
+        interval=interval,
+        max_symbols=len(batch),
+        chunk_size=len(batch),
+        threads=threads,
+        batch_sleep=0,
+        max_retries=0,
+        fallback_to_single=False,
+        chart_fallback=True,
+        required_latest_date=expected_date,
+    )
+    available = _symbols_with_history(history, batch)
+    current = _symbols_with_history(
+        history,
+        batch,
+        required_latest_date=expected_date,
+    )
+    not_current = [symbol for symbol in batch if symbol not in current]
+    return history, available, current, not_current
+
+
 def refresh_universe_history_to_db(
     tickers: List[str],
     engine: Engine,
@@ -199,26 +212,17 @@ def refresh_universe_history_to_db(
                     f"symbols={', '.join(batch)}"
                 )
 
-            history = download_price_history(
+            history, available, current, not_current = _download_refresh_batch(
                 batch,
                 period=fetch_period,
                 interval=interval,
-                max_symbols=len(batch),
-                chunk_size=len(batch),
                 threads=threads,
-                batch_sleep=0,
-                max_retries=0,
-                fallback_to_single=False,
-                chart_fallback=True,
-                required_latest_date=expected_date,
+                expected_date=expected_date,
             )
-            available = _symbols_with_history(history, batch)
-            current = _symbols_with_history(
-                history, batch, required_latest_date=expected_date
+            rows_saved = save_universe_history_batch_to_db(
+                history, available, engine, interval=interval
             )
             current_from_download.update(current)
-            not_current = [symbol for symbol in batch if symbol not in current]
-            rows_saved = save_universe_history_batch_to_db(history, available, engine, interval=interval)
 
             if rows_saved:
                 updated.extend(available)
@@ -258,26 +262,17 @@ def refresh_universe_history_to_db(
             for batch in _chunk_symbols(group_symbols, retry_chunk_size):
                 if log_callback:
                     log_callback(f"Retry {retry_index} {interval}: period={fetch_period}, symbols={', '.join(batch)}")
-                history = download_price_history(
+                history, available, current, not_current = _download_refresh_batch(
                     batch,
                     period=fetch_period,
                     interval=interval,
-                    max_symbols=len(batch),
-                    chunk_size=len(batch),
                     threads=threads,
-                    batch_sleep=0,
-                    max_retries=0,
-                    fallback_to_single=False,
-                    chart_fallback=True,
-                    required_latest_date=expected_date,
+                    expected_date=expected_date,
                 )
-                available = _symbols_with_history(history, batch)
-                current = _symbols_with_history(
-                    history, batch, required_latest_date=expected_date
+                rows_saved = save_universe_history_batch_to_db(
+                    history, available, engine, interval=interval
                 )
                 current_from_download.update(current)
-                not_current = [symbol for symbol in batch if symbol not in current]
-                rows_saved = save_universe_history_batch_to_db(history, available, engine, interval=interval)
                 if rows_saved:
                     updated.extend(available)
                 next_retry.extend(not_current)
@@ -391,26 +386,17 @@ def refresh_universe_hourly_history_to_db(
                     f"symbols={', '.join(batch)}"
                 )
 
-            history = download_price_history(
+            history, available, current, not_current = _download_refresh_batch(
                 batch,
                 period=fetch_period,
                 interval="1h",
-                max_symbols=len(batch),
-                chunk_size=len(batch),
                 threads=threads,
-                batch_sleep=0,
-                max_retries=0,
-                fallback_to_single=False,
-                chart_fallback=True,
-                required_latest_date=expected_date,
+                expected_date=expected_date,
             )
-            available = _symbols_with_history(history, batch)
-            current = _symbols_with_history(
-                history, batch, required_latest_date=expected_date
+            rows_saved = save_universe_hourly_history_batch_to_db(
+                history, available, engine, source=source
             )
             current_from_download.update(current)
-            not_current = [symbol for symbol in batch if symbol not in current]
-            rows_saved = save_universe_hourly_history_batch_to_db(history, available, engine, source=source)
 
             if rows_saved:
                 updated.extend(available)
@@ -450,26 +436,17 @@ def refresh_universe_hourly_history_to_db(
             for batch in _chunk_symbols(group_symbols, retry_chunk_size):
                 if log_callback:
                     log_callback(f"Retry {retry_index} 1h: period={fetch_period}, symbols={', '.join(batch)}")
-                history = download_price_history(
+                history, available, current, not_current = _download_refresh_batch(
                     batch,
                     period=fetch_period,
                     interval="1h",
-                    max_symbols=len(batch),
-                    chunk_size=len(batch),
                     threads=threads,
-                    batch_sleep=0,
-                    max_retries=0,
-                    fallback_to_single=False,
-                    chart_fallback=True,
-                    required_latest_date=expected_date,
+                    expected_date=expected_date,
                 )
-                available = _symbols_with_history(history, batch)
-                current = _symbols_with_history(
-                    history, batch, required_latest_date=expected_date
+                rows_saved = save_universe_hourly_history_batch_to_db(
+                    history, available, engine, source=source
                 )
                 current_from_download.update(current)
-                not_current = [symbol for symbol in batch if symbol not in current]
-                rows_saved = save_universe_hourly_history_batch_to_db(history, available, engine, source=source)
                 if rows_saved:
                     updated.extend(available)
                 next_retry.extend(not_current)

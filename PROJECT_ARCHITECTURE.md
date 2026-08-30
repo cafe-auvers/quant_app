@@ -40,207 +40,82 @@ main.py
 
 Long-running work runs in `QThread` workers so the PyQt UI remains responsive.
 
-## Overall Workflow
+## Architecture at a Glance
 
-The diagram below is the high-level operational map. It distinguishes market-data
-and review work from the guarded broker-order lifecycle: an `ACCEPTED` broker
-response is deliberately **not** a fill. Only reconciliation can update a
-buylist position as filled.
-
-```mermaid
-flowchart TB
-    Start([Launch: python main.py]) --> Qt[QApplication]
-    Qt --> Window[MainWindow]
-
-    subgraph Startup[Startup and recovery]
-        direction LR
-        Window --> State[Load local JSON state\nlegacy migration data, buylist, queue, orders, drawings, settings]
-        Window --> UI[Build tabs, menus, sidebar, and status log]
-        Window --> DBInit[Connect canonical MySQL, or fall back to\nthe offline SQLite mirror when unreachable]
-        Window --> AccountPreload[Preload KIS account profiles and snapshots]
-        Window --> StartupReconcile[Restore unresolved local order state\nand schedule reconciliation]
-    end
-
-    subgraph Data[Market-data acquisition and cache]
-        direction LR
-        Universe[Ticker universe\nKIS master with S&P 500 fallback] --> Daily[Daily and hourly history\nYahoo / KIS]
-        Daily --> Metrics[Technical metrics and indicators]
-        Intraday[Intraday request] --> KISIntraday[KIS provider when configured]
-        KISIntraday --> IntradayCache[Source-aware intraday cache]
-        KISIntraday -. unavailable or no usable bars .-> YF[yfinance fallback]
-        YF --> IntradayCache
-        Daily --> MySQL[(MySQL cache:\ncanonical on the always-on PC,\noptional/local-only otherwise)]
-        Metrics --> MySQL
-        IntradayCache --> MySQL
-        MySQL -. background top-up when reachable .-> Mirror[(SQLite offline mirror\ndata/local_mirror.db)]
-    end
-
-    subgraph Review[Research, planning, and monitoring]
-        direction TB
-        MySQL --> Scanner[Scanner rules and results]
-        Daily --> Scanner
-        Scanner --> Charts[Daily, hourly, and TradingView charts]
-        Charts --> Breakout[Version-fenced canonical breakout command]
-        Breakout --> ORB[ORBStrategy range and trigger signal]
-        IntradayCache --> ORB
-        ORB --> ORBRisk[ORB position sizing and risk validation]
-        ORBRisk --> Queue[Execution queue]
-        Queue --> Board[Kanban Buy Board projection]
-        LegacyPlanning[Legacy planning state] -. create only missing cards .-> Board
-        ORB --> Board
-        Daily --> Charts
-        IntradayCache --> Charts
-    end
-
-    subgraph Execution[Guarded order lifecycle]
-        direction TB
-        Board --> BoardCommand[Typed, revision-fenced board command]
-        BoardCommand --> BoardIntent[Validate ownership/conflicts and\npersist durable card intent]
-        BoardIntent --> KanbanRuntime[BuyboardRuntimeWorker\nreconciliation, quotes, heartbeat]
-        KanbanRuntime --> KanbanReady{Lease, account, feed, DB,\nand action readiness satisfied?}
-        KanbanReady -- No --> ObserveOnly[Remain observation-only / retain intent]
-        KanbanReady -- Yes --> Gateway[Shared execution command gateway]
-
-        Queue --> Ready{Status is\nEXECUTE_READY?}
-        Ready -- No --> Monitor[Keep monitoring / refresh data]
-        Monitor --> Queue
-        Ready -- Yes --> Validate[Validate account, quantity, risk,\nand duplicate-open-order guard]
-        Validate --> Reserve[Persist local intent and\nUNKNOWN_SUBMISSION_STATE]
-        Reserve --> Gateway
-        Gateway --> KISOrder[KIS overseas order API]
-        KISOrder --> Result{Broker response}
-        Result -- Rejected --> Rejected[Persist REJECTED\nand show UI result]
-        Result -- Ambiguous --> Unknown[Keep UNKNOWN_SUBMISSION_STATE\nblock resubmission]
-        Result -- Accepted --> Accepted[Persist ACCEPTED\nsubmission only, not a fill]
-        Accepted --> Reconcile[Reconcile against KIS account snapshots]
-        Unknown --> Reconcile
-        Reconcile --> Fill{Conservative fill\nevidence?}
-        Fill -- No / ambiguous --> Working[Keep WORKING or pending]
-        Fill -- Yes --> Position[Apply filled quantity to buylist\nshares, cost, and exit state]
-        Reconcile --> KanbanProjection[Apply broker truth to trade card\nand system-owned column]
-        KanbanProjection --> Board
-    end
-
-    subgraph Persistence[Durable local state]
-        direction LR
-        StateStore[(data/*.json)]
-        Backup[Atomic write + rolling .bak recovery]
-        Metadata[state_metadata.json\nsave status]
-        KanbanStore[(Canonical SQL state\ntrade cards, ownership, commands, orders,\nreservations, device readiness)]
-        KanbanSnapshot[trade_cards.json\nrecovery snapshot]
-        StateStore --> Backup
-        StateStore --> Metadata
-        KanbanStore --> KanbanSnapshot
-    end
-
-    LegacyPlanning --> StateStore
-    Queue --> StateStore
-    Reserve --> StateStore
-    Rejected --> StateStore
-    Unknown --> StateStore
-    Accepted --> StateStore
-    Working --> StateStore
-    Position --> StateStore
-    Charts --> StateStore
-    BoardIntent --> KanbanStore
-    KanbanRuntime <--> KanbanStore
-
-    classDef safety fill:#fff3cd,stroke:#b7791f,color:#3d2b00;
-    classDef critical fill:#fde2e1,stroke:#c53030,color:#4a0808;
-    class Ready,Validate,Reserve,Accepted,Reconcile,Fill safety;
-    class Unknown,Rejected critical;
-```
-
-Reading guide:
-
-- Solid arrows are the normal flow; dashed arrows are explicit fallbacks (KIS-to-yfinance intraday, and MySQL-to-local-mirror data).
-- MySQL improves freshness and speed and is optional for a single-machine setup: Yahoo/KIS sources and local state keep the desktop application usable without it. In the two-machine setup (see [Two-Machine Data Pipeline](#two-machine-data-pipeline-pc-sync) below) it is the one canonical database, and the local SQLite mirror is a disposable safety copy, not a peer.
-- The persistence area is shared by user edits, the execution queue, chart drawings, and every meaningful order-status transition.
-- The Buy Board is a projection, not a second broker client. Gestures persist typed intent; the runtime reaches KIS only through the shared execution gateway, and reconciliation is the only authority for fills, quantities, and broker-confirmed columns.
-
-## System Architecture
-
-This companion diagram shows the code-level boundaries behind the workflow. UI
-controllers coordinate work; core modules contain trading rules; services own
-cross-cutting lifecycle behavior; and adapters isolate external systems.
+The application has one core responsibility: turn reviewed trading intent into a
+broker mutation through a single guarded path. UI rendering, market-data
+acquisition, persistence, and optional workstation operations support that path
+but are not alternate execution systems.
 
 ```mermaid
 flowchart LR
-    User([Trader]) --> UI
+    Trader([Trader]) --> UI[PyQt views]
 
-    subgraph Desktop[PyQt5 desktop application]
-        direction TB
-        UI[MainWindow and tab mixins\nwidgets, tables, Buy Board, dialogs, charts]
-        Controllers[UI controllers\naccount, scanner, chart, Buy Board, execution]
-        Workers[QThread workers\nnetwork, refresh, scanner,\norder submission/query/cancel, reconciliation,\nKanban projection/runtime, PC status polling]
-        Core[Core domain\nscanner, legacy planning models, scoring, trade cards,\nboard commands/transitions, execution state]
-        Strategy[Strategy contracts and plugins\nMarketSnapshot, PortfolioSnapshot, Signal,\nORBStrategy]
-        Risk[Risk\nposition sizing]
-        Services[Services\napp state, intraday orchestration,\ntrade-card/ownership/order repositories,\nKanban runtime, guarded execution, reconciliation,\ncross-machine state sync, PC remote control,\nruntime heartbeats, historical refresh control,\ncloud/env backup]
-        Utils[Utilities\nconfig, storage, market calendar, logging,\nloaders, DB and local-mirror helpers]
-
-        UI <--> Controllers
-        Controllers --> Workers
-        Controllers <--> Core
-        Workers <--> Core
-        Controllers <--> Services
-        Workers <--> Services
-        Core --> Strategy
-        Core <--> Risk
-        Services <--> Risk
-        Core --> Utils
-        Services --> Utils
+    subgraph Desktop[Desktop application]
+        UI --> Controllers[Explicit workflow controllers]
+        Controllers --> App[Application services]
+        App --> Domain[Trading domain, strategy, and risk]
+        Domain --> Gateway[Single execution gateway]
     end
 
-    subgraph Local[This machine]
-        direction TB
-        Json[(data/*.json\nstate, queue, legacy order ledger, drawings,\ntrade-card recovery snapshot)]
-        Rulebooks[rulebooks/*.md]
-        Env[.env\nlocal credentials only]
-        RuntimeConfig[config/runtime.json + runtime.local.json\nnon-secret operational settings]
-        Mirror[(data/local_mirror.db\noffline SQLite mirror)]
-        DeviceRole[data/device_role.json\ndevice id and main/pull-only role]
-        Historical[historical.py\nstandalone 1D/1H refresh process]
+    Gateway --> KIS[KIS broker API]
+    App --> TradeStore[(Canonical SQL trade state)]
+    App --> LocalState[(Local preferences and recovery files)]
+
+    Providers[Yahoo / KIS market data] --> MarketStore[(Market-data store)]
+    Controllers --> MarketStore
+    MarketStore -. disposable offline copy .-> Mirror[(SQLite mirror)]
+
+    subgraph OptionalOps[Optional workstation operations]
+        Sync[Cross-machine sync]
+        Refresh[Historical refresh]
+        Backup[Backup and remote PC control]
     end
-
-    subgraph PC[Always-on PC, reached over LAN/Tailscale\noptional second machine]
-        direction TB
-        MySQL[(MySQL: quant_app\ncanonical prices and indicators,\ntrade cards, execution ownership/commands/orders,\nreservations, reconciliation/readiness state)]
-        Listener[pc_remote_control_listener.py\nremote status/shutdown]
-    end
-
-    subgraph External[External providers]
-        direction TB
-        KIS[KIS APIs\naccounts, orders, market data]
-        Yahoo[Yahoo Finance\nmarket and intraday data]
-        OpenAI[OpenAI API\noptional trade review]
-        Drive[Google Drive for Desktop\noffsite JSON/.env backup]
-    end
-
-    UI <--> Json
-    Services <--> Json
-    Core --> Rulebooks
-    Utils --> Env
-    Utils --> RuntimeConfig
-    Utils <--> Mirror
-    Services --> DeviceRole
-    Services -. launches/monitors .-> Historical
-    Historical <--> MySQL
-    Historical -. falls back when PC unreachable .-> Mirror
-    Utils <--> MySQL
-    Services <--> Listener
-    Workers <--> KIS
-    Workers <--> Yahoo
-    Core -. optional review .-> OpenAI
-    Services -. best-effort backup .-> Drive
-
-    classDef boundary fill:#eaf2ff,stroke:#2b6cb0,color:#102a43;
-    classDef store fill:#f0fff4,stroke:#2f855a,color:#1c4532;
-    class UI,Controllers,Workers,Core,Strategy,Risk,Services,Utils boundary;
-    class Json,Rulebooks,Env,Mirror,DeviceRole,Historical,MySQL,Listener,KIS,Yahoo,OpenAI,Drive store;
+    App -. coordinates .-> OptionalOps
 ```
 
-Peer-machine roles, the SQLite fallback/backup mechanics, and the always-on-PC automation scripts are described in full in [docs/pc_sync_data_pipeline.md](docs/pc_sync_data_pipeline.md); this diagram only shows how they attach to the desktop app's own layers. A single machine works the same way with the `PC` subgraph absent and MySQL either unset (Yahoo/KIS-only) or pointed at a local instance.
+The boundaries are deliberate:
+
+- UI gestures create typed intent; they never call KIS directly.
+- Broker mutations cross one execution gateway. Broker acceptance is not a fill;
+  reconciliation alone applies fills and positions.
+- SQL is authoritative for the Kanban execution lifecycle. JSON files are local
+  preferences, compatibility state, audit/recovery material, or exports. The
+  SQLite mirror is a disposable market-data fallback, not a peer database.
+- Blocking database, synchronization, and broker work runs in focused QThread
+  workers outside `main_window.py`.
+- Optional two-machine, backup, and refresh operations attach at the application
+  boundary and do not own trading rules.
+
+The guarded order sequence is intentionally small at this level:
+
+```text
+reviewed intent
+  -> validate ownership, readiness, duplicates, and risk
+  -> persist durable command / unknown-submission state
+  -> call the broker once
+  -> reconcile broker truth
+  -> project confirmed order and position state
+```
+
+Detailed state transitions belong in
+[Current Order Logic](docs/current_order_logic.md),
+[Kanban Architecture](docs/kanban_architecture.md), and the
+[Activation Gate Specification](docs/activation_gate_specification.md), rather
+than in the top-level system diagram.
+
+### Transitional debt
+
+The repository still carries a legacy Buylist/execution-queue compatibility
+model beside canonical Trade Cards. Compatibility code may project into the
+canonical model, but it must not become a second broker boundary or a second
+source of fills. Removal of that compatibility model is the next major
+simplification milestone.
+
+`MainWindow` remains the desktop composition root and still has an oversized
+orchestration surface. It no longer implements database, synchronization,
+ownership, or readiness worker logic; those dependencies are imported from
+focused modules. New workflow logic must not be added directly to the window.
 
 ## Kanban Buy Board Architecture
 
@@ -301,7 +176,7 @@ quant_app/
   main.py                         Application entry point
   historical.py                   Standalone 1D/1H historical-data refresh process (not Qt)
   src/
-    ui/                           PyQt windows, Buy Board, UI controllers, workers, chart bridge, UI constants
+    ui/                           PyQt views, explicit controllers, presenters, and background workers
     core/                         Trading domain models, Kanban commands/transitions, and pure business logic
     strategy/                     Strategy-neutral snapshots/signals and built-in strategy plugins
     infrastructure/              Database engines, schemas, refresh orchestration, mirrors, and repositories
@@ -333,7 +208,9 @@ MainWindow(
   SidebarMixin,
   HealthPanelMixin,
   DashboardMixin,
+  MarketPulseMixin,
   ScannerMixin,
+  WatchlistActionsMixin,
   PlanningSupportMixin,
   BuylistMixin,
   ChartCommandRoutingMixin,
@@ -366,6 +243,9 @@ Supporting UI modules:
 | `src/ui/mixins/charts_controller_mixin.py` | Compatibility import for `src/ui/charts/controller.py` |
 | `src/ui/workers.py` | `QThread` workers for KIS snapshots, intraday fetches, scanner runs, and PC status polling |
 | `src/ui/order_workers.py` | `QThread` workers for KIS order submission, query, cancel, and reconciliation |
+| `src/ui/database_workers.py` | Database discovery, freshness, recovery, and local-mirror synchronization workers |
+| `src/ui/coordination_workers.py` | Planning sync, Live Trading control, execution/operator ownership, and plan-publish workers |
+| `src/ui/readiness_presenter.py` | Pure conversion of runtime readiness into labels, progress, and operator guidance |
 | `src/ui/chart_bridge.py` | `QWebChannel` bridge used by chart JavaScript to persist drawings and breakout-price markers |
 | `src/ui/filter_catalog.py` | Default scanner setups, scanner metric labels, tab defaults, and settings defaults |
 
@@ -376,7 +256,12 @@ symbols and cannot start work by itself.
 
 ### UI Workflow Controllers
 
-Controllers are ordinary Python objects that receive the `MainWindow` only as a dependency boundary. They keep workflow code out of tab rendering methods while preserving the existing UI side effects in the mixins. `src/ui/controllers/base.py` provides `WindowController`, a thin base that forwards otherwise-unhandled attribute access back to the owning `MainWindow`, plus a `get_controller()` helper that lazily constructs and caches a controller instance on the window.
+Controllers are ordinary Python objects with an explicit `window` host reference.
+They keep workflow code out of tab rendering methods while preserving required UI
+side effects in the mixins. `WindowController` does not implement `__getattr__`
+or `__setattr__` forwarding: every host dependency is visible as
+`self.window.<name>`, and controller-local state cannot silently mutate the
+window namespace. `get_controller()` only handles lazy construction/caching.
 
 | Controller | Responsibility |
 |---|---|
@@ -405,7 +290,14 @@ and an old `tab_options.json` cannot restore that view.
 
 ## Worker Layer
 
-Most workers live in `src/ui/workers.py`; KIS order submission/query/cancel and reconciliation workers live in `src/ui/order_workers.py`. Kanban projection and runtime workers live in `src/ui/buyboard/`. Daily/hourly history refresh is no longer an in-process worker -- see [Historical Data Refresh](#historical-data-refresh).
+Workers are grouped by the external boundary they serve. General KIS/data-fetch
+workers live in `src/ui/workers.py`; order workers live in
+`src/ui/order_workers.py`; database/mirror workers live in
+`src/ui/database_workers.py`; shared-control workers live in
+`src/ui/coordination_workers.py`; and Kanban projection/runtime workers live in
+`src/ui/buyboard/`. `main_window.py` coordinates these workers but implements no
+`QThread` subclass. Daily/hourly history refresh is a separate process -- see
+[Historical Data Refresh](#historical-data-refresh).
 
 | Worker | Module | Purpose |
 |---|---|---|
@@ -416,6 +308,8 @@ Most workers live in `src/ui/workers.py`; KIS order submission/query/cancel and 
 | `IntradayBulkFetchWorker` | `workers.py` | Fetch intraday bars for multiple symbols |
 | `ScannerWorker` | `workers.py` | Run scanner rules over loaded metrics |
 | `PcRemoteStatusWorker` | `workers.py` | Check database, remote-control listener, and remote `main.py` health independently |
+| Database/mirror workers | `database_workers.py` | Discover databases, read freshness, recover MySQL, and top up the disposable SQLite mirror |
+| Coordination/control workers | `coordination_workers.py` | Synchronize planning state and update Live Trading, operator, and execution ownership controls |
 | `KisOrderWorker` | `order_workers.py` | Submit KIS overseas orders and emit broker acceptance/rejection state |
 | `OrderReconciliationWorker` | `order_workers.py` | Fetch position snapshots through an injected `Broker` and reconcile open orders against holdings deltas |
 | `KisOrderQueryWorker` | `order_workers.py` | Query and reconcile unresolved orders through an injectable `Broker` |
