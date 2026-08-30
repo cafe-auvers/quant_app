@@ -1,14 +1,15 @@
 """Data loading utilities for stock scanning using yfinance."""
 from __future__ import annotations
 
-from pathlib import Path
-from typing import List, Dict, Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import contextlib
 import datetime as dt
 import logging
 import random
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import StringIO
+from pathlib import Path
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -16,7 +17,6 @@ import requests
 import yfinance as yf
 
 from src.utils.config import DATA_DIR
-
 
 DEFAULT_UNIVERSE_CACHE = DATA_DIR / "us_kis_tickers.csv"
 SP500_UNIVERSE_CACHE = DATA_DIR / "sp500_tickers.csv"
@@ -252,10 +252,8 @@ def _parse_chart_history_response(response: requests.Response) -> pd.DataFrame:
     meta = result.get("meta", {})
     tz = meta.get("exchangeTimezoneName")
     if tz and not df.empty:
-        try:
+        with contextlib.suppress(Exception):
             df = df.tz_convert(tz)
-        except Exception:
-            pass
 
     return df
 
@@ -638,6 +636,37 @@ def _download_chart_fallback_batch(
     return pd.concat(frames, axis=1)
 
 
+def _download_yfinance_history_batch(
+    symbols: List[str],
+    *,
+    period: str,
+    interval: str,
+    threads: bool | int,
+    timeout_seconds: float,
+    required_latest_date: Optional[dt.date],
+) -> tuple[pd.DataFrame, List[str], List[str]]:
+    try:
+        data = _download_yfinance_batch(
+            symbols,
+            period=period,
+            interval=interval,
+            threads=threads,
+            timeout=timeout_seconds,
+        )
+    except Exception:
+        data = pd.DataFrame()
+    data = _normalize_batch_download_columns(data, symbols)
+    if required_latest_date is not None:
+        data = _normalize_refresh_history_index(data, interval)
+    available = _symbols_with_downloaded_history(data, symbols)
+    satisfied = _symbols_with_downloaded_history(
+        data,
+        symbols,
+        required_latest_date=required_latest_date,
+    )
+    return data, available, satisfied
+
+
 def download_price_history(
     tickers: List[str],
     period: str = "3mo",
@@ -671,23 +700,13 @@ def download_price_history(
     batches = _chunked_symbols(universe, effective_chunk_size)
 
     for batch_index, batch in enumerate(batches):
-        try:
-            data = _download_yfinance_batch(
-                batch,
-                period=period,
-                interval=interval,
-                threads=threads,
-                timeout=timeout_seconds,
-            )
-        except Exception:
-            data = pd.DataFrame()
-        data = _normalize_batch_download_columns(data, batch)
-        if required_latest_date is not None:
-            data = _normalize_refresh_history_index(data, interval)
-
-        available = _symbols_with_downloaded_history(data, batch)
-        satisfied = _symbols_with_downloaded_history(
-            data, batch, required_latest_date=required_latest_date
+        data, available, satisfied = _download_yfinance_history_batch(
+            batch,
+            period=period,
+            interval=interval,
+            threads=threads,
+            timeout_seconds=timeout_seconds,
+            required_latest_date=required_latest_date,
         )
         if not data.empty and available:
             frames.append(data)
@@ -707,23 +726,13 @@ def download_price_history(
         next_retry: List[str] = []
 
         for batch in _chunked_symbols(retry_symbols, retry_chunk_size):
-            try:
-                data = _download_yfinance_batch(
-                    batch,
-                    period=period,
-                    interval=interval,
-                    threads=threads,
-                    timeout=timeout_seconds,
-                )
-            except Exception:
-                data = pd.DataFrame()
-            data = _normalize_batch_download_columns(data, batch)
-            if required_latest_date is not None:
-                data = _normalize_refresh_history_index(data, interval)
-
-            available = _symbols_with_downloaded_history(data, batch)
-            satisfied = _symbols_with_downloaded_history(
-                data, batch, required_latest_date=required_latest_date
+            data, available, satisfied = _download_yfinance_history_batch(
+                batch,
+                period=period,
+                interval=interval,
+                threads=threads,
+                timeout_seconds=timeout_seconds,
+                required_latest_date=required_latest_date,
             )
             if not data.empty and available:
                 frames.append(data)

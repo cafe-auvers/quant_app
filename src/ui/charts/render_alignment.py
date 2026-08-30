@@ -8,7 +8,6 @@ from typing import Mapping, Optional
 
 from src.core.market_alignment import ContextState, MarketAlignmentSnapshot
 
-
 MARKET_ALIGNMENT_OVERLAY_CSS = """
 #market-alignment-overlay {
     position: absolute;
@@ -323,13 +322,6 @@ def _condition(values: Mapping, name: str) -> str:
             value = condition.get("result")
             return "Yes" if value is True else "No" if value is False else "N/A"
     return "N/A"
-
-
-def _score(value: object, suffix: str = "") -> str:
-    try:
-        return f"{int(round(float(value)))}{suffix}"
-    except (TypeError, ValueError, OverflowError):
-        return "N/A"
 
 
 def _number(value: object) -> str:

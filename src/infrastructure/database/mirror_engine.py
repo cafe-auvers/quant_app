@@ -1,13 +1,26 @@
 """Local mirror construction, handoff guards, and engine resolution."""
 
+import contextlib
 import datetime as dt
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
-from sqlalchemy import (Boolean, Column, DateTime, Integer, MetaData, String,
-                        Table, create_engine, event, inspect, select, text)
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    create_engine,
+    event,
+    inspect,
+    select,
+    text,
+)
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
@@ -15,18 +28,20 @@ from sqlalchemy.exc import SQLAlchemyError
 from src.utils.config import DATA_DIR
 
 from .engine import init_mysql_engine
-from .schema import (_ensure_chart_indicator_manifests_table,
-                     _ensure_chart_indicators_table,
-                     _ensure_earnings_events_table,
-                     _ensure_fundamental_sync_state_table,
-                     _ensure_hourly_price_history_table,
-                     _ensure_market_alignment_tables,
-                     _ensure_price_history_indexes,
-                     _ensure_price_history_table,
-                     _ensure_scanner_metric_snapshots_table,
-                     _ensure_scanner_metrics_table,
-                     _ensure_stock_profiles_table,
-                     _ensure_symbol_refresh_failures_table)
+from .schema import (
+    _ensure_chart_indicator_manifests_table,
+    _ensure_chart_indicators_table,
+    _ensure_earnings_events_table,
+    _ensure_fundamental_sync_state_table,
+    _ensure_hourly_price_history_table,
+    _ensure_market_alignment_tables,
+    _ensure_price_history_indexes,
+    _ensure_price_history_table,
+    _ensure_scanner_metric_snapshots_table,
+    _ensure_scanner_metrics_table,
+    _ensure_stock_profiles_table,
+    _ensure_symbol_refresh_failures_table,
+)
 from .settings import logger
 
 # --- Local mirror (offline fallback when the PC's MySQL is unreachable) -----
@@ -349,10 +364,8 @@ def acquire_local_mirror_handoff_guard(local_engine: Engine):
         try:
             conn.rollback()
         finally:
-            try:
+            with contextlib.suppress(Exception):
                 conn.exec_driver_sql("PRAGMA busy_timeout=30000")
-            except Exception:
-                pass
             conn.close()
         raise
 
@@ -363,10 +376,8 @@ def release_local_mirror_handoff_guard(conn) -> None:
     try:
         conn.rollback()
     finally:
-        try:
+        with contextlib.suppress(Exception):
             conn.exec_driver_sql("PRAGMA busy_timeout=30000")
-        except Exception:
-            pass
         conn.close()
 
 

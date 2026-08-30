@@ -22,7 +22,7 @@ import subprocess
 import sys
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -109,10 +109,8 @@ def _exclusive_launch_lock(mode: str) -> Iterator[None]:
             except Exception:
                 os.close(descriptor)
                 descriptor = None
-                try:
+                with suppress(OSError):
                     path.unlink()
-                except OSError:
-                    pass
                 raise
         except FileExistsError:
             try:
@@ -120,10 +118,8 @@ def _exclusive_launch_lock(mode: str) -> Iterator[None]:
             except OSError:
                 stale = False
             if stale:
-                try:
+                with suppress(OSError):
                     path.unlink()
-                except OSError:
-                    pass
                 continue
             if time.monotonic() >= deadline:
                 raise RuntimeError(f"Timed out waiting to launch {mode} refresh.")
@@ -133,10 +129,8 @@ def _exclusive_launch_lock(mode: str) -> Iterator[None]:
         yield
     finally:
         os.close(descriptor)
-        try:
+        with suppress(OSError):
             path.unlink()
-        except OSError:
-            pass
 
 
 def is_derived_data_complete(mode: str, completed_phases: Optional[List[str]]) -> bool:
@@ -217,15 +211,13 @@ def is_process_alive(pid: Optional[int]) -> bool:
 
 def _taskkill(pid: int) -> None:
     """Best-effort forced kill. Never raises — actual success is verified by the caller via is_process_alive."""
-    try:
+    with suppress(OSError, subprocess.SubprocessError):
         subprocess.run(
             ["taskkill", "/PID", str(pid), "/T", "/F"],
             capture_output=True,
             text=True,
             timeout=10,
         )
-    except (OSError, subprocess.SubprocessError):
-        pass
 
 
 # --- Status queries ----------------------------------------------------------

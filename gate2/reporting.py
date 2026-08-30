@@ -2,19 +2,31 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, dataclass, field
-from datetime import date, datetime, timezone
 import hashlib
 import json
 import logging
 import os
-from pathlib import Path
 import subprocess
 import threading
 import time as wall_time
+from dataclasses import asdict, dataclass, field
+from datetime import date, datetime, timezone
+from pathlib import Path
 from typing import Mapping, Sequence
+
 from zoneinfo import ZoneInfo
 
+from gate2.capabilities import (
+    EXECUTION_NOTICE,
+    QUOTE_SEQUENCE,
+    QUOTE_TIMESTAMP,
+    SHA256_PATTERN,
+    TRADE_SEQUENCE,
+    TRADE_TIMESTAMP,
+    capability_snapshot_complete,
+    load_verified_capability_manifest,
+)
+from src.api.kis_websocket import KisWsProtocolOperation
 from src.core import execution_config
 from src.core.runtime_safety_audit import (
     BROKER_MUTATION_AUDIT_SOURCE,
@@ -23,6 +35,7 @@ from src.core.runtime_safety_audit import (
     RuntimeSafetyAuditSession,
     begin_runtime_safety_audit,
 )
+
 # Importing the sole real broker adapter registers its instrumented boundary.
 # Gate 2 never constructs it or any execution workflow.
 from src.services import broker as _broker_audit_boundary  # noqa: F401
@@ -35,7 +48,6 @@ from src.services.kis_realtime_market_data import (
     build_kis_realtime_market_data_from_environment,
 )
 from src.services.kis_ws_symbol_keys import KisWsSymbolKeyStore
-from src.api.kis_websocket import KisWsProtocolOperation
 from src.services.realtime_market_data import QuoteSnapshot
 from src.services.trading_state import is_trading_enabled
 from src.utils.market_calendar import (
@@ -44,17 +56,6 @@ from src.utils.market_calendar import (
     nyse_holidays,
     nyse_regular_session_close_time,
 )
-from gate2.capabilities import (
-    EXECUTION_NOTICE,
-    QUOTE_SEQUENCE,
-    QUOTE_TIMESTAMP,
-    SHA256_PATTERN,
-    TRADE_SEQUENCE,
-    TRADE_TIMESTAMP,
-    capability_snapshot_complete,
-    load_verified_capability_manifest,
-)
-
 
 KST_ZONE = ZoneInfo("Asia/Seoul")
 SAFE_RUNTIME_EXPECTATIONS = {
@@ -254,9 +255,9 @@ def build_report(evidence: Gate2Evidence) -> dict:
     capability_ok = capability_snapshot_complete(
         evidence.verified_capabilities, environment=evidence.environment
     )
-    audit_sources_ok = GATE2_REQUIRED_AUDIT_SOURCES <= set(
+    audit_sources_ok = set(
         evidence.safety_audit_sources
-    )
+    ) >= GATE2_REQUIRED_AUDIT_SOURCES
     monotonic_capabilities = [
         evidence.verified_capabilities.get(item, {})
         for item in (TRADE_SEQUENCE, QUOTE_SEQUENCE)
@@ -1253,9 +1254,6 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
             frame_ready = all(
                 evidence.frame_counts_by_tr_id.get(tr_id, 0) > 0
                 for tr_id in ("HDFSCNT0", "HDFSASP0")
-            )
-            critical_ready = set(evidence.requested_subscriptions) <= set(
-                evidence.acked_subscriptions
             )
             if runner.current_feed_ready and frame_ready and not stop_probe_complete:
                 evidence.synthetic_stop_tests = _synthetic_stop_test(service)

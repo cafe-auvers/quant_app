@@ -23,6 +23,7 @@ only during an explicit restore requested by the user.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import shutil
@@ -126,10 +127,8 @@ def _atomic_copy(src: Path, dest: Path) -> None:
         tmp_dest.replace(dest)
     except Exception:
         if tmp_dest is not None:
-            try:
+            with contextlib.suppress(OSError):
                 tmp_dest.unlink(missing_ok=True)
-            except OSError:
-                pass
         raise
 
 

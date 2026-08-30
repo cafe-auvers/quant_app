@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import json
 import logging
@@ -18,7 +19,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Dict, Iterable, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Optional, Tuple
 
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -68,17 +69,13 @@ class _ResilientWindowsSelectorEventLoop(asyncio.SelectorEventLoop):
                 last_error = exc
                 ssock = getattr(self, "_ssock", None)
                 if ssock is not None:
-                    try:
+                    with contextlib.suppress(Exception):
                         self._remove_reader(ssock.fileno())
-                    except Exception:
-                        pass
                 for attribute in ("_ssock", "_csock"):
                     candidate = getattr(self, attribute, None)
                     if candidate is not None:
-                        try:
+                        with contextlib.suppress(OSError):
                             candidate.close()
-                        except OSError:
-                            pass
                     setattr(self, attribute, None)
                 self._internal_fds = internal_fds_before
                 if attempt < _EVENT_LOOP_START_ATTEMPTS:
@@ -102,10 +99,8 @@ class _ResilientWindowsSelectorEventLoop(asyncio.SelectorEventLoop):
             return
         for candidate in (ssock, csock):
             if candidate is not None:
-                try:
+                with contextlib.suppress(OSError):
                     candidate.close()
-                except OSError:
-                    pass
         self._ssock = None
         self._csock = None
 

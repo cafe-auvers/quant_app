@@ -11,7 +11,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Mapping, Optional, Sequence
 
-
 ACTIVATION_DEFAULTS: Mapping[str, str] = {
     "TRADING_ENABLED": "false",
     # Engine availability is not broker-mutation authority.  Keeping the
@@ -169,13 +168,13 @@ def evaluate_post_failure_properties(
         set(observation.broker_open_order_ids)
         - set(observation.remembered_broker_order_ids)
     )
-    for broker_order_id in forgotten:
-        violations.append(
-            {
-                "property": "no_open_broker_order_silently_forgotten",
-                "detail": f"broker_order_id={broker_order_id!r} has no durable local audit row",
-            }
-        )
+    violations.extend(
+        {
+            "property": "no_open_broker_order_silently_forgotten",
+            "detail": f"broker_order_id={broker_order_id!r} has no durable local audit row",
+        }
+        for broker_order_id in forgotten
+    )
 
     symbols = sorted(set(observation.broker_holdings))
     for symbol in symbols:

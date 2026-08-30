@@ -21,13 +21,13 @@ from typing import Any, Dict, Optional
 
 from sqlalchemy import (
     BigInteger,
-    case,
     Column,
     DateTime,
     MetaData,
     String,
     Table,
     Text,
+    case,
     func,
     inspect,
     select,
@@ -1473,13 +1473,13 @@ def claim_main_device_if_unclaimed(
                 },
                 separators=(",", ":"),
             )
-            values = dict(
-                payload=payload_json,
-                revision=prior_revision + 1 if row is not None else 1,
-                updated_at=_server_now(engine),
-                updated_by_host=role.hostname,
-                updated_by_device=role.device_id,
-            )
+            values = {
+                "payload": payload_json,
+                "revision": prior_revision + 1 if row is not None else 1,
+                "updated_at": _server_now(engine),
+                "updated_by_host": role.hostname,
+                "updated_by_device": role.device_id,
+            }
             if row is None:
                 conn.execute(
                     table.insert().values(state_key=MAIN_DEVICE_KEY, **values)

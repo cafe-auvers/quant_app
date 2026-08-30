@@ -1,10 +1,13 @@
 """Verify the full snapshot now picks up frcr_evlu_tota_krw from CTRP6548R."""
-import sys, io
+import io
+import sys
+
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 from pathlib import Path
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.api.kis_account_snapshot_dual import fetch_account_snapshot, KisEnvironment
+from src.api.kis_account_snapshot_dual import KisEnvironment, fetch_account_snapshot
 
 snapshot = fetch_account_snapshot(
     KisEnvironment.PROD,

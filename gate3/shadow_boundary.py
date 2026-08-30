@@ -9,14 +9,14 @@ Read-only broker methods may be delegated to the real guarded gateway.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, is_dataclass
-from datetime import datetime, timezone
-from enum import Enum
 import hashlib
 import json
 import os
-from pathlib import Path
 import threading
+from dataclasses import asdict, dataclass, is_dataclass
+from datetime import datetime, timezone
+from enum import Enum
+from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 from uuid import uuid4
 
@@ -26,7 +26,6 @@ from src.core.execution_request import (
     SubmitExecutionRequest,
 )
 from src.core.order_state import OrderSide
-
 
 SHADOW_LABEL = "SHADOW_ONLY_NO_BROKER_ACK_OR_FILL"
 SHADOW_EVENT_TYPES = frozenset(
@@ -150,11 +149,11 @@ class ShadowEventStore:
     def read_all(self) -> list[ShadowEvent]:
         if not self.path.exists():
             return []
-        events: list[ShadowEvent] = []
-        for line in self.path.read_text(encoding="utf-8").splitlines():
-            if line.strip():
-                events.append(ShadowEvent(**json.loads(line)))
-        return events
+        return [
+            ShadowEvent(**json.loads(line))
+            for line in self.path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
 
     def sha256(self) -> str:
         return hashlib.sha256(

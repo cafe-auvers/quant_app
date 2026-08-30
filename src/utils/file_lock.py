@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import os
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -48,10 +48,8 @@ def exclusive_file_lock(
             except OSError:
                 stale = False
             if stale:
-                try:
+                with suppress(OSError):
                     lock_path.unlink()
-                except OSError:
-                    pass
                 continue
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"Timed out waiting for file lock: {lock_path}")
@@ -60,7 +58,5 @@ def exclusive_file_lock(
         yield
     finally:
         os.close(descriptor)
-        try:
+        with suppress(OSError):
             lock_path.unlink()
-        except OSError:
-            pass

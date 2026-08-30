@@ -8,7 +8,7 @@ import os
 import re
 import time
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, ROUND_DOWN
+from decimal import ROUND_DOWN, Decimal
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -20,6 +20,10 @@ from src.core.order_state import (
     OrderSide,
     OrderStatus,
 )
+from src.services.controlled_live_policy import automatic_mutation_retry_permitted
+from src.services.kis_request_boundary import execute_kis_request
+from src.services.kis_request_scheduler import RequestKind, RequestPriority
+from src.services.mutation_budget_protocol import CommandType
 
 from .kis_account_snapshot_dual import (
     KisAccountClient,
@@ -30,10 +34,6 @@ from .kis_account_snapshot_dual import (
     KisTokenError,
     load_config,
 )
-from src.services.kis_request_boundary import execute_kis_request
-from src.services.kis_request_scheduler import RequestKind, RequestPriority
-from src.services.mutation_budget_protocol import CommandType
-from src.services.controlled_live_policy import automatic_mutation_retry_permitted
 
 logger = logging.getLogger(__name__)
 
@@ -564,9 +564,7 @@ def _matches_order_filter(
         return False
     if symbol and snapshot.symbol and snapshot.symbol != str(symbol).upper():
         return False
-    if side and snapshot.side != _normalize_side(side):
-        return False
-    return True
+    return not side or snapshot.side == _normalize_side(side)
 
 
 def _unknown_snapshot(

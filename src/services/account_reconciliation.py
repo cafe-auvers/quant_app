@@ -773,12 +773,10 @@ def _heuristic_candidate(
         broker_started = broker_started.replace(tzinfo=timezone.utc)
     if local_started.tzinfo is None:
         local_started = local_started.replace(tzinfo=timezone.utc)
-    if (
+    return (
         abs((broker_started - local_started).total_seconds())
-        > execution_config.AMBIGUOUS_SUBMISSION_CANDIDATE_WINDOW_SECONDS
-    ):
-        return False
-    return True
+        <= execution_config.AMBIGUOUS_SUBMISSION_CANDIDATE_WINDOW_SECONDS
+    )
 
 
 def _record_absence(
@@ -1708,24 +1706,24 @@ def reduce_account_reconciliation(
         for alert in alerts
         if alert.code == "DISCOVERED_UNOWNED_BROKER_ORDER"
     }
-    for external in external_orders:
+    alerts.extend(
+        ReconciliationAlert(
+            "DISCOVERED_UNOWNED_BROKER_ORDER",
+            ReconciliationAlertSeverity.CRITICAL,
+            (
+                "Durable active unowned broker order continues to fence "
+                "all mutations for this account and symbol"
+            ),
+            external.symbol,
+            broker_order_id=external.broker_order_id,
+        )
+        for external in external_orders
         if (
             external.disposition == ExternalOrderDisposition.DISCOVERED_UNOWNED
             and external.broker_status in _OPEN_EXECUTION_STATUSES
             and external.broker_order_id not in alerted_external_ids
-        ):
-            alerts.append(
-                ReconciliationAlert(
-                    "DISCOVERED_UNOWNED_BROKER_ORDER",
-                    ReconciliationAlertSeverity.CRITICAL,
-                    (
-                        "Durable active unowned broker order continues to fence "
-                        "all mutations for this account and symbol"
-                    ),
-                    external.symbol,
-                    broker_order_id=external.broker_order_id,
-                )
-            )
+        )
+    )
 
     # Holdings reconciliation is independent from reserved/history failures.
     if snapshot.completeness.allows(ReconciliationAction.POSITION_QUANTITY_UPDATE):

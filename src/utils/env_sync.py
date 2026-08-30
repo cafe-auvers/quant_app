@@ -13,11 +13,10 @@ import re
 import stat
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator
-
 
 _ASSIGNMENT_RE = re.compile(
     r"^(\s*(?:export\s+)?)([A-Za-z_][A-Za-z0-9_]*)(\s*)=(.*)$"
@@ -252,10 +251,8 @@ def _exclusive_symbol_write_lock(path: Path) -> Iterator[None]:
             except OSError:
                 stale = False
             if stale:
-                try:
+                with suppress(OSError):
                     lock_path.unlink()
-                except OSError:
-                    pass
                 continue
             if time.monotonic() >= deadline:
                 raise TimeoutError(
@@ -266,10 +263,8 @@ def _exclusive_symbol_write_lock(path: Path) -> Iterator[None]:
         yield
     finally:
         os.close(descriptor)
-        try:
+        with suppress(OSError):
             lock_path.unlink()
-        except OSError:
-            pass
 
 
 def _migrate_legacy_symbol_keys(

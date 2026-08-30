@@ -1,37 +1,65 @@
 """PC-authoritative local mirror copy and checkpoint workflows."""
 
+import contextlib
 import datetime as dt
 import hashlib
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
-from sqlalchemy import (Boolean, DateTime, Float, Integer, MetaData, Table,
-                        delete, func, insert, inspect, select, text, tuple_)
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Float,
+    Integer,
+    MetaData,
+    Table,
+    delete,
+    func,
+    insert,
+    inspect,
+    select,
+    text,
+    tuple_,
+)
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
 from src.utils.market_calendar import expected_latest_market_data_date
 
-from .mirror_engine import (_BOOLEAN_RECONCILE_COLUMNS, _RAW_MIRROR_SPECS,
-                            _RECONCILE_TABLE_SPECS, MIRRORED_TABLES,
-                            LocalMirrorNeedsReconciliationError,
-                            _ensure_local_mirror_handoff_tracking,
-                            _ensure_local_mirror_sync_state,
-                            _local_mirror_handoff_table,
-                            _local_mirror_sync_state_table,
-                            _mark_local_mirror_handoff_clean,
-                            _MirrorSyncCheckpoint, _MirrorTableSignature,
-                            _PartitionFingerprint, _RawMirrorSpec,
-                            _ReconcileTableSpec)
-from .repositories.chart_indicators import (_chart_indicator_manifest_matches,
-                                            _history_watermark_values)
-from .repositories.scanner import (scanner_metrics_input_fingerprint,
-                                   scanner_metrics_snapshot_date)
-from .settings import (CACHE_QUERY_SYMBOL_CHUNK_SIZE,
-                       HOURLY_CACHE_QUERY_SYMBOL_CHUNK_SIZE, REFERENCE_SYMBOL,
-                       SCANNER_QUERY_SYMBOL_CHUNK_SIZE, logger)
+from .mirror_engine import (
+    _BOOLEAN_RECONCILE_COLUMNS,
+    _RAW_MIRROR_SPECS,
+    _RECONCILE_TABLE_SPECS,
+    MIRRORED_TABLES,
+    LocalMirrorNeedsReconciliationError,
+    _ensure_local_mirror_handoff_tracking,
+    _ensure_local_mirror_sync_state,
+    _local_mirror_handoff_table,
+    _local_mirror_sync_state_table,
+    _mark_local_mirror_handoff_clean,
+    _MirrorSyncCheckpoint,
+    _MirrorTableSignature,
+    _PartitionFingerprint,
+    _RawMirrorSpec,
+    _ReconcileTableSpec,
+)
+from .repositories.chart_indicators import (
+    _chart_indicator_manifest_matches,
+    _history_watermark_values,
+)
+from .repositories.scanner import (
+    scanner_metrics_input_fingerprint,
+    scanner_metrics_snapshot_date,
+)
+from .settings import (
+    CACHE_QUERY_SYMBOL_CHUNK_SIZE,
+    HOURLY_CACHE_QUERY_SYMBOL_CHUNK_SIZE,
+    REFERENCE_SYMBOL,
+    SCANNER_QUERY_SYMBOL_CHUNK_SIZE,
+    logger,
+)
 from .sql_helpers import _clean_symbols, _execute_bulk_upsert, _record_chunks
 from .time_utils import _utcnow_naive
 
@@ -1499,10 +1527,8 @@ def _sync_clean_local_mirror_from_pc_exactly(
         raise
     except Exception as exc:
         if local_conn is not None:
-            try:
+            with contextlib.suppress(Exception):
                 local_conn.rollback()
-            except Exception:
-                pass
         raise RuntimeError(f"Exact PC -> local mirror sync failed: {exc}") from exc
     finally:
         if local_conn is not None:
@@ -1839,10 +1865,8 @@ def sync_local_mirror_from_pc_checkpointed(
         return written
     except Exception as exc:
         if local_conn is not None:
-            try:
+            with contextlib.suppress(Exception):
                 local_conn.rollback()
-            except Exception:
-                pass
         raise RuntimeError(
             f"Checkpointed PC -> local mirror sync failed: {exc}"
         ) from exc

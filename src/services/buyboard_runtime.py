@@ -116,32 +116,35 @@ from uuid import uuid4
 from sqlalchemy.engine import Engine
 
 from src.core import execution_config
+from src.core.discovered_external_order import ExternalOrderDisposition
 from src.core.execution_mode import ExecutionLease, ExecutionMode, ExecutionSource
-from src.core.exit_execution_command import (
-    build_exit_execution_command,
-    exit_execution_policy,
-    marketable_exit_limit_price,
-)
-from src.core.execution_request import (
-    CancelIntent,
-    derive_execution_client_order_id,
-)
 from src.core.execution_order_record import (
     TERMINAL_EXECUTION_ORDER_STATUSES,
     ExecutionOrderRecord,
     ExecutionOrderStatus,
 )
-from src.core.discovered_external_order import ExternalOrderDisposition
+from src.core.execution_request import (
+    CancelIntent,
+    derive_execution_client_order_id,
+)
 from src.core.execution_result import broker_order_from_execution_record
+from src.core.exit_execution_command import (
+    build_exit_execution_command,
+    exit_execution_policy,
+    marketable_exit_limit_price,
+)
 from src.core.order_state import (
+    REGULAR_LIMIT_EXECUTION,
     BrokerOrder,
     OrderIntent,
     OrderSide,
-    REGULAR_LIMIT_EXECUTION,
     is_open_status,
 )
 from src.core.trade_card_state import BoardStatus, TradeCardState
-from src.risk.orb_position import calculate_orb_position_values, is_orb_position_plan_valid
+from src.risk.orb_position import (
+    calculate_orb_position_values,
+    is_orb_position_plan_valid,
+)
 from src.risk.portfolio import (
     PortfolioPositionRisk,
     PortfolioProjectedExposure,
@@ -151,13 +154,18 @@ from src.risk.portfolio import (
     ProposedPortfolioEntry,
 )
 from src.risk.pre_trade import PreTradeRiskDecision
-from src.services import capital_allocator
-from src.services import order_ledger
-from src.services import order_reconciliation
+from src.services import capital_allocator, order_ledger, order_reconciliation
 from src.services.broker import Broker, ReadOnlyBroker
+from src.services.entry_attempt_manager import EntryAttemptManager
+from src.services.eod_trading_service import EodActionCallbacks, EodTradingService
+from src.services.execution_authority import ExecutionAuthority, LeaseHandle
 from src.services.execution_command_gateway import (
     ExecutionCommandGateway,
     get_default_execution_gateway,
+)
+from src.services.execution_order_repository import (
+    fetch_execution_order,
+    list_execution_orders_for_card,
 )
 from src.services.execution_workflow_service import (
     request_cancel_intent,
@@ -166,13 +174,6 @@ from src.services.execution_workflow_service import (
     request_submit,
     resume_replace,
 )
-from src.services.execution_order_repository import (
-    fetch_execution_order,
-    list_execution_orders_for_card,
-)
-from src.services.entry_attempt_manager import EntryAttemptManager
-from src.services.eod_trading_service import EodActionCallbacks, EodTradingService
-from src.services.execution_authority import ExecutionAuthority, LeaseHandle
 from src.services.intraday_data_service import (
     ExecutionGradeDataUnavailableError,
     fetch_execution_grade_intraday,
@@ -325,22 +326,6 @@ def _find_open_order(
         environment=environment, account_no=account_no, symbol=symbol, side=side, intent=intent
     )
     return matches[0] if matches else None
-
-
-def _find_open_entry_order(card: TradeCardState) -> Optional[BrokerOrder]:
-    return _find_open_order(
-        environment=card.environment,
-        account_no=card.account_no,
-        symbol=card.symbol,
-        side=OrderSide.BUY,
-        intent=OrderIntent.ENTRY,
-    )
-
-
-def _find_open_sell_order(card: TradeCardState) -> Optional[BrokerOrder]:
-    return _find_open_order(
-        environment=card.environment, account_no=card.account_no, symbol=card.symbol, side=OrderSide.SELL
-    )
 
 
 def _reconcile_order(order: BrokerOrder, *, broker: Broker) -> BrokerOrder:

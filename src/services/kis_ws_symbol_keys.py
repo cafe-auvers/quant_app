@@ -9,21 +9,20 @@ environment values are deliberately never consulted for symbols.
 from __future__ import annotations
 
 import csv
-from contextlib import contextmanager
-from dataclasses import dataclass
 import hashlib
 import json
 import logging
 import os
-from pathlib import Path
 import re
 import time
+from contextlib import contextmanager, suppress
+from dataclasses import dataclass
+from pathlib import Path
 from types import MappingProxyType
 from typing import Dict, Iterator, Mapping, Optional
 
 from src.utils.config import DATA_DIR
 from src.utils.storage import save_json
-
 
 logger = logging.getLogger(__name__)
 
@@ -416,10 +415,8 @@ def _exclusive_update_lock(path: Path) -> Iterator[None]:
             except OSError:
                 stale = False
             if stale:
-                try:
+                with suppress(OSError):
                     lock_path.unlink()
-                except OSError:
-                    pass
                 continue
             if time.monotonic() >= deadline:
                 raise TimeoutError(
@@ -430,10 +427,8 @@ def _exclusive_update_lock(path: Path) -> Iterator[None]:
         yield
     finally:
         os.close(descriptor)
-        try:
+        with suppress(OSError):
             lock_path.unlink()
-        except OSError:
-            pass
 
 
 def write_symbol_keys_file(

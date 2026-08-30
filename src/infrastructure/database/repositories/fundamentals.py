@@ -8,7 +8,7 @@ import json
 import threading
 import weakref
 from dataclasses import asdict
-from typing import Iterable, Mapping, Optional, Sequence
+from typing import Iterable, Mapping, Optional
 
 from sqlalchemy import MetaData, delete, select, update
 from sqlalchemy.engine import Engine
@@ -30,7 +30,6 @@ from src.infrastructure.database.schema import (
 )
 from src.infrastructure.database.sql_helpers import _execute_bulk_upsert
 from src.infrastructure.database.time_utils import _utcnow_naive
-
 
 PROFILE_DATASET = "PROFILE"
 EARNINGS_DATASET = "EARNINGS"
@@ -228,15 +227,7 @@ def seed_stock_profiles(
     return len(records)
 
 
-def load_stock_profile(engine: Engine, symbol: str) -> Optional[StockProfile]:
-    table = _fundamental_tables(engine)[0]
-    symbol = canonical_symbol(symbol)
-    with engine.connect() as conn:
-        row = conn.execute(
-            select(table).where(table.c.symbol == symbol)
-        ).mappings().first()
-    if row is None:
-        return None
+def _stock_profile_from_row(row: Mapping[str, object]) -> StockProfile:
     return StockProfile(
         symbol=row["symbol"],
         provider_symbol=row["provider_symbol"],
@@ -263,39 +254,23 @@ def load_stock_profile(engine: Engine, symbol: str) -> Optional[StockProfile]:
     )
 
 
+def load_stock_profile(engine: Engine, symbol: str) -> Optional[StockProfile]:
+    table = _fundamental_tables(engine)[0]
+    symbol = canonical_symbol(symbol)
+    with engine.connect() as conn:
+        row = conn.execute(
+            select(table).where(table.c.symbol == symbol)
+        ).mappings().first()
+    return None if row is None else _stock_profile_from_row(row)
+
+
 def load_stock_profiles(engine: Engine) -> dict[str, StockProfile]:
     """Load the complete profile cache in one query for universe jobs."""
 
     table = _fundamental_tables(engine)[0]
     with engine.connect() as conn:
         rows = conn.execute(select(table)).mappings().all()
-    return {
-        str(row["symbol"]): StockProfile(
-            symbol=row["symbol"],
-            provider_symbol=row["provider_symbol"],
-            company_name=row["company_name"],
-            short_name=row["short_name"],
-            quote_type=row["quote_type"],
-            exchange=row["exchange"],
-            market=row["market"],
-            currency=row["currency"],
-            country=row["country"],
-            sector_name=row["sector_name"],
-            sector_key=row["sector_key"],
-            industry_name=row["industry_name"],
-            industry_key=row["industry_key"],
-            market_cap=row["market_cap"],
-            market_cap_as_of_date=row["market_cap_as_of_date"],
-            category=row["category"],
-            fund_family=row["fund_family"],
-            profile_status=ProfileStatus(row["profile_status"]),
-            source=row["source"],
-            last_checked_at=row["last_checked_at"],
-            last_successful_sync_at=row["last_successful_sync_at"],
-            updated_at=row["updated_at"],
-        )
-        for row in rows
-    }
+    return {str(row["symbol"]): _stock_profile_from_row(row) for row in rows}
 
 
 def _event_record(event: EarningsEvent) -> dict:

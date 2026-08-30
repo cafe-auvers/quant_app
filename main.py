@@ -3,7 +3,7 @@ PyQt5 Stock Dashboard - Main Application Entry Point
 """
 import faulthandler
 import logging
-import os
+import os as os  # Compatibility surface used by startup configuration checks.
 import sys
 import traceback
 

@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from enum import Enum, IntEnum
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Mapping, Optional, Sequence
+
 from zoneinfo import ZoneInfo
 
 from src.api.kis_websocket import (
@@ -33,18 +34,18 @@ from src.core.runtime_safety_audit import (
     record_entry_readiness,
     register_runtime_safety_audit_source,
 )
+from src.services.kis_ws_symbol_keys import (
+    KisWsSymbolKeysError,
+    KisWsSymbolKeyStore,
+    normalize_symbol_keys,
+    update_symbol_keys_file,
+)
 from src.services.realtime_market_data import (
     DisconnectCallback,
     InMemoryQuoteCache,
     QuoteCallback,
     QuoteSnapshot,
     RealtimeMarketDataService,
-)
-from src.services.kis_ws_symbol_keys import (
-    KisWsSymbolKeyStore,
-    KisWsSymbolKeysError,
-    normalize_symbol_keys,
-    update_symbol_keys_file,
 )
 from src.utils.market_calendar import is_regular_session_open
 
@@ -2029,9 +2030,9 @@ def build_kis_realtime_market_data_from_environment(
         TRADE_TR_ID: set(TRADE_COLUMNS),
         QUOTE_TR_ID: set(QUOTE_COLUMNS),
     }
-    for channel, field in sequence_fields.items():
-        if field not in supported_fields.get(channel, set()):
-            raise ValueError(f"unsupported sequence field {channel}:{field}")
+    for channel, sequence_field in sequence_fields.items():
+        if sequence_field not in supported_fields.get(channel, set()):
+            raise ValueError(f"unsupported sequence field {channel}:{sequence_field}")
     prefix = f"KIS_{environment}"
     base_url = os.getenv(f"{prefix}_BASE_URL", "").strip()
     ws_url = os.getenv(f"{prefix}_WS_URL", "").strip()

@@ -12,14 +12,14 @@ in the configured final-minute safety window.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 from datetime import date
+from pathlib import Path
 from typing import Callable, List, Optional
 
 from sqlalchemy.engine import Engine
 
-from src.core.execution_request import CancelIntent
 from src.core.entry_monitoring_command import build_entry_monitoring_command
+from src.core.execution_request import CancelIntent
 from src.core.exit_policy import market_session_date
 from src.core.order_state import (
     BrokerOrder,
@@ -216,9 +216,7 @@ class EodTradingService:
             if self._reset_buy_today_with_no_order(
                 card,
                 allow_no_order_reset=True,
-            ):
-                changed.append(card)
-            elif repaired_session:
+            ) or repaired_session:
                 changed.append(card)
         return changed
 

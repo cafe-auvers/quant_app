@@ -14,6 +14,7 @@ on it.
 """
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import os
 from pathlib import Path
@@ -96,8 +97,6 @@ def write_sleep_readiness_snapshot(
 ) -> Dict[str, Any]:
     """Best-effort write -- a failure here must never block or crash the app."""
     snapshot = build_sleep_readiness_snapshot(main_window)
-    try:
+    with contextlib.suppress(Exception):
         save_json(path, snapshot)
-    except Exception:
-        pass
     return snapshot

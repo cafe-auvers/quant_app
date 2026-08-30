@@ -1,12 +1,25 @@
 from __future__ import annotations
 
-from PyQt5.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QGroupBox, QFormLayout, QPushButton,
-    QLineEdit, QKeySequenceEdit, QMessageBox, QLabel, QTreeWidget,
-    QTreeWidgetItem, QAbstractItemView, QHeaderView, QSpinBox, QComboBox,
-)
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor, QKeySequence
+from PyQt5.QtWidgets import (
+    QAbstractItemView,
+    QComboBox,
+    QDialog,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QHeaderView,
+    QKeySequenceEdit,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QSpinBox,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QVBoxLayout,
+)
 
 from src.services.app_state import SETTINGS_FILE
 from src.services.cloud_backup import (
@@ -23,6 +36,7 @@ from src.services.env_backup import (
 from src.ui.filter_catalog import DEFAULT_SETTINGS, FILTER_CATALOG
 from src.utils.config import ENV_FILE
 from src.utils.storage import load_json, save_json
+
 
 class SettingsDialog(QDialog):
     def __init__(self, parent=None):
@@ -473,12 +487,11 @@ class AddFilterDialog(QDialog):
         layout.addWidget(header_lbl)
         
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("ðŸ”Ž Search filters by name, category, or description...")
+        self.search_input.setPlaceholderText("Search filters by name, category, or description...")
         self.search_input.textChanged.connect(self.filter_tree)
         layout.addWidget(self.search_input)
         
         # QTreeWidget
-        from PyQt5.QtWidgets import QTreeWidget, QTreeWidgetItem
         self.tree = QTreeWidget()
         self.tree.setColumnCount(3)
         self.tree.setHeaderLabels(["Filter Name", "Explanation", "Suggested Value or Range"])
@@ -517,8 +530,6 @@ class AddFilterDialog(QDialog):
         self.populate_tree()
         
     def populate_tree(self):
-        from PyQt5.QtWidgets import QTreeWidgetItem
-        
         # Group metrics by category
         categories = {}
         for cat, key, name, expl, sugg in FILTER_CATALOG:
@@ -612,4 +623,3 @@ class AddFilterDialog(QDialog):
             return
         self.selected_attribute = key
         self.accept()
-

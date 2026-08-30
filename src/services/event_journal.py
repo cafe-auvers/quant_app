@@ -16,7 +16,7 @@ import re
 import shutil
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -24,7 +24,11 @@ from typing import Any, Callable, Dict, Iterator, List, Optional
 from uuid import uuid4
 
 from src.utils.config import DATA_DIR
-from src.utils.redaction import mask_account_number, redact_payload, scrub_sensitive_text
+from src.utils.redaction import (
+    mask_account_number,
+    redact_payload,
+    scrub_sensitive_text,
+)
 
 EVENT_JOURNAL_FILE = DATA_DIR / "event_journal.jsonl"
 MAX_JOURNAL_BYTES = 25 * 1024 * 1024
@@ -136,10 +140,8 @@ def _exclusive_journal_lock(path: Path) -> Iterator[None]:
                 except OSError:
                     stale = False
                 if stale:
-                    try:
+                    with suppress(OSError):
                         lock_path.unlink()
-                    except OSError:
-                        pass
                     continue
                 if time.monotonic() >= deadline:
                     raise TimeoutError(
@@ -150,10 +152,8 @@ def _exclusive_journal_lock(path: Path) -> Iterator[None]:
             yield
         finally:
             os.close(descriptor)
-            try:
+            with suppress(OSError):
                 lock_path.unlink()
-            except OSError:
-                pass
 
 
 def _archive_paths(path: Path, *, newest_first: bool = True) -> List[Path]:

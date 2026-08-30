@@ -15,7 +15,6 @@ from typing import Iterable, Optional, Sequence
 import pandas as pd
 import requests
 
-
 MASTER_URL_TEMPLATE = "https://new.real.download.dws.co.kr/common/master/{market}mst.cod.zip"
 REQUEST_TIMEOUT_SEC = 60
 
@@ -152,9 +151,10 @@ def is_common_stock_like_symbol(symbol: str, name: str = "") -> bool:
     for pattern in NON_COMMON_NAME_PATTERNS:
         if re.search(pattern, normalized_name):
             return False
-    if re.search(r"\bUNIT[S]?\b", normalized_name) and not re.search(r"\bCOMMON\s+UNIT[S]?\b", normalized_name):
+    if re.search(r"\bUNIT[S]?\b", normalized_name) and not re.search(
+        r"\bCOMMON\s+UNIT[S]?\b", normalized_name
+    ):
         return False
-
     return True
 
 

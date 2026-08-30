@@ -1,10 +1,12 @@
 """Trading rules and watchlist management."""
 
+import contextlib
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import Any, Callable, List, Dict, Optional
 from datetime import datetime, timezone
+from typing import Any, Callable, Dict, List, Optional
+
 from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
@@ -230,10 +232,8 @@ class Watchlist:
         watchlist = cls(name=data.get("name", "Default"))
         created_date = data.get("created_date")
         if created_date:
-            try:
+            with contextlib.suppress(ValueError):
                 watchlist.created_date = _parse_timestamp(created_date)
-            except ValueError:
-                pass
 
         def optional_float(value):
             if value in (None, ""):

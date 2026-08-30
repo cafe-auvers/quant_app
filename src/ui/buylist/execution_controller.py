@@ -28,9 +28,7 @@ class ExecutionQueueRefreshRequest:
     account_size: float = 0.0
     risk_percent: float = 0.01
     buffer_pct: float = 0.001
-    buffer_pct_for_symbol: Callable[[str], Optional[float]] = (
-        lambda _symbol: None
-    )
+    buffer_pct_for_symbol: Callable[[str], Optional[float]] = lambda _symbol: None
     account_no: str = ""
     account_no_for_symbol: Callable[[str], str] = lambda _symbol: ""
     account_size_for_account: Callable[[str, str], Optional[float]] = (
@@ -39,10 +37,16 @@ class ExecutionQueueRefreshRequest:
     trade_card_engine: Optional[Any] = None
     window_days: int = 7
     latest_intraday_session: Callable[[Any], Any] = lambda frame: frame
-    load_intraday_interval: Callable[[str, str, int], Any] = lambda _symbol, _interval, _window_days: None
+    load_intraday_interval: Callable[[str, str, int], Any] = (
+        lambda _symbol, _interval, _window_days: None
+    )
     signal_price_for_symbol: Callable[[str], float] = lambda _symbol: 0.0
-    set_latest_intraday_price: Callable[[str, float], None] = lambda _symbol, _price: None
-    has_duplicate_open_order: Callable[[str, str, str, OrderSide, OrderIntent], bool] = lambda *_args: False
+    set_latest_intraday_price: Callable[[str, float], None] = (
+        lambda _symbol, _price: None
+    )
+    has_duplicate_open_order: Callable[
+        [str, str, str, OrderSide, OrderIntent], bool
+    ] = lambda *_args: False
     adr_percent_for_symbol: Callable[[str], Optional[float]] = lambda _symbol: None
 
     @property
@@ -82,7 +86,9 @@ class BuylistExecutionController(WindowController):
         except Exception:
             return 0.0
 
-    def refresh_execution_queue(self, request: ExecutionQueueRefreshRequest) -> ExecutionQueueRefreshResult:
+    def refresh_execution_queue(
+        self, request: ExecutionQueueRefreshRequest
+    ) -> ExecutionQueueRefreshResult:
         """Refresh existing queue rows, or intentionally queue selected symbols."""
         result = ExecutionQueueRefreshResult(
             env=request.env,
@@ -133,9 +139,7 @@ class BuylistExecutionController(WindowController):
                     )
                     continue
                 try:
-                    item_buffer_pct = float(
-                        request.buffer_pct_for_symbol(symbol)
-                    )
+                    item_buffer_pct = float(request.buffer_pct_for_symbol(symbol))
                 except (TypeError, ValueError, OverflowError):
                     item_buffer_pct = float(request.buffer_pct)
                 if (
@@ -157,9 +161,11 @@ class BuylistExecutionController(WindowController):
                 )
                 if current_price > 0:
                     request.set_latest_intraday_price(symbol, current_price)
-                queue_has_working_order = request.manager.has_pending_or_submitted_order(
-                    symbol,
-                    environment=request.env,
+                queue_has_working_order = (
+                    request.manager.has_pending_or_submitted_order(
+                        symbol,
+                        environment=request.env,
+                    )
                 )
                 broker_has_open_order = request.has_duplicate_open_order(
                     request.env,
@@ -168,7 +174,9 @@ class BuylistExecutionController(WindowController):
                     OrderSide.BUY,
                     OrderIntent.ENTRY,
                 )
-                duplicate_order = bool(broker_has_open_order and not queue_has_working_order)
+                duplicate_order = bool(
+                    broker_has_open_order and not queue_has_working_order
+                )
                 queue_item = request.manager.build_or_update_from_watchlist_item(
                     planning_item,
                     {"1m": one_minute, "5m": five_minute, "30m": five_minute},
@@ -197,7 +205,9 @@ class BuylistExecutionController(WindowController):
                 if sync is not None and sync.changed and sync.card_key:
                     result.canonical_changed_keys.append(sync.card_key)
                 status_text = self._status_text(queue_item.status)
-                result.status_counts[status_text] = result.status_counts.get(status_text, 0) + 1
+                result.status_counts[status_text] = (
+                    result.status_counts.get(status_text, 0) + 1
+                )
                 result.refreshed += 1
             except Exception as exc:
                 result.failures.append(f"{symbol}: {exc}")
@@ -218,11 +228,20 @@ class BuylistExecutionController(WindowController):
             return
 
         protected_statuses = {
-            "BOUGHT", "BUY_SUBMITTED", "BUY_PARTIAL", "SELL_SUBMITTED",
-            "PARTIAL_EXIT_SUBMITTED", "PARTIAL_EXIT_RESERVED", "SELL_RESERVED",
+            "BOUGHT",
+            "BUY_SUBMITTED",
+            "BUY_PARTIAL",
+            "SELL_SUBMITTED",
+            "PARTIAL_EXIT_SUBMITTED",
+            "PARTIAL_EXIT_RESERVED",
+            "SELL_RESERVED",
             "SOLD",
         }
-        manager = buylist_manager if buylist_manager is not None else self.buylist_manager
+        manager = (
+            buylist_manager
+            if buylist_manager is not None
+            else self.window.buylist_manager
+        )
         existing = manager.get(symbol, env)
         if existing is not None:
             existing_status = str(
@@ -286,7 +305,9 @@ class BuylistExecutionController(WindowController):
                 monitoring_status=status_text,
                 environment=env,
                 breakout_price=getattr(planning_item, "breakout_price", None),
-                breakout_method=f"execution_queue:{selected_window}" if selected_window else "execution_queue",
+                breakout_method=f"execution_queue:{selected_window}"
+                if selected_window
+                else "execution_queue",
                 buffer_pct=effective_buffer_pct,
                 kis_account_no=str(default_account_no or "").strip(),
             )
@@ -309,10 +330,12 @@ class BuylistExecutionController(WindowController):
             )
             existing.monitoring_status = status_text
             existing.environment = env
-            existing.breakout_price = getattr(
-                planning_item, "breakout_price", None
+            existing.breakout_price = getattr(planning_item, "breakout_price", None)
+            existing.breakout_method = (
+                f"execution_queue:{selected_window}"
+                if selected_window
+                else "execution_queue"
             )
-            existing.breakout_method = f"execution_queue:{selected_window}" if selected_window else "execution_queue"
             existing.buffer_pct = effective_buffer_pct
             resolved_account_no = str(default_account_no or "").strip()
             if resolved_account_no:
@@ -321,13 +344,25 @@ class BuylistExecutionController(WindowController):
             # compatibility mirror. Auto-selected queue rows keep their
             # existing values unless missing.
             use_selected_plan = bool(getattr(queue_item, "manual_window_lock", False))
-            if use_selected_plan or float(getattr(existing, "entry_price", 0.0) or 0.0) <= 0:
+            if (
+                use_selected_plan
+                or float(getattr(existing, "entry_price", 0.0) or 0.0) <= 0
+            ):
                 existing.entry_price = entry_price
-            if use_selected_plan or float(getattr(existing, "stop_loss", 0.0) or 0.0) <= 0:
+            if (
+                use_selected_plan
+                or float(getattr(existing, "stop_loss", 0.0) or 0.0) <= 0
+            ):
                 existing.stop_loss = stop_loss
-            if use_selected_plan or float(getattr(existing, "total_score", 0.0) or 0.0) <= 0:
+            if (
+                use_selected_plan
+                or float(getattr(existing, "total_score", 0.0) or 0.0) <= 0
+            ):
                 existing.total_score = score
-            if use_selected_plan or float(getattr(existing, "stop_adr", 0.0) or 0.0) <= 0:
+            if (
+                use_selected_plan
+                or float(getattr(existing, "stop_adr", 0.0) or 0.0) <= 0
+            ):
                 existing.stop_adr = stop_adr
             # Always update sizing fields — auto-selected risk% changes each refresh
             existing.position_percent = capital_percent
@@ -346,24 +381,29 @@ class BuylistExecutionController(WindowController):
         )
 
     def submit_selected_queue_order(self, env: str) -> None:
-        submission_guard = getattr(
-            self.window, "_state_sync_allows_order_submission", None
-        )
+        window = self.window
+        submission_guard = getattr(window, "_state_sync_allows_order_submission", None)
         if callable(submission_guard) and not submission_guard():
             return
-        item = self._buylist_selected_item(env)
+        item = window._buylist_selected_item(env)
         if not item:
-            QMessageBox.warning(self.window, "No selection", "Select an execution queue row first.")
+            QMessageBox.warning(
+                window, "No selection", "Select an execution queue row first."
+            )
             return
-        queue_item = self._queue_item_for_buylist_item(item)
+        queue_item = window._queue_item_for_buylist_item(item)
         if queue_item is None:
-            QMessageBox.warning(self.window, "No queue item", f"{item.symbol} is not in the execution queue. Click Refresh Queue first.")
+            QMessageBox.warning(
+                window,
+                "No queue item",
+                f"{item.symbol} is not in the execution queue. Click Refresh Queue first.",
+            )
             return
         candidate = getattr(queue_item, "selected_candidate", None)
         status_text = self._status_text(getattr(queue_item, "status", ""))
         if status_text == "UNKNOWN_SUBMISSION_STATE":
             QMessageBox.warning(
-                self.window,
+                window,
                 "Submission state unknown",
                 f"{item.symbol} has an unknown broker submission result.\n\n"
                 "Reconcile KIS account/order status before clearing this state or submitting again.",
@@ -371,7 +411,7 @@ class BuylistExecutionController(WindowController):
             return
         if candidate is None or status_text != "EXECUTE_READY":
             QMessageBox.warning(
-                self.window,
+                window,
                 "Not ready",
                 f"{item.symbol} is {status_text or 'not ready'}; submit is allowed only when status is EXECUTE_READY.",
             )
@@ -391,16 +431,18 @@ class BuylistExecutionController(WindowController):
             or not bool(getattr(candidate, "breakout_confirmed", False))
         ):
             QMessageBox.warning(
-                self.window,
+                window,
                 "Invalid order",
                 f"{item.symbol} lacks a confirmed passive execution plan.",
             )
             return
-        worker = getattr(self.window, "_buyboard_runtime_worker", None)
+        worker = getattr(window, "_buyboard_runtime_worker", None)
         runtime = getattr(worker, "runtime", None)
         market_data = getattr(runtime, "market_data", None)
         now = datetime.now(timezone.utc)
-        quote = market_data.latest_quote(item.symbol) if market_data is not None else None
+        quote = (
+            market_data.latest_quote(item.symbol) if market_data is not None else None
+        )
         if (
             market_data is None
             or quote is None
@@ -413,65 +455,75 @@ class BuylistExecutionController(WindowController):
             )
         ):
             QMessageBox.warning(
-                self.window,
+                window,
                 "Passive entry not ready",
                 "A fresh WebSocket last trade and best ask must both be strictly "
                 "above the exact execution price.",
             )
             return
-        if self._buylist_auto_order_blocked(item):
+        if window._buylist_auto_order_blocked(item):
             QMessageBox.warning(
-                self.window,
+                window,
                 "KIS order blocked",
                 f"{item.symbol} cannot be submitted through the selected KIS account/API:\n"
                 f"{getattr(item, 'auto_order_block_reason', '')}",
             )
             return
 
-        window_values = getattr(self.window, "__dict__", {})
+        window_values = getattr(window, "__dict__", {})
         selected_account_fn = window_values.get("_selected_order_account_for_item")
         if selected_account_fn is None:
             selected_account_fn = getattr(
-                type(self.window), "_selected_order_account_for_item", None
+                type(window), "_selected_order_account_for_item", None
             )
         account_no = (
             (
                 selected_account_fn(item, env)
                 if "_selected_order_account_for_item" in window_values
-                else selected_account_fn(self.window, item, env)
+                else selected_account_fn(window, item, env)
             )
             if callable(selected_account_fn)
-            else self._first_account_no_for_environment(env)
+            else window._first_account_no_for_environment(env)
         )
         if not account_no:
             warn_account_fn = window_values.get("_warn_order_account_unavailable")
             if warn_account_fn is None:
                 warn_account_fn = getattr(
-                    type(self.window), "_warn_order_account_unavailable", None
+                    type(window), "_warn_order_account_unavailable", None
                 )
             if callable(warn_account_fn):
                 if "_warn_order_account_unavailable" in window_values:
                     warn_account_fn(item, env)
                 else:
-                    warn_account_fn(self.window, item, env)
+                    warn_account_fn(window, item, env)
             else:
                 QMessageBox.warning(
-                    self.window,
+                    window,
                     "KIS account required",
                     "Select a configured KIS account before submitting an order.",
                 )
             return
-        if self._has_duplicate_open_order(env, account_no, item.symbol, OrderSide.BUY, OrderIntent.ENTRY):
-            QMessageBox.warning(self.window, "Duplicate order", f"An open BUY ENTRY order already exists for {item.symbol}.")
+        if window._has_duplicate_open_order(
+            env,
+            account_no,
+            item.symbol,
+            OrderSide.BUY,
+            OrderIntent.ENTRY,
+        ):
+            QMessageBox.warning(
+                window,
+                "Duplicate order",
+                f"An open BUY ENTRY order already exists for {item.symbol}.",
+            )
             return
 
-        review = self._format_execution_queue_order_review(env, item, queue_item)
+        review = window._format_execution_queue_order_review(env, item, queue_item)
         title = f"Submit {env} BUY Order"
         body = review
         if env == "PROD":
             body = "This will submit a live PROD BUY order.\n\n" + review
         reply = QMessageBox.question(
-            self.window,
+            window,
             title,
             body + "\n\nSubmit this order?",
             QMessageBox.Yes | QMessageBox.No,
@@ -480,16 +532,20 @@ class BuylistExecutionController(WindowController):
         if reply != QMessageBox.Yes:
             return
 
-        manager = self._ensure_execution_queue_manager()
-        manager.mark_order_submitted(item.symbol, order_status="PENDING", environment=env)
-        queue_status = self._execution_queue_status_for_buylist_item(item) or "ORDER_PENDING"
+        manager = window._ensure_execution_queue_manager()
+        manager.mark_order_submitted(
+            item.symbol, order_status="PENDING", environment=env
+        )
+        queue_status = (
+            window._execution_queue_status_for_buylist_item(item) or "ORDER_PENDING"
+        )
         item.monitoring_status = queue_status
         item.status = queue_status
         item._buy_order_pending = True
-        self._save_buylist_state()
-        self._save_execution_queue_state()
-        self.populate_buylist_dashboard()
-        self._submit_kis_buy_order(
+        window._save_buylist_state()
+        window._save_execution_queue_state()
+        window.populate_buylist_dashboard()
+        window._submit_kis_buy_order(
             item,
             quantity=int(shares_value),
             order_price=execution_price,

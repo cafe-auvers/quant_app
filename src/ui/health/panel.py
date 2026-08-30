@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import logging
 from dataclasses import replace
 from typing import List, Optional
 
-from PyQt5.QtCore import QDate, QThread, Qt, QUrl, pyqtSignal
+from PyQt5.QtCore import QDate, Qt, QThread, QUrl, pyqtSignal
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
     QAbstractItemView,
@@ -34,10 +35,10 @@ except ImportError:  # pragma: no cover - PyQtWebEngine is a hard requirement,
 
 from src.core.exit_policy import market_session_date
 from src.services.daily_trading_summary import (
-    DailyTradingSummary,
     PLAN_ORIGIN_ADDED_INTRADAY,
     PLAN_ORIGIN_TODAYS_PLAN,
     PLAN_ORIGIN_UNKNOWN,
+    DailyTradingSummary,
     build_daily_trading_summary,
 )
 from src.services.health import (
@@ -533,16 +534,16 @@ class HealthPanelMixin:
                 self.health_pnl_table.setItem(row, column, item)
 
     def _pnl_inputs(self) -> tuple:
-        positions = []
-        for item in getattr(self.buylist_manager, "items", []) or []:
-            if getattr(item, "shares_held", 0) > 0 and getattr(item, "avg_cost", 0) > 0:
-                positions.append(
-                    {
-                        "symbol": item.symbol,
-                        "shares_held": item.shares_held,
-                        "avg_cost": item.avg_cost,
-                    }
-                )
+        positions = [
+            {
+                "symbol": item.symbol,
+                "shares_held": item.shares_held,
+                "avg_cost": item.avg_cost,
+            }
+            for item in getattr(self.buylist_manager, "items", []) or []
+            if getattr(item, "shares_held", 0) > 0
+            and getattr(item, "avg_cost", 0) > 0
+        ]
         fx_rate = 0.0
         if hasattr(self, "usd_krw_rate_input"):
             fx_rate = self._parse_float(self.usd_krw_rate_input, 0.0)
@@ -591,15 +592,13 @@ class HealthPanelMixin:
             domestic = snapshot.get("domestic")
             if isinstance(domestic, dict) and fx_rate > 0:
                 broker_unrealized_available = True
-                try:
+                with contextlib.suppress(AttributeError, TypeError, ValueError):
                     broker_unrealized_usd += float(
                         domestic.get("summary", {}).get(
                             "evaluation_profit_loss_krw", 0.0
                         )
                         or 0.0
                     ) / fx_rate
-                except (AttributeError, TypeError, ValueError):
-                    pass
         if broker_unrealized_available:
             unrealized_usd_today = broker_unrealized_usd
 

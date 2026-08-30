@@ -30,11 +30,11 @@ from src.ui.buyboard import board as buyboard_board
 from src.ui.buyboard import controller as buyboard_controller
 from src.ui.charts.controller_data_flow import ChartsDataFlowMixin
 from src.ui.mixins.dashboard_mixin import DashboardMixin
-from src.ui.main_window import (
-    MainWindow,
+from src.ui.database_workers import (
     MarketDataStatusResult,
     MarketDataStatusWorker,
 )
+from src.ui.main_window import MainWindow
 
 
 def test_market_data_status_formatting_never_queries_the_database():
@@ -138,7 +138,7 @@ def test_background_freshness_result_finishes_pending_local_startup():
 def test_local_status_worker_uses_spy_instead_of_global_hourly_max(monkeypatch):
     import src.infrastructure.database.repositories.market_bars as market_bars
     import src.infrastructure.database.repositories.market_watermarks as watermarks
-    import src.ui.main_window as main_window
+    import src.ui.database_workers as database_workers
 
     engine = object()
     hourly_symbols = []
@@ -154,13 +154,15 @@ def test_local_status_worker_uses_spy_instead_of_global_hourly_max(monkeypatch):
         or datetime(2026, 8, 21),
     )
     monkeypatch.setattr(
-        main_window,
+        database_workers,
         "expected_latest_market_data_date",
         lambda: datetime(2026, 8, 21).date(),
     )
-    monkeypatch.setattr(main_window, "local_mirror_is_stale", lambda *a, **k: False)
     monkeypatch.setattr(
-        main_window,
+        database_workers, "local_mirror_is_stale", lambda *a, **k: False
+    )
+    monkeypatch.setattr(
+        database_workers,
         "local_mirror_hourly_is_stale",
         lambda *a, **k: False,
     )
@@ -214,9 +216,7 @@ def test_buyboard_projection_worker_uses_authoritative_services(monkeypatch):
     completed = []
     worker = buyboard_controller.BuyboardProjectionWorker(request)
     worker.completed.connect(
-        lambda result, error, generation: completed.append(
-            (result, error, generation)
-        )
+        lambda result, error, generation: completed.append((result, error, generation))
     )
 
     worker.run()
@@ -278,9 +278,8 @@ def test_minute_projection_check_skips_bootstrap_and_payload_when_unchanged(
 
     assert completed == [(None, "", 5)]
     assert worker.resolved_revision == expected
-    assert (
-        buyboard_controller.BuyboardMixin._BUYBOARD_PROJECTION_REFRESH_MS
-        == int(execution_config.COORDINATION_BOARD_PROJECTION_SECONDS * 1000)
+    assert buyboard_controller.BuyboardMixin._BUYBOARD_PROJECTION_REFRESH_MS == int(
+        execution_config.COORDINATION_BOARD_PROJECTION_SECONDS * 1000
     )
 
 
@@ -447,9 +446,7 @@ def test_database_outage_renders_local_snapshot_read_only_instead_of_emptying_bo
     monkeypatch, tmp_path
 ):
     snapshot_path = tmp_path / "trade_cards.json"
-    monkeypatch.setattr(
-        trade_card_repo, "LOCAL_TRADE_CARDS_FILE", snapshot_path
-    )
+    monkeypatch.setattr(trade_card_repo, "LOCAL_TRADE_CARDS_FILE", snapshot_path)
     trade_card_repo.save_local_trade_cards_snapshot(
         [
             TradeCardState(
@@ -477,9 +474,9 @@ def test_database_outage_renders_local_snapshot_read_only_instead_of_emptying_bo
         execution_price=13.30,
         current_price=13.46,
         breakout_confirmed=False,
-        source_session_date=datetime.now(
-            ZoneInfo("America/New_York")
-        ).date().isoformat(),
+        source_session_date=datetime.now(ZoneInfo("America/New_York"))
+        .date()
+        .isoformat(),
         stop_loss=13.00,
         shares=10,
         status=OrbCandidateStatus.WAITING_BREAKOUT,
@@ -554,9 +551,7 @@ def test_database_outage_retains_last_in_memory_board_before_using_disk_snapshot
 
 def test_buy_today_orb_symbols_fall_back_to_local_snapshot(monkeypatch, tmp_path):
     snapshot_path = tmp_path / "trade_cards.json"
-    monkeypatch.setattr(
-        trade_card_repo, "LOCAL_TRADE_CARDS_FILE", snapshot_path
-    )
+    monkeypatch.setattr(trade_card_repo, "LOCAL_TRADE_CARDS_FILE", snapshot_path)
     trade_card_repo.save_local_trade_cards_snapshot(
         [
             TradeCardState(
@@ -600,9 +595,7 @@ def test_recovery_projection_uses_fresh_kis_snapshot_to_close_stale_position():
             "overseas": {"holdings": []},
         }
     }
-    window.kis_account_snapshot_fetched_at = {
-        ("PROD", "1"): datetime.now(timezone.utc)
-    }
+    window.kis_account_snapshot_fetched_at = {("PROD", "1"): datetime.now(timezone.utc)}
 
     projection = window._buyboard_recovery_projections()[0]
 
@@ -635,9 +628,7 @@ def test_recovery_projection_promotes_buy_today_when_kis_confirms_holding():
             }
         }
     }
-    window.kis_account_snapshot_fetched_at = {
-        ("PROD", "1"): datetime.now(timezone.utc)
-    }
+    window.kis_account_snapshot_fetched_at = {("PROD", "1"): datetime.now(timezone.utc)}
 
     projection = window._buyboard_recovery_projections()[0]
 
@@ -870,12 +861,8 @@ def test_buyboard_live_metric_refresh_pauses_during_drag(monkeypatch):
 def test_buyboard_orb_refresh_targets_only_buy_today_and_is_independent_of_readiness(
     monkeypatch,
 ):
-    monkeypatch.setattr(
-        buyboard_controller, "is_buyboard_engine_enabled", lambda: True
-    )
-    monkeypatch.setattr(
-        buyboard_controller, "is_regular_session_open", lambda: True
-    )
+    monkeypatch.setattr(buyboard_controller, "is_buyboard_engine_enabled", lambda: True)
+    monkeypatch.setattr(buyboard_controller, "is_regular_session_open", lambda: True)
     requests = []
 
     class _Window:
@@ -923,7 +910,7 @@ def test_buyboard_orb_refresh_targets_only_buy_today_and_is_independent_of_readi
             "show_messages": False,
             "triggered_by_live": True,
             "source": "Buy Today ORB",
-                "symbols": ["WEX"],
+            "symbols": ["WEX"],
             "purpose": "buyboard_orb",
         }
     ]

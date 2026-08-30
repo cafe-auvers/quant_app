@@ -202,6 +202,21 @@ def _watchlist_from_buylist(item, *, card: Optional[TradeCardState] = None) -> W
     )
 
 
+def _sync_watchlist_item(target: WatchlistItem, source: WatchlistItem) -> bool:
+    fields = (
+        "name",
+        "entry_price",
+        "breakout_price",
+        "stop_loss",
+        "notes",
+        "selected_orb_plan",
+    )
+    before = tuple(getattr(target, field) for field in fields)
+    for field in fields:
+        setattr(target, field, getattr(source, field))
+    return before != tuple(getattr(target, field) for field in fields)
+
+
 def add_watchlist_candidate(
     watchlist,
     *,
@@ -472,29 +487,7 @@ def sync_legacy_planning_membership_from_card(
             watchlist.items.append(converted)
             item_changed = True
         else:
-            before = (
-                watch_item.name,
-                watch_item.entry_price,
-                watch_item.breakout_price,
-                watch_item.stop_loss,
-                watch_item.notes,
-                watch_item.selected_orb_plan,
-            )
-            watch_item.name = converted.name
-            watch_item.entry_price = converted.entry_price
-            watch_item.breakout_price = converted.breakout_price
-            watch_item.stop_loss = converted.stop_loss
-            watch_item.notes = converted.notes
-            watch_item.selected_orb_plan = None
-            after = (
-                watch_item.name,
-                watch_item.entry_price,
-                watch_item.breakout_price,
-                watch_item.stop_loss,
-                watch_item.notes,
-                watch_item.selected_orb_plan,
-            )
-            item_changed = before != after
+            item_changed = _sync_watchlist_item(watch_item, converted)
         removed = False
         if buy_item is not None and _passive_buylist_item(buy_item):
             removed = buylist_manager.remove(symbol, "PROD")
@@ -552,29 +545,7 @@ def sync_legacy_planning_membership_from_card(
                 watchlist.items.append(converted)
                 watch_changed = True
             else:
-                before = (
-                    watch_item.name,
-                    watch_item.entry_price,
-                    watch_item.breakout_price,
-                    watch_item.stop_loss,
-                    watch_item.notes,
-                    watch_item.selected_orb_plan,
-                )
-                watch_item.name = converted.name
-                watch_item.entry_price = converted.entry_price
-                watch_item.breakout_price = converted.breakout_price
-                watch_item.stop_loss = converted.stop_loss
-                watch_item.notes = converted.notes
-                watch_item.selected_orb_plan = None
-                after = (
-                    watch_item.name,
-                    watch_item.entry_price,
-                    watch_item.breakout_price,
-                    watch_item.stop_loss,
-                    watch_item.notes,
-                    watch_item.selected_orb_plan,
-                )
-                watch_changed = before != after
+                watch_changed = _sync_watchlist_item(watch_item, converted)
         else:
             watch_changed = bool(watchlist.remove(symbol))
         return PlanningMembershipResult(

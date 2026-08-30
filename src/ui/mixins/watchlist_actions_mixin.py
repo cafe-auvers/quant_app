@@ -319,7 +319,7 @@ class WatchlistActionsMixin:
         if result is None:
             return False
         if hasattr(result, "succeeded"):
-            return bool(getattr(result, "succeeded"))
+            return bool(result.succeeded)
         action = str(getattr(result, "action", "") or "").lower()
         return bool(getattr(result, "changed", False)) or action in {
             "promoted",

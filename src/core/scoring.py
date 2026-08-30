@@ -1,15 +1,16 @@
 """Deterministic technical scoring and optional AI review for stock setups."""
 from __future__ import annotations
 
-import math
 import json
-from typing import Dict, Any, List, Optional
+import math
+from typing import Any, Dict, List, Optional
+
 import pandas as pd
 import requests
 
-from src.utils.config import get_env_value
-from src.risk.position_sizer import PositionSizer
 from src.risk.orb_position import get_orb_settings
+from src.risk.position_sizer import PositionSizer
+from src.utils.config import get_env_value
 
 
 def _finite_float(value: Any) -> Optional[float]:
@@ -378,8 +379,9 @@ def fetch_recent_news_headlines(symbol: str) -> list:
     import sys
     if "pytest" in sys.modules:
         return []
-    import requests
     import xml.etree.ElementTree as ET
+
+    import requests
     try:
         url = f"https://news.google.com/rss/search?q={symbol}+stock"
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -765,8 +767,8 @@ Use this exact schema:
             }
         else:
             return _generate_fallback_ai_review(symbol, metrics or {}, headlines, prefix=f"[API Error {response.status_code}] ")
-    except Exception as e:
-        return _generate_fallback_ai_review(symbol, metrics or {}, headlines, prefix=f"[Request Fail] ")
+    except Exception:
+        return _generate_fallback_ai_review(symbol, metrics or {}, headlines, prefix="[Request Fail] ")
 
 
 def _generate_fallback_ai_review(symbol: str, metrics: Dict[str, Any], headlines: list = None, prefix: str = "") -> Dict[str, Any]:

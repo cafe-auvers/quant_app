@@ -14,7 +14,17 @@ import threading
 import weakref
 from typing import List, Optional
 
-from sqlalchemy import Column, DateTime, Integer, MetaData, String, Table, UniqueConstraint, func, select
+from sqlalchemy import (
+    Column,
+    DateTime,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    UniqueConstraint,
+    func,
+    select,
+)
 from sqlalchemy.engine import Connection, Engine
 
 from src.core.execution_ownership import ExecutionOwner, ExecutionOwnership
@@ -176,13 +186,13 @@ def assign_ownership_in_transaction(
         )
 
     next_version = current_version + 1
-    values = dict(
-        owner=ownership.owner.value,
-        strategy_instance_id=ownership.strategy_instance_id,
-        assigned_by=ownership.assigned_by,
-        version=next_version,
-        updated_at=_server_now(conn.engine),
-    )
+    values = {
+        "owner": ownership.owner.value,
+        "strategy_instance_id": ownership.strategy_instance_id,
+        "assigned_by": ownership.assigned_by,
+        "version": next_version,
+        "updated_at": _server_now(conn.engine),
+    }
     if current_row is None:
         conn.execute(
             table.insert().values(

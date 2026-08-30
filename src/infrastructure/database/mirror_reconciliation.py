@@ -1,27 +1,36 @@
 """Explicit bidirectional mirror reconciliation maintenance workflow."""
 
+import contextlib
 from typing import Dict, List, Optional, Set, Tuple
 
 from sqlalchemy import MetaData, Table, select, text
 from sqlalchemy.engine import Engine
 
-from .mirror_copy import (_copy_pc_partitions_to_local_exactly,
-                          _insert_missing_local_raw_partitions,
-                          _mismatched_partitions,
-                          _scoped_partition_fingerprints,
-                          _validate_reconcile_table_schema)
-from .mirror_engine import (_RECONCILE_TABLE_SPECS, MIRRORED_TABLES,
-                            LocalMirrorReconciliationResult,
-                            _ensure_local_mirror_handoff_tracking,
-                            _mark_local_mirror_handoff_clean,
-                            _PartitionFingerprint)
-from .repositories.chart_indicators import (get_chart_indicator_refresh_plan,
-                                            refresh_chart_indicators_to_db)
+from .mirror_copy import (
+    _copy_pc_partitions_to_local_exactly,
+    _insert_missing_local_raw_partitions,
+    _mismatched_partitions,
+    _scoped_partition_fingerprints,
+    _validate_reconcile_table_schema,
+)
+from .mirror_engine import (
+    _RECONCILE_TABLE_SPECS,
+    MIRRORED_TABLES,
+    LocalMirrorReconciliationResult,
+    _ensure_local_mirror_handoff_tracking,
+    _mark_local_mirror_handoff_clean,
+    _PartitionFingerprint,
+)
+from .repositories.chart_indicators import (
+    get_chart_indicator_refresh_plan,
+    refresh_chart_indicators_to_db,
+)
 from .repositories.market_watermarks import get_price_history_watermarks
-from .repositories.scanner import (is_scanner_metrics_snapshot_current,
-                                   refresh_scanner_metrics_to_db)
-from .schema import (_ensure_price_history_table,
-                     _ensure_symbol_refresh_failures_table)
+from .repositories.scanner import (
+    is_scanner_metrics_snapshot_current,
+    refresh_scanner_metrics_to_db,
+)
+from .schema import _ensure_price_history_table, _ensure_symbol_refresh_failures_table
 from .settings import REFERENCE_SYMBOL
 from .sql_helpers import _clean_symbols
 
@@ -381,10 +390,8 @@ def reconcile_local_mirror_with_pc(
             local_handoff_ready = local_engine.dialect.name == "sqlite"
         except Exception as exc:
             if local_conn is not None:
-                try:
+                with contextlib.suppress(Exception):
                     local_conn.rollback()
-                except Exception:
-                    pass
             errors.append(f"Atomic PC/local equality barrier failed: {exc}")
         finally:
             if local_conn is not None:

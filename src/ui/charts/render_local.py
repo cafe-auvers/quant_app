@@ -6,9 +6,9 @@ import datetime as dt
 import html
 import json
 from typing import Any, List, Mapping, Optional
-from zoneinfo import ZoneInfo
 
 import pandas as pd
+from zoneinfo import ZoneInfo
 
 try:
     from PyQt5.QtWebEngineWidgets import QWebEngineView
@@ -201,7 +201,7 @@ class ChartLocalRenderMixin:
 
         candle_elements = []
         candle_width = max(3.0, plot_width / max(len(closes), 1) * 0.58)
-        for index, row in chart_history.iterrows():
+        for _, row in chart_history.iterrows():
             x = x_for(data_slot_offset + len(candle_elements))
             open_value = float(row["Open"])
             high_value = float(row["High"])

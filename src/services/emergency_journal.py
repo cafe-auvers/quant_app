@@ -12,7 +12,7 @@ import json
 import os
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,8 +23,8 @@ from sqlalchemy import (
     BigInteger,
     Column,
     DateTime,
-    MetaData,
     Integer,
+    MetaData,
     String,
     Table,
     Text,
@@ -38,12 +38,16 @@ from src.core.execution_mode import ExecutionLease
 from src.core.execution_order_record import (
     ExecutionOrderRecord,
     ExecutionOrderStatus,
-    apply_status_transition,
     allowed_status_transitions,
+    apply_status_transition,
 )
-from src.core.order_recovery_state import OrderRecoveryState, validate_recovery_transition
+from src.core.order_recovery_state import (
+    OrderRecoveryState,
+    validate_recovery_transition,
+)
 from src.core.order_state import OrderIntent, OrderSide, OrderStatus
 from src.core.trade_card_state import BoardStatus, PositionRuntimeStatus
+from src.services import trade_card_repository as trade_card_repo
 from src.services.execution_command_repository import (
     ExecutionCommand,
     ensure_execution_commands_table,
@@ -57,7 +61,6 @@ from src.services.execution_order_repository import (
     insert_execution_order,
     update_execution_order,
 )
-from src.services import trade_card_repository as trade_card_repo
 from src.utils.config import DATA_DIR
 
 EMERGENCY_JOURNAL_FILE = DATA_DIR / "emergency_execution_journal.jsonl"
@@ -231,10 +234,8 @@ def _exclusive_lock(path: Path) -> Iterator[None]:
                 except OSError:
                     stale = False
                 if stale:
-                    try:
+                    with suppress(OSError):
                         lock_path.unlink()
-                    except OSError:
-                        pass
                     continue
                 if time.monotonic() >= deadline:
                     raise TimeoutError(
@@ -245,10 +246,8 @@ def _exclusive_lock(path: Path) -> Iterator[None]:
             yield
         finally:
             os.close(descriptor)
-            try:
+            with suppress(OSError):
                 lock_path.unlink()
-            except OSError:
-                pass
 
 
 def _canonical_bytes(record: Dict[str, Any]) -> bytes:

@@ -3,11 +3,12 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import src.ui.main_window as main_window_module
+import src.ui.readiness_presenter as readiness_presenter
 from src.core.runtime_readiness import EngineReadiness, RuntimeDeviceState
-from src.ui.main_window import (
-    MainWindow,
-    _buyboard_readiness_display,
-    _live_execution_status_text,
+from src.ui.main_window import MainWindow
+from src.ui.readiness_presenter import (
+    buyboard_readiness_display as _buyboard_readiness_display,
+    live_execution_status_text as _live_execution_status_text,
 )
 
 
@@ -35,7 +36,7 @@ def test_live_execution_status_names_the_controlled_scope(monkeypatch):
         "CONTROLLED_LIVE",
     )
     monkeypatch.setattr(
-        main_window_module,
+        readiness_presenter,
         "controlled_live_symbols",
         lambda **_kwargs: ("STIM",),
     )
@@ -229,9 +230,7 @@ def test_database_outage_reports_kis_recovery_instead_of_runtime_unavailable(
     window.pc_db_engine = None
     window._pc_database_ready = False
     window.kis_account_snapshots = {("PROD", "1"): {"overseas": {"holdings": []}}}
-    window.kis_account_snapshot_fetched_at = {
-        ("PROD", "1"): object()
-    }
+    window.kis_account_snapshot_fetched_at = {("PROD", "1"): object()}
 
     display = MainWindow._current_buyboard_readiness_display(window)
 

@@ -3,16 +3,16 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-from datetime import datetime, timezone
 import json
 import os
-from pathlib import Path
 import platform
 import subprocess
 import sys
 import tempfile
-from typing import Mapping, Sequence
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Mapping, Sequence
 
 from gate1.contract import ACTIVATION_DEFAULTS, REQUIRED_POST_FAILURE_PROPERTIES
 from gate1.manifest import (
@@ -210,13 +210,13 @@ def build_report(
             }
         )
     present_ids = {str(item.get("scenario_id") or "") for item in scenarios}
-    for scenario_id in sorted(set(required_scenario_ids) - present_ids):
-        violations.append(
-            {
-                "property": "gate1_manifest_complete",
-                "detail": f"required scenario is absent: {scenario_id}",
-            }
-        )
+    violations.extend(
+        {
+            "property": "gate1_manifest_complete",
+            "detail": f"required scenario is absent: {scenario_id}",
+        }
+        for scenario_id in sorted(set(required_scenario_ids) - present_ids)
+    )
     for group_id, minimum in sorted(required_group_minimums.items()):
         actual = counts.get(group_id, 0)
         if actual < int(minimum):

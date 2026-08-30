@@ -118,7 +118,7 @@ FILTER_CATALOG = [
     ("Basic tradability", "price", "price", "Latest close price. Avoids penny stocks.", "Hard filter: >= 5; quality filter: >= 10"),
     ("Basic tradability", "volume", "volume", "Latest daily share volume.", "Minimum: >= 40,000; better: >= 100,000"),
     ("Basic tradability", "avg_volume_20d", "avg_volume_20d", "20-day average daily volume. More stable than one-day volume.", "Minimum: >= 100,000; quality: >= 500,000"),
-    ("Basic tradability", "dollar_volume", "dollar_volume", "price Ã— volume. Measures tradable money flow.", "Minimum: >= 500,000; quality: >= 1,000,000"),
+    ("Basic tradability", "dollar_volume", "dollar_volume", "Price × volume. Measures tradable money flow.", "Minimum: >= 500,000; quality: >= 1,000,000"),
     ("Basic tradability", "avg_dollar_volume_20d", "avg_dollar_volume_20d", "20-day average dollar volume. Best liquidity filter.", "Minimum: >= 1M; quality: >= 5M—10M"),
     ("Basic tradability", "price_history_days", "price_history_days", "Number of usable OHLCV rows.", "Minimum: >= 65; ideal: >= 252"),
     ("Volatility", "adr_20", "adr_20", "20-day average daily range percentage. Captures swing-trading movement.", "Minimum: >= 2.4%; stricter: >= 3.0%; caution if > 12—15%"),

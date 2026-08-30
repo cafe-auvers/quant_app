@@ -21,7 +21,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 from collections import defaultdict, deque
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Deque, Dict, Iterable, List, Mapping, Optional, Tuple
 
@@ -182,7 +182,7 @@ def compute_realized_pnl_by_date(
             continue
         daily_delta[session_date] += value
 
-    for account_no, series in broker_by_account.items():
+    for series in broker_by_account.values():
         for raw_date, raw_value in series.daily_usd.items():
             session_date = str(raw_date)
             if not (series.start_date <= session_date <= series.end_date):
