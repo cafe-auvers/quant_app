@@ -250,14 +250,15 @@ def test_watchlist_legacy_target_price_migrates_to_breakout_price():
     assert watchlist.to_dict()["items"][0]["breakout_price"] == 180.0
 
 
-def test_fallback_ai_review():
+def test_fallback_ai_review(monkeypatch):
+    monkeypatch.setattr("src.core.scoring.get_env_value", lambda key: "")
     metrics = {
         "price": 100.0,
         "rr": 2.0,
         "warnings": [],
     }
     
-    res = run_ai_review("XYZ", metrics)
+    res = run_ai_review("XYZ", metrics, recent_news_json="[]")
     assert "Clean bullish setup" in res["summary"]
     assert res["news_score"] == 80.0
     
@@ -267,7 +268,7 @@ def test_fallback_ai_review():
         "rr": 1.0,
         "warnings": ["Stop loss is wider than the selected risk model"],
     }
-    res_warn = run_ai_review("XYZ", metrics_warn)
+    res_warn = run_ai_review("XYZ", metrics_warn, recent_news_json="[]")
     assert "active violations" in res_warn["summary"]
     assert res_warn["news_score"] == 50.0
 
