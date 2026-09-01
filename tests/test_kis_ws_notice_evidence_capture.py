@@ -1,0 +1,85 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+from scripts import capture_kis_ws_notice_evidence as collector
+from src.api.kis_websocket import KisWsDataFrame, KisWsSystemFrame
+
+
+def test_notice_capture_persists_structure_without_decrypted_values(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(collector, "_git_snapshot", lambda: "d" * 40)
+    for name, value in {
+        "KIS_PROD_BASE_URL": "configured",
+        "KIS_PROD_APP_KEY": "configured",
+        "KIS_PROD_APP_SECRET": "configured",
+        "KIS_PROD_WS_URL": "configured",
+        "KIS_WS_HTS_ID": "configured",
+        "KIS_PROD_ACCOUNT_NO": "12345678",
+    }.items():
+        monkeypatch.setenv(name, value)
+
+    private_values = [f"VALUE-{index}" for index in range(len(collector.NOTICE_COLUMNS))]
+    private_values[1] = "12345678"
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            self._connection = lambda *_args: None
+            self._ack = lambda *_args: None
+            self._data = lambda *_args: None
+
+        def on_connection(self, callback):
+            self._connection = callback
+
+        def on_ack(self, callback):
+            self._ack = callback
+
+        def on_data(self, callback):
+            self._data = callback
+
+        def subscribe(self, _subscriptions):
+            return None
+
+        def start(self):
+            now = datetime.now(timezone.utc)
+            self._connection(True, "", 1)
+            self._ack(
+                KisWsSystemFrame(
+                    tr_id=collector.NOTICE_TR_ID,
+                    accepted=True,
+                    encrypt="Y",
+                    encryption_key="K" * 32,
+                    encryption_iv="I" * 16,
+                )
+            )
+            self._data(
+                KisWsDataFrame(
+                    tr_id=collector.NOTICE_TR_ID,
+                    record_count=1,
+                    payload="^".join(private_values),
+                    encrypted=True,
+                    received_at=now,
+                    payload_fingerprint="ciphertext-fingerprint",
+                )
+            )
+
+        def stop(self):
+            return None
+
+    monkeypatch.setattr(collector, "KisWsApprovalKeyProvider", lambda **_kwargs: object())
+    monkeypatch.setattr(collector, "KisWebSocketClient", FakeClient)
+
+    output = tmp_path / "notice.json"
+    evidence = collector.capture_notice(output=output, timeout_seconds=5)
+    persisted = output.read_text(encoding="utf-8")
+
+    assert evidence["errors"] == []
+    assert evidence["broker_mutations"] == 0
+    assert evidence["subscription_acknowledgement"]["encryption_key_present"] is True
+    assert evidence["notice_observation"]["field_count"] == len(
+        collector.NOTICE_COLUMNS
+    )
+    assert evidence["notice_observation"]["configured_account_matches_field_2"] is True
+    assert evidence["notice_observation"]["decrypted_values_persisted"] is False
+    assert not any(value in persisted for value in private_values)
