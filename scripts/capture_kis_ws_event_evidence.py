@@ -21,6 +21,7 @@ Example::
 from __future__ import annotations
 
 import argparse
+import asyncio
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -185,6 +186,7 @@ def capture(
     output: Path,
     frames_per_channel: int,
     timeout_seconds: float,
+    reconnect_after_seconds: float | None = None,
 ) -> dict[str, Any]:
     commit_sha = _git_snapshot()
     symbol = str(symbol or "").strip().upper()
@@ -214,6 +216,7 @@ def capture(
     fatal = threading.Event()
     connection_events: list[dict[str, Any]] = []
     acknowledgements: list[dict[str, Any]] = []
+    protocol_operations: list[dict[str, Any]] = []
     frames: dict[str, list[dict[str, Any]]] = {
         TRADE_TR_ID: [],
         QUOTE_TR_ID: [],
@@ -223,6 +226,33 @@ def capture(
         QUOTE_TR_ID: [],
     }
     errors: list[str] = []
+    current_generation = 0
+    initial_generation = 0
+    latest_operation_generation: dict[tuple[str, str], int] = {}
+    reconnect_requested_at: datetime | None = None
+    reconnect_reacked_at: datetime | None = None
+    reconnect_recovery_seconds: float | None = None
+    post_reconnect_data_channels: set[str] = set()
+
+    reconnect_offset = (
+        None
+        if reconnect_after_seconds is None
+        else max(1.0, float(reconnect_after_seconds))
+    )
+
+    def capture_complete() -> bool:
+        frames_complete = all(
+            len(frames[tr_id]) >= target for tr_id in (TRADE_TR_ID, QUOTE_TR_ID)
+        )
+        if not frames_complete:
+            return False
+        if reconnect_offset is None:
+            return True
+        return bool(
+            reconnect_requested_at is not None
+            and reconnect_reacked_at is not None
+            and post_reconnect_data_channels == {TRADE_TR_ID, QUOTE_TR_ID}
+        )
 
     def sensitive_value_audit(_value: str) -> None:
         # Positive proof that approval issuance occurred, without retaining the
@@ -253,7 +283,11 @@ def capture(
     )
 
     def on_connection(connected: bool, reason: str, generation: int) -> None:
+        nonlocal current_generation, initial_generation
         with lock:
+            current_generation = int(generation)
+            if connected and initial_generation <= 0:
+                initial_generation = current_generation
             connection_events.append(
                 {
                     "connected": bool(connected),
@@ -268,17 +302,39 @@ def capture(
                 }
             )
 
+    def on_operation(operation) -> None:
+        with lock:
+            generation = int(operation.generation)
+            latest_operation_generation[
+                (operation.tr_id, operation.tr_key)
+            ] = generation
+            protocol_operations.append(
+                {
+                    "generation": generation,
+                    "action": operation.action,
+                    "tr_id": operation.tr_id,
+                    "tr_key": operation.tr_key,
+                    "sent_at": _iso(operation.sent_at),
+                }
+            )
+
     def on_ack(frame: KisWsSystemFrame) -> None:
+        nonlocal reconnect_reacked_at, reconnect_recovery_seconds
         if frame.tr_id not in {TRADE_TR_ID, QUOTE_TR_ID}:
             return
         with lock:
+            generation = latest_operation_generation.get(
+                (frame.tr_id, frame.tr_key), current_generation
+            )
+            observed_at = datetime.now(timezone.utc)
             acknowledgements.append(
                 {
                     "tr_id": frame.tr_id,
                     "tr_key": frame.tr_key,
+                    "generation": generation,
                     "accepted": bool(frame.accepted),
                     "message": frame.message,
-                    "observed_at": _iso(datetime.now(timezone.utc)),
+                    "observed_at": _iso(observed_at),
                 }
             )
             if not frame.accepted:
@@ -286,6 +342,23 @@ def capture(
                     f"subscription rejected for {frame.tr_id}: {frame.message}"
                 )
                 fatal.set()
+            elif (
+                reconnect_requested_at is not None
+                and generation > initial_generation
+            ):
+                reacked_channels = {
+                    item["tr_id"]
+                    for item in acknowledgements
+                    if item.get("accepted") is True
+                    and int(item.get("generation") or 0) == generation
+                }
+                if reacked_channels == {TRADE_TR_ID, QUOTE_TR_ID}:
+                    reconnect_reacked_at = observed_at
+                    reconnect_recovery_seconds = (
+                        observed_at - reconnect_requested_at
+                    ).total_seconds()
+                    if capture_complete():
+                        done.set()
 
     def on_data(frame: KisWsDataFrame) -> None:
         columns = (
@@ -305,9 +378,20 @@ def capture(
             fatal.set()
             return
         with lock:
-            if len(frames[frame.tr_id]) < target:
+            is_post_reconnect = bool(
+                reconnect_requested_at is not None
+                and current_generation > initial_generation
+            )
+            already_has_post_reconnect_frame = any(
+                int(item.get("generation") or 0) > initial_generation
+                for item in frames[frame.tr_id]
+            )
+            if len(frames[frame.tr_id]) < target or (
+                is_post_reconnect and not already_has_post_reconnect_frame
+            ):
                 frames[frame.tr_id].append(
                     {
+                        "generation": current_generation,
                         "received_at": _iso(frame.received_at),
                         "record_count": frame.record_count,
                         "payload_fingerprint": frame.payload_fingerprint,
@@ -315,10 +399,13 @@ def capture(
                     }
                 )
                 records[frame.tr_id].extend(parsed)
-            if all(len(frames[tr_id]) >= target for tr_id in (TRADE_TR_ID, QUOTE_TR_ID)):
+            if is_post_reconnect:
+                post_reconnect_data_channels.add(frame.tr_id)
+            if capture_complete():
                 done.set()
 
     client.on_connection(on_connection)
+    client.on_operation(on_operation)
     client.on_ack(on_ack)
     client.on_data(on_data)
     client.subscribe(
@@ -330,9 +417,42 @@ def capture(
 
     started_at = datetime.now(timezone.utc)
     client.start()
+    started_monotonic = time.monotonic()
     deadline = time.monotonic() + timeout
     try:
         while time.monotonic() < deadline and not done.is_set() and not fatal.is_set():
+            should_reconnect = False
+            with lock:
+                elapsed = time.monotonic() - started_monotonic
+                initial_acks = {
+                    item["tr_id"]
+                    for item in acknowledgements
+                    if item.get("accepted") is True
+                    and int(item.get("generation") or 0) == initial_generation
+                }
+                healthy_initial_session = bool(
+                    initial_generation > 0
+                    and initial_acks == {TRADE_TR_ID, QUOTE_TR_ID}
+                    and all(frames[tr_id] for tr_id in (TRADE_TR_ID, QUOTE_TR_ID))
+                )
+                if (
+                    reconnect_offset is not None
+                    and reconnect_requested_at is None
+                    and elapsed >= reconnect_offset
+                    and healthy_initial_session
+                ):
+                    reconnect_requested_at = datetime.now(timezone.utc)
+                    should_reconnect = True
+            if should_reconnect:
+                loop = getattr(client, "_loop", None)
+                if loop is None:
+                    with lock:
+                        errors.append(
+                            "forced reconnect requested before the event loop was ready"
+                        )
+                    fatal.set()
+                    continue
+                asyncio.run_coroutine_threadsafe(client.reconnect(), loop)
             time.sleep(0.1)
     finally:
         client.stop()
@@ -363,6 +483,24 @@ def capture(
             "approval_key_persisted": False,
             "connection_events": list(connection_events),
             "subscription_acknowledgements": list(acknowledgements),
+            "protocol_operations": list(protocol_operations),
+            "forced_reconnect": {
+                "configured": reconnect_offset is not None,
+                "requested_at": (
+                    _iso(reconnect_requested_at)
+                    if reconnect_requested_at is not None
+                    else None
+                ),
+                "reacked_at": (
+                    _iso(reconnect_reacked_at)
+                    if reconnect_reacked_at is not None
+                    else None
+                ),
+                "recovery_seconds": reconnect_recovery_seconds,
+                "post_reconnect_data_channels": sorted(
+                    post_reconnect_data_channels
+                ),
+            },
             "frame_counts": counts,
             "frames": {tr_id: list(items) for tr_id, items in frames.items()},
             "field_observations": {
@@ -383,6 +521,17 @@ def capture(
             "capture timed out before target frame count for: "
             + ", ".join(incomplete)
         )
+    if reconnect_offset is not None:
+        if reconnect_requested_at is None:
+            evidence["errors"].append("forced reconnect was not injected")
+        elif reconnect_reacked_at is None:
+            evidence["errors"].append(
+                "forced reconnect did not re-ACK both subscriptions"
+            )
+        if post_reconnect_data_channels != {TRADE_TR_ID, QUOTE_TR_ID}:
+            evidence["errors"].append(
+                "post-reconnect data did not resume on both channels"
+            )
 
     output.write_text(
         json.dumps(evidence, indent=2, sort_keys=True) + "\n",
@@ -399,6 +548,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--symbol", required=True)
     parser.add_argument("--frames-per-channel", type=int, default=20)
     parser.add_argument("--timeout-seconds", type=float, default=120.0)
+    parser.add_argument(
+        "--reconnect-after-seconds",
+        type=float,
+        help="inject one read-only transport reconnect after healthy ACK/data flow",
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
 
@@ -410,6 +564,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         output=output,
         frames_per_channel=args.frames_per_channel,
         timeout_seconds=args.timeout_seconds,
+        reconnect_after_seconds=args.reconnect_after_seconds,
     )
     digest = _sha256(output)
     print(f"Evidence: {output}")
