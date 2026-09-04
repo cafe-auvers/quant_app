@@ -56,6 +56,7 @@ BLOCKER_GUIDANCE = {
     "redacted_evidence_bundle": "Provide at least one nonempty redacted evidence file outside the repository.",
     "execution_notice_not_observed": "Arrange one genuine external account receipt, accepted, cancelled, or fill event while the read-only H0GSCNI0 collector is connected.",
     "execution_notice_ack_incomplete": "Fix the H0GSCNI0 subscription ACK or missing encryption key/IV before retrying.",
+    "execution_notice_validation_failed": "Review the recorded H0GSCNI0 validation errors; do not approve the capability until every error is resolved.",
 }
 
 
@@ -472,7 +473,10 @@ def _run_worker(config_path: Path) -> int:
             evidence = _read_json(Path(config["paths"]["notice_evidence"]))
             ack = evidence.get("subscription_acknowledgement", {})
             notice_observed = bool(evidence.get("notice_observation"))
+            evidence_errors = list(evidence.get("errors", []))
             blockers = []
+            if live_status.get("state") == "PREFLIGHT_FAILED":
+                blockers.append("preflight_failed")
             if not (
                 ack.get("accepted")
                 and ack.get("encryption_key_present")
@@ -481,9 +485,19 @@ def _run_worker(config_path: Path) -> int:
                 blockers.append("execution_notice_ack_incomplete")
             if not notice_observed:
                 blockers.append("execution_notice_not_observed")
+            if evidence_errors:
+                blockers.append("execution_notice_validation_failed")
             if evidence:
-                state = "COMPLETED"
-                result = "NOTICE_CAPTURED" if not blockers else "INCOMPLETE"
+                state = (
+                    "ERROR"
+                    if live_status.get("state") == "PREFLIGHT_FAILED"
+                    else "COMPLETED"
+                )
+                result = (
+                    "NOTICE_CAPTURED"
+                    if not blockers and exit_code == 0
+                    else "INCOMPLETE"
+                )
             else:
                 state = "ERROR"
                 result = ""
@@ -568,8 +582,12 @@ def summarize_session(session_dir: Path) -> dict[str, Any]:
     live = _read_json(session_dir / "live_status.json")
     report = _read_json(session_dir / "gate2_report.json")
     notice_evidence = _read_json(session_dir / "notice_evidence.json")
-    alive = _process_alive(session.get("worker_pid"))
     recorded_state = str(session.get("state") or "UNKNOWN")
+    alive = (
+        _process_alive(session.get("worker_pid"))
+        if recorded_state not in TERMINAL_STATES
+        else False
+    )
     effective_state = recorded_state
     if recorded_state in {"STARTING", "RUNNING"} and not alive:
         effective_state = "INTERRUPTED"
@@ -638,7 +656,9 @@ def summarize_session(session_dir: Path) -> dict[str, Any]:
         "parser_failure_count": live.get("parser_failure_count", 0),
         "malformed_frame_count": live.get("malformed_frame_count", 0),
         "preflight_error": (
-            live.get("error") if live.get("state") == "PREFLIGHT_FAILED" else None
+            live.get("error")
+            if live.get("state") == "PREFLIGHT_FAILED"
+            else notice_evidence.get("error") if notice_evidence.get("error") else None
         ),
         "watchdog": live.get("watchdog", {}),
         "blockers": blockers,
@@ -654,6 +674,8 @@ def _print_summary(summary: Mapping[str, Any]) -> None:
     print(
         f"Worker: pid={summary.get('worker_pid')} alive={summary.get('process_alive')}"
     )
+    if summary.get("result"):
+        print(f"Result: {summary['result']}")
     if summary.get("mode") == "NOTICE":
         notice = summary.get("notice") or {}
         ack = notice.get("acknowledgement") or {}
@@ -664,6 +686,10 @@ def _print_summary(summary: Mapping[str, Any]) -> None:
             f"key={bool(ack.get('encryption_key_present'))} "
             f"iv={bool(ack.get('encryption_iv_present'))}"
         )
+        if notice.get("errors"):
+            print("Notice validation errors:")
+            for error in notice["errors"]:
+                print(f"  - {error}")
     if summary.get("checkpoint_at"):
         print(
             "Last checkpoint: "
