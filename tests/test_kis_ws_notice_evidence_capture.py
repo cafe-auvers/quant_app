@@ -97,3 +97,59 @@ def test_notice_capture_persists_structure_without_decrypted_values(
     assert not any(value in persisted for value in private_values)
     assert json.loads(status)["state"] == "CAPTURED"
     assert not any(value in status for value in private_values)
+
+
+def test_non_fill_order_event_accepts_observed_missing_trailing_fill_price():
+    values = [f"VALUE-{index}" for index in range(len(collector.NOTICE_COLUMNS) - 1)]
+    values[collector.NOTICE_FILL_FLAG_POSITION] = "1"
+
+    schema = collector._notice_schema(values)
+
+    assert schema["notification_kind"] == "ORDER_EVENT"
+    assert schema["schema_variant"] == "ORDER_EVENT_WITHOUT_TRAILING_FILL_PRICE"
+    assert schema["schema_validation_passed"] is True
+    assert schema["wire_field_count"] == 24
+    assert schema["normalized_field_count"] == 25
+    assert schema["field_count_matches_official_sample"] is False
+    assert schema["missing_trailing_columns"] == ["CNTG_UNPR12"]
+    assert schema["normalized_values"][-1] == ""
+
+
+def test_fill_notice_does_not_accept_missing_trailing_fill_price():
+    values = [f"VALUE-{index}" for index in range(len(collector.NOTICE_COLUMNS) - 1)]
+    values[collector.NOTICE_FILL_FLAG_POSITION] = collector.NOTICE_FILL_FLAG
+
+    schema = collector._notice_schema(values)
+
+    assert schema["notification_kind"] == "FILL"
+    assert schema["schema_variant"] == "UNRECOGNIZED"
+    assert schema["schema_validation_passed"] is False
+
+
+def test_main_persists_safe_preflight_failure(monkeypatch, tmp_path):
+    output = tmp_path / "notice.json"
+    status_output = tmp_path / "status.json"
+    monkeypatch.setattr(collector, "install_repository_configuration", lambda: None)
+
+    def fail_capture(**_kwargs):
+        raise RuntimeError("missing configuration: KIS_WS_HTS_ID")
+
+    monkeypatch.setattr(collector, "capture_notice", fail_capture)
+
+    exit_code = collector.main(
+        [
+            "--confirm-read-only",
+            "--output",
+            str(output),
+            "--status-output",
+            str(status_output),
+        ]
+    )
+
+    evidence = json.loads(output.read_text(encoding="utf-8"))
+    status = json.loads(status_output.read_text(encoding="utf-8"))
+    assert exit_code == 1
+    assert evidence["errors"] == ["missing configuration: KIS_WS_HTS_ID"]
+    assert evidence["broker_mutations"] == 0
+    assert status["state"] == "PREFLIGHT_FAILED"
+    assert status["error"]["message"] == "missing configuration: KIS_WS_HTS_ID"

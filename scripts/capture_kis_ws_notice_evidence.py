@@ -75,6 +75,9 @@ NOTICE_COLUMNS = (
     "TM_DIV_TP",
     "CNTG_UNPR12",
 )
+NOTICE_FILL_FLAG_POSITION = 12
+NOTICE_FILL_FLAG = "2"
+NOTICE_TRAILING_FILL_PRICE_COLUMN = NOTICE_COLUMNS[-1]
 
 
 def _digits(value: object) -> str:
@@ -92,6 +95,54 @@ def _structural_fields(values: Sequence[str]) -> list[dict[str, Any]]:
         }
         for index, (column, value) in enumerate(zip(NOTICE_COLUMNS, values), start=1)
     ]
+
+
+def _notice_schema(values: Sequence[str]) -> dict[str, Any]:
+    """Classify the official shape and the observed non-fill receipt variant.
+
+    KIS documents 25 fields.  Production has also been observed omitting the
+    final fill-price field entirely for a non-fill order event instead of
+    sending an empty trailing value.  That narrow variant can be normalized
+    without shifting any preceding field.  Fill notices remain strict.
+    """
+
+    wire_values = tuple(values)
+    notification_kind = (
+        "FILL"
+        if len(wire_values) > NOTICE_FILL_FLAG_POSITION
+        and wire_values[NOTICE_FILL_FLAG_POSITION] == NOTICE_FILL_FLAG
+        else "ORDER_EVENT"
+    )
+    official_count = len(NOTICE_COLUMNS)
+    omitted_trailing_fill_price = (
+        notification_kind == "ORDER_EVENT" and len(wire_values) == official_count - 1
+    )
+    if len(wire_values) == official_count:
+        variant = "OFFICIAL_25_FIELD"
+        normalized_values = wire_values
+        valid = True
+        missing_columns: list[str] = []
+    elif omitted_trailing_fill_price:
+        variant = "ORDER_EVENT_WITHOUT_TRAILING_FILL_PRICE"
+        normalized_values = (*wire_values, "")
+        valid = True
+        missing_columns = [NOTICE_TRAILING_FILL_PRICE_COLUMN]
+    else:
+        variant = "UNRECOGNIZED"
+        normalized_values = wire_values
+        valid = False
+        missing_columns = []
+    return {
+        "notification_kind": notification_kind,
+        "schema_variant": variant,
+        "schema_validation_passed": valid,
+        "wire_field_count": len(wire_values),
+        "normalized_field_count": len(normalized_values),
+        "expected_field_count": official_count,
+        "field_count_matches_official_sample": len(wire_values) == official_count,
+        "missing_trailing_columns": missing_columns,
+        "normalized_values": normalized_values,
+    }
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -157,6 +208,10 @@ def _notice_status(
         "notice_field_count": notice_observation.get("field_count"),
         "notice_field_count_matches_official_sample": notice_observation.get(
             "field_count_matches_official_sample"
+        ),
+        "notice_schema_variant": notice_observation.get("schema_variant"),
+        "notice_schema_validation_passed": notice_observation.get(
+            "schema_validation_passed"
         ),
         "error_count": len(errors),
         "errors": list(errors),
@@ -250,6 +305,8 @@ def capture_notice(
         if frame.tr_id != NOTICE_TR_ID:
             return
         values = tuple(frame.payload.split("^"))
+        schema = _notice_schema(values)
+        normalized_values = schema.pop("normalized_values")
         configured_account = _digits(os.getenv("KIS_PROD_ACCOUNT_NO", ""))
         observed_account = _digits(values[1] if len(values) > 1 else "")
         with lock:
@@ -259,10 +316,7 @@ def capture_notice(
                     "transport_encrypted": bool(frame.encrypted),
                     "decryption_succeeded": True,
                     "field_count": len(values),
-                    "expected_field_count": len(NOTICE_COLUMNS),
-                    "field_count_matches_official_sample": (
-                        len(values) == len(NOTICE_COLUMNS)
-                    ),
+                    **schema,
                     "configured_account_matches_field_2": bool(
                         configured_account
                         and observed_account
@@ -272,15 +326,15 @@ def capture_notice(
                             or observed_account.endswith(configured_account)
                         )
                     ),
-                    "structural_fields": _structural_fields(values),
+                    "structural_fields": _structural_fields(normalized_values),
                     "payload_fingerprint": frame.payload_fingerprint,
                     "decrypted_values_persisted": False,
                 }
             )
-            if len(values) != len(NOTICE_COLUMNS):
+            if not schema["schema_validation_passed"]:
                 errors.append(
-                    "decrypted execution-notice field count does not match "
-                    "the pinned official sample"
+                    "decrypted execution-notice shape is neither the official "
+                    "25-field schema nor the observed 24-field non-fill order-event variant"
                 )
             done.set()
 
@@ -391,19 +445,66 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if not args.confirm_read_only:
         parser.error("--confirm-read-only is required")
-    install_repository_configuration()
     output = _require_external_output(args.output)
     status_output = (
         _require_external_output(args.status_output)
         if args.status_output is not None
         else None
     )
-    evidence = capture_notice(
-        output=output,
-        timeout_seconds=args.timeout_seconds,
-        status_output=status_output,
-        status_seconds=args.status_seconds,
-    )
+    try:
+        install_repository_configuration()
+        evidence = capture_notice(
+            output=output,
+            timeout_seconds=args.timeout_seconds,
+            status_output=status_output,
+            status_seconds=args.status_seconds,
+        )
+    except Exception as exc:
+        message = str(exc)
+        if not message.startswith("missing configuration:"):
+            message = "collector initialization failed before a safe evidence report"
+        now = datetime.now(timezone.utc)
+        safe_error = {"type": type(exc).__name__, "message": message}
+        evidence = {
+            "schema_version": 1,
+            "evidence_kind": "KIS_WS_EXECUTION_NOTICE_CAPTURE",
+            "qualification_only": True,
+            "review_status": "UNREVIEWED",
+            "environment": "PROD",
+            "tr_id": NOTICE_TR_ID,
+            "started_at": _iso(now),
+            "ended_at": _iso(now),
+            "broker_mutations": 0,
+            "credentials_persisted": False,
+            "decrypted_values_persisted": False,
+            "subscription_acknowledgement": {},
+            "notice_observation": {},
+            "errors": [message],
+            "error": safe_error,
+        }
+        _atomic_write_json(output, evidence)
+        if status_output is not None:
+            _atomic_write_json(
+                status_output,
+                {
+                    "schema_version": 1,
+                    "evidence_kind": "KIS_WS_EXECUTION_NOTICE_CAPTURE_STATUS",
+                    "state": "PREFLIGHT_FAILED",
+                    "generated_at": _iso(now),
+                    "environment": "PROD",
+                    "tr_id": NOTICE_TR_ID,
+                    "notice_observed": False,
+                    "subscription_acknowledgement": {},
+                    "broker_mutations": 0,
+                    "credentials_persisted": False,
+                    "decrypted_values_persisted": False,
+                    "error_count": 1,
+                    "errors": [message],
+                    "error": safe_error,
+                },
+            )
+        print(f"ERROR: {safe_error['type']}: {message}", file=sys.stderr)
+        return 1
     print(f"Evidence: {output}")
     print(f"SHA-256: {_sha256(output)}")
     ack = evidence["subscription_acknowledgement"]

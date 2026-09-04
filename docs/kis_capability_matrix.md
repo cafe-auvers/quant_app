@@ -225,9 +225,20 @@ field mapping.
 
 **Status:** ⬜ Not verified
 
-**Finding:** `KIS_WS_HTS_ID` is not configured in this environment and no
-controlled order notice was generated. This channel must remain absent from
-the active subscription set.
+**Prior baseline finding:** `KIS_WS_HTS_ID` was not configured and no
+controlled order notice had been generated. The channel remains absent from
+the active subscription set until the new live finding below is independently
+reviewed and included in an exact-commit capability manifest.
+
+**Unreviewed live finding (2026-09-04):** a production `H0GSCNI0` account
+notice was ACKed with key/IV, decrypted, matched to the configured account,
+and captured with zero broker mutations on commit `ec2275c`. The wire payload
+contained 24 fields and was structurally consistent with a non-fill order
+event that omitted the final `CNTG_UNPR12` fill-price field instead of sending
+an empty trailing value. The first-party schema still lists 25 fields. The
+collector therefore distinguishes this narrow order-event variant from fills,
+which remain strict 25-field messages. The evidence remains unreviewed and
+does not change this capability row to verified by itself.
 
 ## REST request and mutation capacities
 

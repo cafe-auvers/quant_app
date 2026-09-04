@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from scripts import manage_gate2_session
 
@@ -191,3 +192,89 @@ def test_create_session_records_detached_worker_before_returning(tmp_path, monke
     assert "_worker" in launched["command"]
     assert "KIS_PROD_APP_SECRET" not in config_text
     assert (evidence_root / "latest_session.json").is_file()
+
+
+def test_notice_worker_fails_closed_when_evidence_contains_validation_error(
+    tmp_path, monkeypatch
+):
+    config_path = tmp_path / "session_config.json"
+    evidence_path = tmp_path / "notice_evidence.json"
+    status_path = tmp_path / "live_status.json"
+    config = {
+        "mode": "NOTICE",
+        "python_executable": "python.exe",
+        "paths": {
+            "notice_evidence": str(evidence_path),
+            "live_status": str(status_path),
+        },
+        "options": {"timeout_seconds": 10.0, "status_seconds": 1.0},
+    }
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    (tmp_path / "session.json").write_text(
+        json.dumps(
+            manage_gate2_session._session_payload(
+                session_dir=tmp_path,
+                state="STARTING",
+                worker_pid=None,
+                started_at="2026-09-04T13:00:00+00:00",
+                mode="NOTICE",
+            )
+        ),
+        encoding="utf-8",
+    )
+    evidence_path.write_text(
+        json.dumps(
+            {
+                "subscription_acknowledgement": {
+                    "accepted": True,
+                    "encryption_key_present": True,
+                    "encryption_iv_present": True,
+                },
+                "notice_observation": {"field_count": 24},
+                "errors": ["schema mismatch"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    status_path.write_text(
+        json.dumps({"state": "INCOMPLETE", "errors": ["schema mismatch"]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(manage_gate2_session, "_set_keep_awake", lambda _value: True)
+    monkeypatch.setattr(
+        manage_gate2_session.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=1),
+    )
+
+    exit_code = manage_gate2_session._run_worker(config_path)
+    session = json.loads((tmp_path / "session.json").read_text(encoding="utf-8"))
+
+    assert exit_code == 1
+    assert session["state"] == "COMPLETED"
+    assert session["result"] == "INCOMPLETE"
+    assert "execution_notice_validation_failed" in session["blockers"]
+
+
+def test_terminal_session_never_reports_stale_worker_as_alive(tmp_path, monkeypatch):
+    session = {
+        "state": "COMPLETED",
+        "mode": "NOTICE",
+        "worker_pid": 123,
+        "started_at": "2026-09-04T13:00:00+00:00",
+        "ended_at": "2026-09-04T13:01:00+00:00",
+        "result": "NOTICE_CAPTURED",
+        "blockers": [],
+        "artifacts": {},
+    }
+    (tmp_path / "session.json").write_text(json.dumps(session), encoding="utf-8")
+    monkeypatch.setattr(
+        manage_gate2_session,
+        "_process_alive",
+        lambda _pid: (_ for _ in ()).throw(AssertionError("must not be called")),
+    )
+
+    summary = manage_gate2_session.summarize_session(tmp_path)
+
+    assert summary["state"] == "COMPLETED"
+    assert summary["process_alive"] is False
