@@ -9,10 +9,11 @@ account, order, name, symbol, price, and quantity values are never persisted.
 This command does not construct a broker or call any mutation endpoint.  A
 notice can only arrive because of account activity initiated elsewhere.
 """
+
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -20,6 +21,7 @@ import sys
 import threading
 import time
 from typing import Any, Sequence
+import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,6 +34,7 @@ from scripts.capture_kis_ws_event_evidence import (
     _require_external_output,
     _sha256,
 )
+from src.utils.config import install_repository_configuration
 from src.api.kis_websocket import (
     KisWebSocketClient,
     KisWsDataFrame,
@@ -87,13 +90,89 @@ def _structural_fields(values: Sequence[str]) -> list[dict[str, Any]]:
             "character_count": len(value),
             "numeric": bool(value) and value.replace(".", "", 1).isdigit(),
         }
-        for index, (column, value) in enumerate(
-            zip(NOTICE_COLUMNS, values), start=1
-        )
+        for index, (column, value) in enumerate(zip(NOTICE_COLUMNS, values), start=1)
     ]
 
 
-def capture_notice(*, output: Path, timeout_seconds: float) -> dict[str, Any]:
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            temporary = Path(handle.name)
+        temporary.replace(path)
+    finally:
+        if temporary is not None and temporary.exists():
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+
+
+def _notice_status(
+    *,
+    state: str,
+    commit_sha: str,
+    started_at: datetime,
+    deadline_at: datetime,
+    connection_events: Sequence[dict[str, Any]],
+    acknowledgement: dict[str, Any],
+    notice_observation: dict[str, Any],
+    errors: Sequence[str],
+) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    return {
+        "schema_version": 1,
+        "evidence_kind": "KIS_WS_EXECUTION_NOTICE_CAPTURE_STATUS",
+        "state": state,
+        "generated_at": _iso(now),
+        "pid": os.getpid(),
+        "commit_sha": commit_sha,
+        "environment": "PROD",
+        "tr_id": NOTICE_TR_ID,
+        "started_at": _iso(started_at),
+        "deadline_at": _iso(deadline_at),
+        "seconds_remaining": max(0.0, (deadline_at - now).total_seconds()),
+        "connection_event_count": len(connection_events),
+        "connected": bool(connection_events and connection_events[-1].get("connected")),
+        "subscription_acknowledgement": {
+            "accepted": bool(acknowledgement.get("accepted")),
+            "encryption_key_present": bool(
+                acknowledgement.get("encryption_key_present")
+            ),
+            "encryption_iv_present": bool(acknowledgement.get("encryption_iv_present")),
+            "observed_at": acknowledgement.get("observed_at"),
+        },
+        "notice_observed": bool(notice_observation),
+        "notice_observed_at": notice_observation.get("observed_at"),
+        "notice_field_count": notice_observation.get("field_count"),
+        "notice_field_count_matches_official_sample": notice_observation.get(
+            "field_count_matches_official_sample"
+        ),
+        "error_count": len(errors),
+        "errors": list(errors),
+        "broker_mutations": 0,
+        "credentials_persisted": False,
+        "decrypted_values_persisted": False,
+    }
+
+
+def capture_notice(
+    *,
+    output: Path,
+    timeout_seconds: float,
+    status_output: Path | None = None,
+    status_seconds: float = 30.0,
+) -> dict[str, Any]:
     commit_sha = _git_snapshot()
     timeout = max(5.0, float(timeout_seconds))
     required_env = (
@@ -219,10 +298,29 @@ def capture_notice(*, output: Path, timeout_seconds: float) -> dict[str, Any]:
     )
 
     started_at = datetime.now(timezone.utc)
+    deadline_at = started_at + timedelta(seconds=timeout)
     client.start()
     deadline = time.monotonic() + timeout
+    last_status_write = 0.0
     try:
         while time.monotonic() < deadline and not done.is_set() and not fatal.is_set():
+            monotonic_now = time.monotonic()
+            if status_output is not None and (
+                monotonic_now - last_status_write >= max(1.0, status_seconds)
+            ):
+                with lock:
+                    status = _notice_status(
+                        state="RUNNING",
+                        commit_sha=commit_sha,
+                        started_at=started_at,
+                        deadline_at=deadline_at,
+                        connection_events=list(connection_events),
+                        acknowledgement=dict(acknowledgement),
+                        notice_observation=dict(notice_observation),
+                        errors=list(errors),
+                    )
+                _atomic_write_json(status_output, status)
+                last_status_write = monotonic_now
             time.sleep(0.1)
     finally:
         client.stop()
@@ -264,10 +362,20 @@ def capture_notice(*, output: Path, timeout_seconds: float) -> dict[str, Any]:
             "no live execution notice arrived during the observation window"
         )
 
-    output.write_text(
-        json.dumps(evidence, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    _atomic_write_json(output, evidence)
+    if status_output is not None:
+        with lock:
+            status = _notice_status(
+                state="CAPTURED" if not evidence["errors"] else "INCOMPLETE",
+                commit_sha=commit_sha,
+                started_at=started_at,
+                deadline_at=deadline_at,
+                connection_events=list(connection_events),
+                acknowledgement=dict(acknowledgement),
+                notice_observation=dict(notice_observation),
+                errors=list(evidence["errors"]),
+            )
+        _atomic_write_json(status_output, status)
     return evidence
 
 
@@ -278,11 +386,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--confirm-read-only", action="store_true")
     parser.add_argument("--timeout-seconds", type=float, default=300.0)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--status-output", type=Path)
+    parser.add_argument("--status-seconds", type=float, default=30.0)
     args = parser.parse_args(argv)
     if not args.confirm_read_only:
         parser.error("--confirm-read-only is required")
+    install_repository_configuration()
     output = _require_external_output(args.output)
-    evidence = capture_notice(output=output, timeout_seconds=args.timeout_seconds)
+    status_output = (
+        _require_external_output(args.status_output)
+        if args.status_output is not None
+        else None
+    )
+    evidence = capture_notice(
+        output=output,
+        timeout_seconds=args.timeout_seconds,
+        status_output=status_output,
+        status_seconds=args.status_seconds,
+    )
     print(f"Evidence: {output}")
     print(f"SHA-256: {_sha256(output)}")
     ack = evidence["subscription_acknowledgement"]

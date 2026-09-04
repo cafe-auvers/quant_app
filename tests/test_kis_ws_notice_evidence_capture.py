@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 
 from scripts import capture_kis_ws_notice_evidence as collector
 from src.api.kis_websocket import KisWsDataFrame, KisWsSystemFrame
@@ -20,7 +21,9 @@ def test_notice_capture_persists_structure_without_decrypted_values(
     }.items():
         monkeypatch.setenv(name, value)
 
-    private_values = [f"VALUE-{index}" for index in range(len(collector.NOTICE_COLUMNS))]
+    private_values = [
+        f"VALUE-{index}" for index in range(len(collector.NOTICE_COLUMNS))
+    ]
     private_values[1] = "12345678"
 
     class FakeClient:
@@ -67,12 +70,21 @@ def test_notice_capture_persists_structure_without_decrypted_values(
         def stop(self):
             return None
 
-    monkeypatch.setattr(collector, "KisWsApprovalKeyProvider", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        collector, "KisWsApprovalKeyProvider", lambda **_kwargs: object()
+    )
     monkeypatch.setattr(collector, "KisWebSocketClient", FakeClient)
 
     output = tmp_path / "notice.json"
-    evidence = collector.capture_notice(output=output, timeout_seconds=5)
+    status_output = tmp_path / "notice-status.json"
+    evidence = collector.capture_notice(
+        output=output,
+        timeout_seconds=5,
+        status_output=status_output,
+        status_seconds=1,
+    )
     persisted = output.read_text(encoding="utf-8")
+    status = status_output.read_text(encoding="utf-8")
 
     assert evidence["errors"] == []
     assert evidence["broker_mutations"] == 0
@@ -83,3 +95,5 @@ def test_notice_capture_persists_structure_without_decrypted_values(
     assert evidence["notice_observation"]["configured_account_matches_field_2"] is True
     assert evidence["notice_observation"]["decrypted_values_persisted"] is False
     assert not any(value in persisted for value in private_values)
+    assert json.loads(status)["state"] == "CAPTURED"
+    assert not any(value in status for value in private_values)

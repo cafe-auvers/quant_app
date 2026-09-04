@@ -132,6 +132,68 @@ LOCAL_RECEIVE_STALE_SECONDS=2
 - [ ] Stop immediately if an activation flag changes, a mutation is attempted,
   a secret appears in output, or the aggregate subscription budget is crossed.
 
+## Unattended durable session
+
+The dashboard, terminal, and Codex session do not need to remain open. Run the
+collector on the PC that will remain powered and network-connected. The
+detached worker requests Windows system-awake state for its lifetime while
+allowing the display to turn off, writes an atomic checkpoint every 30 seconds,
+and releases the power request after the child exits. It cannot survive a power
+loss, forced reboot, or manually requested hibernation.
+
+The current first step is the read-only execution-notice observation. Start it
+shortly before the regular-session open; 24,000 seconds covers ten minutes of
+pre-open plus a 6.5-hour regular session:
+
+```powershell
+python scripts/manage_gate2_session.py start-notice `
+  --confirm-read-only `
+  --timeout-seconds 24000
+```
+
+After the detached-start message appears, the launching terminal may close.
+The collector never constructs a broker and cannot create the account event it
+needs to observe. Arrange a genuine external accepted, cancelled, receipt, or
+fill notice while it is connected; do not add mutation authority to the
+collector. Check the result after the session with:
+
+```powershell
+python scripts/manage_gate2_session.py status
+```
+
+The status command reports worker liveness, checkpoint age, notice ACK/key/IV
+state, whether a notice arrived, failed Gate-2 metrics, their measured values
+and thresholds, and concrete next actions. Every run receives a unique folder
+under `%USERPROFILE%\quant_evidence\gate2_sessions` containing:
+
+- `session.json`: supervisor lifecycle and terminal result;
+- `live_status.json`: atomic in-session checkpoint;
+- `supervisor.log`: detached worker/entrypoint output;
+- `notice_evidence.json`: redacted notice evidence in notice mode;
+- `gate2_runtime.log` and `gate2_report.json`: full-soak artifacts.
+
+Once the genuine notice evidence has been independently reviewed and included
+in an exact-commit approved capability manifest, launch the certified soak in
+the same detached form:
+
+```powershell
+python scripts/manage_gate2_session.py start `
+  --confirm-read-only `
+  --environment PROD `
+  --symbols AAPL,MSFT `
+  --session-date YYYY-MM-DD `
+  --gate1-report C:\redacted\gate1_report.json `
+  --capability-manifest C:\redacted\gate2_capabilities.json `
+  --redacted-evidence C:\redacted\regular-session-frames.json `
+  --reconnect-after-seconds 3600 `
+  --silent-stale-probe-after-seconds 5400
+```
+
+Do not run another WebSocket client for the same app-key session. The full soak
+still fails closed unless the exact read-only activation snapshot, clean
+worktree, exact-head Gate-1 report, reviewed manifest, evidence digests, symbol
+keys, and all other preflight requirements in this checklist are valid.
+
 ## Acceptance metrics
 
 | Metric | Pass requirement | Evidence field |
