@@ -1,4 +1,5 @@
 """Standalone, mutation-free Gate-2 KIS WebSocket soak reporter."""
+
 from __future__ import annotations
 
 import argparse
@@ -96,9 +97,7 @@ def runtime_activation_snapshot() -> dict[str, bool | int | float | str | list[s
         "TRADING_ENABLED": bool(is_trading_enabled()),
         "BUYBOARD_ENGINE_ENABLED": execution_config.is_buyboard_engine_enabled(),
         "KIS_WS_ENABLED": bool(execution_config.KIS_WS_ENABLED),
-        "KIS_WS_PROTOCOL_VERIFIED": bool(
-            execution_config.KIS_WS_PROTOCOL_VERIFIED
-        ),
+        "KIS_WS_PROTOCOL_VERIFIED": bool(execution_config.KIS_WS_PROTOCOL_VERIFIED),
         "KIS_MUTATION_BUDGET_VERIFIED": bool(
             execution_config.KIS_MUTATION_BUDGET_VERIFIED
         ),
@@ -111,9 +110,7 @@ def runtime_activation_snapshot() -> dict[str, bool | int | float | str | list[s
         "KIS_REPLACE_MUTATION_CAPACITY": int(
             execution_config.KIS_REPLACE_MUTATION_CAPACITY
         ),
-        "KIS_LIVE_EXECUTION_MODE": str(
-            execution_config.KIS_LIVE_EXECUTION_MODE
-        ),
+        "KIS_LIVE_EXECUTION_MODE": str(execution_config.KIS_LIVE_EXECUTION_MODE),
         "CONTROLLED_LIVE_ACTIVE_CARD_SYMBOLS": list(controlled_live_symbols()),
         "KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL": float(
             execution_config.KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL
@@ -193,9 +190,18 @@ class Gate2Evidence:
 
 
 def _metric(
-    *, value: float | int, threshold: str, passed: bool, numerator=None, denominator=None
+    *,
+    value: float | int,
+    threshold: str,
+    passed: bool,
+    numerator=None,
+    denominator=None,
 ) -> dict:
-    item = {"value": value, "threshold": threshold, "result": "PASSED" if passed else "FAILED"}
+    item = {
+        "value": value,
+        "threshold": threshold,
+        "result": "PASSED" if passed else "FAILED",
+    }
     if numerator is not None:
         item["numerator"] = numerator
     if denominator is not None:
@@ -235,10 +241,14 @@ def build_report(evidence: Gate2Evidence) -> dict:
     queue = evidence.queue_lag_ms
     stop = evidence.synthetic_stop_tests
     injected_disconnects = [
-        item for item in evidence.disconnects if item.get("classification") == "INJECTED"
+        item
+        for item in evidence.disconnects
+        if item.get("classification") == "INJECTED"
     ]
     unexpected_disconnects = [
-        item for item in evidence.disconnects if item.get("classification") == "UNEXPECTED"
+        item
+        for item in evidence.disconnects
+        if item.get("classification") == "UNEXPECTED"
     ]
     unresolved_disconnects = [
         item for item in evidence.disconnects if not item.get("reacked_at")
@@ -255,9 +265,9 @@ def build_report(evidence: Gate2Evidence) -> dict:
     capability_ok = capability_snapshot_complete(
         evidence.verified_capabilities, environment=evidence.environment
     )
-    audit_sources_ok = set(
-        evidence.safety_audit_sources
-    ) >= GATE2_REQUIRED_AUDIT_SOURCES
+    audit_sources_ok = (
+        set(evidence.safety_audit_sources) >= GATE2_REQUIRED_AUDIT_SOURCES
+    )
     monotonic_capabilities = [
         evidence.verified_capabilities.get(item, {})
         for item in (TRADE_SEQUENCE, QUOTE_SEQUENCE)
@@ -275,15 +285,17 @@ def build_report(evidence: Gate2Evidence) -> dict:
         str(item.get("tr_id") or ""): str(item.get("reset_semantics") or "")
         for item in monotonic_capabilities
     }
-    sequence_ok = capability_ok and sorted(
-        evidence.runtime_confirmed_sequence_channels
-    ) == expected_sequence_channels and (
-        evidence.runtime_sequence_fields == expected_sequence_fields
-        and evidence.runtime_sequence_reset_semantics == expected_sequence_resets
+    sequence_ok = (
+        capability_ok
+        and sorted(evidence.runtime_confirmed_sequence_channels)
+        == expected_sequence_channels
+        and (
+            evidence.runtime_sequence_fields == expected_sequence_fields
+            and evidence.runtime_sequence_reset_semantics == expected_sequence_resets
+        )
     )
     redacted_evidence_ok = bool(evidence.redacted_evidence_sha256) and all(
-        str(name or "").strip()
-        and SHA256_PATTERN.fullmatch(str(digest or ""))
+        str(name or "").strip() and SHA256_PATTERN.fullmatch(str(digest or ""))
         for name, digest in evidence.redacted_evidence_sha256.items()
     )
     continuity_start = (
@@ -399,9 +411,7 @@ def build_report(evidence: Gate2Evidence) -> dict:
                     "entry_readiness_ready_before_probe"
                 )
                 is True
-                and evidence.silent_stale_probe.get(
-                    "entry_readiness_ready_while_stale"
-                )
+                and evidence.silent_stale_probe.get("entry_readiness_ready_while_stale")
                 is False
                 and evidence.entry_readiness_check_count is not None
                 and evidence.stale_entry_readiness_check_count is not None
@@ -438,8 +448,7 @@ def build_report(evidence: Gate2Evidence) -> dict:
             passed=(
                 stop.get("injected", 0) > 0
                 and stop.get("accepted_by_live_service") == stop.get("injected")
-                and stop.get("injected") == stop.get("latched")
-                == stop.get("consumed")
+                and stop.get("injected") == stop.get("latched") == stop.get("consumed")
             ),
         ),
         "watchdog_deadlocks": _metric(
@@ -577,12 +586,16 @@ def build_report(evidence: Gate2Evidence) -> dict:
             "scheduled_close_utc": _iso(evidence.session_close),
             "start_kst": evidence.started_at.astimezone(KST_ZONE).isoformat(),
             "end_kst": ended_at.astimezone(KST_ZONE).isoformat(),
-            "start_us_eastern": evidence.started_at.astimezone(US_MARKET_ZONE).isoformat(),
+            "start_us_eastern": evidence.started_at.astimezone(
+                US_MARKET_ZONE
+            ).isoformat(),
             "end_us_eastern": ended_at.astimezone(US_MARKET_ZONE).isoformat(),
         },
         "symbols": sorted(evidence.symbols),
         "tr_ids": sorted(evidence.tr_ids),
-        "verified_subscription_keys": dict(sorted(evidence.verified_subscription_keys.items())),
+        "verified_subscription_keys": dict(
+            sorted(evidence.verified_subscription_keys.items())
+        ),
         "requested_subscriptions": sorted(requested),
         "acked_subscriptions": sorted(acked),
         "max_aggregate_registration_usage": evidence.max_aggregate_registration_usage,
@@ -596,7 +609,9 @@ def build_report(evidence: Gate2Evidence) -> dict:
         "stale_detection_seconds": evidence.stale_detection_seconds,
         "frame_counts_by_tr_id": dict(sorted(evidence.frame_counts_by_tr_id.items())),
         "record_counts_by_tr_id": dict(sorted(evidence.record_counts_by_tr_id.items())),
-        "schema_fingerprints_by_tr_id": dict(sorted(evidence.schema_fingerprints_by_tr_id.items())),
+        "schema_fingerprints_by_tr_id": dict(
+            sorted(evidence.schema_fingerprints_by_tr_id.items())
+        ),
         "parser_failure_count": evidence.parser_failure_count,
         "malformed_frame_count": evidence.malformed_frame_count,
         "duplicate_event_count": evidence.duplicate_event_count,
@@ -643,11 +658,15 @@ def build_report(evidence: Gate2Evidence) -> dict:
         "runtime_confirmed_sequence_channels": sorted(
             evidence.runtime_confirmed_sequence_channels
         ),
-        "runtime_sequence_fields": dict(sorted(evidence.runtime_sequence_fields.items())),
+        "runtime_sequence_fields": dict(
+            sorted(evidence.runtime_sequence_fields.items())
+        ),
         "runtime_sequence_reset_semantics": dict(
             sorted(evidence.runtime_sequence_reset_semantics.items())
         ),
-        "redacted_evidence_sha256": dict(sorted(evidence.redacted_evidence_sha256.items())),
+        "redacted_evidence_sha256": dict(
+            sorted(evidence.redacted_evidence_sha256.items())
+        ),
         "activation_snapshot": evidence.activation_snapshot,
         "production_activation_authorized": False,
         "broker_mutations": evidence.broker_mutation_count,
@@ -719,9 +738,9 @@ class LiveGate2Runner:
         value = str(reason or "")
         return {
             "reason_present": bool(value),
-            "reason_sha256": hashlib.sha256(value.encode("utf-8")).hexdigest()
-            if value
-            else "",
+            "reason_sha256": (
+                hashlib.sha256(value.encode("utf-8")).hexdigest() if value else ""
+            ),
         }
 
     def _operation_label(self, operation: KisWsProtocolOperation) -> str:
@@ -730,9 +749,10 @@ class LiveGate2Runner:
         for symbol, key in self.evidence.verified_subscription_keys.items():
             if key == operation.tr_key:
                 return symbol
-        return "UNMAPPED_" + hashlib.sha256(
-            operation.tr_key.encode("utf-8")
-        ).hexdigest()[:12]
+        return (
+            "UNMAPPED_"
+            + hashlib.sha256(operation.tr_key.encode("utf-8")).hexdigest()[:12]
+        )
 
     def _on_protocol_operation(self, operation: KisWsProtocolOperation) -> None:
         label = self._operation_label(operation)
@@ -797,7 +817,11 @@ class LiveGate2Runner:
         self._expected_disconnects += 1
         self.evidence.injected_disconnect_request_count += 1
         self.evidence.connection_events.append(
-            {"kind": "DISCONNECT_REQUESTED", "classification": "INJECTED", "at": _iso(now)}
+            {
+                "kind": "DISCONNECT_REQUESTED",
+                "classification": "INJECTED",
+                "at": _iso(now),
+            }
         )
         self.service.reconnect()
 
@@ -919,15 +943,26 @@ class LiveGate2Runner:
         notice_tr_id = "H0GSCNI0" if self.evidence.environment == "PROD" else "H0GSCNI9"
         if capacity.execution_notice_acked:
             generation = max(
-                (state.reconnect_generation for state in map(self.service.symbol_state, self.evidence.symbols)),
+                (
+                    state.reconnect_generation
+                    for state in map(self.service.symbol_state, self.evidence.symbols)
+                ),
                 default=0,
             )
-            self._operation_states[(generation, notice_tr_id, "EXECUTION_NOTICE")] = "SUBSCRIBED"
+            self._operation_states[(generation, notice_tr_id, "EXECUTION_NOTICE")] = (
+                "SUBSCRIBED"
+            )
 
         critical_ready = requested <= acked_set
         for disconnect in self.evidence.disconnects:
-            if disconnect.get("reconnected_at") and not disconnect.get("reacked_at") and critical_ready:
-                disconnected_at = datetime.fromisoformat(str(disconnect["disconnect_at"]))
+            if (
+                disconnect.get("reconnected_at")
+                and not disconnect.get("reacked_at")
+                and critical_ready
+            ):
+                disconnected_at = datetime.fromisoformat(
+                    str(disconnect["disconnect_at"])
+                )
                 recovery = max(0.0, (now - disconnected_at).total_seconds())
                 disconnect["reacked_at"] = _iso(now)
                 disconnect["recovery_seconds"] = recovery
@@ -945,7 +980,9 @@ class LiveGate2Runner:
             if self.evidence.continuity_started_at:
                 self.evidence.continuity_sample_count += 1
                 expected_gap = bool(
-                    any(not item.get("reacked_at") for item in self.evidence.disconnects)
+                    any(
+                        not item.get("reacked_at") for item in self.evidence.disconnects
+                    )
                     or self._silent_probe_phase in {"SUPPRESSED", "RECOVERING"}
                 )
                 if not self.current_feed_ready and not expected_gap:
@@ -1025,7 +1062,9 @@ class _ProgressWatchdog:
 class _SecretRedactingFormatter(logging.Formatter):
     """Redact every known static/dynamic credential before log persistence."""
 
-    def __init__(self, *args, sensitive_values: set[str], lock: threading.Lock, **kwargs):
+    def __init__(
+        self, *args, sensitive_values: set[str], lock: threading.Lock, **kwargs
+    ):
         super().__init__(*args, **kwargs)
         self._sensitive_values = sensitive_values
         self._lock = lock
@@ -1046,8 +1085,165 @@ class _SecretRedactingFormatter(logging.Formatter):
 def _write_report(path: Path, report: Mapping) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     temporary.replace(path)
+
+
+def build_live_status(
+    evidence: Gate2Evidence,
+    *,
+    state: str,
+    report_path: Path,
+    log_path: Path,
+    report: Mapping | None = None,
+) -> dict:
+    """Build a redacted, atomic checkpoint suitable for unattended runs.
+
+    The status deliberately contains subscription labels and aggregate metrics,
+    never credentials, approval keys, raw frames, decrypted notices, or symbol
+    subscription keys.  The formal report remains the certification artifact;
+    this file is operational evidence when a host or process exits early.
+    """
+    now = datetime.now(timezone.utc)
+    requested = set(evidence.requested_subscriptions)
+    acked = set(evidence.acked_subscriptions)
+    failed_metrics: list[dict[str, object]] = []
+    result = None
+    blockers: list[str] = []
+    if report is not None:
+        result = str(report.get("result") or "") or None
+        blockers = [str(item) for item in report.get("blockers", [])]
+        metrics = report.get("metrics", {})
+        if isinstance(metrics, Mapping):
+            for name, metric in metrics.items():
+                if not isinstance(metric, Mapping) or metric.get("result") == "PASSED":
+                    continue
+                failed_metrics.append(
+                    {
+                        "name": str(name),
+                        "value": metric.get("value"),
+                        "threshold": metric.get("threshold"),
+                    }
+                )
+    try:
+        log_bytes = log_path.stat().st_size
+    except OSError:
+        log_bytes = 0
+    return {
+        "schema_version": 1,
+        "gate": "GATE_2_LIVE_KIS_READ_ONLY_SOAK",
+        "state": str(state).upper(),
+        "result": result,
+        "generated_at": _iso(now),
+        "pid": os.getpid(),
+        "commit_sha": evidence.commit_sha,
+        "environment": evidence.environment,
+        "production_activation_authorized": False,
+        "session": {
+            "started_at": _iso(evidence.started_at),
+            "scheduled_open_utc": _iso(evidence.session_open),
+            "scheduled_close_utc": _iso(evidence.session_close),
+            "seconds_until_close": max(
+                0.0, (evidence.session_close - now).total_seconds()
+            ),
+        },
+        "symbols": sorted(evidence.symbols),
+        "subscriptions": {
+            "requested_count": len(requested),
+            "acked_count": len(requested & acked),
+            "missing": sorted(requested - acked),
+        },
+        "frame_counts_by_tr_id": dict(sorted(evidence.frame_counts_by_tr_id.items())),
+        "record_counts_by_tr_id": dict(sorted(evidence.record_counts_by_tr_id.items())),
+        "parser_failure_count": evidence.parser_failure_count,
+        "malformed_frame_count": evidence.malformed_frame_count,
+        "disconnect_count": len(evidence.disconnects),
+        "injected_disconnect_request_count": (
+            evidence.injected_disconnect_request_count
+        ),
+        "reconnect_recovery_count": len(evidence.reconnect_recovery_seconds),
+        "continuity_sample_count": evidence.continuity_sample_count,
+        "continuity_unexpected_unready_count": (
+            evidence.continuity_unexpected_unready_count
+        ),
+        "watchdog": {
+            "cycles": evidence.watchdog_cycles,
+            "deadlocks": evidence.deadlock_count,
+            "max_gap_seconds": evidence.watchdog_max_gap_seconds,
+            "timeout_seconds": evidence.watchdog_timeout_seconds,
+        },
+        "operator_abort_reasons": list(evidence.operator_abort_reasons),
+        "log": {"path": str(log_path), "bytes_written": log_bytes},
+        "report_path": str(report_path),
+        "blockers": blockers,
+        "failed_metrics": failed_metrics,
+    }
+
+
+def _write_live_status(
+    path: Path,
+    evidence: Gate2Evidence,
+    *,
+    state: str,
+    report_path: Path,
+    log_path: Path,
+    report: Mapping | None = None,
+) -> None:
+    _write_report(
+        path,
+        build_live_status(
+            evidence,
+            state=state,
+            report_path=report_path,
+            log_path=log_path,
+            report=report,
+        ),
+    )
+
+
+def _redact_runtime_secrets(value: object) -> str:
+    rendered = str(value)
+    for name in (
+        "KIS_PROD_APP_KEY",
+        "KIS_PROD_APP_SECRET",
+        "KIS_SIM_APP_KEY",
+        "KIS_SIM_APP_SECRET",
+        "KIS_WS_HTS_ID",
+    ):
+        secret = os.getenv(name, "")
+        if len(secret) >= 6:
+            rendered = rendered.replace(secret, "<redacted-secret>")
+    return rendered
+
+
+def _write_preflight_failure(path: Path, exc: BaseException, report_path: Path) -> None:
+    safe_message = _redact_runtime_secrets(exc)
+    _write_report(
+        path,
+        {
+            "schema_version": 1,
+            "gate": "GATE_2_LIVE_KIS_READ_ONLY_SOAK",
+            "state": "PREFLIGHT_FAILED",
+            "result": None,
+            "generated_at": _iso(datetime.now(timezone.utc)),
+            "pid": os.getpid(),
+            "production_activation_authorized": False,
+            "error": {
+                "type": type(exc).__name__,
+                "message": safe_message,
+                "fingerprint": hashlib.sha256(
+                    f"{type(exc).__name__}:{safe_message}".encode(
+                        "utf-8", errors="replace"
+                    )
+                ).hexdigest(),
+            },
+            "blockers": ["preflight_failed"],
+            "failed_metrics": [],
+            "report_path": str(report_path),
+        },
+    )
 
 
 def run_live_soak(args: argparse.Namespace, root: Path) -> int:
@@ -1060,7 +1256,9 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
     if gate1.get("result") != "PASSED" or gate1.get("commit_sha") != commit:
         raise RuntimeError("Gate-1 report must be PASSED on this exact commit")
     activation = runtime_activation_snapshot()
-    if any(activation.get(key) != value for key, value in SAFE_RUNTIME_EXPECTATIONS.items()):
+    if any(
+        activation.get(key) != value for key, value in SAFE_RUNTIME_EXPECTATIONS.items()
+    ):
         raise RuntimeError("runtime activation snapshot is not read-only Gate-2 safe")
     if execution_config.KIS_WS_TOTAL_SUBSCRIPTION_CAPACITY <= 0:
         raise RuntimeError("verified aggregate WebSocket capacity is still zero")
@@ -1068,11 +1266,17 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
         raise RuntimeError("Gate-2 poll interval must be in (0, 0.25] seconds")
     if float(args.watchdog_timeout_seconds) <= float(args.poll_seconds) * 2:
         raise RuntimeError("Gate-2 watchdog timeout must exceed two poll intervals")
-    if max(
-        execution_config.BROKER_EVENT_STALE_SECONDS,
-        execution_config.LOCAL_RECEIVE_STALE_SECONDS,
-    ) + float(args.poll_seconds) > 3.0:
-        raise RuntimeError("configured stale budget cannot meet the 3-second Gate-2 limit")
+    if (
+        max(
+            execution_config.BROKER_EVENT_STALE_SECONDS,
+            execution_config.LOCAL_RECEIVE_STALE_SECONDS,
+        )
+        + float(args.poll_seconds)
+        > 3.0
+    ):
+        raise RuntimeError(
+            "configured stale budget cannot meet the 3-second Gate-2 limit"
+        )
     hts_id = os.getenv("KIS_WS_HTS_ID", "").strip()
     if not hts_id:
         raise RuntimeError(
@@ -1080,7 +1284,9 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
             "is part of the current Gate-2 contract"
         )
 
-    symbols = sorted({item.strip().upper() for item in args.symbols.split(",") if item.strip()})
+    symbols = sorted(
+        {item.strip().upper() for item in args.symbols.split(",") if item.strip()}
+    )
     if not symbols:
         raise ValueError("--symbols must contain at least one symbol")
     requested_slots = len(symbols) * 2 + 1
@@ -1128,7 +1334,11 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
         ),
         environment=args.environment,
         symbols=symbols,
-        tr_ids=["HDFSCNT0", "HDFSASP0", "H0GSCNI0" if args.environment == "PROD" else "H0GSCNI9"],
+        tr_ids=[
+            "HDFSCNT0",
+            "HDFSASP0",
+            "H0GSCNI0" if args.environment == "PROD" else "H0GSCNI9",
+        ],
         verified_subscription_keys={symbol: str(keys[symbol]) for symbol in symbols},
         activation_snapshot=activation,
         session_open=session_open,
@@ -1159,7 +1369,9 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
         except ValueError:
             pass
         else:
-            raise RuntimeError("redacted raw evidence must remain outside the repository")
+            raise RuntimeError(
+                "redacted raw evidence must remain outside the repository"
+            )
         if not resolved.is_file() or resolved.stat().st_size <= 0:
             raise RuntimeError(f"redacted raw evidence is missing or empty: {resolved}")
         if resolved.name in evidence_names:
@@ -1170,6 +1382,15 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
         evidence.redacted_evidence_sha256[resolved.name] = _sha256(resolved)
 
     log_path = args.log_output.resolve()
+    status_path = getattr(args, "status_output", None)
+    if status_path is None:
+        status_path = args.output.with_name(f"{args.output.stem}_status.json")
+    status_path = Path(status_path).resolve()
+    status_interval_seconds = max(1.0, float(getattr(args, "status_seconds", 30.0)))
+    if status_path in {log_path, args.output.resolve()}:
+        raise RuntimeError(
+            "Gate-2 status, runtime log, and formal report paths must be distinct"
+        )
     try:
         log_path.relative_to(root.resolve())
     except ValueError:
@@ -1216,8 +1437,7 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
     def record_critical_alert(message: str) -> None:
         logging.getLogger("gate2.alert").critical("%s", message)
         evidence.operator_abort_reasons.append(
-            "critical_alert:"
-            + hashlib.sha256(str(message).encode("utf-8")).hexdigest()
+            "critical_alert:" + hashlib.sha256(str(message).encode("utf-8")).hexdigest()
         )
 
     service = build_kis_realtime_market_data_from_environment(
@@ -1234,7 +1454,9 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
         symbol_key_store=symbol_key_store,
     )
     priority = {symbol: int(SubscriptionPriority.CRITICAL_EXIT) for symbol in symbols}
-    service.configure_desired_channels(trade_priorities=priority, quote_priorities=priority)
+    service.configure_desired_channels(
+        trade_priorities=priority, quote_priorities=priority
+    )
     safety_audit = begin_runtime_safety_audit()
     runner = LiveGate2Runner(service, evidence, safety_audit)
     reconnect_offsets = sorted(float(value) for value in args.reconnect_after_seconds)
@@ -1243,7 +1465,32 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
     duplicate_probe_complete = False
     stale_probe_started = False
     watchdog = _ProgressWatchdog(evidence, args.watchdog_timeout_seconds)
+    runtime_failure = False
+    last_status_write = 0.0
+
+    def record_runtime_failure(stage: str, exc: BaseException) -> None:
+        nonlocal runtime_failure
+        runtime_failure = True
+        fingerprint = hashlib.sha256(
+            f"{type(exc).__name__}:{exc}".encode("utf-8", errors="replace")
+        ).hexdigest()
+        reason = f"runtime_{stage}_error:{type(exc).__name__}:{fingerprint}"
+        if reason not in evidence.operator_abort_reasons:
+            evidence.operator_abort_reasons.append(reason)
+        logging.getLogger("gate2.runtime").exception(
+            "Gate-2 runtime failure during %s (fingerprint=%s)",
+            stage,
+            fingerprint,
+        )
+
     try:
+        _write_live_status(
+            status_path,
+            evidence,
+            state="STARTING",
+            report_path=args.output,
+            log_path=log_path,
+        )
         watchdog.start()
         service.start()
         while datetime.now(timezone.utc) < session_close:
@@ -1258,7 +1505,11 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
             if runner.current_feed_ready and frame_ready and not stop_probe_complete:
                 evidence.synthetic_stop_tests = _synthetic_stop_test(service)
                 stop_probe_complete = True
-            if runner.current_feed_ready and frame_ready and not duplicate_probe_complete:
+            if (
+                runner.current_feed_ready
+                and frame_ready
+                and not duplicate_probe_complete
+            ):
                 before = len(evidence.protocol_operations)
                 service.subscribe(symbols)
                 service.subscribe(symbols)
@@ -1290,34 +1541,58 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
             ):
                 runner.inject_disconnect()
                 next_reconnect += 1
+            monotonic_now = wall_time.monotonic()
+            if monotonic_now - last_status_write >= status_interval_seconds:
+                _write_live_status(
+                    status_path,
+                    evidence,
+                    state="RUNNING",
+                    report_path=args.output,
+                    log_path=log_path,
+                )
+                last_status_write = monotonic_now
             wall_time.sleep(args.poll_seconds)
     except KeyboardInterrupt:
         evidence.operator_abort_reasons.append("operator interrupted soak")
+    except Exception as exc:
+        record_runtime_failure("sampling", exc)
     finally:
         evidence.ended_at = datetime.now(timezone.utc)
-        runner.sample(evidence.ended_at)
-        watchdog.progress()
-        runner.finalize()
-        watchdog.stop()
-        service.stop()
-        safety_snapshot = safety_audit.close()
-        evidence.safety_audit_initialized = safety_snapshot.initialized
-        evidence.safety_audit_sources = list(safety_snapshot.registered_sources)
-        evidence.broker_mutation_count = (
-            safety_snapshot.broker_mutation_attempt_count
-        )
-        evidence.entry_readiness_check_count = (
-            safety_snapshot.entry_readiness_check_count
-        )
-        evidence.stale_entry_readiness_check_count = (
-            safety_snapshot.stale_entry_readiness_check_count
-        )
-        evidence.stale_entry_readiness_rejection_count = (
-            safety_snapshot.stale_entry_readiness_rejection_count
-        )
-        evidence.stale_entry_readiness_allow_count = (
-            safety_snapshot.stale_entry_readiness_allow_count
-        )
+        try:
+            runner.sample(evidence.ended_at)
+            watchdog.progress()
+            runner.finalize()
+        except Exception as exc:
+            record_runtime_failure("final_sample", exc)
+        try:
+            watchdog.stop()
+        except Exception as exc:
+            record_runtime_failure("watchdog_stop", exc)
+        try:
+            service.stop()
+        except Exception as exc:
+            record_runtime_failure("service_stop", exc)
+        try:
+            safety_snapshot = safety_audit.close()
+            evidence.safety_audit_initialized = safety_snapshot.initialized
+            evidence.safety_audit_sources = list(safety_snapshot.registered_sources)
+            evidence.broker_mutation_count = (
+                safety_snapshot.broker_mutation_attempt_count
+            )
+            evidence.entry_readiness_check_count = (
+                safety_snapshot.entry_readiness_check_count
+            )
+            evidence.stale_entry_readiness_check_count = (
+                safety_snapshot.stale_entry_readiness_check_count
+            )
+            evidence.stale_entry_readiness_rejection_count = (
+                safety_snapshot.stale_entry_readiness_rejection_count
+            )
+            evidence.stale_entry_readiness_allow_count = (
+                safety_snapshot.stale_entry_readiness_allow_count
+            )
+        except Exception as exc:
+            record_runtime_failure("safety_audit_close", exc)
         root_logger.removeHandler(log_handler)
         root_logger.setLevel(previous_root_level)
         log_handler.flush()
@@ -1340,35 +1615,72 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
     evidence.log_redaction_count = redacting_formatter.redaction_count
     report = build_report(evidence)
     _write_report(args.output, report)
+    _write_live_status(
+        status_path,
+        evidence,
+        state="PASSED" if report["result"] == "PASSED" else "FAILED",
+        report_path=args.output,
+        log_path=log_path,
+        report=report,
+    )
     print(f"Gate 2 {report['result']}: report={args.output}")
-    return 0 if report["result"] == "PASSED" else 1
+    return 0 if report["result"] == "PASSED" and not runtime_failure else 1
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run the live, read-only KIS Gate-2 soak")
+    parser = argparse.ArgumentParser(
+        description="Run the live, read-only KIS Gate-2 soak"
+    )
     parser.add_argument("--confirm-read-only", action="store_true")
     parser.add_argument("--environment", choices=("PROD", "SIM"), default="PROD")
-    parser.add_argument("--symbols", required=True, help="comma-separated critical symbols")
-    parser.add_argument("--session-date", required=True, help="NYSE session date YYYY-MM-DD")
+    parser.add_argument(
+        "--symbols", required=True, help="comma-separated critical symbols"
+    )
+    parser.add_argument(
+        "--session-date", required=True, help="NYSE session date YYYY-MM-DD"
+    )
     parser.add_argument("--gate1-report", type=Path, required=True)
     parser.add_argument("--capability-manifest", type=Path, required=True)
     parser.add_argument(
         "--redacted-evidence", type=Path, action="append", required=True
     )
-    parser.add_argument("--reconnect-after-seconds", type=float, action="append", required=True)
+    parser.add_argument(
+        "--reconnect-after-seconds", type=float, action="append", required=True
+    )
     parser.add_argument("--silent-stale-probe-after-seconds", type=float, required=True)
     parser.add_argument("--poll-seconds", type=float, default=0.1)
     parser.add_argument("--watchdog-timeout-seconds", type=float, default=2.0)
     parser.add_argument("--log-output", type=Path, required=True)
-    parser.add_argument("--output", type=Path, default=Path("artifacts/gate2_report.json"))
+    parser.add_argument(
+        "--output", type=Path, default=Path("artifacts/gate2_report.json")
+    )
+    parser.add_argument(
+        "--status-output",
+        type=Path,
+        help="atomic live checkpoint JSON (defaults beside --output)",
+    )
+    parser.add_argument("--status-seconds", type=float, default=30.0)
     args = parser.parse_args(argv)
     root = Path(__file__).resolve().parents[1]
-    for name in ("gate1_report", "capability_manifest", "log_output", "output"):
+    for name in (
+        "gate1_report",
+        "capability_manifest",
+        "log_output",
+        "output",
+        "status_output",
+    ):
         value = getattr(args, name)
-        if not value.is_absolute():
+        if value is not None and not value.is_absolute():
             setattr(args, name, root / value)
-    args.redacted_evidence = [path if path.is_absolute() else root / path for path in args.redacted_evidence]
-    return run_live_soak(args, root)
+    args.redacted_evidence = [
+        path if path.is_absolute() else root / path for path in args.redacted_evidence
+    ]
+    try:
+        return run_live_soak(args, root)
+    except Exception as exc:
+        if args.status_output is not None:
+            _write_preflight_failure(args.status_output, exc, args.output)
+        raise
 
 
 if __name__ == "__main__":

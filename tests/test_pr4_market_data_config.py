@@ -33,6 +33,8 @@ from gate2.reporting import (
     LiveGate2Runner,
     _ProgressWatchdog,
     _SecretRedactingFormatter,
+    _write_preflight_failure,
+    build_live_status,
     build_report,
     main as gate2_main,
 )
@@ -63,9 +65,7 @@ def _write_runtime_capability_manifest(
         (QUOTE_SEQUENCE, "HDFSASP0", "NO_USABLE_SEQUENCE"),
     ]
     if include_execution_notice:
-        definitions.append(
-            (EXECUTION_NOTICE, "H0GSCNI0", NOTICE_INTERPRETATION)
-        )
+        definitions.append((EXECUTION_NOTICE, "H0GSCNI0", NOTICE_INTERPRETATION))
     entries = []
     for index, (capability_id, tr_id, interpretation) in enumerate(definitions):
         sequence = (
@@ -183,9 +183,7 @@ def test_environment_template_is_credential_only_and_runtime_has_no_symbols():
         "REMOTE_CONTROL_TOKEN",
         "OPENAI_API_KEY",
     }
-    runtime = json.loads(
-        (ROOT / "config" / "runtime.json").read_text(encoding="utf-8")
-    )
+    runtime = json.loads((ROOT / "config" / "runtime.json").read_text(encoding="utf-8"))
     assert all("SYMBOL" not in key for key in runtime)
 
 
@@ -229,9 +227,7 @@ def test_buy_today_session_date_rolls_post_close_activation_forward():
     eastern = ZoneInfo("America/New_York")
     friday_after_close = dt.datetime(2026, 8, 21, 16, 5, tzinfo=eastern)
 
-    assert current_or_next_nyse_session_date(friday_after_close) == dt.date(
-        2026, 8, 24
-    )
+    assert current_or_next_nyse_session_date(friday_after_close) == dt.date(2026, 8, 24)
 
 
 def test_live_factory_requires_both_enable_and_protocol_verification(monkeypatch):
@@ -247,7 +243,8 @@ def test_live_factory_requires_both_enable_and_protocol_verification(monkeypatch
 
 
 def test_live_factory_uses_only_aggregate_pool_and_wires_verified_sequences(
-    tmp_path, monkeypatch,
+    tmp_path,
+    monkeypatch,
 ):
     from src.services.kis_ws_symbol_keys import (
         KisWsSymbolKeyStore,
@@ -342,9 +339,7 @@ def test_ws0_contract_explicitly_allows_only_inactive_provisional_adapters():
     contract = (ROOT / "docs" / "kanban_production_readiness.md").read_text(
         encoding="utf-8"
     )
-    matrix = (ROOT / "docs" / "kis_capability_matrix.md").read_text(
-        encoding="utf-8"
-    )
+    matrix = (ROOT / "docs" / "kis_capability_matrix.md").read_text(encoding="utf-8")
 
     assert "revision 3.5 pilot amendment recorded" in contract
     assert "May be written provisionally before evidence" in contract
@@ -529,7 +524,13 @@ def _passing_gate2_evidence() -> Gate2Evidence:
         frame_counts_by_tr_id={"HDFSCNT0": 100, "HDFSASP0": 100},
         record_counts_by_tr_id={"HDFSCNT0": 100, "HDFSASP0": 100},
         schema_fingerprints_by_tr_id={"HDFSCNT0": "d" * 64, "HDFSASP0": "e" * 64},
-        receive_lag_ms={"count": 200, "p50": 50.0, "p95": 100.0, "p99": 200.0, "max": 300.0},
+        receive_lag_ms={
+            "count": 200,
+            "p50": 50.0,
+            "p95": 100.0,
+            "p99": 200.0,
+            "max": 300.0,
+        },
         queue_lag_ms={"count": 200, "p50": 1.0, "p95": 2.0, "p99": 3.0, "max": 4.0},
         synthetic_stop_tests={
             "injected": 1,
@@ -579,6 +580,45 @@ def test_gate2_report_passes_only_complete_read_only_session_evidence():
     assert report["broker_mutations"] == 0
     assert not report["production_activation_authorized"]
     assert report["metrics"]["critical_subscription_ack"]["result"] == "PASSED"
+
+
+def test_gate2_live_status_is_actionable_without_persisting_subscription_keys(tmp_path):
+    evidence = _passing_gate2_evidence()
+    evidence.verified_subscription_keys = {"AAPL": "DNASAAPL-PRIVATE-KEY"}
+    evidence.acked_subscriptions = ["HDFSCNT0:AAPL"]
+    report = build_report(evidence)
+
+    status = build_live_status(
+        evidence,
+        state="FAILED",
+        report_path=tmp_path / "gate2_report.json",
+        log_path=tmp_path / "gate2_runtime.log",
+        report=report,
+    )
+
+    serialized = json.dumps(status)
+    assert status["state"] == "FAILED"
+    assert status["subscriptions"]["requested_count"] > 0
+    assert status["subscriptions"]["missing"]
+    assert status["failed_metrics"]
+    assert "verified_subscription_keys" not in serialized
+    assert "DNASAAPL-PRIVATE-KEY" not in serialized
+
+
+def test_gate2_preflight_failure_status_redacts_credentials(tmp_path, monkeypatch):
+    monkeypatch.setenv("KIS_PROD_APP_SECRET", "TOP-SECRET-VALUE")
+    status_path = tmp_path / "live_status.json"
+
+    _write_preflight_failure(
+        status_path,
+        RuntimeError("invalid manifest TOP-SECRET-VALUE"),
+        tmp_path / "gate2_report.json",
+    )
+
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    assert status["state"] == "PREFLIGHT_FAILED"
+    assert status["blockers"] == ["preflight_failed"]
+    assert status["error"]["message"] == "invalid manifest <redacted-secret>"
 
 
 def test_gate2_report_fails_closed_for_activation_or_missing_reconnect_evidence():
@@ -720,7 +760,9 @@ def test_gate2_progress_watchdog_produces_independent_measurement_cycles():
     assert 0 < evidence.watchdog_max_gap_seconds <= 0.5
 
 
-def test_gate2_capability_manifest_requires_reviewed_matching_nonempty_evidence(tmp_path):
+def test_gate2_capability_manifest_requires_reviewed_matching_nonempty_evidence(
+    tmp_path,
+):
     commit = "a" * 40
     entries = []
     definitions = (

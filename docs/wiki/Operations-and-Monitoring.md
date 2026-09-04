@@ -35,7 +35,10 @@ duplicate submission.
 - `data/event_journal.jsonl`: append-only lifecycle evidence
 - `data/orders.json`: local durable legacy order ledger
 - refresh status/log files under `data/`
-- Gate 1/Gate 2 evidence under `artifacts/` when generated
+- Gate 1 reports under `artifacts/` when generated
+- unattended Gate 2 session checkpoints, logs, and reports under
+  `%USERPROFILE%\quant_evidence\gate2_sessions`; inspect the newest session
+  with `python scripts/manage_gate2_session.py status`
 
 Do not paste raw account responses or tokens into issues/screenshots.
 
