@@ -8,6 +8,7 @@ installs them into the process before this module resolves its typed values.
 Explicit OS-level variables remain useful for isolated tests and emergency
 deployment overrides without putting operational configuration in ``.env``.
 """
+
 from __future__ import annotations
 
 import math
@@ -179,9 +180,7 @@ def _env_text(name: str, default: str = "") -> str:
 
 # --- Entry attempt lifetime and retry (section 393-399) ---------------------
 ENTRY_ATTEMPT_TTL_SECONDS = _env_int("ENTRY_ATTEMPT_TTL_SECONDS", 15, minimum=1)
-ENTRY_RETRY_COOLDOWN_SECONDS = _env_int(
-    "ENTRY_RETRY_COOLDOWN_SECONDS", 3, minimum=0
-)
+ENTRY_RETRY_COOLDOWN_SECONDS = _env_int("ENTRY_RETRY_COOLDOWN_SECONDS", 3, minimum=0)
 MAX_ENTRY_ATTEMPTS_PER_SYMBOL_PER_MINUTE = _env_int(
     "MAX_ENTRY_ATTEMPTS_PER_SYMBOL_PER_MINUTE", 4, minimum=1
 )
@@ -190,9 +189,7 @@ MAX_ENTRY_ATTEMPTS_PER_SYMBOL_PER_MINUTE = _env_int(
 # A liquidation must retry aggressively (an open position with no working
 # sell order is real, ongoing risk) but a rejected/erroring submission must
 # not be resubmitted on literally every 1-second heartbeat tick.
-EXIT_RETRY_COOLDOWN_SECONDS = _env_int(
-    "EXIT_RETRY_COOLDOWN_SECONDS", 5, minimum=0
-)
+EXIT_RETRY_COOLDOWN_SECONDS = _env_int("EXIT_RETRY_COOLDOWN_SECONDS", 5, minimum=0)
 
 # --- Exit order TTL / cancel-confirm / reprice cycle (code review: "a
 # partially filled working [Sell All] order could remain open indefinitely
@@ -204,9 +201,7 @@ EXIT_RETRY_COOLDOWN_SECONDS = _env_int(
 PARTIAL_EXIT_ATTEMPT_TTL_SECONDS = _env_int(
     "PARTIAL_EXIT_ATTEMPT_TTL_SECONDS", 10, minimum=1
 )
-SELL_ALL_ATTEMPT_TTL_SECONDS = _env_int(
-    "SELL_ALL_ATTEMPT_TTL_SECONDS", 5, minimum=1
-)
+SELL_ALL_ATTEMPT_TTL_SECONDS = _env_int("SELL_ALL_ATTEMPT_TTL_SECONDS", 5, minimum=1)
 EXIT_CANCEL_CONFIRMATION_TIMEOUT_SECONDS = _env_int(
     "EXIT_CANCEL_CONFIRMATION_TIMEOUT_SECONDS", 10, minimum=1
 )
@@ -231,15 +226,11 @@ COORDINATION_RU_PROFILE = "operator-executor-sync-v8"
 # cap Internet coordination traffic without delaying broker-boundary fencing.
 COORDINATION_ACTIVE_CARD_POLL_SECONDS = max(
     180.0,
-    _env_float(
-        "COORDINATION_ACTIVE_CARD_POLL_SECONDS", 180.0, minimum=180.0
-    ),
+    _env_float("COORDINATION_ACTIVE_CARD_POLL_SECONDS", 180.0, minimum=180.0),
 )
 COORDINATION_STANDBY_CARD_POLL_SECONDS = max(
     300.0,
-    _env_float(
-        "COORDINATION_STANDBY_CARD_POLL_SECONDS", 300.0, minimum=300.0
-    ),
+    _env_float("COORDINATION_STANDBY_CARD_POLL_SECONDS", 300.0, minimum=300.0),
 )
 # The runtime-device heartbeat is itself a real coordination-store write, and
 # every safety-critical mutation independently proves database/lease state.
@@ -261,9 +252,7 @@ COORDINATION_LEASE_POLL_SECONDS = max(
 # action boundary and publishes immediately when runtime details change.
 COORDINATION_DEVICE_HEARTBEAT_SECONDS = max(
     240.0,
-    _env_float(
-        "COORDINATION_DEVICE_HEARTBEAT_SECONDS", 240.0, minimum=240.0
-    ),
+    _env_float("COORDINATION_DEVICE_HEARTBEAT_SECONDS", 240.0, minimum=240.0),
 )
 # The stale-owner and standby-readiness fences must always exceed the write
 # cadence. Sixty seconds of delivery/scheduling margin prevents an ordinary
@@ -295,9 +284,7 @@ EXTERNAL_WATCHDOG_HEARTBEAT_SECONDS = max(
 )
 EXTERNAL_WATCHDOG_TIDB_AUDIT_SECONDS = max(
     3600.0,
-    _env_float(
-        "EXTERNAL_WATCHDOG_TIDB_AUDIT_SECONDS", 3600.0, minimum=3600.0
-    ),
+    _env_float("EXTERNAL_WATCHDOG_TIDB_AUDIT_SECONDS", 3600.0, minimum=3600.0),
 )
 # Once a critical alert has been delivered successfully, the durable incident
 # remains open until an operator acknowledges it. Re-sending the same alert
@@ -306,9 +293,7 @@ EXTERNAL_WATCHDOG_TIDB_AUDIT_SECONDS = max(
 # their independent exponential retry schedule.
 EXTERNAL_ALERT_ACK_REMINDER_SECONDS = max(
     3600.0,
-    _env_float(
-        "EXTERNAL_ALERT_ACK_REMINDER_SECONDS", 21600.0, minimum=3600.0
-    ),
+    _env_float("EXTERNAL_ALERT_ACK_REMINDER_SECONDS", 21600.0, minimum=3600.0),
 )
 # Operator commands are the hottest remaining coordination read while the US
 # regular session is open.  Production measurements near 20 RU/s were
@@ -320,9 +305,7 @@ EXTERNAL_ALERT_ACK_REMINDER_SECONDS = max(
 # The local market/stop loop and broker-boundary lease proof are independent.
 COORDINATION_OPERATOR_COMMAND_POLL_SECONDS = max(
     20.0,
-    _env_float(
-        "COORDINATION_OPERATOR_COMMAND_POLL_SECONDS", 20.0, minimum=20.0
-    ),
+    _env_float("COORDINATION_OPERATOR_COMMAND_POLL_SECONDS", 20.0, minimum=20.0),
 )
 COORDINATION_OFF_HOURS_POLL_SECONDS = max(
     300.0,
@@ -345,18 +328,14 @@ COORDINATION_STATE_SYNC_SECONDS = max(
 )
 COORDINATION_BOARD_PROJECTION_SECONDS = max(
     180.0,
-    _env_float(
-        "COORDINATION_BOARD_PROJECTION_SECONDS", 180.0, minimum=180.0
-    ),
+    _env_float("COORDINATION_BOARD_PROJECTION_SECONDS", 180.0, minimum=180.0),
 )
 # When the existing Tailscale listener confirms change-pulse protocol v2/v3,
 # unchanged display/card/command reads use this disaster-recovery fallback.
 # Normal cross-device changes arrive as local tokens and reconcile at once.
 COORDINATION_REMOTE_FALLBACK_SECONDS = max(
     3600.0,
-    _env_float(
-        "COORDINATION_REMOTE_FALLBACK_SECONDS", 3600.0, minimum=3600.0
-    ),
+    _env_float("COORDINATION_REMOTE_FALLBACK_SECONDS", 3600.0, minimum=3600.0),
 )
 PENDING_ORDER_RECONCILIATION_SECONDS = max(
     2, _env_int("PENDING_ORDER_RECONCILIATION_SECONDS", 2, minimum=2)
@@ -367,20 +346,14 @@ UNKNOWN_ORDER_RECONCILIATION_SECONDS = max(
 ACTIVE_ACCOUNT_REFRESH_SECONDS = _env_int(
     "ACTIVE_ACCOUNT_REFRESH_SECONDS", 5, minimum=1
 )
-IDLE_ACCOUNT_REFRESH_SECONDS = _env_int(
-    "IDLE_ACCOUNT_REFRESH_SECONDS", 20, minimum=1
-)
-FULL_RECONCILIATION_SECONDS = _env_int(
-    "FULL_RECONCILIATION_SECONDS", 60, minimum=1
-)
+IDLE_ACCOUNT_REFRESH_SECONDS = _env_int("IDLE_ACCOUNT_REFRESH_SECONDS", 20, minimum=1)
+FULL_RECONCILIATION_SECONDS = _env_int("FULL_RECONCILIATION_SECONDS", 60, minimum=1)
 # Broker truth still refreshes every minute. The relational comparison side
 # is process-local between canonical writes and is force-refreshed from TiDB
 # periodically, avoiding the same three unchanged table reads every minute.
 COORDINATION_RECONCILIATION_CACHE_SECONDS = max(
     300.0,
-    _env_float(
-        "COORDINATION_RECONCILIATION_CACHE_SECONDS", 900.0, minimum=300.0
-    ),
+    _env_float("COORDINATION_RECONCILIATION_CACHE_SECONDS", 900.0, minimum=300.0),
 )
 # Broker status/fill/recovery transitions are persisted immediately.  When an
 # exact working order is observed with no semantic change, its durable
@@ -456,12 +429,8 @@ KIS_WS_TOTAL_SUBSCRIPTION_CAPACITY = _env_int(
 # Deprecated as live KIS limits: credentialed WS0 evidence proved one
 # aggregate pool. These remain only for compatibility with older diagnostics;
 # production composition derives both candidate sets from TOTAL capacity.
-KIS_WS_TRADE_CHANNEL_CAPACITY = _env_int(
-    "KIS_WS_TRADE_CHANNEL_CAPACITY", 0, minimum=0
-)
-KIS_WS_QUOTE_CHANNEL_CAPACITY = _env_int(
-    "KIS_WS_QUOTE_CHANNEL_CAPACITY", 0, minimum=0
-)
+KIS_WS_TRADE_CHANNEL_CAPACITY = _env_int("KIS_WS_TRADE_CHANNEL_CAPACITY", 0, minimum=0)
+KIS_WS_QUOTE_CHANNEL_CAPACITY = _env_int("KIS_WS_QUOTE_CHANNEL_CAPACITY", 0, minimum=0)
 KIS_WS_RAW_CAPTURE_ENABLED = _env_bool("KIS_WS_RAW_CAPTURE_ENABLED", False)
 # Stable identity used only after a symbol is explicitly assigned to this
 # Kanban strategy in the durable ownership table.  It does not activate the
@@ -509,18 +478,10 @@ EMERGENCY_LEASE_ALLOWANCE_SECONDS = _env_float(
 # Workstream 10 / Workstream 0 boundary. These values are inert unless the
 # operator explicitly records that the KIS mutation limits were measured and
 # verified. Keeping VERIFIED false leaves all new-entry buckets UNKNOWN.
-KIS_MUTATION_BUDGET_VERIFIED = _env_bool(
-    "KIS_MUTATION_BUDGET_VERIFIED", False
-)
-KIS_SUBMIT_MUTATION_CAPACITY = _env_int(
-    "KIS_SUBMIT_MUTATION_CAPACITY", 0, minimum=0
-)
-KIS_CANCEL_MUTATION_CAPACITY = _env_int(
-    "KIS_CANCEL_MUTATION_CAPACITY", 0, minimum=0
-)
-KIS_REPLACE_MUTATION_CAPACITY = _env_int(
-    "KIS_REPLACE_MUTATION_CAPACITY", 0, minimum=0
-)
+KIS_MUTATION_BUDGET_VERIFIED = _env_bool("KIS_MUTATION_BUDGET_VERIFIED", False)
+KIS_SUBMIT_MUTATION_CAPACITY = _env_int("KIS_SUBMIT_MUTATION_CAPACITY", 0, minimum=0)
+KIS_CANCEL_MUTATION_CAPACITY = _env_int("KIS_CANCEL_MUTATION_CAPACITY", 0, minimum=0)
+KIS_REPLACE_MUTATION_CAPACITY = _env_int("KIS_REPLACE_MUTATION_CAPACITY", 0, minimum=0)
 KIS_MUTATION_BUDGET_WINDOW_SECONDS = _env_float(
     "KIS_MUTATION_BUDGET_WINDOW_SECONDS",
     1.0,
@@ -549,16 +510,22 @@ KIS_MUTATION_MAX_CONFIRMED_ATTEMPTS = _env_int(
 # Supervised production envelope. DISABLED is an additional one-way fence on
 # the Kanban engine even when the administrative and in-session trading
 # switches are both armed. CONTROLLED_LIVE permits BUY entries only for
-# persisted active Trade Cards and caps each entry command's notional.
-# Protective SELL/cancel paths are not constrained by the entry cap. FULL_LIVE
-# is a later explicit operational promotion, not a code-path change. Symbols
-# deliberately do not live in environment configuration; Buy Today is the
-# operator-owned persisted live-stock list.
-KIS_LIVE_EXECUTION_MODE = _env_text(
-    "KIS_LIVE_EXECUTION_MODE", "DISABLED"
-).upper()
+# persisted active Trade Cards and caps each entry command against the fresh
+# account-equity fraction and/or fixed USD ceiling. Protective SELL/cancel
+# paths are not constrained by the entry cap. FULL_LIVE is a later explicit
+# operational promotion, not a code-path change. Symbols deliberately do not
+# live in environment configuration; Buy Today is the operator-owned persisted
+# live-stock list.
+KIS_LIVE_EXECUTION_MODE = _env_text("KIS_LIVE_EXECUTION_MODE", "DISABLED").upper()
 KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL = _env_float(
     "KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL", 0.0, minimum=0.0
+)
+KIS_CONTROLLED_LIVE_MAX_ENTRY_EQUITY_FRACTION = _env_float(
+    "KIS_CONTROLLED_LIVE_MAX_ENTRY_EQUITY_FRACTION",
+    0.0,
+    minimum=0.0,
+    maximum=1.0,
+    entry_boundary=True,
 )
 
 # --- Portfolio-level entry governor ---------------------------------------
@@ -657,9 +624,7 @@ EOD_ENTRY_CLEANUP_SECONDS_BEFORE_CLOSE = _env_int(
 # conservative placeholder covering typical US overseas-brokerage round-trip
 # commission -- must be reviewed against the real account's fee schedule
 # before any live breakeven stop is placed off of it.
-BREAKEVEN_BUFFER_BPS = _env_float(
-    "BREAKEVEN_BUFFER_BPS", 15.0, minimum=0.0
-)
+BREAKEVEN_BUFFER_BPS = _env_float("BREAKEVEN_BUFFER_BPS", 15.0, minimum=0.0)
 
 
 def is_buyboard_engine_enabled() -> bool:

@@ -43,7 +43,8 @@ KIS_CAPABILITY_MANIFEST_SHA256=<reviewed manifest digest>
 KIS_RUNTIME_COMMIT_SHA=<exact deployed 40-character commit>
 
 KIS_LIVE_EXECUTION_MODE=CONTROLLED_LIVE
-KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL=<minimum practical per-entry cap>
+KIS_CONTROLLED_LIVE_MAX_ENTRY_EQUITY_FRACTION=<reviewed fraction of current account NAV>
+KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL=<optional additional fixed USD ceiling; 0 disables it>
 
 KIS_MUTATION_BUDGET_VERIFIED=true
 KIS_SUBMIT_MUTATION_CAPACITY=<reviewed conservative policy>
@@ -69,9 +70,12 @@ starts disarmed after every process launch. Each ON action is bound to the
 current/next NYSE session and the approved runtime commit; it becomes
 ineffective at that session's close or after a release change and must be
 confirmed again. A legacy unscoped ON row fails closed. `CONTROLLED_LIVE`
-additionally
-blocks production BUYs without an exact active canonical Trade Card or above
-the per-entry cap.
+additionally blocks production BUYs without an exact active canonical Trade
+Card or above the per-entry cap. A configured equity fraction is evaluated
+again for every BUY from the fresh, exact-account KIS total-equity snapshot
+(cash plus the current value of positions). A missing or stale equity snapshot
+blocks the BUY. When both a percentage cap and fixed USD ceiling are
+configured, the lower ceiling wins.
 Protective SELLs are not blocked by the entry cap. The shared scheduler
 enforces process-wide spacing across endpoints and performs one mutation
 attempt only. The low-level KIS token-expiry branches also do not repeat a
@@ -125,8 +129,8 @@ card in Buy Today authorizes that exact environment/account/symbol for
 controlled-live entry. Entry Pending remains authorized while its durable
 order is tracked, and an Open Position may buy only the recorded remainder of
 an `ENTRY_COMPLETING` partial entry. Ordinary open positions and any exit in
-progress do not authorize additional buying. A planned entry above
-`KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL` remains blocked at the final broker
+progress do not authorize additional buying. A planned entry above the
+configured percentage or fixed ceiling remains blocked at the final broker
 adapter. The dashboard header displays the mode, active cards, and cap; verify
 that full text rather than relying on "Live Trading: Enabled."
 Promotion to `FULL_LIVE` is a separate financial-scope decision and must not

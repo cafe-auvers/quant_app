@@ -13,6 +13,7 @@ A zero exit code means configuration/preflight passed.  The in-application
 trading switch still starts OFF and must be armed explicitly after the runtime
 reaches ACTIVE with fresh broker/market-data readiness.
 """
+
 from __future__ import annotations
 
 import os
@@ -134,8 +135,7 @@ def main() -> int:
     result.check(
         "approved exact-release identity",
         not release_identity.issues,
-        "; ".join(release_identity.issues)
-        or "release identity could not be verified",
+        "; ".join(release_identity.issues) or "release identity could not be verified",
     )
 
     for name in (
@@ -182,10 +182,15 @@ def main() -> int:
             "No persisted Buy Today/Entry Pending cards are active; controlled-live "
             "entry remains fail-closed until a reviewed plan is activated."
         )
+    fixed_entry_cap = float(execution_config.KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL)
+    equity_entry_fraction = float(
+        execution_config.KIS_CONTROLLED_LIVE_MAX_ENTRY_EQUITY_FRACTION
+    )
     result.check(
         "entry notional cap",
-        float(execution_config.KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL) > 0,
-        "KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL must be positive",
+        fixed_entry_cap > 0 or 0 < equity_entry_fraction <= 1,
+        "set a positive KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL or an account-equity "
+        "fraction in (0, 1]",
     )
 
     def _check_symbol_map() -> None:
@@ -193,15 +198,12 @@ def main() -> int:
         if snapshot.last_error:
             raise RuntimeError(snapshot.last_error)
         normalized = dict(snapshot.keys)
-        missing = [
-            symbol
-            for symbol in live_symbols
-            if not normalized.get(symbol)
-        ]
+        missing = [symbol for symbol in live_symbols if not normalized.get(symbol)]
         if missing:
             raise RuntimeError(
                 "missing verified WebSocket keys for: " + ", ".join(sorted(missing))
             )
+
     result.guarded("controlled symbol WebSocket keys", _check_symbol_map)
 
     scheduler = KisRequestScheduler(
@@ -224,8 +226,7 @@ def main() -> int:
             environment="PROD",
         )
         priority = {
-            symbol: int(SubscriptionPriority.CRITICAL_EXIT)
-            for symbol in live_symbols
+            symbol: int(SubscriptionPriority.CRITICAL_EXIT) for symbol in live_symbols
         }
         service.configure_desired_channels(
             trade_priorities=priority,
@@ -233,9 +234,13 @@ def main() -> int:
         )
         capacity = service.subscription_capacity_snapshot()
         if live_symbols and capacity.reconnect_replay_count <= 0:
-            raise RuntimeError("no controlled-live WebSocket registrations were composed")
+            raise RuntimeError(
+                "no controlled-live WebSocket registrations were composed"
+            )
         if capacity.reconnect_replay_count > capacity.total_capacity:
-            raise RuntimeError("configured WebSocket registrations exceed total capacity")
+            raise RuntimeError(
+                "configured WebSocket registrations exceed total capacity"
+            )
 
     result.guarded(
         "reviewed production WebSocket composition (no connection)",

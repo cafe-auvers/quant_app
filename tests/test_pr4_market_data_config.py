@@ -486,6 +486,7 @@ def _passing_gate2_evidence() -> Gate2Evidence:
             "KIS_LIVE_EXECUTION_MODE": "DISABLED",
             "CONTROLLED_LIVE_ACTIVE_CARD_SYMBOLS": [],
             "KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL": 0.0,
+            "KIS_CONTROLLED_LIVE_MAX_ENTRY_EQUITY_FRACTION": 0.0,
         },
         session_open=opened,
         session_close=closed,

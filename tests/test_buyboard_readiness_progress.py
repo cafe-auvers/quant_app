@@ -45,9 +45,41 @@ def test_live_execution_status_names_the_controlled_scope(monkeypatch):
         "KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL",
         0.01,
     )
+    monkeypatch.setattr(
+        main_window_module.execution_config,
+        "KIS_CONTROLLED_LIVE_MAX_ENTRY_EQUITY_FRACTION",
+        0.0,
+    )
 
     assert _live_execution_status_text(True) == (
         "Enabled (CONTROLLED_LIVE active cards: STIM, max $0.01/entry)"
+    )
+
+
+def test_live_execution_status_names_dynamic_nav_cap(monkeypatch):
+    monkeypatch.setattr(
+        main_window_module.execution_config,
+        "KIS_LIVE_EXECUTION_MODE",
+        "CONTROLLED_LIVE",
+    )
+    monkeypatch.setattr(
+        readiness_presenter,
+        "controlled_live_symbols",
+        lambda **_kwargs: ("AAPL",),
+    )
+    monkeypatch.setattr(
+        main_window_module.execution_config,
+        "KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL",
+        0.0,
+    )
+    monkeypatch.setattr(
+        main_window_module.execution_config,
+        "KIS_CONTROLLED_LIVE_MAX_ENTRY_EQUITY_FRACTION",
+        0.30,
+    )
+
+    assert _live_execution_status_text(True) == (
+        "Enabled (CONTROLLED_LIVE active cards: AAPL, max 30% current NAV/entry)"
     )
 
 

@@ -70,6 +70,7 @@ SAFE_RUNTIME_EXPECTATIONS = {
     "KIS_REPLACE_MUTATION_CAPACITY": 0,
     "KIS_LIVE_EXECUTION_MODE": "DISABLED",
     "KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL": 0.0,
+    "KIS_CONTROLLED_LIVE_MAX_ENTRY_EQUITY_FRACTION": 0.0,
 }
 
 
@@ -114,6 +115,9 @@ def runtime_activation_snapshot() -> dict[str, bool | int | float | str | list[s
         "CONTROLLED_LIVE_ACTIVE_CARD_SYMBOLS": list(controlled_live_symbols()),
         "KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL": float(
             execution_config.KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL
+        ),
+        "KIS_CONTROLLED_LIVE_MAX_ENTRY_EQUITY_FRACTION": float(
+            execution_config.KIS_CONTROLLED_LIVE_MAX_ENTRY_EQUITY_FRACTION
         ),
     }
 
