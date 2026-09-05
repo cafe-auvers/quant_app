@@ -15,7 +15,8 @@ reference; startup migrates recognized legacy runtime keys out of `.env`.
 | `BUYBOARD_ENGINE_ENABLED` | Guarded Kanban runtime availability | `true`; not broker authorization |
 | `KANBAN_STRATEGY_INSTANCE_ID` | Stable Kanban ownership identity | Must be deliberate |
 | `KIS_LIVE_EXECUTION_MODE` | Disabled/controlled/full-live envelope | Disabled |
-| `KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL` | Controlled-live per-entry cap | Zero blocks entry |
+| `KIS_CONTROLLED_LIVE_MAX_ENTRY_EQUITY_FRACTION` | Controlled-live per-entry share of fresh account NAV | Zero disables this cap |
+| `KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL` | Optional additional fixed USD per-entry ceiling | Zero disables this cap; at least one controlled-live cap is required |
 | `KIS_WS_*`, `KIS_MARKET_DATA_*` | Verified real-time capability | Fail-closed |
 | `KIS_MUTATION_*` | Shared request budgets and spacing | Unknown/zero blocks entry |
 | `EXTERNAL_ALERT_*` | Critical out-of-process alerting | Optional |

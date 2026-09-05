@@ -6,17 +6,18 @@ or legacy recovery composition reaches the gateway. Controlled live and full
 live use the same gateway/broker path; promotion changes configuration, not
 execution code.
 """
+
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, Callable
 
 from sqlalchemy.engine import Engine
 
 from src.core import execution_config
 from src.core.order_state import OrderSide
 from src.core.trade_card_state import BoardStatus, PositionRuntimeStatus
-from src.services import trade_card_repository
+from src.services import buying_power_cache, trade_card_repository
 
 
 CONTROLLED_LIVE = "CONTROLLED_LIVE"
@@ -120,11 +121,29 @@ def require_controlled_live_configuration(
             "CONTROLLED_LIVE requires the reviewed production WebSocket path"
         )
     if mode == CONTROLLED_LIVE:
-        if not math.isfinite(
-            execution_config.KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL
-        ) or execution_config.KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL <= 0:
+        try:
+            fixed_cap = float(execution_config.KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL)
+            equity_fraction = float(
+                execution_config.KIS_CONTROLLED_LIVE_MAX_ENTRY_EQUITY_FRACTION
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
             raise _configuration_error(
-                "CONTROLLED_LIVE requires a positive maximum entry notional"
+                "CONTROLLED_LIVE entry caps must be valid finite numbers"
+            ) from exc
+        if (
+            not math.isfinite(fixed_cap)
+            or fixed_cap < 0
+            or not math.isfinite(equity_fraction)
+            or not 0 <= equity_fraction <= 1
+        ):
+            raise _configuration_error(
+                "CONTROLLED_LIVE entry caps must be finite and non-negative, and "
+                "the account-equity fraction cannot exceed 1"
+            )
+        if fixed_cap <= 0 and equity_fraction <= 0:
+            raise _configuration_error(
+                "CONTROLLED_LIVE requires a positive fixed or account-equity "
+                "maximum entry cap"
             )
         if int(execution_config.KIS_MUTATION_MAX_CONFIRMED_ATTEMPTS) != 1:
             raise _configuration_error(
@@ -139,16 +158,12 @@ def require_controlled_live_configuration(
                 ),
                 (
                     "PORTFOLIO_MAX_TOTAL_OPEN_RISK_FRACTION",
-                    float(
-                        execution_config.PORTFOLIO_MAX_TOTAL_OPEN_RISK_FRACTION
-                    ),
+                    float(execution_config.PORTFOLIO_MAX_TOTAL_OPEN_RISK_FRACTION),
                     CONTROLLED_LIVE_MAX_TOTAL_OPEN_RISK_FRACTION,
                 ),
                 (
                     "PORTFOLIO_MAX_GROSS_NOTIONAL_FRACTION",
-                    float(
-                        execution_config.PORTFOLIO_MAX_GROSS_NOTIONAL_FRACTION
-                    ),
+                    float(execution_config.PORTFOLIO_MAX_GROSS_NOTIONAL_FRACTION),
                     CONTROLLED_LIVE_MAX_GROSS_NOTIONAL_FRACTION,
                 ),
             )
@@ -181,9 +196,7 @@ def require_controlled_live_configuration(
             )
 
 
-def require_live_mutation_allowed(
-    *, environment: str, action: str
-) -> None:
+def require_live_mutation_allowed(*, environment: str, action: str) -> None:
     """Reject every real production mutation while the envelope is disabled."""
 
     if str(environment or "").strip().upper() != "PROD":
@@ -208,6 +221,7 @@ def require_live_entry_allowed(
     quantity: int,
     limit_price: float,
     engine: Engine | None = None,
+    account_equity_provider: Callable[[str, str], float] | None = None,
 ) -> None:
     """Fence a real production BUY at the final broker adapter boundary.
 
@@ -219,15 +233,15 @@ def require_live_entry_allowed(
     if str(environment or "").strip().upper() != "PROD":
         return
     require_live_mutation_allowed(environment=environment, action="order submission")
-    normalized_side = side if isinstance(side, OrderSide) else OrderSide(str(side).upper())
+    normalized_side = (
+        side if isinstance(side, OrderSide) else OrderSide(str(side).upper())
+    )
     if normalized_side != OrderSide.BUY:
         return
     invalid_entry_configuration = execution_config.entry_configuration_issues()
     if invalid_entry_configuration:
         names = ", ".join(item.split(":", 1)[0] for item in invalid_entry_configuration)
-        raise _configuration_error(
-            f"invalid entry-risk runtime override(s): {names}"
-        )
+        raise _configuration_error(f"invalid entry-risk runtime override(s): {names}")
     if _mode() == FULL_LIVE:
         return
     normalized_symbol = str(symbol or "").strip().upper()
@@ -248,11 +262,38 @@ def require_live_entry_allowed(
             "Blocked production BUY: CONTROLLED_LIVE entry notional must be positive "
             "and finite. No broker mutation was sent. Correct the order and retry."
         )
-    if notional > float(execution_config.KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL):
+    entry_caps: list[float] = []
+    fixed_cap = float(execution_config.KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL)
+    if fixed_cap > 0:
+        entry_caps.append(fixed_cap)
+    equity_fraction = float(
+        execution_config.KIS_CONTROLLED_LIVE_MAX_ENTRY_EQUITY_FRACTION
+    )
+    if equity_fraction > 0:
+        provider = account_equity_provider or (
+            buying_power_cache.make_account_equity_provider()
+        )
+        try:
+            account_equity = float(provider(environment, account_no) or 0.0)
+        except Exception as exc:
+            raise LiveExecutionEnvelopeError(
+                "Blocked production BUY: current account equity could not be read "
+                "for the CONTROLLED_LIVE percentage cap. No broker mutation was "
+                "sent. Refresh broker account state and retry."
+            ) from exc
+        if not math.isfinite(account_equity) or account_equity <= 0:
+            raise LiveExecutionEnvelopeError(
+                "Blocked production BUY: fresh positive current account equity is "
+                "required for the CONTROLLED_LIVE percentage cap. No broker mutation "
+                "was sent. Refresh broker account state and retry."
+            )
+        entry_caps.append(account_equity * equity_fraction)
+    maximum_notional = min(entry_caps)
+    if notional > maximum_notional:
         raise LiveExecutionEnvelopeError(
             "Blocked production BUY: the entry exceeds the CONTROLLED_LIVE maximum "
-            "notional. No broker mutation was sent. Reduce the order or deliberately "
-            "review the configured ceiling before retrying."
+            f"notional ({maximum_notional:.2f}). No broker mutation was sent. Reduce "
+            "the order or deliberately review the configured ceiling before retrying."
         )
 
 
@@ -293,8 +334,7 @@ def controlled_live_symbols(
         symbols = {
             str(card.symbol or "").strip().upper()
             for card in cards
-            if str(card.environment or "").strip().upper()
-            == normalized_environment
+            if str(card.environment or "").strip().upper() == normalized_environment
             and (
                 not normalized_account
                 or str(card.account_no or "").strip() == normalized_account
@@ -367,6 +407,5 @@ def automatic_mutation_retry_permitted(*, environment: str) -> bool:
     """
 
     return not (
-        str(environment or "").strip().upper() == "PROD"
-        and _mode() == CONTROLLED_LIVE
+        str(environment or "").strip().upper() == "PROD" and _mode() == CONTROLLED_LIVE
     )

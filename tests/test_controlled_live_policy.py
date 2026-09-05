@@ -16,6 +16,7 @@ from src.core.trade_card_state import (
     TradeCardState,
 )
 from src.services import controlled_live_policy
+from src.services import buying_power_cache
 from src.services import trade_card_repository
 from src.services.broker import KisBroker
 from src.services.controlled_live_policy import (
@@ -33,6 +34,9 @@ def _configure_controlled_live(monkeypatch) -> None:
     monkeypatch.setattr(
         execution_config, "KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL", 500.0
     )
+    monkeypatch.setattr(
+        execution_config, "KIS_CONTROLLED_LIVE_MAX_ENTRY_EQUITY_FRACTION", 0.0
+    )
     monkeypatch.setattr(execution_config, "KIS_MUTATION_BUDGET_VERIFIED", True)
     monkeypatch.setattr(execution_config, "KIS_SUBMIT_MUTATION_CAPACITY", 2)
     monkeypatch.setattr(execution_config, "KIS_CANCEL_MUTATION_CAPACITY", 2)
@@ -42,15 +46,11 @@ def _configure_controlled_live(monkeypatch) -> None:
     monkeypatch.setattr(execution_config, "KIS_WS_ENABLED", True)
     monkeypatch.setattr(execution_config, "KIS_WS_PROTOCOL_VERIFIED", True)
     monkeypatch.setattr(execution_config, "KIS_MARKET_DATA_MODE", "WEBSOCKET")
-    monkeypatch.setattr(
-        execution_config, "PORTFOLIO_MAX_SIMULTANEOUS_POSITIONS", 30
-    )
+    monkeypatch.setattr(execution_config, "PORTFOLIO_MAX_SIMULTANEOUS_POSITIONS", 30)
     monkeypatch.setattr(
         execution_config, "PORTFOLIO_MAX_TOTAL_OPEN_RISK_FRACTION", 0.10
     )
-    monkeypatch.setattr(
-        execution_config, "PORTFOLIO_MAX_GROSS_NOTIONAL_FRACTION", 2.0
-    )
+    monkeypatch.setattr(execution_config, "PORTFOLIO_MAX_GROSS_NOTIONAL_FRACTION", 2.0)
     monkeypatch.setattr(execution_config, "is_buyboard_engine_enabled", lambda: True)
 
 
@@ -194,15 +194,11 @@ def test_controlled_live_configuration_requires_no_retry_spacing_and_budgets(
         min_mutation_spacing_seconds=0.2,
     )
 
-    require_controlled_live_configuration(
-        environment="PROD", scheduler=scheduler
-    )
+    require_controlled_live_configuration(environment="PROD", scheduler=scheduler)
 
     monkeypatch.setattr(execution_config, "KIS_MUTATION_MAX_CONFIRMED_ATTEMPTS", 2)
     with pytest.raises(LiveExecutionEnvelopeError, match="forbids automatic"):
-        require_controlled_live_configuration(
-            environment="PROD", scheduler=scheduler
-        )
+        require_controlled_live_configuration(environment="PROD", scheduler=scheduler)
 
 
 @pytest.mark.parametrize(
@@ -273,7 +269,8 @@ def test_buyboard_engine_defaults_enabled_but_accepts_explicit_recovery_disable(
 @pytest.mark.parametrize("engine_enabled", [True, False])
 @pytest.mark.usefixtures("trading_enabled")
 def test_disabled_live_envelope_runs_engine_but_blocks_submit_sell_and_cancel(
-    monkeypatch, engine_enabled,
+    monkeypatch,
+    engine_enabled,
 ):
     monkeypatch.setattr(execution_config, "KIS_LIVE_EXECUTION_MODE", "DISABLED")
     monkeypatch.setattr(
@@ -320,7 +317,8 @@ def test_disabled_live_envelope_runs_engine_but_blocks_submit_sell_and_cancel(
 
 @pytest.mark.usefixtures("trading_enabled")
 def test_controlled_live_entry_envelope_blocks_unlisted_or_oversized_buy(
-    tmp_path, monkeypatch,
+    tmp_path,
+    monkeypatch,
 ):
     _configure_controlled_live(monkeypatch)
     engine = _engine(tmp_path)
@@ -344,7 +342,9 @@ def test_controlled_live_entry_envelope_blocks_unlisted_or_oversized_buy(
     )
     assert accepted.broker_order_id == "B-1"
 
-    with pytest.raises(LiveExecutionEnvelopeError, match="unapproved symbol") as unlisted:
+    with pytest.raises(
+        LiveExecutionEnvelopeError, match="unapproved symbol"
+    ) as unlisted:
         broker.submit_order(
             environment="PROD",
             account_no="1",
@@ -391,6 +391,137 @@ def test_controlled_live_entry_cap_never_blocks_protective_sell(monkeypatch):
     assert calls[0]["side"] == "sell"
 
 
+@pytest.mark.usefixtures("trading_enabled")
+def test_controlled_live_percentage_cap_uses_current_total_equity(
+    tmp_path, monkeypatch
+):
+    _configure_controlled_live(monkeypatch)
+    monkeypatch.setattr(execution_config, "KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL", 0.0)
+    monkeypatch.setattr(
+        execution_config, "KIS_CONTROLLED_LIVE_MAX_ENTRY_EQUITY_FRACTION", 0.30
+    )
+    engine = _engine(tmp_path)
+    _persist_card(engine)
+
+    require_live_entry_allowed(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        side=OrderSide.BUY,
+        quantity=30,
+        limit_price=100.0,
+        engine=engine,
+        account_equity_provider=lambda _environment, _account: 10_000.0,
+    )
+
+    with pytest.raises(LiveExecutionEnvelopeError, match="maximum notional"):
+        require_live_entry_allowed(
+            environment="PROD",
+            account_no="1",
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            quantity=31,
+            limit_price=100.0,
+            engine=engine,
+            account_equity_provider=lambda _environment, _account: 10_000.0,
+        )
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_controlled_live_percentage_cap_rechecks_fresh_cached_equity(
+    tmp_path, monkeypatch
+):
+    _configure_controlled_live(monkeypatch)
+    monkeypatch.setattr(execution_config, "KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL", 0.0)
+    monkeypatch.setattr(
+        execution_config, "KIS_CONTROLLED_LIVE_MAX_ENTRY_EQUITY_FRACTION", 0.30
+    )
+    engine = _engine(tmp_path)
+    _persist_card(engine)
+    buying_power_cache.clear()
+    buying_power_cache.record_snapshot(
+        environment="PROD",
+        account_no="1",
+        usable_buying_power_usd=8_000.0,
+        total_equity_usd=10_000.0,
+    )
+    require_live_entry_allowed(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        side=OrderSide.BUY,
+        quantity=30,
+        limit_price=100.0,
+        engine=engine,
+    )
+
+    buying_power_cache.record_snapshot(
+        environment="PROD",
+        account_no="1",
+        usable_buying_power_usd=4_000.0,
+        total_equity_usd=5_000.0,
+    )
+    with pytest.raises(LiveExecutionEnvelopeError, match="maximum notional"):
+        require_live_entry_allowed(
+            environment="PROD",
+            account_no="1",
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            quantity=30,
+            limit_price=100.0,
+            engine=engine,
+        )
+    buying_power_cache.clear()
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_controlled_live_percentage_cap_fails_closed_without_fresh_equity(
+    tmp_path, monkeypatch
+):
+    _configure_controlled_live(monkeypatch)
+    monkeypatch.setattr(execution_config, "KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL", 0.0)
+    monkeypatch.setattr(
+        execution_config, "KIS_CONTROLLED_LIVE_MAX_ENTRY_EQUITY_FRACTION", 0.30
+    )
+    engine = _engine(tmp_path)
+    _persist_card(engine)
+    buying_power_cache.clear()
+
+    with pytest.raises(LiveExecutionEnvelopeError, match="fresh positive"):
+        require_live_entry_allowed(
+            environment="PROD",
+            account_no="1",
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            quantity=1,
+            limit_price=100.0,
+            engine=engine,
+        )
+
+
+def test_controlled_live_requires_at_least_one_entry_cap(monkeypatch):
+    _configure_controlled_live(monkeypatch)
+    monkeypatch.setattr(execution_config, "KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL", 0.0)
+    monkeypatch.setattr(
+        execution_config, "KIS_CONTROLLED_LIVE_MAX_ENTRY_EQUITY_FRACTION", 0.0
+    )
+
+    with pytest.raises(LiveExecutionEnvelopeError, match="requires a positive"):
+        require_controlled_live_configuration(environment="PROD")
+
+
+def test_controlled_live_rejects_malformed_percentage_cap(monkeypatch):
+    _configure_controlled_live(monkeypatch)
+    monkeypatch.setattr(
+        execution_config,
+        "KIS_CONTROLLED_LIVE_MAX_ENTRY_EQUITY_FRACTION",
+        "invalid",
+    )
+
+    with pytest.raises(LiveExecutionEnvelopeError, match="valid finite"):
+        require_controlled_live_configuration(environment="PROD")
+
+
 def test_controlled_live_envelope_allows_tracked_cancellation(monkeypatch):
     _configure_controlled_live(monkeypatch)
     expected = object()
@@ -425,9 +556,7 @@ def test_controlled_live_envelope_allows_tracked_cancellation(monkeypatch):
 @pytest.mark.parametrize(
     "operation", ["submit", "cancel", "reserved_submit", "reserved_cancel"]
 )
-def test_controlled_live_token_expiry_never_repeats_a_mutation(
-    monkeypatch, operation
-):
+def test_controlled_live_token_expiry_never_repeats_a_mutation(monkeypatch, operation):
     _configure_controlled_live(monkeypatch)
     auth_calls = []
     post_calls = []

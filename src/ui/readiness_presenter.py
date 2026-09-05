@@ -47,8 +47,17 @@ def live_execution_status_text(enabled: bool, *, engine=None) -> str:
         return f"{switch} ({mode})"
     symbols = ",".join(controlled_live_symbols(engine=engine)) or "none"
     cap = float(execution_config.KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL or 0.0)
+    equity_fraction = float(
+        execution_config.KIS_CONTROLLED_LIVE_MAX_ENTRY_EQUITY_FRACTION or 0.0
+    )
+    cap_labels = []
+    if cap > 0:
+        cap_labels.append(f"${cap:,.2f}")
+    if equity_fraction > 0:
+        cap_labels.append(f"{equity_fraction:.0%} current NAV")
+    cap_text = " and ".join(cap_labels) or "blocked"
     return (
-        f"{switch} (CONTROLLED_LIVE active cards: {symbols}, " f"max ${cap:,.2f}/entry)"
+        f"{switch} (CONTROLLED_LIVE active cards: {symbols}, " f"max {cap_text}/entry)"
     )
 
 
