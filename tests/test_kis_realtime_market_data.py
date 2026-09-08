@@ -907,6 +907,37 @@ def test_reconnect_clears_session_ack_state_and_preserves_replay_intent():
     assert service.symbol_state("AAPL").reconnect_generation == 2
 
 
+def test_ack_arriving_before_connected_callback_is_applied_to_replayed_session():
+    transport = _Transport()
+    service = KisRealtimeMarketDataService(
+        transport=transport,
+        symbol_key_resolver=lambda symbol, channel: f"D{symbol}",
+        trade_capacity=1,
+        quote_capacity=1,
+        total_capacity=2,
+        clock=lambda: NOW,
+    )
+    service.configure_desired_channels(
+        trade_priorities={"AAPL": 1},
+        quote_priorities={"AAPL": 1},
+    )
+
+    # KisWebSocketClient starts its reader before replay and announces the
+    # connected generation only after all replay requests have been sent.
+    # A fast broker ACK can therefore win this race.
+    _ack(service, "AAPL", "HDFSCNT0")
+    _ack(service, "AAPL", "HDFSASP0")
+    assert service.subscription_capacity_snapshot().active_count == 0
+
+    service._on_connection(True, "", 1)
+
+    snapshot = service.subscription_capacity_snapshot()
+    assert snapshot.active_count == 2
+    assert snapshot.pending_subscribe_count == 0
+    assert service.symbol_state("AAPL").trade_acked
+    assert service.symbol_state("AAPL").quote_acked
+
+
 def test_breach_between_two_higher_prices_in_one_drain_window_is_never_lost():
     accumulator = PendingMarketStateAccumulator(clock=lambda: NOW)
     accumulator.replace_stop_rules("AAPL", [StopRule("PROD:1:AAPL", 100, "1")])
