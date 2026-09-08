@@ -608,6 +608,12 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         self._session_subscriptions: Dict[tuple[str, str], KisWsSubscription] = {}
         self._session_status: Dict[tuple[str, str], SubscriptionSessionStatus] = {}
         self._session_nacked: set[tuple[str, str]] = set()
+        # The transport reads concurrently while replaying its desired set and
+        # deliberately announces the connection only after every request has
+        # crossed the socket.  KIS can ACK an early request before that
+        # announcement, so retain exact known-subscription ACKs until the
+        # session tables have been materialized by _on_connection().
+        self._preconnection_acks: Dict[tuple[str, str], KisWsSystemFrame] = {}
         self._max_session_slots_used = 0
         self._symbol_by_key: Dict[tuple[str, str], str] = {}
         self._quote_callbacks: list[QuoteCallback] = []
@@ -1380,6 +1386,7 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         was_connected = self._connected
         self._connected = connected
         self._reconnect_generation = generation
+        preconnection_acks: list[KisWsSystemFrame] = []
         with self._state_lock:
             self._session_subscriptions.clear()
             self._session_status.clear()
@@ -1425,7 +1432,11 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
                     len(self._session_status),
                 )
                 self._reconcile_subscription_target_locked()
+                preconnection_acks = list(self._preconnection_acks.values())
+            self._preconnection_acks.clear()
             self._refresh_capacity_rejections_locked()
+        for frame in preconnection_acks:
+            self._on_ack(frame)
         if was_connected and not connected:
             for callback in list(self._disconnect_callbacks):
                 callback(reason or "KIS WebSocket disconnected")
@@ -1452,6 +1463,13 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
             sub = self._session_subscriptions.get(key)
             status = self._session_status.get(key)
             if sub is None or status is None:
+                if (
+                    not self._connected
+                    and not frame.is_unsubscribe
+                    and key in self._active_subscriptions
+                    and key in self._target_subscriptions
+                ):
+                    self._preconnection_acks[key] = frame
                 return
 
             if frame.is_unsubscribe:
