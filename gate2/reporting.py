@@ -690,6 +690,22 @@ def _session_bounds(session_day: date) -> tuple[datetime, datetime]:
     return opened.astimezone(timezone.utc), closed.astimezone(timezone.utc)
 
 
+def validate_session_start(
+    session_day: date, now: datetime
+) -> tuple[datetime, datetime]:
+    """Reject a soak that can no longer cover the entire regular session."""
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("Gate-2 session start requires a timezone-aware timestamp")
+    session_open, session_close = _session_bounds(session_day)
+    if now > session_open:
+        raise RuntimeError(
+            f"Gate 2 cannot cover the full regular session for {session_day.isoformat()}: "
+            f"the session opened at {session_open.isoformat()}. "
+            "Start a new soak before the next NYSE regular-session open."
+        )
+    return session_open, session_close
+
+
 def _synthetic_stop_test(service: KisRealtimeMarketDataService) -> dict[str, int]:
     now = datetime.now(timezone.utc)
     service.replace_stop_rules("GATE2", [StopRule("gate2", 100.0, "v1")])
@@ -1308,8 +1324,8 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
     if missing:
         raise RuntimeError(f"missing verified subscription keys: {', '.join(missing)}")
     session_day = date.fromisoformat(args.session_date)
-    session_open, session_close = _session_bounds(session_day)
     now = datetime.now(timezone.utc)
+    session_open, session_close = validate_session_start(session_day, now)
     capability_manifest = load_verified_capability_manifest(
         args.capability_manifest,
         expected_commit=commit,
