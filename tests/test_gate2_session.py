@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from scripts import manage_gate2_session
 
@@ -278,3 +281,98 @@ def test_terminal_session_never_reports_stale_worker_as_alive(tmp_path, monkeypa
 
     assert summary["state"] == "COMPLETED"
     assert summary["process_alive"] is False
+
+
+@pytest.mark.parametrize(
+    "pointer", [None, {}, {"session_dir": ""}, {"session_dir": " "}]
+)
+def test_latest_session_missing_pointer_does_not_select_working_directory(
+    tmp_path, monkeypatch, pointer
+):
+    evidence_root = tmp_path / "evidence"
+    evidence_root.mkdir()
+    (tmp_path / "session.json").write_text(
+        json.dumps({"state": "RUNNING"}), encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+    if pointer is not None:
+        (evidence_root / "latest_session.json").write_text(
+            json.dumps(pointer), encoding="utf-8"
+        )
+
+    assert manage_gate2_session._latest_session(evidence_root) is None
+
+
+@pytest.mark.parametrize("pointer_target", ["missing", "invalid", "outside"])
+def test_latest_session_falls_back_to_newest_valid_recorded_session(
+    tmp_path, pointer_target
+):
+    evidence_root = tmp_path / "evidence"
+    evidence_root.mkdir()
+    for name, modified_at in (("gate2_old", 100), ("gate2_new", 200)):
+        session_dir = evidence_root / name
+        session_dir.mkdir()
+        (session_dir / "session.json").write_text(
+            json.dumps({"state": "PASSED"}), encoding="utf-8"
+        )
+        os.utime(session_dir, (modified_at, modified_at))
+    invalid = evidence_root / "gate2_unrelated"
+    invalid.mkdir()
+    (invalid / "session.json").write_text("{}", encoding="utf-8")
+    outside = tmp_path / "gate2_outside"
+    outside.mkdir()
+    (outside / "session.json").write_text(
+        json.dumps({"state": "RUNNING"}), encoding="utf-8"
+    )
+    target = {
+        "missing": evidence_root / "gate2_missing",
+        "invalid": invalid,
+        "outside": outside,
+    }[pointer_target]
+    (evidence_root / "latest_session.json").write_text(
+        json.dumps({"session_dir": str(target)}), encoding="utf-8"
+    )
+
+    assert (
+        manage_gate2_session._latest_session(evidence_root)
+        == evidence_root / "gate2_new"
+    )
+
+
+def test_latest_session_uses_valid_pointer(tmp_path):
+    session_dir = tmp_path / "gate2_recorded"
+    session_dir.mkdir()
+    (session_dir / "session.json").write_text(
+        json.dumps({"state": "PASSED"}), encoding="utf-8"
+    )
+    (tmp_path / "latest_session.json").write_text(
+        json.dumps({"session_dir": str(session_dir)}), encoding="utf-8"
+    )
+
+    assert manage_gate2_session._latest_session(tmp_path) == session_dir
+
+
+@pytest.mark.parametrize("json_output", [False, True])
+def test_status_without_sessions_returns_clear_no_session_result(
+    tmp_path, capsys, json_output
+):
+    evidence_root = tmp_path / "not_created_yet"
+    args = ["status", "--evidence-root", str(evidence_root)]
+    if json_output:
+        args.append("--json")
+
+    assert manage_gate2_session.main(args) == 1
+
+    captured = capsys.readouterr()
+    assert not captured.err
+    assert not evidence_root.exists()
+    if json_output:
+        summary = json.loads(captured.out)
+        assert summary["state"] == "NO_SESSION"
+        assert summary["result"] is None
+        assert summary["session_dir"] is None
+        assert summary["blockers"] == ["no_session_found"]
+        assert "scheduled launch log" in summary["recommended_actions"][0]
+    else:
+        assert "Gate 2 session: NO_SESSION" in captured.out
+        assert "scheduled launch log" in captured.out

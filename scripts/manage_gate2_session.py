@@ -558,20 +558,31 @@ def _run_worker(config_path: Path) -> int:
     return exit_code
 
 
-def _latest_session(evidence_root: Path) -> Path:
+def _is_session_directory(path: Path, evidence_root: Path) -> bool:
+    if path.parent != evidence_root or not path.is_dir():
+        return False
+    session = _read_json(path / "session.json")
+    return isinstance(session.get("state"), str) and bool(session["state"].strip())
+
+
+def _latest_session(evidence_root: Path) -> Path | None:
     evidence_root = evidence_root.expanduser().resolve()
     pointer = _read_json(evidence_root / "latest_session.json")
-    candidate = Path(str(pointer.get("session_dir") or ""))
-    if candidate.is_dir():
-        return candidate
+    pointer_value = pointer.get("session_dir")
+    if isinstance(pointer_value, str) and pointer_value.strip():
+        candidate = (evidence_root / pointer_value).expanduser().resolve()
+        if _is_session_directory(candidate, evidence_root):
+            return candidate
     directories = sorted(
-        (path for path in evidence_root.glob("gate2_*") if path.is_dir()),
+        (
+            path
+            for path in evidence_root.glob("gate2_*")
+            if _is_session_directory(path, evidence_root)
+        ),
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )
-    if not directories:
-        raise RuntimeError(f"no Gate-2 sessions found under {evidence_root}")
-    return directories[0]
+    return directories[0] if directories else None
 
 
 def summarize_session(session_dir: Path) -> dict[str, Any]:
@@ -787,6 +798,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "_worker":
         return _run_worker(args.config)
     session_dir = args.session_dir or _latest_session(args.evidence_root)
+    if session_dir is None:
+        summary = {
+            "schema_version": 1,
+            "state": "NO_SESSION",
+            "session_dir": None,
+            "evidence_root": str(args.evidence_root.expanduser().resolve()),
+            "process_alive": False,
+            "result": None,
+            "blockers": ["no_session_found"],
+            "recommended_actions": [
+                "No recorded session was found. Check the scheduled launch log "
+                "or use --evidence-root to inspect the intended evidence directory."
+            ],
+        }
+        if args.json:
+            print(json.dumps(summary, indent=2, sort_keys=True))
+        else:
+            print("Gate 2 session: NO_SESSION")
+            print(f"Evidence directory: {summary['evidence_root']}")
+            print(summary["recommended_actions"][0])
+        return 1
     summary = summarize_session(session_dir)
     if args.json:
         print(json.dumps(summary, indent=2, sort_keys=True))

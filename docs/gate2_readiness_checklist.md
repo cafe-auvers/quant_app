@@ -63,6 +63,13 @@ runtime commit through `KIS_CAPABILITY_MANIFEST_*` / `KIS_RUNTIME_COMMIT_SHA`.
 
 ## Exact preflight fence
 
+Run `python scripts/check_gate2_readiness.py --help` for the non-network local
+preflight before launching a session. It reports local blockers together and
+does not change activation or claim a gate pass. See the
+[gate closure workflow](gate_closure_workflow.md) for unattended collection,
+host-specific status and the implementation/freeze order that avoids repeating
+qualification after later code changes.
+
 - [ ] Qualification commit is reviewed and recorded.
 - [ ] Full Gate-1 report is `PASSED` on that exact commit with zero skips,
   zero unclassified scenarios, and zero invariant violations.
