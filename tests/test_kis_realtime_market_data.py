@@ -645,6 +645,81 @@ def test_future_broker_timestamp_is_rejected(monkeypatch):
     assert service.symbol_state("AAPL").clock_health == ClockHealth.FUTURE_TIMESTAMP
 
 
+def test_later_valid_event_recovers_transient_clock_rejection():
+    service, _ = _service()
+    service.configure_desired_channels(
+        trade_priorities={"AAPL": SubscriptionPriority.CRITICAL_EXIT},
+        quote_priorities={"AAPL": SubscriptionPriority.CRITICAL_EXIT},
+    )
+    _ack(service, "AAPL", "HDFSCNT0")
+    _ack(service, "AAPL", "HDFSASP0")
+    assert service.ingest_trade(_event(fingerprint="trade-1"))
+    assert service.ingest_quote(
+        _event(channel="HDFSASP0", fingerprint="quote-1")
+    )
+
+    assert not service.ingest_trade(
+        _event(seconds=-1, fingerprint="out-of-order-trade")
+    )
+    rejected = service.symbol_state("AAPL")
+    assert rejected.trade_clock_health == ClockHealth.NON_MONOTONIC
+    assert rejected.clock_health == ClockHealth.NON_MONOTONIC
+    assert rejected.trade_error == "TRADE:NON_MONOTONIC"
+    assert service.health_metrics(now=NOW).stale_symbols == ("AAPL",)
+
+    assert service.ingest_trade(_event(seconds=1, fingerprint="trade-2"))
+    recovered = service.symbol_state("AAPL")
+    assert recovered.trade_clock_health == ClockHealth.HEALTHY
+    assert recovered.clock_health == ClockHealth.HEALTHY
+    assert recovered.trade_error == ""
+    assert recovered.last_error == ""
+    assert service.health_metrics(
+        now=NOW + dt.timedelta(seconds=1)
+    ).stale_symbols == ()
+
+
+def test_channel_recovery_does_not_clear_other_channel_clock_failure():
+    service, _ = _service(sequences={"HDFSCNT0", "HDFSASP0"})
+    assert service.ingest_trade(_event(sequence=10, fingerprint="trade-10"))
+    assert service.ingest_quote(
+        _event(channel="HDFSASP0", sequence=20, fingerprint="quote-20")
+    )
+    assert not service.ingest_trade(
+        _event(seconds=1, sequence=9, fingerprint="trade-9")
+    )
+    assert not service.ingest_quote(
+        _event(
+            channel="HDFSASP0",
+            seconds=1,
+            sequence=19,
+            fingerprint="quote-19",
+        )
+    )
+
+    assert service.ingest_trade(
+        _event(seconds=2, sequence=11, fingerprint="trade-11")
+    )
+    partially_recovered = service.symbol_state("AAPL")
+    assert partially_recovered.trade_clock_health == ClockHealth.HEALTHY
+    assert partially_recovered.quote_clock_health == ClockHealth.SEQUENCE_REGRESSION
+    assert partially_recovered.clock_health == ClockHealth.SEQUENCE_REGRESSION
+    assert partially_recovered.last_error == "QUOTE:SEQUENCE_REGRESSION"
+
+    assert service.ingest_quote(
+        _event(
+            channel="HDFSASP0",
+            seconds=2,
+            sequence=21,
+            fingerprint="quote-21",
+        )
+    )
+    recovered = service.symbol_state("AAPL")
+    assert recovered.trade_clock_health == ClockHealth.HEALTHY
+    assert recovered.quote_clock_health == ClockHealth.HEALTHY
+    assert recovered.clock_health == ClockHealth.HEALTHY
+    assert recovered.last_error == ""
+
+
 def test_recent_event_with_backed_up_queue_is_not_execution_fresh():
     event = _event(processed_at=NOW + dt.timedelta(seconds=5))
     assert not event.is_execution_fresh(

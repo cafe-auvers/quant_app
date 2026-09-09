@@ -587,6 +587,18 @@ def test_gate2_live_status_is_actionable_without_persisting_subscription_keys(tm
     evidence = _passing_gate2_evidence()
     evidence.verified_subscription_keys = {"AAPL": "DNASAAPL-PRIVATE-KEY"}
     evidence.acked_subscriptions = ["HDFSCNT0:AAPL"]
+    evidence.current_feed_ready = False
+    evidence.current_stale_symbols = ["AAPL"]
+    evidence.current_symbol_health = {
+        "AAPL": {
+            "trade_acked": True,
+            "quote_acked": True,
+            "trade_error_present": True,
+            "quote_error_present": False,
+            "trade_clock_health": "NON_MONOTONIC",
+            "quote_clock_health": "HEALTHY",
+        }
+    }
     report = build_report(evidence)
 
     status = build_live_status(
@@ -602,6 +614,12 @@ def test_gate2_live_status_is_actionable_without_persisting_subscription_keys(tm
     assert status["subscriptions"]["requested_count"] > 0
     assert status["subscriptions"]["missing"]
     assert status["failed_metrics"]
+    assert status["feed_health"]["ready"] is False
+    assert status["feed_health"]["stale_symbols"] == ["AAPL"]
+    assert (
+        status["feed_health"]["symbols"]["AAPL"]["trade_clock_health"]
+        == "NON_MONOTONIC"
+    )
     assert "verified_subscription_keys" not in serialized
     assert "DNASAAPL-PRIVATE-KEY" not in serialized
 
