@@ -22,7 +22,10 @@ from src.infrastructure.database.time_utils import _utcnow_naive
 
 
 PUBLISHED_STATUS = "published"
-MARKET_ALIGNMENT_WRITE_CHUNK_SIZE = 250
+# These rows include 37 columns and detailed JSON. A 250-row MySQL upsert
+# exceeded the PC driver's 15-second read timeout; use smaller statements
+# while retaining a single transaction for the entire publication.
+MARKET_ALIGNMENT_WRITE_CHUNK_SIZE = 50
 
 
 class MarketAlignmentRepository:
@@ -92,14 +95,20 @@ class MarketAlignmentRepository:
             "published_at": now,
             "updated_at": now,
         }
+        stage = "opening transaction"
         try:
             with self.engine.begin() as conn:
                 # One transaction is the publication boundary. Keep each SQL
                 # statement below the PC driver's timeout/packet thresholds;
                 # a failed row chunk or manifest still rolls back everything.
+                written = 0
                 for chunk in _record_chunks(
                     records, MARKET_ALIGNMENT_WRITE_CHUNK_SIZE
                 ):
+                    stage = (
+                        f"snapshot rows {written + 1}-{written + len(chunk)} "
+                        f"of {len(records)}"
+                    )
                     _execute_bulk_upsert(
                         conn,
                         snapshot_table,
@@ -107,6 +116,8 @@ class MarketAlignmentRepository:
                         ("symbol", "as_of_date", "feature_version"),
                         self.engine.dialect.name,
                     )
+                    written += len(chunk)
+                stage = "publication manifest"
                 _execute_bulk_upsert(
                     conn,
                     batch_table,
@@ -114,11 +125,12 @@ class MarketAlignmentRepository:
                     ("as_of_date", "feature_version"),
                     self.engine.dialect.name,
                 )
+                stage = "transaction commit"
         except SQLAlchemyError as exc:
             original = getattr(exc, "orig", None)
             detail = str(original or type(exc).__name__)
             raise RuntimeError(
-                f"Unable to publish market-alignment batch: {detail}"
+                f"Unable to publish market-alignment batch ({stage}): {detail}"
             ) from None
         return len(records)
 

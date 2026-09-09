@@ -7,7 +7,7 @@ from dataclasses import replace
 
 import pandas as pd
 import pytest
-from sqlalchemy import MetaData, create_engine, func, select
+from sqlalchemy import MetaData, create_engine, event, func, select
 from sqlalchemy.exc import OperationalError
 
 from src.core.chart_fundamentals import ProfileStatus, StockProfile
@@ -355,7 +355,7 @@ def test_repository_chunks_wide_market_alignment_publications(monkeypatch):
     assert repository.publish_batch(
         snapshots, input_fingerprint="wide", stats={}
     ) == len(snapshots)
-    assert snapshot_chunk_sizes == [250, 250, 1]
+    assert snapshot_chunk_sizes == [50] * 10 + [1]
 
 
 def test_repository_hides_large_sql_payload_when_publication_fails(monkeypatch):
@@ -375,6 +375,7 @@ def test_repository_hides_large_sql_payload_when_publication_fails(monkeypatch):
         repository.publish_batch([_snapshot()], input_fingerprint="x", stats={})
 
     assert "sensitive-large-payload" not in str(caught.value)
+    assert "snapshot rows 1-1 of 1" in str(caught.value)
     assert caught.value.__cause__ is None
 
 
@@ -412,6 +413,73 @@ def test_failed_force_publication_rolls_back_and_preserves_last_successful(monke
         )
 
     assert repository.get_latest_market_alignment("AAPL").leadership_score == 70.0
+
+
+@pytest.mark.parametrize(
+    ("failure_stage", "expected_detail"),
+    [
+        ("second_chunk", "snapshot rows 3-3 of 3"),
+        ("manifest", "publication manifest"),
+        ("commit", "transaction commit"),
+    ],
+)
+def test_chunked_publication_failure_preserves_rows_and_manifest(
+    monkeypatch, failure_stage, expected_detail
+):
+    engine = create_engine("sqlite:///:memory:", future=True)
+    repository = MarketAlignmentRepository(engine)
+    original = _snapshot(score=70.0)
+    repository.publish_batch([original], input_fingerprint="original", stats={})
+    monkeypatch.setattr(alignment_repo_module, "MARKET_ALIGNMENT_WRITE_CHUNK_SIZE", 2)
+    real_upsert = alignment_repo_module._execute_bulk_upsert
+    snapshot_writes = 0
+
+    def fail_write(conn, table, records, keys, dialect):
+        nonlocal snapshot_writes
+        if table.name == "stock_market_alignment_daily":
+            snapshot_writes += 1
+            should_fail = failure_stage == "second_chunk" and snapshot_writes == 2
+        else:
+            should_fail = failure_stage == "manifest"
+        if should_fail:
+            raise OperationalError("INSERT", {}, RuntimeError("read timed out"))
+        return real_upsert(conn, table, records, keys, dialect)
+
+    def fail_commit(_conn):
+        # Ignore the schema guard's transaction; fail before the publication
+        # commit reaches the driver. A lost acknowledgement after an actual
+        # server commit has an unknown outcome and cannot promise rollback.
+        if snapshot_writes:
+            raise OperationalError("COMMIT", {}, RuntimeError("read timed out"))
+
+    monkeypatch.setattr(alignment_repo_module, "_execute_bulk_upsert", fail_write)
+    if failure_stage == "commit":
+        event.listen(engine, "commit", fail_commit)
+    try:
+        with pytest.raises(RuntimeError, match=expected_detail):
+            repository.publish_batch(
+                [
+                    replace(original, leadership_score=99.0),
+                    _snapshot(symbol="NEW1"),
+                    _snapshot(symbol="NEW2"),
+                ],
+                input_fingerprint="replacement",
+                stats={},
+            )
+    finally:
+        if failure_stage == "commit":
+            event.remove(engine, "commit", fail_commit)
+
+    snapshots, batches = repository._table_definitions()
+    with engine.connect() as conn:
+        stored_rows = conn.execute(
+            select(snapshots.c.symbol, snapshots.c.leadership_score)
+        ).all()
+        stored_manifest = conn.execute(
+            select(batches.c.input_fingerprint, batches.c.symbol_count)
+        ).one()
+    assert stored_rows == [("AAPL", 70.0)]
+    assert stored_manifest == ("original", 1)
 
 
 def test_chart_lookup_marks_stale_without_calculation_or_schema_creation():

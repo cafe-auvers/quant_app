@@ -78,4 +78,7 @@ def test_cold_start_records_preflight_before_refresh_and_dashboard_launch():
 
     assert preflight < refresh < launch
     assert '"controlled_live_preflight.json"' in text
+    assert "--startup --json-output $preflightJsonPath" in text
+    assert '$preflightRecord.status -eq "READ_ONLY_STARTUP_READY"' in text
+    assert "$preflightRecord.controlled_live_ready" in text
     assert "production broker mutations remain fail-closed" in text
