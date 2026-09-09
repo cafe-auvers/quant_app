@@ -9,13 +9,18 @@ Usage (from the repository root)::
 
     python scripts/check_controlled_live_readiness.py
 
-A zero exit code means configuration/preflight passed.  The in-application
-trading switch still starts OFF and must be armed explicitly after the runtime
-reaches ACTIVE with fresh broker/market-data readiness.
+By default, zero means the controlled-live configuration passed. With
+``--startup``, explicitly disabled trading can instead pass read-only startup;
+the structured result distinguishes startup readiness from live readiness.
+Neither result arms trading or certifies an activation gate. The application
+must reach ACTIVE with fresh broker/market-data readiness before manual arming.
 """
 
 from __future__ import annotations
 
+import argparse
+from datetime import datetime, timezone
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -42,6 +47,7 @@ from src.core import execution_config  # noqa: E402
 from src.core.release_identity import current_release_identity  # noqa: E402
 from src.services.controlled_live_policy import (  # noqa: E402
     CONTROLLED_LIVE,
+    DISABLED,
     controlled_live_symbols,
     require_controlled_live_configuration,
 )
@@ -62,6 +68,7 @@ class Preflight:
         self.failures: list[str] = []
         self.warnings: list[str] = []
         self.passes: list[str] = []
+        self.information: list[str] = []
 
     def check(self, name: str, predicate: bool, failure: str) -> None:
         if predicate:
@@ -110,8 +117,32 @@ def _missing_external_delivery_configuration() -> tuple[str, ...]:
     )
 
 
-def main() -> int:
+def _read_only_startup_requested(*, startup: bool) -> bool:
+    return bool(
+        startup
+        and execution_config.KIS_LIVE_EXECUTION_MODE == DISABLED
+        and os.getenv("TRADING_ENABLED", "").strip().lower()
+        in {"0", "false", "no", "off"}
+        and is_trading_locked_disabled()
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--startup", action="store_true",
+        help="Recognize an explicitly disabled, administratively locked read-only startup.",
+    )
+    parser.add_argument("--json-output", type=Path)
+    args = parser.parse_args(argv)
     result = Preflight()
+    read_only = _read_only_startup_requested(startup=args.startup)
+    if read_only:
+        result.information.append(
+            "Read-only startup: TRADING_ENABLED=false and KIS_LIVE_EXECUTION_MODE=DISABLED. "
+            "Live permission, CONTROLLED_LIVE mode and a positive entry cap are not "
+            "required for this startup; live trading remains unavailable."
+        )
 
     try:
         head = _git("rev-parse", "HEAD").lower()
@@ -149,21 +180,23 @@ def main() -> int:
     ):
         result.check(name, _configured(name), f"{name} is missing")
 
-    result.check(
-        "administrative trading permission",
-        _truthy(os.getenv("TRADING_ENABLED", "")) and not is_trading_locked_disabled(),
-        "set TRADING_ENABLED=true; the in-app trading switch will still start OFF",
-    )
+    if not read_only:
+        result.check(
+            "administrative trading permission",
+            _truthy(os.getenv("TRADING_ENABLED", "")) and not is_trading_locked_disabled(),
+            "set TRADING_ENABLED=true; the in-app trading switch will still start OFF",
+        )
     result.check(
         "Kanban engine flag",
         bool(execution_config.is_buyboard_engine_enabled()),
         "set BUYBOARD_ENGINE_ENABLED=true",
     )
-    result.check(
-        "controlled-live mode",
-        execution_config.KIS_LIVE_EXECUTION_MODE == CONTROLLED_LIVE,
-        "set KIS_LIVE_EXECUTION_MODE=CONTROLLED_LIVE",
-    )
+    if not read_only:
+        result.check(
+            "controlled-live mode",
+            execution_config.KIS_LIVE_EXECUTION_MODE == CONTROLLED_LIVE,
+            "set KIS_LIVE_EXECUTION_MODE=CONTROLLED_LIVE",
+        )
     result.check(
         "WebSocket mode",
         bool(execution_config.KIS_WS_ENABLED)
@@ -186,12 +219,13 @@ def main() -> int:
     equity_entry_fraction = float(
         execution_config.KIS_CONTROLLED_LIVE_MAX_ENTRY_EQUITY_FRACTION
     )
-    result.check(
-        "entry notional cap",
-        fixed_entry_cap > 0 or 0 < equity_entry_fraction <= 1,
-        "set a positive KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL or an account-equity "
-        "fraction in (0, 1]",
-    )
+    if not read_only:
+        result.check(
+            "entry notional cap",
+            fixed_entry_cap > 0 or 0 < equity_entry_fraction <= 1,
+            "set a positive KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL or an account-equity "
+            "fraction in (0, 1]",
+        )
 
     def _check_symbol_map() -> None:
         snapshot = KisWsSymbolKeyStore().snapshot()
@@ -215,7 +249,7 @@ def main() -> int:
         ),
     )
     result.guarded(
-        "controlled-live execution envelope",
+        "disabled production execution envelope" if read_only else "controlled-live execution envelope",
         lambda: require_controlled_live_configuration(
             environment="PROD", scheduler=scheduler
         ),
@@ -271,26 +305,56 @@ def main() -> int:
             "KIS_WS_HTS_ID is absent. This does not block the supervised pilot "
             "when execution-notice capability is omitted; REST reconciliation remains authoritative."
         )
-    print("Controlled-live preflight")
-    print(f"  git head: {head or '<unknown>'}")
+    lines = [
+        "Read-only startup preflight" if read_only else "Controlled-live preflight",
+        f"  git head: {head or '<unknown>'}",
+    ]
     for name in result.passes:
-        print(f"  [PASS] {name}")
+        lines.append(f"  [PASS] {name}")
+    for information in result.information:
+        lines.append(f"  [INFO] {information}")
     for warning in result.warnings:
-        print(f"  [WARN] {warning}")
+        lines.append(f"  [WARN] {warning}")
     for failure in result.failures:
-        print(f"  [FAIL] {failure}")
+        lines.append(f"  [FAIL] {failure}")
 
     if result.failures:
-        print(f"\nNOT READY: {len(result.failures)} blocking item(s).")
-        return 1
-
-    print(
-        "\nREADY FOR APPLICATION STARTUP (supervised controlled-live configuration).\n"
-        "The script did not connect to KIS and did not submit/cancel any order.\n"
-        "Launch the app, wait for the Buy Board runtime to reach ACTIVE with fresh "
-        "market/account readiness, then arm the in-session trading switch explicitly."
-    )
-    return 0
+        status = "BLOCKED"
+        lines.append(f"\nNOT READY: {len(result.failures)} blocking item(s).")
+    elif read_only:
+        status = "READ_ONLY_STARTUP_READY"
+        lines.append(
+            "\nREADY FOR READ-ONLY APPLICATION STARTUP. Live trading remains disabled.\n"
+            "This does not certify Gate 2 or controlled-live readiness."
+        )
+    else:
+        status = "CONTROLLED_LIVE_CONFIGURATION_READY"
+        lines.append(
+            "\nREADY FOR APPLICATION STARTUP (supervised controlled-live configuration).\n"
+            "The script did not connect to KIS and did not submit/cancel any order.\n"
+            "Launch the app, wait for the Buy Board runtime to reach ACTIVE with fresh "
+            "market/account readiness, then arm the in-session trading switch explicitly."
+        )
+    exit_code = 1 if result.failures else 0
+    if args.json_output is not None:
+        record = {
+            "schema_version": 1,
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "repository": str(ROOT),
+            "commit_sha": head,
+            "mode": "READ_ONLY" if read_only else "CONTROLLED_LIVE",
+            "execution_mode": execution_config.KIS_LIVE_EXECUTION_MODE,
+            "status": status,
+            "exit_code": exit_code,
+            "ready": not result.failures and not read_only,
+            "startup_ready": not result.failures,
+            "controlled_live_ready": not result.failures and not read_only,
+            "failures": result.failures,
+            "output": lines,
+        }
+        args.json_output.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    print("\n".join(lines))
+    return exit_code
 
 
 if __name__ == "__main__":

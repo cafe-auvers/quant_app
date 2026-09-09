@@ -13,7 +13,7 @@ On a cold boot/logon, when main.py is not already running, it chains:
      dependency failure remains diagnosable from the laptop.
   3. Synchronize the credential-only .env schema, migrate legacy non-secret
      settings to config/runtime.local.json, then regenerate .env.pc.
-  4. Runs the controlled-live readiness preflight and records a machine-
+  4. Runs the startup readiness preflight and records a machine-
      readable result. A failure leaves the dashboard available for diagnosis,
      while the Python runtime's independent broker gate remains fail-closed.
   5. scripts/run_daily_refresh.py -- gates on whether the database's actual
@@ -272,34 +272,55 @@ if ($ResumeMode) {
     }
 }
 
-# --- 1.9. Controlled-live release/configuration preflight -----------------
+# --- 1.9. Startup release/configuration preflight -------------------------
 
 $PreflightPath = Join-Path $LogDir "controlled_live_preflight.json"
 if ($ResumeMode) {
     Write-Log "Resume mode: skipping startup preflight because the running dashboard retains its already-loaded release and configuration."
 } else {
     $preflightScript = Join-Path $RepoRoot "scripts\check_controlled_live_readiness.py"
+    $preflightJsonPath = Join-Path $LogDir ("startup_preflight_{0}.json" -f [guid]::NewGuid().ToString("N"))
+    $preflightRecord = $null
     if (Test-Path -LiteralPath $preflightScript) {
-        $preflightOutput = @(& $PythonExe $preflightScript 2>&1)
+        $preflightOutput = @(& $PythonExe $preflightScript --startup --json-output $preflightJsonPath 2>&1)
         $preflightExitCode = $LASTEXITCODE
+        try {
+            if (Test-Path -LiteralPath $preflightJsonPath) {
+                $preflightRecord = Get-Content -LiteralPath $preflightJsonPath -Raw | ConvertFrom-Json
+            }
+        } catch {
+            $preflightOutput += "Could not read startup preflight result: $($_.Exception.Message)"
+        } finally {
+            if (Test-Path -LiteralPath $preflightJsonPath) {
+                Remove-Item -LiteralPath $preflightJsonPath
+            }
+        }
     } else {
         $preflightOutput = @("Preflight script is missing: $preflightScript")
         $preflightExitCode = 1
     }
     $preflightOutput | ForEach-Object { Write-Log "[preflight] $_" }
-    $preflightRecord = [ordered]@{
-        checked_at = (Get-Date).ToUniversalTime().ToString("o")
-        repository = $RepoRoot
-        exit_code = $preflightExitCode
-        ready = ($preflightExitCode -eq 0)
-        output = @($preflightOutput | ForEach-Object { "$_" })
+    if ($null -eq $preflightRecord -or $preflightRecord.exit_code -ne $preflightExitCode) {
+        $preflightExitCode = 1
+        $preflightRecord = [ordered]@{
+            checked_at = (Get-Date).ToUniversalTime().ToString("o")
+            repository = $RepoRoot
+            status = "ERROR"
+            exit_code = $preflightExitCode
+            ready = $false
+            startup_ready = $false
+            controlled_live_ready = $false
+            output = @($preflightOutput | ForEach-Object { "$_" })
+        }
     }
     $preflightRecord | ConvertTo-Json -Depth 4 | Set-Content `
         -LiteralPath $PreflightPath -Encoding UTF8
-    if ($preflightExitCode -eq 0) {
+    if ($preflightExitCode -eq 0 -and $preflightRecord.status -eq "READ_ONLY_STARTUP_READY") {
+        Write-Log "Read-only startup preflight PASSED; live trading remains disabled and Gate 2 is not certified by this check. Evidence: $PreflightPath"
+    } elseif ($preflightExitCode -eq 0 -and $preflightRecord.controlled_live_ready) {
         Write-Log "Controlled-live preflight PASSED; evidence saved to $PreflightPath."
     } else {
-        Write-Log "WARN: controlled-live preflight FAILED (exit code $preflightExitCode). The dashboard will launch for diagnosis, but production broker mutations remain fail-closed. Evidence: $PreflightPath"
+        Write-Log "WARN: startup preflight BLOCKED (exit code $preflightExitCode). Resolve the reported release/configuration failures. The dashboard will launch for diagnosis, but production broker mutations remain fail-closed. Evidence: $PreflightPath"
     }
 }
 
