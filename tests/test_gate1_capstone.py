@@ -542,13 +542,16 @@ def test_gate1_ambiguous_submission_restart_reconciles_without_resubmitting(tmp_
     lease = ExecutionLease("pc", "token", 1)
     protocol = FakeExecutionLeaseProtocol(current=lease)
     broker = CapstoneBroker()
+    fixed_now = datetime(2026, 1, 2, 15, 30, tzinfo=timezone.utc)
     market_data = RestPollingMarketDataService(
         quote_fetcher=lambda symbol: QuoteSnapshot(
             symbol=symbol,
             last_price=99.0,
             bid=98.9,
             ask=99.0,
-        )
+            received_at=fixed_now,
+        ),
+        clock=lambda: fixed_now,
     )
     market_data.subscribe([SYMBOL])
     market_data.poll_once()
