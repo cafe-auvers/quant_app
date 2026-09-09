@@ -147,6 +147,8 @@ class SymbolFeedState:
     quote_error: str = ""
     trade_configuration_error: str = ""
     quote_configuration_error: str = ""
+    trade_clock_health: ClockHealth = ClockHealth.HEALTHY
+    quote_clock_health: ClockHealth = ClockHealth.HEALTHY
     clock_health: ClockHealth = ClockHealth.HEALTHY
     reconnect_generation: int = 0
     trading_halted: bool = False
@@ -1402,6 +1404,8 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
                     state.last_error = ""
                     state.trade_error = ""
                     state.quote_error = ""
+                    state.trade_clock_health = ClockHealth.HEALTHY
+                    state.quote_clock_health = ClockHealth.HEALTHY
                     state.clock_health = ClockHealth.HEALTHY
             if connected:
                 reset_channels = {
@@ -1689,6 +1693,7 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
             state = self._states.setdefault(quote.symbol, SymbolFeedState(symbol=quote.symbol))
             state.last_trade_event_at = quote.broker_event_at
             state.last_trade_received_at = quote.received_at
+            self._record_valid_channel_event_locked(state, FeedChannel.TRADE)
         return True
 
     def ingest_quote(self, quote: QuoteSnapshot) -> bool:
@@ -1699,7 +1704,49 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
             state = self._states.setdefault(quote.symbol, SymbolFeedState(symbol=quote.symbol))
             state.last_quote_event_at = quote.broker_event_at
             state.last_quote_received_at = quote.received_at
+            self._record_valid_channel_event_locked(state, FeedChannel.QUOTE)
         return True
+
+    @staticmethod
+    def _record_valid_channel_event_locked(
+        state: SymbolFeedState, channel: FeedChannel
+    ) -> None:
+        """Clear a transient clock rejection after this channel recovers.
+
+        A rejected event must block execution immediately, but the rejection
+        must not poison an otherwise healthy feed forever. Only a later event
+        that passes every timestamp, sequence and deduplication check reaches
+        this helper. Keep an independent health value per channel so recovery
+        on one channel cannot hide an outstanding failure on the other.
+        """
+
+        if channel == FeedChannel.TRADE:
+            previous = state.trade_clock_health
+            state.trade_clock_health = ClockHealth.HEALTHY
+            if state.trade_error == f"{channel.value}:{previous.value}":
+                state.trade_error = ""
+        else:
+            previous = state.quote_clock_health
+            state.quote_clock_health = ClockHealth.HEALTHY
+            if state.quote_error == f"{channel.value}:{previous.value}":
+                state.quote_error = ""
+        state.clock_health = next(
+            (
+                health
+                for health in (
+                    state.trade_clock_health,
+                    state.quote_clock_health,
+                )
+                if health != ClockHealth.HEALTHY
+            ),
+            ClockHealth.HEALTHY,
+        )
+        state.last_error = (
+            state.quote_configuration_error
+            or state.trade_configuration_error
+            or state.quote_error
+            or state.trade_error
+        )
 
     def _accept_event(self, quote: QuoteSnapshot, channel: FeedChannel) -> bool:
         now = quote.received_at
@@ -1758,15 +1805,31 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
     def _reject_event(
         self, symbol: str, channel: FeedChannel, health: ClockHealth
     ) -> bool:
+        changed = False
         with self._state_lock:
             state = self._states.setdefault(symbol, SymbolFeedState(symbol=symbol))
+            channel_health = (
+                state.trade_clock_health
+                if channel == FeedChannel.TRADE
+                else state.quote_clock_health
+            )
+            changed = channel_health != health
             state.clock_health = health
             message = f"{channel.value}:{health.value}"
             state.last_error = message
             if channel == FeedChannel.TRADE:
+                state.trade_clock_health = health
                 state.trade_error = message
             else:
+                state.quote_clock_health = health
                 state.quote_error = message
+        if changed:
+            logger.warning(
+                "KIS realtime rejected %s %s event: %s",
+                symbol,
+                channel.value,
+                health.value,
+            )
         return False
 
     def clear_symbol_error(self, symbol: str) -> None:
@@ -1775,6 +1838,8 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
             state.last_error = ""
             state.trade_error = ""
             state.quote_error = ""
+            state.trade_clock_health = ClockHealth.HEALTHY
+            state.quote_clock_health = ClockHealth.HEALTHY
             state.clock_health = ClockHealth.HEALTHY
 
     def _expire_ack_timeouts(self, now: datetime) -> None:

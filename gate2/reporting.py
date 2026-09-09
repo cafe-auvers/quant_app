@@ -172,6 +172,9 @@ class Gate2Evidence:
     continuity_unexpected_unready_count: int = 0
     continuity_started_at: str = ""
     continuity_start_delay_seconds: float = 0.0
+    current_feed_ready: bool = False
+    current_stale_symbols: list[str] = field(default_factory=list)
+    current_symbol_health: dict[str, dict[str, object]] = field(default_factory=dict)
     poll_interval_seconds: float = 0.0
     safety_audit_initialized: bool = False
     safety_audit_sources: list[str] = field(default_factory=list)
@@ -991,6 +994,43 @@ class LiveGate2Runner:
         stale_symbols = set(health.stale_symbols)
         self._advance_silent_probe(now, stale_symbols)
         self.current_feed_ready = critical_ready and not stale_symbols
+        self.evidence.current_feed_ready = self.current_feed_ready
+        self.evidence.current_stale_symbols = sorted(stale_symbols)
+
+        def event_age(value: datetime | None) -> float | None:
+            if value is None:
+                return None
+            return round((now - value).total_seconds(), 3)
+
+        self.evidence.current_symbol_health = {}
+        for symbol in self.evidence.symbols:
+            state = self.service.symbol_state(symbol)
+            self.evidence.current_symbol_health[symbol] = {
+                "trade_acked": state.trade_acked,
+                "quote_acked": state.quote_acked,
+                "trade_error_present": bool(state.trade_error),
+                "quote_error_present": bool(state.quote_error),
+                "trade_configuration_error_present": bool(
+                    state.trade_configuration_error
+                ),
+                "quote_configuration_error_present": bool(
+                    state.quote_configuration_error
+                ),
+                "trade_clock_health": state.trade_clock_health.value,
+                "quote_clock_health": state.quote_clock_health.value,
+                "trade_broker_event_age_seconds": event_age(
+                    state.last_trade_event_at
+                ),
+                "quote_broker_event_age_seconds": event_age(
+                    state.last_quote_event_at
+                ),
+                "trade_receive_age_seconds": event_age(
+                    state.last_trade_received_at
+                ),
+                "quote_receive_age_seconds": event_age(
+                    state.last_quote_received_at
+                ),
+            }
         if self.evidence.session_open <= now <= self.evidence.session_close:
             if not self.evidence.continuity_started_at and self.current_feed_ready:
                 self.evidence.continuity_started_at = _iso(now) or ""
@@ -1188,6 +1228,11 @@ def build_live_status(
         "continuity_unexpected_unready_count": (
             evidence.continuity_unexpected_unready_count
         ),
+        "feed_health": {
+            "ready": evidence.current_feed_ready,
+            "stale_symbols": list(evidence.current_stale_symbols),
+            "symbols": dict(evidence.current_symbol_health),
+        },
         "watchdog": {
             "cycles": evidence.watchdog_cycles,
             "deadlocks": evidence.deadlock_count,
