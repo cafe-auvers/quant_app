@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -63,6 +64,17 @@ def local_ready(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "install_repository_configuration", lambda: None)
     monkeypatch.setattr(preflight, "_git", lambda root, *args: commit if args[0] == "rev-parse" else "")
     monkeypatch.setattr(reporting, "runtime_activation_snapshot", lambda: dict(reporting.SAFE_RUNTIME_EXPECTATIONS))
+    monkeypatch.setattr(
+        reporting,
+        "clock_synchronization_status",
+        lambda: {
+            "checked": True,
+            "synchronized": True,
+            "reference_id": "0x01020304",
+            "leap_indicator": 0,
+            "reason": "synchronized",
+        },
+    )
     monkeypatch.setattr(execution_config, "configuration_issues", lambda: ())
     monkeypatch.setattr(execution_config, "KIS_WS_TOTAL_SUBSCRIPTION_CAPACITY", 41)
     monkeypatch.setattr(execution_config, "BROKER_EVENT_STALE_SECONDS", 2.0)
@@ -134,6 +146,56 @@ def test_preflight_reports_independent_blockers_together(local_ready, monkeypatc
         "capability_manifest",
     }.issubset(report["blockers"])
     assert report["status"] == "LOCAL_BLOCKERS"
+
+
+def test_preflight_blocks_an_unsynchronized_windows_clock(local_ready, monkeypatch):
+    from gate2 import reporting
+
+    args, root, now = local_ready
+    monkeypatch.setattr(
+        reporting,
+        "clock_synchronization_status",
+        lambda: {
+            "checked": True,
+            "synchronized": False,
+            "reference_id": "0x00000000",
+            "leap_indicator": 3,
+            "reason": "windows_time_unsynchronized",
+        },
+    )
+
+    report = preflight.check_readiness(args, root=root, now=now)
+
+    assert "clock_synchronization" in report["blockers"]
+
+
+def test_windows_clock_status_requires_a_nonzero_reference_and_no_leap_warning(
+    monkeypatch,
+):
+    from gate2 import reporting
+
+    monkeypatch.setattr(reporting.os, "name", "nt")
+    monkeypatch.setattr(
+        reporting.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="Leap Indicator: 0(no warning)\nReferenceId: 0x34E772B7\n",
+        ),
+    )
+    assert reporting.clock_synchronization_status()["synchronized"] is True
+
+    monkeypatch.setattr(
+        reporting.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="Leap Indicator: 3(not synchronized)\nReferenceId: 0x00000000\n",
+        ),
+    )
+    status = reporting.clock_synchronization_status()
+    assert status["synchronized"] is False
+    assert status["reason"] == "windows_time_unsynchronized"
 
 
 @pytest.mark.parametrize("poll", [float("nan"), float("inf"), 0, -1, 0.3])

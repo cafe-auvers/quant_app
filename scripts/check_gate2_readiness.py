@@ -26,7 +26,7 @@ EXTERNAL_CHECKS = [
     "Authenticate the independent reviewer's identity and approval reference.",
     "Confirm credential/token file permissions, backup, free disk space and log retention.",
     "Confirm no other WebSocket client uses this app key; credentials are not authenticated here.",
-    "Confirm host power, network, clock synchronization, operator coverage and stop procedure.",
+    "Confirm host power, network, operator coverage and stop procedure.",
     "Live ACK/data coverage, notice mapping, reconnect, latency and full-session metrics require the actual soak.",
 ]
 
@@ -95,7 +95,8 @@ def check_readiness(
         sha256_file,
     )
     from gate2.reporting import (
-        SAFE_RUNTIME_EXPECTATIONS, _session_bounds, runtime_activation_snapshot,
+        SAFE_RUNTIME_EXPECTATIONS, _session_bounds, clock_synchronization_status,
+        runtime_activation_snapshot,
         validate_session_start,
     )
     from src.core import execution_config
@@ -175,6 +176,13 @@ def check_readiness(
         "configuration_values", not issues,
         "Invalid Gate-2 activation or market-data overrides block preflight; unrelated overrides are informational.",
         issues=issues, unrelated_issues=unrelated_issues,
+    )
+    clock_status = clock_synchronization_status()
+    check(
+        "clock_synchronization",
+        bool(clock_status.get("synchronized")),
+        "Windows clock must be synchronized to an NTP source before a Gate-2 soak.",
+        **clock_status,
     )
 
     symbols = sorted({item.strip().upper() for item in args.symbols.split(",") if item.strip()})
