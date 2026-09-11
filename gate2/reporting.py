@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
 import threading
 import time as wall_time
@@ -92,6 +93,58 @@ def _git(root: Path, *args: str) -> str:
     ).stdout.strip()
 
 
+def clock_synchronization_status() -> dict[str, object]:
+    """Return a locale-neutral, read-only Windows time-service verdict.
+
+    Gate 2 rejects broker events that are materially ahead of the local clock.
+    Merely having the Windows Time service running is not enough: an
+    unsynchronised machine reports a zero reference ID and leap-indicator 3.
+    Keep the raw command output out of evidence because it is localized and
+    unsuitable for a stable report schema.
+    """
+    if os.name != "nt":
+        return {
+            "checked": False,
+            "synchronized": False,
+            "reason": "windows_time_status_unavailable",
+        }
+    try:
+        completed = subprocess.run(
+            ["w32tm", "/query", "/status"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {
+            "checked": False,
+            "synchronized": False,
+            "reason": "windows_time_status_unavailable",
+        }
+    output = completed.stdout or ""
+    reference_match = re.search(r"0x([0-9A-Fa-f]{8})", output)
+    # The leap indicator is the first numeric status field in w32tm output in
+    # both English and localized Windows builds.
+    leap_match = re.search(r"^[^:\r\n]+:\s*(\d+)", output, flags=re.MULTILINE)
+    reference_id = (
+        f"0x{reference_match.group(1).upper()}" if reference_match else None
+    )
+    leap_indicator = int(leap_match.group(1)) if leap_match else None
+    synchronized = bool(
+        completed.returncode == 0
+        and reference_id not in {None, "0x00000000"}
+        and leap_indicator == 0
+    )
+    return {
+        "checked": True,
+        "synchronized": synchronized,
+        "reference_id": reference_id,
+        "leap_indicator": leap_indicator,
+        "reason": "synchronized" if synchronized else "windows_time_unsynchronized",
+    }
+
+
 def runtime_activation_snapshot() -> dict[str, bool | int | float | str | list[str]]:
     """Read safety state without mutating any flag or composing an engine."""
     return {
@@ -141,6 +194,7 @@ class Gate2Evidence:
     session_open: datetime
     session_close: datetime
     started_at: datetime
+    clock_synchronization: dict[str, object] = field(default_factory=dict)
     ended_at: datetime | None = None
     requested_subscriptions: list[str] = field(default_factory=list)
     acked_subscriptions: list[str] = field(default_factory=list)
@@ -584,6 +638,7 @@ def build_report(evidence: Gate2Evidence) -> dict:
         "capability_matrix_sha256": evidence.capability_matrix_sha256,
         "capability_manifest_sha256": evidence.capability_manifest_sha256,
         "capability_review": evidence.capability_review,
+        "clock_synchronization": evidence.clock_synchronization,
         "verified_capabilities": evidence.verified_capabilities,
         "environment": evidence.environment,
         "session": {
@@ -1371,6 +1426,11 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
     session_day = date.fromisoformat(args.session_date)
     now = datetime.now(timezone.utc)
     session_open, session_close = validate_session_start(session_day, now)
+    clock_status = clock_synchronization_status()
+    if not clock_status["synchronized"]:
+        raise RuntimeError(
+            "Gate 2 requires a Windows clock synchronized to an NTP source"
+        )
     capability_manifest = load_verified_capability_manifest(
         args.capability_manifest,
         expected_commit=commit,
@@ -1409,6 +1469,7 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
         session_open=session_open,
         session_close=session_close,
         started_at=now,
+        clock_synchronization=clock_status,
         requested_subscriptions=sorted(
             [f"HDFSCNT0:{symbol}" for symbol in symbols]
             + [f"HDFSASP0:{symbol}" for symbol in symbols]
