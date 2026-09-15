@@ -8,6 +8,8 @@ from .shadow_boundary import (
     ShadowStoreAudit,
 )
 from .decision_oracle import OracleDecision
+from .collector import Gate3EvidenceCollector
+from .shadow_gateway import ShadowExecutionGateway
 
 __all__ = [
     "ShadowEvent",
@@ -16,4 +18,6 @@ __all__ = [
     "ShadowMutationIntercepted",
     "ShadowStoreAudit",
     "OracleDecision",
+    "Gate3EvidenceCollector",
+    "ShadowExecutionGateway",
 ]

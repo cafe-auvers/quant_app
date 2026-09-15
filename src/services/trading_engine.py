@@ -324,6 +324,7 @@ class TradingEngine:
         ] = None,
         unattended_session: Optional[Callable[[], bool]] = None,
         trading_halt_lookup: Optional[Callable[[str], bool]] = None,
+        enabled_provider: Optional[Callable[[], bool]] = None,
         clock: Callable[[], datetime] = _utc_now,
     ) -> None:
         self._entry_attempt_manager = entry_attempt_manager
@@ -354,11 +355,13 @@ class TradingEngine:
         )
         self._unattended_session = unattended_session or (lambda: True)
         self._trading_halt_lookup = trading_halt_lookup or (lambda symbol: False)
+        self._enabled_provider = enabled_provider or (
+            lambda: is_buyboard_engine_enabled()
+        )
         self._clock = clock
 
-    @staticmethod
-    def is_enabled() -> bool:
-        return is_buyboard_engine_enabled()
+    def is_enabled(self) -> bool:
+        return bool(self._enabled_provider())
 
     # --- Every market-data tick (section 766-770, 784-788) ------------
 

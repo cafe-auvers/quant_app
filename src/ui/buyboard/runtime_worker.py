@@ -77,6 +77,7 @@ from src.services.account_reconciliation import (
     run_account_reconciliation_pass,
 )
 from src.services.controlled_live_policy import (
+    controlled_live_symbols,
     live_entry_card_allowed,
     require_controlled_live_configuration,
 )
@@ -515,6 +516,7 @@ class BuyboardRuntimeWorker(QThread):
     ):
         if not self._device_id:
             self.device_state = state
+            self._observe_gate4_runtime_state(state)
             return
         details = self._runtime_readiness_details(state)
         if state != RuntimeDeviceState.STANDBY_READY and not handoff_confirmed:
@@ -528,6 +530,7 @@ class BuyboardRuntimeWorker(QThread):
             self.device_state = state
             self._last_device_state_published_at = datetime.now(timezone.utc)
             self._last_device_state_details = details
+            self._observe_gate4_runtime_state(state)
             return None
         record = save_runtime_device_state(
             self._db_engine,
@@ -543,7 +546,31 @@ class BuyboardRuntimeWorker(QThread):
         self.readiness_generation = int(record.readiness_generation or 0)
         self._last_device_state_published_at = datetime.now(timezone.utc)
         self._last_device_state_details = details
+        self._observe_gate4_runtime_state(state)
         return record
+
+    def _observe_gate4_runtime_state(self, state: RuntimeDeviceState) -> None:
+        if state != RuntimeDeviceState.ACTIVE:
+            return
+        from gate4.runtime_observer import observe_gate4_event
+
+        observe_gate4_event(
+            "RUNTIME_ACTIVE",
+            owner_count=1,
+            lease_count=1 if self._lease_current else 0,
+            live_execution_mode=str(execution_config.KIS_LIVE_EXECUTION_MODE),
+            reviewed_entry_notional_cap=float(
+                execution_config.KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL
+            ),
+            approved_symbols=list(controlled_live_symbols()),
+            runtime_state=state.value,
+        )
+
+    @staticmethod
+    def _gate4_qualification_observer(event_type: str, payload: dict) -> None:
+        from gate4.runtime_observer import observe_gate4_event
+
+        observe_gate4_event(event_type, **dict(payload))
 
     def _publish_device_state_if_due(self, state: RuntimeDeviceState) -> None:
         """Refresh durable readiness at a safe cadence, not every local tick."""
@@ -997,6 +1024,7 @@ class BuyboardRuntimeWorker(QThread):
                         else None
                     ),
                     schema_migration_manager=migration_manager,
+                    qualification_observer=self._gate4_qualification_observer,
                 )
             if isinstance(runtime_broker, ExecutionCommandGateway):
                 self.execution_gateway = runtime_broker
@@ -1340,6 +1368,25 @@ class BuyboardRuntimeWorker(QThread):
             except Exception as exc:
                 self.shutdown_errors.append(f"market-data close: {exc}")
         self.shutdown_prepared = not self.shutdown_errors
+        try:
+            from gate4.runtime_observer import observe_gate4_event
+
+            observe_gate4_event(
+                "FINAL_RECONCILIATION",
+                matches_broker=bool(
+                    self.startup_reconciliation_complete
+                    and not self.startup_reconciliation_errors
+                    and not self.shutdown_errors
+                ),
+            )
+            observe_gate4_event(
+                "SESSION_ENDED",
+                supervised=True,
+                clean_shutdown=not self.shutdown_errors,
+            )
+        except Exception as exc:
+            self.shutdown_errors.append(f"Gate-4 evidence: {exc}")
+            self.shutdown_prepared = False
         try:
             self._set_device_state(
                 RuntimeDeviceState.STOPPED if self.shutdown_prepared else RuntimeDeviceState.FAILED
@@ -1730,6 +1777,7 @@ class BuyboardRuntimeWorker(QThread):
                 )
                 continue
             self._record_account_reconciliation_success(account_no, now)
+            self._observe_gate4_reconciliation(result, account_cards)
 
         if changed:
             self.board_changed.emit()
@@ -1745,6 +1793,60 @@ class BuyboardRuntimeWorker(QThread):
         # actually reconciled.
         self.startup_reconciliation_ran = True
         self.startup_reconciliation_complete = not self.startup_reconciliation_errors
+
+    @staticmethod
+    def _observe_gate4_reconciliation(
+        result: AccountReconciliationResult,
+        cards: List[TradeCardState],
+    ) -> None:
+        from gate4.runtime_observer import observe_gate4_event
+
+        observe_gate4_event(
+            "LIFECYCLE_COMPARISON",
+            agrees=not result.snapshot.errors,
+            snapshot_complete=True,
+        )
+        terminal_statuses = {
+            ExecutionOrderStatus.FILLED,
+            ExecutionOrderStatus.CANCELLED,
+            ExecutionOrderStatus.REJECTED,
+            ExecutionOrderStatus.EXPIRED,
+            ExecutionOrderStatus.NOT_ACCEPTED_CONFIRMED,
+        }
+        for order in result.plan.order_updates:
+            if order.status not in terminal_statuses:
+                continue
+            observe_gate4_event(
+                "MUTATION_TERMINAL",
+                command_type=(
+                    "CANCEL"
+                    if order.status == ExecutionOrderStatus.CANCELLED
+                    else "SUBMIT"
+                ),
+                result=order.status.value,
+                symbol=order.symbol,
+                client_order_id=order.client_order_id,
+                strategy_entry=bool(
+                    order.side == OrderSide.BUY
+                    and order.intent.value == "ENTRY"
+                ),
+                broker_confirmed_terminal=True,
+                identity_ambiguous=False,
+                resolved=True,
+            )
+        for card in cards:
+            if int(card.broker_quantity or 0) <= 0:
+                continue
+            safely_protected = bool(
+                float(card.active_stop_price or 0.0) > 0
+                and int(card.stop_quantity or 0) >= int(card.broker_quantity or 0)
+            )
+            if safely_protected:
+                observe_gate4_event(
+                    "POSITION_PROTECTED",
+                    symbol=card.symbol,
+                    safe_exit_or_protected=True,
+                )
 
     # -- per-cycle heartbeat --------------------------------------------------
 

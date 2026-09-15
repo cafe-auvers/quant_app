@@ -81,8 +81,12 @@ exact full SHA.
   higher timeframe, and a zero-fill working order, with authoritative exact-
   owned cancellation before revalidation.
 - Gate 3 has an append-only, redacted, physically isolated shadow mutation
-  boundary and cumulative validator.
-- Gates 4 and 5 have cumulative, fail-closed report and promotion validators.
+  boundary, headless production-runtime runner, captured-live replay collector,
+  and cumulative validator.
+- Gate 4 has an opt-in runtime collector for supervised session, broker
+  lifecycle, reconciliation, position-protection, disarm, and external-alert
+  evidence. Gate 5 has a cumulative fail-closed validator but still needs its
+  later operational collector.
 - Gate qualification remains separate from operator promotion; validation
   never changes activation state.
 

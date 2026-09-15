@@ -23,7 +23,12 @@ from src.core.runtime_safety_audit import (
 )
 from src.risk.pre_trade import PreTradeRiskDecision
 from src.services import trading_state
-from src.services.broker import BrokerSubmissionResult, KisBroker, ReadOnlyBroker
+from src.services.broker import (
+    BrokerSubmissionResult,
+    KisBroker,
+    MissingImmediateBrokerOrderIdError,
+    ReadOnlyBroker,
+)
 from src.services.trading_state import TradingDisabledError
 
 
@@ -181,6 +186,29 @@ def test_submit_order_reserved_moo_calls_reserved_endpoint(
         "quantity": 4,
         "exchange": "NASD",
     }
+
+
+def test_submit_order_without_immediate_broker_id_is_ambiguous(
+    monkeypatch, trading_enabled
+):
+    response = {"rt_cd": "0", "output": {}}
+    monkeypatch.setattr(
+        kis_order, "place_overseas_order", lambda **kwargs: response
+    )
+    broker = KisBroker()
+
+    with pytest.raises(MissingImmediateBrokerOrderIdError) as raised:
+        broker.submit_order(
+            environment="PROD",
+            account_no="12345678-01",
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            quantity=1,
+            limit_price=100.0,
+        )
+
+    assert raised.value.raw_response is response
+    assert broker.is_ambiguous_submission_error(raised.value) is True
 
 
 def test_cancel_order_regular_vs_reserved_routes_to_different_endpoints(monkeypatch):

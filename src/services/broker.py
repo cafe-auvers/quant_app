@@ -58,6 +58,17 @@ class BrokerSubmissionResult:
     raw_response: Dict[str, Any]
 
 
+class MissingImmediateBrokerOrderIdError(RuntimeError):
+    """KIS accepted a mutation but returned no immediately usable identity."""
+
+    def __init__(self, raw_response: Dict[str, Any]) -> None:
+        self.raw_response = raw_response
+        super().__init__(
+            "KIS submission response lacked an immediate broker order ID; "
+            "the outcome is ambiguous and must be reconciled before any retry"
+        )
+
+
 def _extract_kis_broker_order_id(response: Dict[str, Any]) -> str:
     """Normalize KIS regular/reserved order identifiers at the adapter edge."""
     candidates = (
@@ -248,14 +259,19 @@ class KisBroker:
                 exchange=exchange,
                 order_type="limit",
             )
+        broker_order_id = _extract_kis_broker_order_id(response)
+        if not broker_order_id:
+            raise MissingImmediateBrokerOrderIdError(response)
         return BrokerSubmissionResult(
-            broker_order_id=_extract_kis_broker_order_id(response),
+            broker_order_id=broker_order_id,
             raw_response=response,
         )
 
     def is_ambiguous_submission_error(self, error: BaseException) -> bool:
         if isinstance(error, LiveExecutionEnvelopeError):
             return False
+        if isinstance(error, MissingImmediateBrokerOrderIdError):
+            return True
         return kis_order.is_ambiguous_order_submission_error(error)
 
     @staticmethod

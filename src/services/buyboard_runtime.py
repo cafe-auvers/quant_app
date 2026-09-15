@@ -775,6 +775,7 @@ def build_buyboard_runtime(
     strategy_instance_id: str = "",
     persist_card_before_execution: Optional[Callable[[TradeCardState], None]] = None,
     observation_only: bool = False,
+    qualification_shadow_only: bool = False,
 ) -> BuyboardRuntime:
     """Assembles every engine piece with real callback implementations.
 
@@ -836,7 +837,16 @@ def build_buyboard_runtime(
     # strategy identity therefore fails at startup, before a callback can
     # reach the broker.
     engine_enabled = execution_config.is_buyboard_engine_enabled()
-    if engine_enabled and not observation_only:
+    shadow_gateway = bool(
+        qualification_shadow_only
+        and isinstance(broker, ExecutionCommandGateway)
+        and getattr(broker, "qualification_shadow_only", False) is True
+    )
+    if qualification_shadow_only and not shadow_gateway:
+        raise RuntimeError(
+            "qualification_shadow_only requires the dedicated shadow execution gateway"
+        )
+    if (engine_enabled or qualification_shadow_only) and not observation_only:
         if not isinstance(broker, ExecutionCommandGateway):
             raise RuntimeError(
                 "BUYBOARD_ENGINE_ENABLED=true accepts only an ExecutionCommandGateway "
@@ -847,7 +857,7 @@ def build_buyboard_runtime(
                 "BUYBOARD_ENGINE_ENABLED=true requires gateway.mode=GUARDED_ENGINE"
             )
         broker.require_guarded_runtime_ready()
-        if not isinstance(execution_lease, ExecutionLease):
+        if not qualification_shadow_only and not isinstance(execution_lease, ExecutionLease):
             raise RuntimeError(
                 "BUYBOARD_ENGINE_ENABLED=true requires an epoch-bearing ExecutionLease"
             )
@@ -1417,7 +1427,11 @@ def build_buyboard_runtime(
         ),
         reconcile_order=reconcile_runtime_order,
         refresh_broker_position=lambda card: _refresh_broker_position(card, broker=resolved_broker),
-        persist_order=order_ledger.upsert_order,
+        persist_order=(
+            (lambda _order: None)
+            if qualification_shadow_only
+            else order_ledger.upsert_order
+        ),
         find_entry_order_by_id=find_runtime_entry_order_by_id,
     )
 
@@ -2000,6 +2014,7 @@ def build_buyboard_runtime(
         prepare_entry_attempt=prepare_entry_attempt if guarded_mode else None,
         account_equity_provider=account_equity_provider,
         trading_halt_lookup=resolved_market_data.is_symbol_trading_halted,
+        enabled_provider=(lambda: True) if qualification_shadow_only else None,
     )
 
     return BuyboardRuntime(

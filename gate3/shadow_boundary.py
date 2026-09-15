@@ -68,7 +68,7 @@ def _request_digest(request: Any) -> str:
 
 def _account_reference(account_no: str) -> str:
     value = str(account_no or "").strip()
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16] if value else ""
+    return hashlib.sha256(value.encode("utf-8")).hexdigest() if value else ""
 
 
 @dataclass(frozen=True)
