@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 import threading
 import time
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -20,6 +21,7 @@ from src.utils.market_calendar import (
     seconds_until_regular_session_close,
 )
 from src.services.kis_realtime_market_data import (
+    FeedChannel,
     build_kis_realtime_market_data_from_environment,
 )
 from src.core import execution_config
@@ -29,6 +31,8 @@ from src.core.runtime_safety_audit import (
     begin_runtime_safety_audit,
 )
 from gate2.reporting import (
+    GATE2_RECEIVE_LAG_P95_LIMIT_MS,
+    GATE2_RECEIVE_LAG_P99_LIMIT_MS,
     Gate2Evidence,
     LiveGate2Runner,
     _ProgressWatchdog,
@@ -532,6 +536,8 @@ def _passing_gate2_evidence() -> Gate2Evidence:
             "p99": 200.0,
             "max": 300.0,
         },
+        latency_window_started_at=opened.isoformat(),
+        latency_window_start_delay_seconds=0.0,
         queue_lag_ms={"count": 200, "p50": 1.0, "p95": 2.0, "p99": 3.0, "max": 4.0},
         synthetic_stop_tests={
             "injected": 1,
@@ -581,6 +587,76 @@ def test_gate2_report_passes_only_complete_read_only_session_evidence():
     assert report["broker_mutations"] == 0
     assert not report["production_activation_authorized"]
     assert report["metrics"]["critical_subscription_ack"]["result"] == "PASSED"
+
+
+def test_gate2_receive_lag_limits_are_strict_and_regular_session_bounded():
+    evidence = _passing_gate2_evidence()
+    evidence.receive_lag_ms["p95"] = GATE2_RECEIVE_LAG_P95_LIMIT_MS - 0.1
+    evidence.receive_lag_ms["p99"] = GATE2_RECEIVE_LAG_P99_LIMIT_MS - 0.1
+
+    report = build_report(evidence)
+
+    assert report["metrics"]["receive_lag_p95_ms"]["result"] == "PASSED"
+    assert report["metrics"]["receive_lag_p99_ms"]["result"] == "PASSED"
+
+    evidence.receive_lag_ms["p95"] = GATE2_RECEIVE_LAG_P95_LIMIT_MS
+    evidence.receive_lag_ms["p99"] = GATE2_RECEIVE_LAG_P99_LIMIT_MS
+    report = build_report(evidence)
+
+    assert report["metrics"]["receive_lag_p95_ms"]["result"] == "FAILED"
+    assert report["metrics"]["receive_lag_p99_ms"]["result"] == "FAILED"
+
+    evidence.receive_lag_ms["p95"] = 100.0
+    evidence.receive_lag_ms["p99"] = 200.0
+    evidence.latency_window_start_delay_seconds = 3.1
+    report = build_report(evidence)
+
+    assert report["metrics"]["receive_lag_p95_ms"]["result"] == "FAILED"
+    assert report["metrics"]["receive_lag_p99_ms"]["result"] == "FAILED"
+
+
+def test_gate2_runner_drains_accepted_events_before_sampling():
+    operations = []
+    sampled_at = dt.datetime(2026, 8, 17, 13, 30, tzinfo=dt.timezone.utc)
+    runner = object.__new__(LiveGate2Runner)
+    runner.service = SimpleNamespace(
+        poll_once=lambda: operations.append("poll")
+    )
+    runner.sample = lambda observed_at: operations.append(("sample", observed_at))
+
+    result = runner.poll_and_sample(sampled_at)
+
+    assert result == sampled_at
+    assert operations == ["poll", ("sample", sampled_at)]
+
+
+def test_gate2_silent_stale_probe_always_suppresses_the_quote_channel():
+    now = dt.datetime(2026, 8, 17, 14, 0, tzinfo=dt.timezone.utc)
+    calls = []
+    service = SimpleNamespace(
+        symbol_state=lambda _symbol: SimpleNamespace(
+            last_trade_received_at=now,
+            last_quote_received_at=now,
+            last_trade_event_at=now,
+            last_quote_event_at=now,
+        ),
+        is_connected=lambda: True,
+        entry_quote_ready=lambda _symbol, now: True,
+        set_qualification_channel_suppressed=(
+            lambda symbol, channel, suppressed: calls.append(
+                (symbol, channel, suppressed)
+            )
+        ),
+    )
+    runner = object.__new__(LiveGate2Runner)
+    runner.service = service
+    runner.evidence = SimpleNamespace(silent_stale_probe={})
+    runner._silent_probe_phase = ""
+
+    runner.start_silent_stale_probe(symbol="AAPL", now=now)
+
+    assert calls == [("AAPL", FeedChannel.QUOTE, True)]
+    assert runner.evidence.silent_stale_probe["channel"] == FeedChannel.QUOTE.value
 
 
 def test_gate2_live_status_is_actionable_without_persisting_subscription_keys(tmp_path):

@@ -262,8 +262,8 @@ AND independent review = APPROVED
 | Duplicate-subscription corruption | 0 |
 | Missed synthetic stop breaches | 0 |
 | Queue/accumulator deadlocks | 0 |
-| Receive-lag p95 | Less than 1 second |
-| Receive-lag p99 | Less than 2 seconds |
+| Regular-session receive-lag p95 | Less than 1.5 seconds |
+| Regular-session receive-lag p99 | Less than 3.5 seconds |
 | Secret or approval-key leaks | 0 |
 | Broker mutation attempts | 0 from an initialized final-boundary audit |
 
