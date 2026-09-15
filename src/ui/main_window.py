@@ -2234,7 +2234,9 @@ class MainWindow(
             queue_manager = self._ensure_execution_queue_manager()
             execution_engine = self._execution_state_engine()
             external_alerting = build_external_alerting_service(
-                execution_engine, device_id=role.device_id
+                execution_engine,
+                device_id=role.device_id,
+                qualification_observer=self._gate4_qualification_observer,
             )
 
             # Review finding P0-1: this must be the real, per-account,
@@ -3803,7 +3805,8 @@ class MainWindow(
             "operational_db_engine" not in self.__dict__
             and "pc_db_engine" not in self.__dict__
         ):
-            trading_state.set_trading_enabled(bool(checked))
+            effective = trading_state.set_trading_enabled(bool(checked))
+            self._record_gate4_manual_control(effective)
             self._refresh_trading_enabled_widget()
             return
 
@@ -3841,6 +3844,7 @@ class MainWindow(
 
         effective = live_trading_control_is_effective(result.control)
         trading_state.set_trading_enabled(effective)
+        self._record_gate4_manual_control(effective)
         self._shared_live_trading_available = bool(
             self._execution_state_engine() is not None and self._execution_state_ready()
         )
@@ -3860,6 +3864,35 @@ class MainWindow(
             f"(revision {result.control.revision})."
             + (f" Reason: {reason}." if reason else "")
         )
+
+    @staticmethod
+    def _record_gate4_manual_control(effective: bool) -> None:
+        from gate4.runtime_observer import observe_gate4_event
+
+        if effective:
+            observe_gate4_event("MANUAL_ARM", source="MANUAL_UI")
+            return
+        observe_gate4_event("DISARMED", source="MANUAL_UI")
+        from src.services.trading_state import TradingDisabledError
+
+        blocked = False
+        try:
+            trading_state.require_trading_enabled(
+                environment="PROD", symbol="GATE4-DISARM-PROBE"
+            )
+        except TradingDisabledError:
+            blocked = True
+        observe_gate4_event(
+            "DISARM_PROBE",
+            next_mutation_blocked=blocked,
+            broker_called=False,
+        )
+
+    @staticmethod
+    def _gate4_qualification_observer(event_type: str, payload: dict) -> None:
+        from gate4.runtime_observer import observe_gate4_event
+
+        observe_gate4_event(event_type, **dict(payload))
 
     def _build_status_log(self, parent_layout: QVBoxLayout) -> None:
         """Build the shared dashboard log and progress widgets."""

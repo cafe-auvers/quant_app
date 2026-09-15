@@ -31,6 +31,7 @@ def _gate2_report():
 def _passing_gate3():
     upstream = _gate2_report()
     evidence = {
+        "collector_derived": True,
         "commit_sha": COMMIT,
         "gate2_report_sha256": canonical_report_sha256(upstream),
         "final_production_decision_runtime_used": True,
@@ -40,10 +41,13 @@ def _passing_gate3():
         "shadow_store_isolated": True,
         "shadow_store_visibly_labelled": True,
         "shadow_store_append_only_verified": True,
+        "captured_live_replay_complete": True,
         "production_ledgers_unchanged": True,
         "strategy_rules_sha256": "1" * 64,
         "decision_oracle_sha256": "3" * 64,
         "shadow_store_sha256": "2" * 64,
+        "evidence_journal_sha256": "4" * 64,
+        "production_runtime_source_sha256": "5" * 64,
         "complete_regular_session_count": 1,
         "would_event_counts": {
             "WOULD_SUBMIT": 1,
@@ -56,10 +60,16 @@ def _passing_gate3():
         "fake_broker_ack_count": 0,
         "fake_fill_count": 0,
         "production_ledger_write_count": 0,
+        "runtime_error_count": 0,
         "unresolved_oracle_difference_count": 0,
         "shadow_event_parse_error_count": 0,
         "shadow_event_label_mismatch_count": 0,
         "shadow_duplicate_event_id_count": 0,
+        "evidence_journal_parse_error_count": 0,
+        "evidence_journal_duplicate_event_id_count": 0,
+        "evidence_journal_hash_chain_error_count": 0,
+        "evidence_journal_identity_mismatch_count": 0,
+        "evidence_journal_unknown_event_type_count": 0,
         "observed_decision_branches": sorted(REQUIRED_DECISION_BRANCHES),
         "fence_results": {
             "stale_data": "PASSED",
@@ -76,6 +86,7 @@ def _passing_gate3():
 def _passing_gate4():
     upstream = _passing_gate3()
     evidence = {
+        "collector_derived": True,
         "commit_sha": COMMIT,
         "gate3_report_sha256": canonical_report_sha256(upstream),
         "execution_capabilities_verified": True,
@@ -97,6 +108,13 @@ def _passing_gate4():
         "final_reconciliation_matches_broker": True,
         "controlled_live_config_sha256": "4" * 64,
         "risk_limits_sha256": "5" * 64,
+        "evidence_journal_sha256": "6" * 64,
+        "capability_evidence_sha256": "7" * 64,
+        "evidence_journal_parse_error_count": 0,
+        "evidence_journal_duplicate_event_id_count": 0,
+        "evidence_journal_hash_chain_error_count": 0,
+        "evidence_journal_identity_mismatch_count": 0,
+        "evidence_journal_unknown_event_type_count": 0,
         "reviewed_entry_notional_cap": 1_000.0,
         "max_observed_entry_notional": 500.0,
         "approved_symbols": ["AAPL", "MSFT"],

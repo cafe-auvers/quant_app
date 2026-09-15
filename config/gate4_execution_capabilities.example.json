@@ -1,0 +1,24 @@
+{
+  "commit_sha": "<exact-40-character-release-sha>",
+  "environment": "PROD",
+  "account_ref": "<sha256-of-environment-and-account-identity>",
+  "review": {
+    "status": "PENDING",
+    "author": "",
+    "reviewer": "",
+    "reviewed_at": "",
+    "reference": ""
+  },
+  "capabilities": [
+    {"capability_id": "EXTERNAL_CORRELATION_BEHAVIOR", "status": "UNVERIFIED", "evidence_sha256": "", "finding": ""},
+    {"capability_id": "AMBIGUOUS_SUBMISSION_RECOVERY", "status": "UNVERIFIED", "evidence_sha256": "", "finding": ""},
+    {"capability_id": "IMMEDIATE_BROKER_ORDER_ID", "status": "UNVERIFIED", "evidence_sha256": "", "finding": ""},
+    {"capability_id": "BROKER_ORDER_ID_UNIQUENESS_SCOPE", "status": "UNVERIFIED", "evidence_sha256": "", "finding": ""},
+    {"capability_id": "ORDER_HISTORY_LATENCY", "status": "UNVERIFIED", "evidence_sha256": "", "finding": ""},
+    {"capability_id": "ORDER_HISTORY_COMPLETENESS", "status": "UNVERIFIED", "evidence_sha256": "", "finding": ""},
+    {"capability_id": "SUBMIT_ACCEPTED_MUTATION", "status": "UNVERIFIED", "evidence_sha256": "", "finding": ""},
+    {"capability_id": "CANCEL_ACCEPTED_MUTATION", "status": "UNVERIFIED", "evidence_sha256": "", "finding": ""},
+    {"capability_id": "REPLACE_ACCEPTED_MUTATION", "status": "UNVERIFIED", "evidence_sha256": "", "finding": ""},
+    {"capability_id": "RATE_LIMIT_PRE_ACCEPTANCE_SEMANTICS", "status": "UNVERIFIED", "evidence_sha256": "", "finding": ""}
+  ]
+}

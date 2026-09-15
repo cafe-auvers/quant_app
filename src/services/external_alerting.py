@@ -401,6 +401,7 @@ class ExternalAlertingService:
         heartbeat_audit_interval_seconds: float = 300.0,
         local_spool: Optional[LocalAlertSpool] = None,
         spool_import_fault_hook: Optional[Callable[[str], None]] = None,
+        qualification_observer: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     ) -> None:
         self.engine = engine
         self.provider = provider
@@ -423,6 +424,7 @@ class ExternalAlertingService:
         self._spool_import_fault_hook = spool_import_fault_hook or (
             lambda _point: None
         )
+        self._qualification_observer = qualification_observer
         self._last_heartbeat_attempt_at: Optional[datetime] = None
         self._last_heartbeat_published_at: Optional[datetime] = None
         # The external watchdog is the live authority.  Delay the first
@@ -442,6 +444,24 @@ class ExternalAlertingService:
             if isinstance(alert_type, CriticalAlertType)
             else CriticalAlertType(str(alert_type or "").upper())
         )
+
+    def _observe_qualification_delivery(
+        self, *, alert_type: str, delivery_ref: str
+    ) -> None:
+        observer = self._qualification_observer
+        if observer is None:
+            return
+        try:
+            observer(
+                "EXTERNAL_ALERT_DELIVERED",
+                {
+                    "delivered": True,
+                    "alert_type": str(alert_type or ""),
+                    "delivery_ref": str(delivery_ref or ""),
+                },
+            )
+        except Exception:
+            logger.exception("Could not record Gate-4 alert-delivery evidence")
 
     def raise_alert(
         self,
@@ -629,6 +649,10 @@ class ExternalAlertingService:
             status, error = "DELIVERED", ""
         except Exception as exc:
             delivery_id, status, error = "", "FAILED", str(exc)
+        if status == "DELIVERED":
+            self._observe_qualification_delivery(
+                alert_type=resolved_type, delivery_ref=delivery_id
+            )
         if pending is not None:
             try:
                 self.local_spool.append(
@@ -859,6 +883,11 @@ class ExternalAlertingService:
             status, error = "DELIVERED", ""
         except Exception as exc:
             provider_delivery_id, status, error = "", "FAILED", str(exc)
+        if status == "DELIVERED":
+            self._observe_qualification_delivery(
+                alert_type=str(pending.get("alert_type") or ""),
+                delivery_ref=provider_delivery_id,
+            )
         self.local_spool.append(
             "ALERT_DELIVERY_ATTEMPT",
             {
@@ -968,6 +997,11 @@ class ExternalAlertingService:
                 attempt_status = "FAILED"
                 error = str(exc)
                 delay = self.retry_base_seconds * (2 ** min(attempt_number - 1, 6))
+            if attempt_status == "DELIVERED":
+                self._observe_qualification_delivery(
+                    alert_type=incident.alert_type.value,
+                    delivery_ref=provider_id,
+                )
             incident_table = _incident_table(MetaData())
             attempt_table = _attempt_table(MetaData())
             with self.engine.begin() as conn:
@@ -1223,7 +1257,12 @@ class ExternalAlertingService:
 
 
 def build_external_alerting_service(
-    engine: Engine, *, device_id: str
+    engine: Engine,
+    *,
+    device_id: str,
+    qualification_observer: Optional[
+        Callable[[str, Dict[str, Any]], None]
+    ] = None,
 ) -> ExternalAlertingService:
     """Construct the required production publisher for an enabled runtime."""
 
@@ -1253,4 +1292,5 @@ def build_external_alerting_service(
         heartbeat_audit_interval_seconds=(
             execution_config.EXTERNAL_WATCHDOG_TIDB_AUDIT_SECONDS
         ),
+        qualification_observer=qualification_observer,
     )

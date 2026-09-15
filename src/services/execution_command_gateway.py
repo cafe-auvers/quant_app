@@ -46,12 +46,13 @@ transaction.
 from __future__ import annotations
 
 import logging
+import hashlib
 import math
 import threading
 import time
 import weakref
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from sqlalchemy.engine import Engine
 
@@ -445,6 +446,9 @@ class ExecutionCommandGateway:
         critical_alert_sink: Optional[Callable[[str, str, str], None]] = None,
         schema_migration_manager: Optional[Any] = None,
         projected_portfolio_risk_required: bool = False,
+        qualification_observer: Optional[
+            Callable[[str, Mapping[str, Any]], None]
+        ] = None,
     ) -> None:
         self._engine = engine
         self._real_broker: Broker = (
@@ -480,6 +484,7 @@ class ExecutionCommandGateway:
         self._projected_portfolio_risk_required = bool(
             projected_portfolio_risk_required
         )
+        self._qualification_observer = qualification_observer
         self._last_verified_lease: Optional[ExecutionLease] = None
         self._last_database_writable_state: Optional[bool] = None
         self._emergency_records: Dict[str, ExecutionOrderRecord] = {}
@@ -1594,42 +1599,119 @@ class ExecutionCommandGateway:
         endpoint: str,
         priority: RequestPriority,
         is_new_entry: bool,
+        qualification_context: Optional[Mapping[str, Any]] = None,
     ) -> Any:
+        context = dict(qualification_context or {})
+        observer = self._qualification_observer
+        if observer is None:
+            observer = lambda _event_type, _payload: None
+
+        account_ref = (
+            hashlib.sha256(str(account_no).encode("utf-8")).hexdigest()
+            if account_no
+            else ""
+        )
+        common_observation = {
+            "command_type": command_type.value,
+            "endpoint": endpoint,
+            "account_ref": account_ref,
+            "automatic_retry": False,
+            "duplicate": False,
+            "owned": True,
+            "strategy_entry": is_new_entry,
+            **context,
+        }
+        if is_new_entry:
+            observer(
+                "ENTRY_CANDIDATE",
+                {
+                    "symbol": context.get("symbol", ""),
+                    "notional": float(context.get("quantity", 0) or 0)
+                    * float(context.get("limit_price", 0.0) or 0.0),
+                    "active_trade_card": context.get("active_trade_card") is True,
+                    "risk_rechecked_atomically": context.get("risk_rechecked_atomically")
+                    is True,
+                },
+            )
         scheduler = self._require_mutation_budget()
         classifier = getattr(
             self._real_broker,
             "is_confirmed_pre_acceptance_rejection",
             None,
         )
-        if getattr(self._real_broker, "schedules_at_request_boundary", False):
-            with kis_request_scope(
-                scheduler=scheduler,
-                account_no=account_no,
-                kind=RequestKind.MUTATION,
-                priority=priority,
-                command_type=command_type,
-                endpoint=endpoint,
-                is_new_entry=is_new_entry,
-                mutation_classifier=(
-                    classifier if callable(classifier) else None
-                ),
-            ):
-                return operation()
-        execute = getattr(scheduler, "execute_mutation", None)
-        if not callable(execute):
+        dispatched = False
+
+        def observed_operation() -> Any:
+            nonlocal dispatched
+            dispatched = True
+            observer("MUTATION_DISPATCHED", common_observation)
             return operation()
 
-        return execute(
-            operation,
-            command_type=command_type,
-            account_no=account_no,
-            endpoint=endpoint,
-            priority=priority,
-            is_new_entry=is_new_entry,
-            is_confirmed_pre_acceptance_rejection=(
-                classifier if callable(classifier) else None
-            ),
+        try:
+            if getattr(self._real_broker, "schedules_at_request_boundary", False):
+                with kis_request_scope(
+                    scheduler=scheduler,
+                    account_no=account_no,
+                    kind=RequestKind.MUTATION,
+                    priority=priority,
+                    command_type=command_type,
+                    endpoint=endpoint,
+                    is_new_entry=is_new_entry,
+                    mutation_classifier=(
+                        classifier if callable(classifier) else None
+                    ),
+                ):
+                    result = observed_operation()
+            else:
+                execute = getattr(scheduler, "execute_mutation", None)
+                result = (
+                    observed_operation()
+                    if not callable(execute)
+                    else execute(
+                        observed_operation,
+                        command_type=command_type,
+                        account_no=account_no,
+                        endpoint=endpoint,
+                        priority=priority,
+                        is_new_entry=is_new_entry,
+                        is_confirmed_pre_acceptance_rejection=(
+                            classifier if callable(classifier) else None
+                        ),
+                    )
+                )
+        except Exception as exc:
+            if not dispatched:
+                raise
+            try:
+                ambiguous = not (
+                    callable(classifier) and classifier(exc) is True
+                )
+            except Exception:
+                ambiguous = True
+            observer(
+                "MUTATION_TERMINAL",
+                {
+                    **common_observation,
+                    "result": "AMBIGUOUS" if ambiguous else "REJECTED",
+                    "identity_ambiguous": ambiguous,
+                    "resolved": not ambiguous,
+                    "broker_confirmed_terminal": not ambiguous,
+                    "strategy_entry": is_new_entry,
+                },
+            )
+            raise
+        observer(
+            "MUTATION_TERMINAL",
+            {
+                **common_observation,
+                "result": "BROKER_ACCEPTED",
+                "identity_ambiguous": False,
+                "resolved": True,
+                "broker_confirmed_terminal": False,
+                "strategy_entry": is_new_entry,
+            },
         )
+        return result
 
     @staticmethod
     def _priority_for_submit(request: SubmitExecutionRequest) -> RequestPriority:
@@ -1981,6 +2063,14 @@ class ExecutionCommandGateway:
                     endpoint="submit_order",
                     priority=RequestPriority.EMERGENCY_EXIT,
                     is_new_entry=False,
+                    qualification_context={
+                        "symbol": request.symbol,
+                        "client_order_id": request.client_order_id,
+                        "quantity": quantity,
+                        "limit_price": limit_price,
+                        "side": request.side.value,
+                        "emergency": True,
+                    },
                 )
         except Exception as exc:
             try:
@@ -2123,6 +2213,13 @@ class ExecutionCommandGateway:
                     endpoint="cancel_order",
                     priority=RequestPriority.EMERGENCY_EXIT,
                     is_new_entry=False,
+                    qualification_context={
+                        "symbol": request.symbol,
+                        "client_order_id": request.client_order_id,
+                        "quantity": request.quantity,
+                        "side": request.side,
+                        "emergency": True,
+                    },
                 )
         except Exception as exc:
             classify = getattr(self._real_broker, "is_ambiguous_cancellation_error", None)
@@ -2422,6 +2519,7 @@ class ExecutionCommandGateway:
         # enhancement -- see the module's own follow-up notes); it still
         # closes the concrete race: a stale authorization can no longer
         # reach the broker.
+        final_portfolio_risk_spec = None
         try:
             self._require_ownership(
                 environment, account_no, symbol, request.source,
@@ -2430,7 +2528,7 @@ class ExecutionCommandGateway:
             self._require_verified_lease(request.lease)
             # Recheck at the last possible moment because lease/database work
             # above may consume most of the approval's short TTL.
-            require_current_entry_risk_approval()
+            final_portfolio_risk_spec = require_current_entry_risk_approval()
             require_live_entry_allowed(
                 environment=environment,
                 account_no=account_no,
@@ -2494,6 +2592,19 @@ class ExecutionCommandGateway:
                 endpoint="submit_order",
                 priority=submit_priority,
                 is_new_entry=is_new_entry,
+                qualification_context={
+                    "symbol": symbol,
+                    "client_order_id": request.client_order_id,
+                    "quantity": quantity,
+                    "limit_price": limit_price,
+                    "side": request.side.value,
+                    "active_trade_card": bool(
+                        request.strategy_instance_id and request.risk_plan_id
+                    ),
+                    "risk_rechecked_atomically": bool(
+                        is_new_entry and final_portfolio_risk_spec is not None
+                    ),
+                },
             )
         except Exception as exc:
             error_message = str(exc)
@@ -2684,6 +2795,13 @@ class ExecutionCommandGateway:
                 endpoint="cancel_order",
                 priority=cancel_priority,
                 is_new_entry=False,
+                qualification_context={
+                    "symbol": record.symbol,
+                    "client_order_id": record.client_order_id,
+                    "quantity": quantity,
+                    "limit_price": record.submitted_limit_price,
+                    "side": record.side.value,
+                },
             )
         except Exception as exc:
             error_message = str(exc)
@@ -2832,6 +2950,9 @@ def build_guarded_execution_gateway(
     handoff_pending_provider: Optional[Callable[[], bool]] = None,
     critical_alert_sink: Optional[Callable[[str, str, str], None]] = None,
     schema_migration_manager: Optional[Any] = None,
+    qualification_observer: Optional[
+        Callable[[str, Mapping[str, Any]], None]
+    ] = None,
 ) -> ExecutionCommandGateway:
     """The explicit ``GUARDED_ENGINE``-capable composition root (finding
     10): every dependency ``GUARDED_ENGINE`` mode actually needs is
@@ -2870,4 +2991,5 @@ def build_guarded_execution_gateway(
         critical_alert_sink=critical_alert_sink,
         schema_migration_manager=schema_migration_manager,
         projected_portfolio_risk_required=True,
+        qualification_observer=qualification_observer,
     )

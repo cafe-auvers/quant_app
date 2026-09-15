@@ -29,6 +29,7 @@ def build_report(
         commit_sha=commit_sha,
     )
     required_true = {
+        "collector_derived",
         "execution_capabilities_verified",
         "session_started_disarmed",
         "manual_arm_after_active_readiness",
@@ -71,6 +72,18 @@ def build_report(
     for key in ("controlled_live_config_sha256", "risk_limits_sha256"):
         if not valid_sha256(evidence.get(key)):
             violations.append(violation(key, f"{key} is missing or invalid"))
+    for key in ("evidence_journal_sha256", "capability_evidence_sha256"):
+        if not valid_sha256(evidence.get(key)):
+            violations.append(violation(key, f"{key} is missing or invalid"))
+    for key in (
+        "evidence_journal_parse_error_count",
+        "evidence_journal_duplicate_event_id_count",
+        "evidence_journal_hash_chain_error_count",
+        "evidence_journal_identity_mismatch_count",
+        "evidence_journal_unknown_event_type_count",
+    ):
+        if evidence_integer(evidence.get(key)) != 0:
+            violations.append(violation(key, f"{key} must equal zero"))
     try:
         notional_cap = float(evidence.get("reviewed_entry_notional_cap"))
         max_notional = float(evidence.get("max_observed_entry_notional"))

@@ -953,6 +953,47 @@ def test_mutation_budget_exhaustion_blocks_submission(tmp_path):
     assert broker.submit_calls == []
 
 
+def test_gate4_dispatch_observation_occurs_only_when_scheduler_runs_operation(
+    tmp_path,
+):
+    from src.services.mutation_budget_protocol import MutationBudgetExceededError
+
+    class _RejectBeforeBoundary:
+        context_aware = True
+
+        def require_available(self, command_type, **context):
+            return None
+
+        def execute_mutation(self, operation, **context):
+            raise MutationBudgetExceededError("pre-acceptance rate limit")
+
+    engine = _make_engine(tmp_path)
+    events = []
+    gateway = ExecutionCommandGateway(
+        real_broker=FakeExecutionBroker(),
+        engine=engine,
+        mode_override=True,
+        lease_protocol=_lease()[0],
+        mutation_budget=_RejectBeforeBoundary(),
+        buying_power_provider=lambda environment, account_no: 100_000.0,
+        qualification_observer=lambda event_type, payload: events.append(
+            (event_type, payload)
+        ),
+    )
+
+    with pytest.raises(MutationBudgetExceededError, match="pre-acceptance"):
+        gateway._execute_scheduled_mutation(
+            lambda: pytest.fail("broker operation must not run"),
+            command_type=gw_module.CommandType.SUBMIT,
+            account_no="12345678-01",
+            endpoint="submit_order",
+            priority=gw_module.RequestPriority.NEW_ENTRY,
+            is_new_entry=False,
+        )
+
+    assert events == []
+
+
 # --- finding 5: H1 persisted execution ownership ----------------------------
 
 

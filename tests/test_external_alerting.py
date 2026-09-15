@@ -93,6 +93,33 @@ def test_alert_delivery_failure_retries_and_escalates(tmp_path):
     assert attempts[-1]["escalation_level"] == 1
 
 
+def test_successful_delivery_emits_gate4_qualification_observation(tmp_path):
+    observations = []
+    service, _ = _service(
+        tmp_path,
+        qualification_observer=lambda event_type, payload: observations.append(
+            (event_type, payload)
+        ),
+    )
+    service.raise_alert(
+        CriticalAlertType.DATABASE_UNAVAILABLE,
+        "gate4-delivery",
+        "database unavailable",
+    )
+
+    assert service.process_due() == 1
+    assert observations == [
+        (
+            "EXTERNAL_ALERT_DELIVERED",
+            {
+                "delivered": True,
+                "alert_type": "DATABASE_UNAVAILABLE",
+                "delivery_ref": "delivery-1",
+            },
+        )
+    ]
+
+
 def test_alert_deduplication_and_acknowledgement_are_incident_scoped(tmp_path):
     service, _ = _service(tmp_path)
     first = service.raise_alert(

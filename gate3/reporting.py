@@ -46,6 +46,7 @@ def build_report(
     )
 
     boolean_requirements = {
+        "collector_derived": "evidence was not derived by the Gate-3 collector",
         "final_production_decision_runtime_used": "final production decision runtime was not used",
         "real_quotes_used": "real quotes did not drive the decision pass",
         "final_boundary_interception_enabled": "final mutation boundary was not intercepted",
@@ -54,6 +55,7 @@ def build_report(
         "shadow_store_visibly_labelled": "shadow state was not visibly labelled",
         "shadow_store_append_only_verified": "append-only shadow persistence was not verified",
         "production_ledgers_unchanged": "production ledgers were modified",
+        "captured_live_replay_complete": "captured-live replay did not complete",
     }
     for key, detail in boolean_requirements.items():
         if evidence.get(key) is not True:
@@ -63,6 +65,8 @@ def build_report(
         "strategy_rules_sha256",
         "decision_oracle_sha256",
         "shadow_store_sha256",
+        "evidence_journal_sha256",
+        "production_runtime_source_sha256",
     ):
         if not valid_sha256(evidence.get(digest_key)):
             violations.append(violation(digest_key, f"{digest_key} is missing or invalid"))
@@ -104,10 +108,16 @@ def build_report(
         "fake_broker_ack_count",
         "fake_fill_count",
         "production_ledger_write_count",
+        "runtime_error_count",
         "unresolved_oracle_difference_count",
         "shadow_event_parse_error_count",
         "shadow_event_label_mismatch_count",
         "shadow_duplicate_event_id_count",
+        "evidence_journal_parse_error_count",
+        "evidence_journal_duplicate_event_id_count",
+        "evidence_journal_hash_chain_error_count",
+        "evidence_journal_identity_mismatch_count",
+        "evidence_journal_unknown_event_type_count",
     )
     for key in zero_metrics:
         count = evidence_integer(evidence.get(key))

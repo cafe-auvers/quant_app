@@ -28,8 +28,8 @@ commit's qualification until the same exact-SHA check passes again.
 |---|---|---|
 | 1. Deterministic simulation | **CLOSED / PASSED for the current protected `master` exact-SHA report** | Re-run the protected Python 3.11/3.12 matrix and Gate-1 report after every later commit. |
 | 2. Live KIS read-only protocol qualification | **BLOCKED / NOT PASSED** | Close the live capability evidence and complete one full-session evidence bundle. |
-| 3. Shadow execution | **OFFLINE BOUNDARY, STORE, AND VALIDATOR IMPLEMENTED / NOT QUALIFIED** | Complete Gate 2, compose the final shadow runner against isolated state, then collect one real-quote session plus captured-live branch coverage and review. |
-| 4. Controlled live | **GUARDRAILS AND FAIL-CLOSED REPORT VALIDATOR IMPLEMENTED / NOT QUALIFIED** | Complete execution-capability evidence and at least three supervised regular-session dates. |
+| 3. Shadow execution | **RUNNER, ISOLATED STORE, AND VALIDATOR IMPLEMENTED / NOT QUALIFIED** | Complete Gate 2 on the exact release, then collect one real-quote session plus captured-live branch coverage and review. |
+| 4. Controlled live | **RUNTIME COLLECTOR AND FAIL-CLOSED VALIDATOR IMPLEMENTED / NOT QUALIFIED** | Complete execution-capability evidence and at least three supervised regular-session dates. |
 | 5. Unattended qualification | **FAIL-CLOSED REPORT/PROMOTION VALIDATORS IMPLEMENTED / NOT QUALIFIED** | After Gate 4, complete five consecutive NYSE sessions, all required drills, alert/watchdog proof, independent review, and a separate operator promotion decision. |
 
 The currently qualified level is Gate 1. Four higher gates remain. No statement
@@ -435,9 +435,9 @@ not itself pass Gate 2 or authorize trading.
    every later release-candidate commit.
 3. **Implemented offline:** Freeze and implement the final ORH pullback plus higher-timeframe
    replacement strategy behavior, with deterministic characterization tests.
-4. **Core implemented offline; final runner/live coverage pending:** Implement a final-boundary shadow adapter, isolated shadow store,
+4. **Implemented offline; live coverage pending:** Implement a final-boundary shadow adapter, isolated shadow store,
    `WOULD_*` schema, decision oracle, coverage matrix, and Gate-3 reporter.
-5. **Implemented offline:** Implement machine-readable Gate-4 and Gate-5 report schemas, validators,
+5. **Gate-4 collector implemented offline; Gate-5 collection pending:** Implement machine-readable Gate-4 and Gate-5 report schemas, validators,
    observation counters, drill records, evidence digests, and independent
    review fields.
 6. **Implemented offline:** Enforce cumulative compatible-evidence dependencies and explicit promotion;
