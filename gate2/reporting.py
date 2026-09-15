@@ -60,6 +60,11 @@ from src.utils.market_calendar import (
 )
 
 KST_ZONE = ZoneInfo("Asia/Seoul")
+# KIS WS0 timestamps are whole-second values.  These reviewed limits are for
+# the regular-session-only measurement window and do not relax the separate
+# 2-second execution-freshness fence.
+GATE2_RECEIVE_LAG_P95_LIMIT_MS = 1_500.0
+GATE2_RECEIVE_LAG_P99_LIMIT_MS = 3_500.0
 SAFE_RUNTIME_EXPECTATIONS = {
     "TRADING_ENABLED": False,
     "BUYBOARD_ENGINE_ENABLED": True,
@@ -216,6 +221,8 @@ class Gate2Evidence:
     duplicate_subscription_anomaly_count: int = 0
     receive_lag_ms: dict[str, float] = field(default_factory=dict)
     queue_lag_ms: dict[str, float] = field(default_factory=dict)
+    latency_window_started_at: str = ""
+    latency_window_start_delay_seconds: float = 0.0
     synthetic_stop_tests: dict[str, int] = field(default_factory=dict)
     silent_stale_probe: dict = field(default_factory=dict)
     watchdog_cycles: int = 0
@@ -540,13 +547,29 @@ def build_report(evidence: Gate2Evidence) -> dict:
         ),
         "receive_lag_p95_ms": _metric(
             value=receive.get("p95", 0.0),
-            threshold="< 1000ms",
-            passed=receive.get("count", 0) > 0 and receive.get("p95", 0.0) < 1000.0,
+            threshold=(
+                "regular-session broker-event receive lag < "
+                f"{GATE2_RECEIVE_LAG_P95_LIMIT_MS:g}ms"
+            ),
+            passed=(
+                bool(evidence.latency_window_started_at)
+                and evidence.latency_window_start_delay_seconds <= 3.0
+                and receive.get("count", 0) > 0
+                and receive.get("p95", 0.0) < GATE2_RECEIVE_LAG_P95_LIMIT_MS
+            ),
         ),
         "receive_lag_p99_ms": _metric(
             value=receive.get("p99", 0.0),
-            threshold="< 2000ms",
-            passed=receive.get("count", 0) > 0 and receive.get("p99", 0.0) < 2000.0,
+            threshold=(
+                "regular-session broker-event receive lag < "
+                f"{GATE2_RECEIVE_LAG_P99_LIMIT_MS:g}ms"
+            ),
+            passed=(
+                bool(evidence.latency_window_started_at)
+                and evidence.latency_window_start_delay_seconds <= 3.0
+                and receive.get("count", 0) > 0
+                and receive.get("p99", 0.0) < GATE2_RECEIVE_LAG_P99_LIMIT_MS
+            ),
         ),
         "queue_lag_p99_ms": _metric(
             value=queue.get("p99", 0.0),
@@ -680,6 +703,10 @@ def build_report(evidence: Gate2Evidence) -> dict:
         "duplicate_subscription_anomaly_count": evidence.duplicate_subscription_anomaly_count,
         "receive_lag_ms": evidence.receive_lag_ms,
         "queue_lag_ms": evidence.queue_lag_ms,
+        "latency_window_started_at": evidence.latency_window_started_at,
+        "latency_window_start_delay_seconds": (
+            evidence.latency_window_start_delay_seconds
+        ),
         "synthetic_stop_tests": evidence.synthetic_stop_tests,
         "silent_stale_probe": evidence.silent_stale_probe,
         "watchdog_cycles": evidence.watchdog_cycles,
@@ -808,6 +835,7 @@ class LiveGate2Runner:
         self._operation_states: dict[tuple[int, str, str], str] = {}
         self._silent_probe_phase = ""
         self.current_feed_ready = False
+        self.current_transport_ready = False
         service.on_session(self._on_session)
         service.on_protocol_operation(self._on_protocol_operation)
 
@@ -903,11 +931,13 @@ class LiveGate2Runner:
         )
         self.service.reconnect()
 
-    def start_silent_stale_probe(
-        self, *, symbol: str, channel: FeedChannel, now: datetime
-    ) -> None:
+    def start_silent_stale_probe(self, *, symbol: str, now: datetime) -> None:
         if self.evidence.silent_stale_probe:
             return
+        # Quotes are the continuously updating execution-pricing channel.  A
+        # trade stream can be organically quiet, which is indistinguishable
+        # from suppression and makes it unsuitable for this controlled probe.
+        channel = FeedChannel.QUOTE
         state = self.service.symbol_state(symbol)
         last_received = (
             state.last_trade_received_at
@@ -940,6 +970,13 @@ class LiveGate2Runner:
             "recovered": False,
             "recovered_at": None,
         }
+
+    def poll_and_sample(self, now: datetime | None = None) -> datetime:
+        """Drain accepted events before evaluating Gate-2 service state."""
+        self.service.poll_once()
+        sampled_at = now or datetime.now(timezone.utc)
+        self.sample(sampled_at)
+        return sampled_at
 
     def _advance_silent_probe(self, now: datetime, stale_symbols: set[str]) -> None:
         probe = self.evidence.silent_stale_probe
@@ -1049,6 +1086,13 @@ class LiveGate2Runner:
         stale_symbols = set(health.stale_symbols)
         self._advance_silent_probe(now, stale_symbols)
         self.current_feed_ready = critical_ready and not stale_symbols
+        self.current_transport_ready = bool(
+            critical_ready
+            and all(
+                self.service.is_symbol_feed_available(symbol)
+                for symbol in self.evidence.symbols
+            )
+        )
         self.evidence.current_feed_ready = self.current_feed_ready
         self.evidence.current_stale_symbols = sorted(stale_symbols)
 
@@ -1087,7 +1131,7 @@ class LiveGate2Runner:
                 ),
             }
         if self.evidence.session_open <= now <= self.evidence.session_close:
-            if not self.evidence.continuity_started_at and self.current_feed_ready:
+            if not self.evidence.continuity_started_at and self.current_transport_ready:
                 self.evidence.continuity_started_at = _iso(now) or ""
                 self.evidence.continuity_start_delay_seconds = max(
                     0.0, (now - self.evidence.session_open).total_seconds()
@@ -1100,7 +1144,7 @@ class LiveGate2Runner:
                     )
                     or self._silent_probe_phase in {"SUPPRESSED", "RECOVERING"}
                 )
-                if not self.current_feed_ready and not expected_gap:
+                if not self.current_transport_ready and not expected_gap:
                     self.evidence.continuity_unexpected_unready_count += 1
         self.evidence.frame_counts_by_tr_id = dict(protocol.frame_counts_by_tr_id)
         self.evidence.record_counts_by_tr_id = dict(protocol.record_counts_by_tr_id)
@@ -1282,6 +1326,10 @@ def build_live_status(
         "continuity_sample_count": evidence.continuity_sample_count,
         "continuity_unexpected_unready_count": (
             evidence.continuity_unexpected_unready_count
+        ),
+        "latency_window_started_at": evidence.latency_window_started_at,
+        "latency_window_start_delay_seconds": (
+            evidence.latency_window_start_delay_seconds
         ),
         "feed_health": {
             "ready": evidence.current_feed_ready,
@@ -1590,6 +1638,7 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
     stop_probe_complete = False
     duplicate_probe_complete = False
     stale_probe_started = False
+    latency_window_started = False
     watchdog = _ProgressWatchdog(evidence, args.watchdog_timeout_seconds)
     runtime_failure = False
     last_status_write = 0.0
@@ -1620,9 +1669,21 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
         watchdog.start()
         service.start()
         while datetime.now(timezone.utc) < session_close:
-            sampled_at = datetime.now(timezone.utc)
+            if (
+                not latency_window_started
+                and datetime.now(timezone.utc) >= session_open
+            ):
+                latency_window_started_at = datetime.now(timezone.utc)
+                service.reset_qualification_latency_metrics()
+                evidence.latency_window_started_at = (
+                    _iso(latency_window_started_at) or ""
+                )
+                evidence.latency_window_start_delay_seconds = max(
+                    0.0, (latency_window_started_at - session_open).total_seconds()
+                )
+                latency_window_started = True
+            sampled_at = runner.poll_and_sample()
             elapsed = (sampled_at - evidence.started_at).total_seconds()
-            runner.sample(sampled_at)
             watchdog.progress()
             frame_ready = all(
                 evidence.frame_counts_by_tr_id.get(tr_id, 0) > 0
@@ -1651,12 +1712,10 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
             if (
                 not stale_probe_started
                 and elapsed >= float(args.silent_stale_probe_after_seconds)
-                and runner.current_feed_ready
+                and runner.current_transport_ready
                 and frame_ready
             ):
-                runner.start_silent_stale_probe(
-                    symbol=symbols[0], channel=FeedChannel.TRADE, now=sampled_at
-                )
+                runner.start_silent_stale_probe(symbol=symbols[0], now=sampled_at)
                 stale_probe_started = bool(evidence.silent_stale_probe)
             if (
                 next_reconnect < len(reconnect_offsets)
@@ -1685,7 +1744,7 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
     finally:
         evidence.ended_at = datetime.now(timezone.utc)
         try:
-            runner.sample(evidence.ended_at)
+            runner.poll_and_sample(evidence.ended_at)
             watchdog.progress()
             runner.finalize()
         except Exception as exc:

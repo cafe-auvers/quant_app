@@ -5,6 +5,7 @@ import threading
 
 import pytest
 
+from gate2.reporting import Gate2Evidence, LiveGate2Runner
 from src.api.kis_websocket import KisWsDataFrame, KisWsSubscription, KisWsSystemFrame
 from src.core.runtime_safety_audit import (
     ENTRY_READINESS_AUDIT_SOURCE,
@@ -537,6 +538,22 @@ def test_protocol_latency_statistics_cover_more_than_the_old_rolling_window():
     assert metrics.queue_lag_max_ms >= 699
 
 
+def test_qualification_latency_metrics_can_start_a_new_measurement_window():
+    service, _ = _service(qualification_mode=True)
+    assert service.ingest_trade(_event(fingerprint="before-window-reset"))
+    assert service.protocol_metrics_snapshot().receive_lag_sample_count == 1
+
+    service.reset_qualification_latency_metrics()
+
+    metrics = service.protocol_metrics_snapshot()
+    assert metrics.receive_lag_sample_count == 0
+    assert metrics.queue_lag_sample_count == 0
+
+    service, _ = _service(qualification_mode=False)
+    with pytest.raises(RuntimeError, match="qualification mode"):
+        service.reset_qualification_latency_metrics()
+
+
 def test_qualification_silent_channel_probe_uses_live_service_freshness(monkeypatch):
     monkeypatch.setattr(
         "src.services.kis_realtime_market_data.execution_config.BROKER_EVENT_STALE_SECONDS",
@@ -549,15 +566,28 @@ def test_qualification_silent_channel_probe_uses_live_service_freshness(monkeypa
     service, _ = _service(qualification_mode=True)
     service.configure_desired_channels(
         trade_priorities={"AAPL": SubscriptionPriority.OPEN_POSITION},
-        quote_priorities={},
+        quote_priorities={"AAPL": SubscriptionPriority.OPEN_POSITION},
     )
     _ack(service, "AAPL", "HDFSCNT0")
+    _ack(service, "AAPL", "HDFSASP0")
     assert service.ingest_trade(_event(fingerprint="before-suppression"))
-
-    service.set_qualification_channel_suppressed("AAPL", FeedChannel.TRADE, True)
-    assert not service.ingest_trade(
-        _event(seconds=1, fingerprint="suppressed-live-event")
+    assert service.ingest_quote(
+        _event(channel="HDFSASP0", fingerprint="quote-before-suppression")
     )
+    assert not service.entry_quote_ready("AAPL", now=NOW)
+    service.poll_once()
+    assert service.entry_quote_ready("AAPL", now=NOW)
+
+    service.set_qualification_channel_suppressed("AAPL", FeedChannel.QUOTE, True)
+    assert not service.ingest_quote(
+        _event(
+            channel="HDFSASP0",
+            seconds=1,
+            fingerprint="suppressed-live-quote",
+        )
+    )
+    assert service.ingest_trade(_event(seconds=1, fingerprint="fresh-live-trade"))
+    service.poll_once()
     assert service.is_connected()
     assert service.health_metrics(now=NOW + dt.timedelta(seconds=2.1)).stale_symbols == (
         "AAPL",
@@ -580,11 +610,67 @@ def test_qualification_silent_channel_probe_uses_live_service_freshness(monkeypa
     assert snapshot.stale_entry_readiness_rejection_count == 1
     assert snapshot.stale_entry_readiness_allow_count == 0
 
-    service.set_qualification_channel_suppressed("AAPL", FeedChannel.TRADE, False)
-    assert service.ingest_trade(
-        _event(seconds=2.1, fingerprint="after-suppression")
+    service.set_qualification_channel_suppressed("AAPL", FeedChannel.QUOTE, False)
+    assert service.ingest_quote(
+        _event(
+            channel="HDFSASP0",
+            seconds=2.1,
+            fingerprint="quote-after-suppression",
+        )
     )
+    service.poll_once()
     assert service.health_metrics(now=NOW + dt.timedelta(seconds=2.1)).stale_symbols == ()
+
+
+def test_gate2_continuity_uses_structural_feed_health_not_event_age(monkeypatch):
+    monkeypatch.setattr(
+        "src.services.kis_realtime_market_data.execution_config.BROKER_EVENT_STALE_SECONDS",
+        2.0,
+    )
+    monkeypatch.setattr(
+        "src.services.kis_realtime_market_data.execution_config.LOCAL_RECEIVE_STALE_SECONDS",
+        2.0,
+    )
+    service, _ = _service(qualification_mode=True)
+    service.configure_desired_channels(
+        trade_priorities={"AAPL": SubscriptionPriority.OPEN_POSITION},
+        quote_priorities={"AAPL": SubscriptionPriority.OPEN_POSITION},
+    )
+    _ack(service, "AAPL", "HDFSCNT0")
+    _ack(service, "AAPL", "HDFSASP0")
+    assert service.ingest_trade(_event(fingerprint="continuity-trade"))
+    assert service.ingest_quote(
+        _event(channel="HDFSASP0", fingerprint="continuity-quote")
+    )
+    service.poll_once()
+    evidence = Gate2Evidence(
+        commit_sha="a" * 40,
+        gate1_report_sha256="b" * 64,
+        capability_matrix_sha256="c" * 64,
+        capability_manifest_sha256="d" * 64,
+        capability_review={},
+        verified_capabilities={},
+        runtime_confirmed_sequence_channels=[],
+        runtime_sequence_fields={},
+        runtime_sequence_reset_semantics={},
+        environment="PROD",
+        symbols=["AAPL"],
+        tr_ids=["HDFSCNT0", "HDFSASP0"],
+        verified_subscription_keys={"AAPL": "DAAPL"},
+        activation_snapshot={},
+        session_open=NOW,
+        session_close=NOW + dt.timedelta(hours=6, minutes=30),
+        started_at=NOW,
+        requested_subscriptions=["HDFSCNT0:AAPL", "HDFSASP0:AAPL"],
+    )
+    with begin_runtime_safety_audit() as audit:
+        runner = LiveGate2Runner(service, evidence, audit)
+        runner.sample(NOW + dt.timedelta(seconds=2.1))
+
+    assert runner.current_feed_ready is False
+    assert runner.current_transport_ready is True
+    assert evidence.continuity_sample_count == 1
+    assert evidence.continuity_unexpected_unready_count == 0
 
 
 def test_sequence_check_is_only_enforced_for_confirmed_channels():

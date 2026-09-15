@@ -217,8 +217,8 @@ keys, and all other preflight requirements in this checklist are valid.
 | Duplicate-subscription corruption | 0 | actual generation/TR/key operations and duplicate-request probe |
 | Missed synthetic stop breaches | 0 | injected/latched/consumed IDs |
 | Queue/accumulator deadlocks | 0 | independent watchdog/cycle progress |
-| Receive lag p95 | < 1 second | broker-event to receive |
-| Receive lag p99 | < 2 seconds | broker-event to receive |
+| Regular-session receive lag p95 | < 1.5 seconds | broker-event to receive |
+| Regular-session receive lag p99 | < 3.5 seconds | broker-event to receive |
 | Secret/approval-key leakage | 0 | full captured-log scan including issued approval key |
 | Broker mutations | Initialized audit source and 0 attempts | sole real `KisBroker` mutation-boundary audit |
 

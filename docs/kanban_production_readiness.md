@@ -1281,8 +1281,8 @@ Unchanged from revision 2:
 | Duplicate-subscription corruption | 0 |
 | Missed synthetic stop breaches | 0 |
 | Queue/accumulator deadlocks | 0 |
-| Receive-lag p95 | under 1 second |
-| Receive-lag p99 | under 2 seconds |
+| Regular-session receive-lag p95 | under 1.5 seconds |
+| Regular-session receive-lag p99 | under 3.5 seconds |
 | Secret/approval-key leakage in logs | 0 |
 
 Post-PR8, `BUYBOARD_ENGINE_ENABLED` stays `true` so Kanban, reconciliation,

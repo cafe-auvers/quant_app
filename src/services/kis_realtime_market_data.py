@@ -510,6 +510,13 @@ class _OnlineLatencyHistogram:
             self._count += 1
             self._maximum = max(self._maximum, value)
 
+    def reset(self) -> None:
+        """Begin a new measurement window without replacing the locked object."""
+        with self._lock:
+            self._buckets = [0] * (self._largest_bucket_ms + 2)
+            self._count = 0
+            self._maximum = 0.0
+
     def snapshot(self) -> tuple[int, float, float, float, float]:
         with self._lock:
             buckets = tuple(self._buckets)
@@ -1187,6 +1194,13 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
                 queue_lag_p99_ms=queue_p99,
                 queue_lag_max_ms=queue_max,
             )
+
+    def reset_qualification_latency_metrics(self) -> None:
+        """Start the regular-session latency window for a read-only soak."""
+        if not self._qualification_mode:
+            raise RuntimeError("latency reset is restricted to qualification mode")
+        self._receive_lags_ms.reset()
+        self._queue_lags_ms.reset()
 
     def replace_stop_rules(self, symbol: str, rules: Iterable[StopRule]):
         return self._accumulator.replace_stop_rules(symbol, rules)
