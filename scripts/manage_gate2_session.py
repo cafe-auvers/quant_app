@@ -42,7 +42,7 @@ BLOCKER_GUIDANCE = {
     "duplicate_subscription_corruption": "Fix invalid or duplicate subscribe/unsubscribe protocol transitions.",
     "synthetic_stop_breaches": "Fix the live accumulator so every injected stop breach is latched and consumed.",
     "watchdog_deadlocks": "Investigate sampling-loop stalls recorded by the independent watchdog.",
-    "full_session_continuity": "Eliminate unexplained critical-feed unready samples across the regular session.",
+    "full_session_continuity": "Target 100% structural feed availability and keep the full-session result at or above 99.95%.",
     "receive_lag_p95_ms": "Bring regular-session broker-event receive-lag p95 below 1.5 seconds.",
     "receive_lag_p99_ms": "Bring regular-session broker-event receive-lag p99 below 3.5 seconds.",
     "queue_lag_p99_ms": "Bring queue-lag p99 within the configured decision deadline.",

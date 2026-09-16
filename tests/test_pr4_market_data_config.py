@@ -615,6 +615,28 @@ def test_gate2_receive_lag_limits_are_strict_and_regular_session_bounded():
     assert report["metrics"]["receive_lag_p99_ms"]["result"] == "FAILED"
 
 
+def test_gate2_continuity_targets_100_percent_with_99_95_percent_floor():
+    evidence = _passing_gate2_evidence()
+    evidence.continuity_unexpected_unready_count = 125
+
+    report = build_report(evidence)
+    metric = report["metrics"]["full_session_continuity"]
+
+    assert metric["result"] == "PASSED"
+    assert metric["numerator"] == 249_875
+    assert metric["denominator"] == 250_000
+    assert metric["availability_percent"] == 99.95
+    assert "target 100%" in metric["threshold"]
+    assert "99.95%" in metric["threshold"]
+    assert report["continuity_availability_percent"] == 99.95
+
+    evidence.continuity_unexpected_unready_count = 126
+    report = build_report(evidence)
+
+    assert report["metrics"]["full_session_continuity"]["result"] == "FAILED"
+    assert "full_session_continuity" in report["blockers"]
+
+
 def test_gate2_runner_drains_accepted_events_before_sampling():
     operations = []
     sampled_at = dt.datetime(2026, 8, 17, 13, 30, tzinfo=dt.timezone.utc)
