@@ -1270,7 +1270,7 @@ Unchanged from revision 2:
 
 | Metric | Requirement |
 |---|---|
-| Continuous read-only soak | one full regular trading session, no crash/restart needed |
+| Continuous read-only soak | one full regular trading session, no crash/restart needed, target 100% structural readiness with a 99.95% minimum |
 | Subscription ACK | 100% of critical symbols |
 | Silent parser failures | 0 |
 | Unhandled disconnects | 0 |

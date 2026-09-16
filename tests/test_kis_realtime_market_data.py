@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from dataclasses import replace
 import threading
 
 import pytest
@@ -542,12 +543,15 @@ def test_qualification_latency_metrics_can_start_a_new_measurement_window():
     service, _ = _service(qualification_mode=True)
     assert service.ingest_trade(_event(fingerprint="before-window-reset"))
     assert service.protocol_metrics_snapshot().receive_lag_sample_count == 1
+    with service._state_lock:
+        service._rejected_event_counts["TRADE:EXCESSIVE_SKEW"] = 1
 
     service.reset_qualification_latency_metrics()
 
     metrics = service.protocol_metrics_snapshot()
     assert metrics.receive_lag_sample_count == 0
     assert metrics.queue_lag_sample_count == 0
+    assert metrics.rejected_event_counts == ()
 
     service, _ = _service(qualification_mode=False)
     with pytest.raises(RuntimeError, match="qualification mode"):
@@ -671,6 +675,45 @@ def test_gate2_continuity_uses_structural_feed_health_not_event_age(monkeypatch)
     assert runner.current_transport_ready is True
     assert evidence.continuity_sample_count == 1
     assert evidence.continuity_unexpected_unready_count == 0
+
+
+def test_structural_feed_continuity_ignores_rejected_event_but_execution_does_not(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "src.services.kis_realtime_market_data.execution_config.MAX_BROKER_CLOCK_SKEW_SECONDS",
+        5.0,
+    )
+    service, _ = _service(qualification_mode=True)
+    service.configure_desired_channels(
+        trade_priorities={"AAPL": SubscriptionPriority.OPEN_POSITION},
+        quote_priorities={"AAPL": SubscriptionPriority.OPEN_POSITION},
+    )
+    _ack(service, "AAPL", "HDFSCNT0")
+    _ack(service, "AAPL", "HDFSASP0")
+    assert service.ingest_trade(_event(fingerprint="initial-trade"))
+    assert service.ingest_quote(
+        _event(channel="HDFSASP0", seconds=10, fingerprint="fresh-quote")
+    )
+    service.poll_once()
+
+    delayed_trade = replace(
+        _event(seconds=10, fingerprint="delayed-trade"),
+        broker_event_at=NOW,
+    )
+    assert not service.ingest_trade(delayed_trade)
+
+    state = service.symbol_state("AAPL")
+    assert state.trade_clock_health == ClockHealth.EXCESSIVE_SKEW
+    assert dict(service.protocol_metrics_snapshot().rejected_event_counts) == {
+        "TRADE:EXCESSIVE_SKEW": 1
+    }
+    assert service.is_symbol_feed_available("AAPL")
+    assert not service.entry_quote_ready("AAPL", now=NOW + dt.timedelta(seconds=10))
+
+    with service._state_lock:
+        service._states["AAPL"].trade_error = "subscription NACK"
+    assert not service.is_symbol_feed_available("AAPL")
 
 
 def test_sequence_check_is_only_enforced_for_confirmed_channels():

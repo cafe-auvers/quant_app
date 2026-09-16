@@ -480,6 +480,7 @@ class MarketDataProtocolMetrics:
     schema_fingerprints_by_tr_id: tuple[tuple[str, str], ...]
     parser_failure_count: int
     duplicate_event_count: int
+    rejected_event_counts: tuple[tuple[str, int], ...]
     receive_lag_sample_count: int
     receive_lag_p50_ms: float
     receive_lag_p95_ms: float
@@ -646,6 +647,7 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         self._schema_fingerprints: Dict[str, str] = {}
         self._parser_failure_count = 0
         self._duplicate_event_count = 0
+        self._rejected_event_counts: Dict[str, int] = {}
         self._connected = False
         self._reconnect_generation = 0
         self._single_session_conflict_observed_at: Optional[datetime] = None
@@ -1183,6 +1185,9 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
                 ),
                 parser_failure_count=self._parser_failure_count,
                 duplicate_event_count=self._duplicate_event_count,
+                rejected_event_counts=tuple(
+                    sorted(self._rejected_event_counts.items())
+                ),
                 receive_lag_sample_count=receive_count,
                 receive_lag_p50_ms=receive_p50,
                 receive_lag_p95_ms=receive_p95,
@@ -1196,11 +1201,13 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
             )
 
     def reset_qualification_latency_metrics(self) -> None:
-        """Start the regular-session latency window for a read-only soak."""
+        """Start the regular-session event-quality window for a read-only soak."""
         if not self._qualification_mode:
             raise RuntimeError("latency reset is restricted to qualification mode")
         self._receive_lags_ms.reset()
         self._queue_lags_ms.reset()
+        with self._state_lock:
+            self._rejected_event_counts.clear()
 
     def replace_stop_rules(self, symbol: str, rules: Iterable[StopRule]):
         return self._accumulator.replace_stop_rules(symbol, rules)
@@ -1352,31 +1359,43 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         require_trade: bool = True,
         require_quote: bool = True,
     ) -> bool:
-        """Return structural KIS channel health without using event age.
+        """Return structural KIS channel health without event-quality state.
 
         KIS sends symbol data when market activity changes; an acknowledged
         channel can therefore be healthy even when an illiquid symbol has not
-        produced a trade for several seconds.  Exact broker mutations still
-        call :meth:`is_symbol_execution_ready` and retain every timestamp and
-        queue-delay check.
+        produced a trade for several seconds.  A rejected timestamp is also an
+        individual data-quality failure, not proof that the socket or its ACKed
+        subscription disappeared.  Exact broker mutations still call
+        :meth:`is_symbol_execution_ready` and retain every timestamp,
+        channel-error, freshness, and queue-delay check.
         """
 
         reference = self._clock()
         self._expire_ack_timeouts(reference)
         state = self.symbol_state(symbol)
-        if not self.is_connected() or state.clock_health != ClockHealth.HEALTHY:
+        if not self.is_connected():
             return False
+        trade_event_error = (
+            state.trade_clock_health != ClockHealth.HEALTHY
+            and state.trade_error
+            == f"{FeedChannel.TRADE.value}:{state.trade_clock_health.value}"
+        )
+        quote_event_error = (
+            state.quote_clock_health != ClockHealth.HEALTHY
+            and state.quote_error
+            == f"{FeedChannel.QUOTE.value}:{state.quote_clock_health.value}"
+        )
         if require_trade and (
             not state.trade_acked
             or state.trade_rejected_due_to_capacity
-            or bool(state.trade_error)
+            or (bool(state.trade_error) and not trade_event_error)
             or bool(state.trade_configuration_error)
         ):
             return False
         if require_quote and (
             not state.quote_acked
             or state.quote_rejected_due_to_capacity
-            or bool(state.quote_error)
+            or (bool(state.quote_error) and not quote_event_error)
             or bool(state.quote_configuration_error)
         ):
             return False
@@ -1822,6 +1841,10 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         changed = False
         with self._state_lock:
             state = self._states.setdefault(symbol, SymbolFeedState(symbol=symbol))
+            rejection = f"{channel.value}:{health.value}"
+            self._rejected_event_counts[rejection] = (
+                self._rejected_event_counts.get(rejection, 0) + 1
+            )
             channel_health = (
                 state.trade_clock_health
                 if channel == FeedChannel.TRADE
@@ -1829,7 +1852,7 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
             )
             changed = channel_health != health
             state.clock_health = health
-            message = f"{channel.value}:{health.value}"
+            message = rejection
             state.last_error = message
             if channel == FeedChannel.TRADE:
                 state.trade_clock_health = health

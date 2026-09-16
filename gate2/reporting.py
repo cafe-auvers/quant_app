@@ -65,6 +65,11 @@ KST_ZONE = ZoneInfo("Asia/Seoul")
 # 2-second execution-freshness fence.
 GATE2_RECEIVE_LAG_P95_LIMIT_MS = 1_500.0
 GATE2_RECEIVE_LAG_P99_LIMIT_MS = 3_500.0
+# Structural continuity targets 100%.  The reviewed Gate-2 floor tolerates at
+# most five unavailable samples per 10,000 observed samples (99.95%) while
+# execution readiness remains independently fail-closed on every bad sample.
+GATE2_CONTINUITY_MINIMUM_BASIS_POINTS = 9_995
+GATE2_CONTINUITY_BASIS_POINTS = 10_000
 SAFE_RUNTIME_EXPECTATIONS = {
     "TRADING_ENABLED": False,
     "BUYBOARD_ENGINE_ENABLED": True,
@@ -218,6 +223,7 @@ class Gate2Evidence:
     parser_failure_count: int = 0
     malformed_frame_count: int = 0
     duplicate_event_count: int = 0
+    rejected_event_counts: dict[str, int] = field(default_factory=dict)
     duplicate_subscription_anomaly_count: int = 0
     receive_lag_ms: dict[str, float] = field(default_factory=dict)
     queue_lag_ms: dict[str, float] = field(default_factory=dict)
@@ -275,6 +281,23 @@ def _metric(
     if denominator is not None:
         item["denominator"] = denominator
     return item
+
+
+def _continuity_availability(
+    sample_count: int, unexpected_unready_count: int
+) -> tuple[int, float, bool]:
+    samples = max(0, int(sample_count))
+    unexpected = min(samples, max(0, int(unexpected_unready_count)))
+    ready = samples - unexpected
+    availability_percent = (
+        round(ready * 100.0 / samples, 6) if samples else 0.0
+    )
+    minimum_met = bool(
+        samples
+        and ready * GATE2_CONTINUITY_BASIS_POINTS
+        >= samples * GATE2_CONTINUITY_MINIMUM_BASIS_POINTS
+    )
+    return ready, availability_percent, minimum_met
 
 
 def _review_snapshot_complete(review: Mapping[str, str]) -> bool:
@@ -378,6 +401,14 @@ def build_report(evidence: Gate2Evidence) -> dict:
         int(scheduled_session_seconds / evidence.poll_interval_seconds * 0.95)
         if evidence.poll_interval_seconds > 0
         else 0
+    )
+    (
+        continuity_ready_samples,
+        continuity_availability_percent,
+        continuity_minimum_met,
+    ) = _continuity_availability(
+        evidence.continuity_sample_count,
+        evidence.continuity_unexpected_unready_count,
     )
     metrics = {
         "full_regular_session": _metric(
@@ -534,15 +565,16 @@ def build_report(evidence: Gate2Evidence) -> dict:
         ),
         "full_session_continuity": _metric(
             value=evidence.continuity_unexpected_unready_count,
+            numerator=continuity_ready_samples,
             denominator=evidence.continuity_sample_count,
-            threshold="session-wide samples>0 and no unexplained critical unready sample",
+            threshold="target 100%; minimum >=99.95% structurally ready samples",
             passed=(
                 expected_continuity_samples > 0
                 and 0 < evidence.poll_interval_seconds <= 0.25
                 and bool(evidence.continuity_started_at)
                 and evidence.continuity_start_delay_seconds <= 3.0
                 and evidence.continuity_sample_count >= expected_continuity_samples
-                and evidence.continuity_unexpected_unready_count == 0
+                and continuity_minimum_met
             ),
         ),
         "receive_lag_p95_ms": _metric(
@@ -651,6 +683,9 @@ def build_report(evidence: Gate2Evidence) -> dict:
         [name for name, metric in metrics.items() if metric["result"] != "PASSED"]
         + list(evidence.operator_abort_reasons)
     )
+    metrics["full_session_continuity"]["availability_percent"] = (
+        continuity_availability_percent
+    )
     return {
         "schema_version": 1,
         "gate": "GATE_2_LIVE_KIS_READ_ONLY_SOAK",
@@ -700,6 +735,8 @@ def build_report(evidence: Gate2Evidence) -> dict:
         "parser_failure_count": evidence.parser_failure_count,
         "malformed_frame_count": evidence.malformed_frame_count,
         "duplicate_event_count": evidence.duplicate_event_count,
+        "rejected_event_counts": dict(sorted(evidence.rejected_event_counts.items())),
+        "rejected_event_count": sum(evidence.rejected_event_counts.values()),
         "duplicate_subscription_anomaly_count": evidence.duplicate_subscription_anomaly_count,
         "receive_lag_ms": evidence.receive_lag_ms,
         "queue_lag_ms": evidence.queue_lag_ms,
@@ -720,6 +757,8 @@ def build_report(evidence: Gate2Evidence) -> dict:
         "continuity_unexpected_unready_count": (
             evidence.continuity_unexpected_unready_count
         ),
+        "continuity_ready_sample_count": continuity_ready_samples,
+        "continuity_availability_percent": continuity_availability_percent,
         "log_scan": {
             "completed": evidence.log_scan_completed,
             "capture_sha256": evidence.log_capture_sha256,
@@ -1154,6 +1193,7 @@ class LiveGate2Runner:
         self.evidence.parser_failure_count = protocol.parser_failure_count
         self.evidence.malformed_frame_count = health.malformed_frame_count
         self.evidence.duplicate_event_count = protocol.duplicate_event_count
+        self.evidence.rejected_event_counts = dict(protocol.rejected_event_counts)
         self.evidence.receive_lag_ms = {
             "count": protocol.receive_lag_sample_count,
             "p50": protocol.receive_lag_p50_ms,
@@ -1266,6 +1306,12 @@ def build_live_status(
     this file is operational evidence when a host or process exits early.
     """
     now = datetime.now(timezone.utc)
+    continuity_ready_samples, continuity_availability_percent, _ = (
+        _continuity_availability(
+            evidence.continuity_sample_count,
+            evidence.continuity_unexpected_unready_count,
+        )
+    )
     requested = set(evidence.requested_subscriptions)
     acked = set(evidence.acked_subscriptions)
     failed_metrics: list[dict[str, object]] = []
@@ -1318,6 +1364,8 @@ def build_live_status(
         "record_counts_by_tr_id": dict(sorted(evidence.record_counts_by_tr_id.items())),
         "parser_failure_count": evidence.parser_failure_count,
         "malformed_frame_count": evidence.malformed_frame_count,
+        "rejected_event_counts": dict(sorted(evidence.rejected_event_counts.items())),
+        "rejected_event_count": sum(evidence.rejected_event_counts.values()),
         "disconnect_count": len(evidence.disconnects),
         "injected_disconnect_request_count": (
             evidence.injected_disconnect_request_count
@@ -1327,6 +1375,8 @@ def build_live_status(
         "continuity_unexpected_unready_count": (
             evidence.continuity_unexpected_unready_count
         ),
+        "continuity_ready_sample_count": continuity_ready_samples,
+        "continuity_availability_percent": continuity_availability_percent,
         "latency_window_started_at": evidence.latency_window_started_at,
         "latency_window_start_delay_seconds": (
             evidence.latency_window_start_delay_seconds

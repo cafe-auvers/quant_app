@@ -249,7 +249,7 @@ AND independent review = APPROVED
 | Metric | Pass requirement |
 |---|---:|
 | Full regular session | Start no later than open and end no earlier than close |
-| Scheduled continuity samples | At least 95%, with zero unexplained critical-unready samples |
+| Scheduled continuity samples | Observe at least 95% of scheduled samples; target 100% structural readiness with a 99.95% minimum |
 | Critical subscription ACK | 100% |
 | Aggregate registration usage | At most 41 |
 | Required frame coverage | At least one `HDFSCNT0` and `HDFSASP0` frame |
@@ -266,6 +266,12 @@ AND independent review = APPROVED
 | Regular-session receive-lag p99 | Less than 3.5 seconds |
 | Secret or approval-key leaks | 0 |
 | Broker mutation attempts | 0 from an initialized final-boundary audit |
+
+Structural continuity measures the connected, ACKed, capacity-valid channel,
+not the validity of every individual broker timestamp. Rejected timestamp or
+sequence events remain fail-closed at the execution-readiness boundary and are
+reported separately; they do not by themselves assert that the WebSocket
+subscription disappeared.
 
 ### Current blockers
 

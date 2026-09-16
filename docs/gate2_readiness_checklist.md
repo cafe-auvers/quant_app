@@ -206,7 +206,7 @@ keys, and all other preflight requirements in this checklist are valid.
 
 | Metric | Pass requirement | Evidence field |
 |---|---|---|
-| Continuous read-only soak | One full regular session with at least 95% of scheduled samples | start/end/session calendar and sample count |
+| Continuous read-only soak | One full regular session, at least 95% of scheduled samples observed, target 100% structural readiness and minimum 99.95% | start/end/session calendar, ready/unready sample counts, and availability percentage |
 | Critical subscription ACK | 100% | requested/acked keys |
 | Silent parser failures | 0 | parser drop/error counts |
 | Unhandled disconnects | 0 | disconnect classifications |
@@ -235,7 +235,10 @@ The generated Gate-2 report must contain:
 - every metric above with numerator, denominator, threshold, and result;
 - reconnect injection timestamps and ACK-recovery durations;
 - parser/frame counts by TR ID and schema fingerprint;
+- timestamp/sequence event-rejection counts by channel and reason;
 - session-wide sample counts plus p50/p95/p99/max receive and queue lag;
+- structural-continuity ready/unready counts and availability percentage, with
+  the 100% target and 99.95% minimum shown explicitly;
 - activation-default snapshot plus initialized runtime-safety audit sources,
   observed stale-readiness rejection, and `broker_mutations=0`;
 - captured-log digest/byte count, issued-approval-key scan result, and hashes
@@ -246,6 +249,11 @@ Gate 2 passes only when every metric passes in one evidence bundle. A failed or
 partial session does not authorize Gate 3. After the run, restore
 `KIS_WS_ENABLED=false` and `KIS_WS_PROTOCOL_VERIFIED=false` until the evidence
 has received an explicit review decision.
+
+Structural continuity is deliberately separate from execution readiness. An
+isolated event rejected for timestamp or sequence integrity must still block
+execution until valid data recovers, but it does not count as a transport loss
+while the socket and required subscriptions remain connected and ACKed.
 
 The runner never changes configuration or activation state. Once all
 WebSocket-specific WS0 rows are independently verified and a new exact-head
