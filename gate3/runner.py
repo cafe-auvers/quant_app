@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import copy
 import ctypes
+from decimal import Decimal, ROUND_HALF_UP
 import hashlib
 import json
 import subprocess
@@ -351,7 +352,24 @@ def run_captured_live_replay(collector: Gate3EvidenceCollector) -> None:
     if not quote_events:
         raise RuntimeError("Captured-live replay requires at least one real KIS quote")
     quote = quote_events[-1].payload
-    reference = max(1.0, float(quote.get("last_price") or 1.0))
+    captured_last = Decimal(str(quote.get("last_price") or "0"))
+    if not captured_last.is_finite() or captured_last <= 0:
+        raise RuntimeError("Captured-live replay requires a positive finite last price")
+    # Build a deterministic, cent-aligned price grid from the captured quote.
+    # Percentage multiplication can create sub-cent prices (for example,
+    # 10.61 * 0.98 = 10.3978), making an otherwise allowed oracle probe invalid.
+    tick = Decimal("0.01")
+    reference_decimal = max(Decimal("1.00"), captured_last).quantize(
+        tick, rounding=ROUND_HALF_UP
+    )
+    reference = float(reference_decimal)
+    orb_low = float(reference_decimal - (tick * 3))
+    breakout_price = float(reference_decimal - (tick * 2))
+    execution_price = float(reference_decimal - tick)
+    confirmed_trade = float(reference_decimal + (tick * 2))
+    ready_ask = float(reference_decimal + tick)
+    replacement_price = float(reference_decimal - (tick * 2))
+    protective_sell_price = reference
     account = "GATE3-SHADOW-ACCOUNT"
     symbol = str(quote.get("symbol") or "AAPL").upper()
     collector.record(
@@ -373,12 +391,12 @@ def run_captured_live_replay(collector: Gate3EvidenceCollector) -> None:
 
     entry_oracle = expected_entry(
         orb_high=reference,
-        orb_low=reference * 0.90,
-        breakout_price=reference * 0.95,
-        execution_price=reference * 0.98,
+        orb_low=orb_low,
+        breakout_price=breakout_price,
+        execution_price=execution_price,
         breakout_confirmed=True,
-        last_trade=reference * 1.01,
-        best_ask=reference * 1.005,
+        last_trade=confirmed_trade,
+        best_ask=ready_ask,
         regular_session_open=True,
         quote_fresh=True,
         mutation_enabled=True,
@@ -399,7 +417,7 @@ def run_captured_live_replay(collector: Gate3EvidenceCollector) -> None:
                 side=OrderSide.BUY,
                 intent=OrderIntent.ENTRY,
                 quantity=1,
-                limit_price=reference * 0.98,
+                limit_price=execution_price,
             )
         ),
     )
@@ -450,7 +468,7 @@ def run_captured_live_replay(collector: Gate3EvidenceCollector) -> None:
                 replace_command_id="gate3-replay-replace",
                 new_client_order_id="gate3-replay-entry-2",
                 new_quantity=1,
-                new_limit_price=reference * 0.97,
+                new_limit_price=replacement_price,
                 environment="PROD",
                 account_no=account,
             )
@@ -477,7 +495,7 @@ def run_captured_live_replay(collector: Gate3EvidenceCollector) -> None:
                 side=OrderSide.SELL,
                 intent=OrderIntent.MANUAL_EXIT,
                 quantity=1,
-                limit_price=reference * 0.99,
+                limit_price=protective_sell_price,
             )
         ),
     )
@@ -492,12 +510,12 @@ def run_captured_live_replay(collector: Gate3EvidenceCollector) -> None:
     for branch, fence, mutation_enabled, lease_current, ownership_current, reconciliation_clear in blocked:
         oracle = expected_entry(
             orb_high=reference,
-            orb_low=reference * 0.90,
-            breakout_price=reference * 0.95,
-            execution_price=reference * 0.98,
+            orb_low=orb_low,
+            breakout_price=breakout_price,
+            execution_price=execution_price,
             breakout_confirmed=True,
-            last_trade=reference * 1.01,
-            best_ask=reference * 1.005,
+            last_trade=confirmed_trade,
+            best_ask=ready_ask,
             regular_session_open=True,
             quote_fresh=fence != "stale_data",
             mutation_enabled=mutation_enabled,
