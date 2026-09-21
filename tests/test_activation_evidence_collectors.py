@@ -22,6 +22,7 @@ from gate4.runtime_observer import (
     observe_gate4_event,
     reset_runtime_observer_for_tests,
 )
+from src.core.orb_entry_logic import is_legal_execution_price
 from src.services.realtime_market_data import QuoteSnapshot, RealtimeMarketDataService
 
 
@@ -91,9 +92,11 @@ def test_gate3_collector_builds_passing_evidence_from_journals(tmp_path):
     collector.record(
         "REAL_QUOTE_EVALUATED",
         symbol="AAPL",
-        last_price=100.0,
-        bid=99.9,
-        ask=100.1,
+        # This was the final live price in the failed Gate-3 session. The old
+        # percentage-derived replay produced an illegal 10.5644 entry limit.
+        last_price=10.78,
+        bid=10.76,
+        ask=10.80,
         source="KIS_WEBSOCKET",
         channel="HDFSASP0",
         real_quote=True,
@@ -139,6 +142,12 @@ def test_gate3_collector_builds_passing_evidence_from_journals(tmp_path):
         "WOULD_REPLACE",
         "WOULD_SELL",
     }
+    assert evidence["unresolved_oracle_difference_count"] == 0
+    assert all(
+        is_legal_execution_price(event.limit_price)
+        for event in collector.shadow_store.read_all()
+        if event.limit_price > 0
+    )
 
 
 def test_gate4_collector_derives_three_session_lifecycle(tmp_path):
