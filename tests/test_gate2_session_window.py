@@ -66,6 +66,42 @@ def test_session_start_requires_aware_now():
         reporting.validate_session_start(date(2026, 9, 9), datetime(2026, 9, 9, 13))
 
 
+def test_owner_authorized_exception_accepts_only_first_hour_of_2026_09_22():
+    opened = datetime(2026, 9, 22, 13, 30, tzinfo=timezone.utc)
+
+    assert reporting.validate_session_start(
+        date(2026, 9, 22),
+        opened + timedelta(minutes=59),
+        allowed_late_start_seconds=3600,
+        authorization_reference=reporting.LATE_START_EXCEPTION_REFERENCE,
+    )[0] == opened
+
+    with pytest.raises(RuntimeError, match="cannot cover"):
+        reporting.validate_session_start(
+            date(2026, 9, 22),
+            opened + timedelta(hours=1, microseconds=1),
+            allowed_late_start_seconds=3600,
+            authorization_reference=reporting.LATE_START_EXCEPTION_REFERENCE,
+        )
+
+
+@pytest.mark.parametrize(
+    ("session_day", "reference"),
+    [
+        (date(2026, 9, 23), reporting.LATE_START_EXCEPTION_REFERENCE),
+        (date(2026, 9, 22), "UNAPPROVED"),
+    ],
+)
+def test_late_start_exception_is_date_and_authorization_bound(session_day, reference):
+    with pytest.raises(RuntimeError, match="not authorized"):
+        reporting.validate_session_start(
+            session_day,
+            datetime.combine(session_day, datetime.min.time(), timezone.utc),
+            allowed_late_start_seconds=3600,
+            authorization_reference=reference,
+        )
+
+
 @pytest.mark.parametrize("hour", [14, 20])
 def test_late_soak_never_constructs_evidence_or_live_service(tmp_path, monkeypatch, hour):
     moment = datetime(2026, 9, 9, hour, tzinfo=timezone.utc)

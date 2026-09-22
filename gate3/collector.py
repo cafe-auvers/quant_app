@@ -8,7 +8,7 @@ caller-supplied collection of pass/fail booleans.
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -113,12 +113,28 @@ class Gate3EvidenceCollector:
         session_close = _parse_time(started.get("session_close"))
         started_at = _parse_time(started.get("started_at"))
         ended_at = _parse_time(ended.get("ended_at"))
+        authorized_late_start_seconds = float(
+            started.get("authorized_late_start_seconds") or 0.0
+        )
+        late_start_authorization_reference = str(
+            started.get("late_start_authorization_reference") or ""
+        )
+        late_start_exception_valid = bool(
+            0.0 < authorized_late_start_seconds <= 3_600.0
+            and str(started.get("session_date") or "") == "2026-09-22"
+            and late_start_authorization_reference
+            == "OWNER_AUTHORIZED_2026-09-22_FIRST_HOUR"
+        )
+        permitted_late_start_seconds = (
+            authorized_late_start_seconds if late_start_exception_valid else 0.0
+        )
         complete_session = bool(
             session_open
             and session_close
             and started_at
             and ended_at
-            and started_at <= session_open
+            and started_at
+            <= session_open + timedelta(seconds=permitted_late_start_seconds)
             and ended_at >= session_close
             and str(started.get("session_date") or "")
             == str(ended.get("session_date") or "")
@@ -251,6 +267,20 @@ class Gate3EvidenceCollector:
             "fence_results": fence_results,
             "session_date": started.get("session_date"),
             "collection_mode": started.get("collection_mode") or "STANDALONE_GATE3",
+            "authorized_late_start_exception": {
+                "applied": bool(permitted_late_start_seconds),
+                "maximum_excluded_seconds": permitted_late_start_seconds,
+                "actual_start_delay_seconds": (
+                    max(0.0, (started_at - session_open).total_seconds())
+                    if started_at and session_open
+                    else None
+                ),
+                "authorization_reference": (
+                    late_start_authorization_reference
+                    if permitted_late_start_seconds
+                    else ""
+                ),
+            },
             "review": dict(review or {}),
         }
 

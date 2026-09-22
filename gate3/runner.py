@@ -333,6 +333,8 @@ class CombinedGate3Observer:
         output_dir: Path,
         strategy_rules_path: Path,
         account_equity: float,
+        authorized_late_start_seconds: float = 0.0,
+        late_start_authorization_reference: str = "",
     ) -> None:
         self.output_dir = _require_external_output(output_dir)
         if self.output_dir.exists():
@@ -358,6 +360,8 @@ class CombinedGate3Observer:
             session_close=session_close.isoformat(),
             started_at=started_at.isoformat(),
             collection_mode="COMBINED_GATE2_GATE3_SINGLE_WEBSOCKET",
+            authorized_late_start_seconds=float(authorized_late_start_seconds),
+            late_start_authorization_reference=late_start_authorization_reference,
         )
         self.mysql_engine = init_mysql_engine(ensure_schema=False)
         if self.mysql_engine is None:
@@ -935,7 +939,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--strategy-rules",
         type=Path,
-        default=ROOT / "rulebooks" / "US Swing Trading Rulebook.md",
+        default=ROOT / "rulebooks" / "technical_rules.md",
     )
     parser.add_argument("--review", type=Path)
     parser.add_argument("--finalize-only", action="store_true")

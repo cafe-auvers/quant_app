@@ -12,7 +12,7 @@ import subprocess
 import threading
 import time as wall_time
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
@@ -70,6 +70,9 @@ GATE2_RECEIVE_LAG_P99_LIMIT_MS = 3_500.0
 # execution readiness remains independently fail-closed on every bad sample.
 GATE2_CONTINUITY_MINIMUM_BASIS_POINTS = 9_995
 GATE2_CONTINUITY_BASIS_POINTS = 10_000
+LATE_START_EXCEPTION_DATE = date(2026, 9, 22)
+LATE_START_EXCEPTION_MAX_SECONDS = 3_600.0
+LATE_START_EXCEPTION_REFERENCE = "OWNER_AUTHORIZED_2026-09-22_FIRST_HOUR"
 SAFE_RUNTIME_EXPECTATIONS = {
     "TRADING_ENABLED": False,
     "BUYBOARD_ENGINE_ENABLED": True,
@@ -204,6 +207,8 @@ class Gate2Evidence:
     session_open: datetime
     session_close: datetime
     started_at: datetime
+    authorized_late_start_seconds: float = 0.0
+    late_start_authorization_reference: str = ""
     clock_synchronization: dict[str, object] = field(default_factory=dict)
     ended_at: datetime | None = None
     requested_subscriptions: list[str] = field(default_factory=list)
@@ -410,12 +415,24 @@ def build_report(evidence: Gate2Evidence) -> dict:
         evidence.continuity_sample_count,
         evidence.continuity_unexpected_unready_count,
     )
+    late_start_valid = _late_start_exception_valid(
+        evidence.session_open.astimezone(US_MARKET_ZONE).date(),
+        evidence.authorized_late_start_seconds,
+        evidence.late_start_authorization_reference,
+    )
+    permitted_late_seconds = (
+        evidence.authorized_late_start_seconds if late_start_valid else 0.0
+    )
     metrics = {
         "full_regular_session": _metric(
             value=max(0.0, (ended_at - evidence.started_at).total_seconds()),
-            threshold="started_at<=session_open and ended_at>=session_close",
+            threshold=(
+                "started_at<=session_open+authorized_late_start_seconds "
+                "and ended_at>=session_close"
+            ),
             passed=(
-                evidence.started_at <= evidence.session_open
+                evidence.started_at
+                <= evidence.session_open + timedelta(seconds=permitted_late_seconds)
                 and ended_at >= evidence.session_close
             ),
         ),
@@ -572,7 +589,8 @@ def build_report(evidence: Gate2Evidence) -> dict:
                 expected_continuity_samples > 0
                 and 0 < evidence.poll_interval_seconds <= 0.25
                 and bool(evidence.continuity_started_at)
-                and evidence.continuity_start_delay_seconds <= 3.0
+                and evidence.continuity_start_delay_seconds
+                <= 3.0 + permitted_late_seconds
                 and evidence.continuity_sample_count >= expected_continuity_samples
                 and continuity_minimum_met
             ),
@@ -585,7 +603,8 @@ def build_report(evidence: Gate2Evidence) -> dict:
             ),
             passed=(
                 bool(evidence.latency_window_started_at)
-                and evidence.latency_window_start_delay_seconds <= 3.0
+                and evidence.latency_window_start_delay_seconds
+                <= 3.0 + permitted_late_seconds
                 and receive.get("count", 0) > 0
                 and receive.get("p95", 0.0) < GATE2_RECEIVE_LAG_P95_LIMIT_MS
             ),
@@ -598,7 +617,8 @@ def build_report(evidence: Gate2Evidence) -> dict:
             ),
             passed=(
                 bool(evidence.latency_window_started_at)
-                and evidence.latency_window_start_delay_seconds <= 3.0
+                and evidence.latency_window_start_delay_seconds
+                <= 3.0 + permitted_late_seconds
                 and receive.get("count", 0) > 0
                 and receive.get("p99", 0.0) < GATE2_RECEIVE_LAG_P99_LIMIT_MS
             ),
@@ -710,6 +730,19 @@ def build_report(evidence: Gate2Evidence) -> dict:
                 US_MARKET_ZONE
             ).isoformat(),
             "end_us_eastern": ended_at.astimezone(US_MARKET_ZONE).isoformat(),
+            "authorized_late_start_exception": {
+                "applied": bool(permitted_late_seconds),
+                "maximum_excluded_seconds": permitted_late_seconds,
+                "actual_start_delay_seconds": max(
+                    0.0,
+                    (evidence.started_at - evidence.session_open).total_seconds(),
+                ),
+                "authorization_reference": (
+                    evidence.late_start_authorization_reference
+                    if permitted_late_seconds
+                    else ""
+                ),
+            },
         },
         "symbols": sorted(evidence.symbols),
         "tr_ids": sorted(evidence.tr_ids),
@@ -814,14 +847,38 @@ def _session_bounds(session_day: date) -> tuple[datetime, datetime]:
     return opened.astimezone(timezone.utc), closed.astimezone(timezone.utc)
 
 
+def _late_start_exception_valid(
+    session_day: date,
+    allowed_seconds: float,
+    authorization_reference: str,
+) -> bool:
+    return bool(
+        0.0 < allowed_seconds <= LATE_START_EXCEPTION_MAX_SECONDS
+        and session_day == LATE_START_EXCEPTION_DATE
+        and authorization_reference == LATE_START_EXCEPTION_REFERENCE
+    )
+
+
 def validate_session_start(
-    session_day: date, now: datetime
+    session_day: date,
+    now: datetime,
+    *,
+    allowed_late_start_seconds: float = 0.0,
+    authorization_reference: str = "",
 ) -> tuple[datetime, datetime]:
     """Reject a soak that can no longer cover the entire regular session."""
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("Gate-2 session start requires a timezone-aware timestamp")
     session_open, session_close = _session_bounds(session_day)
-    if now > session_open:
+    allowed_late_start_seconds = float(allowed_late_start_seconds)
+    if allowed_late_start_seconds < 0:
+        raise ValueError("authorized late-start seconds cannot be negative")
+    if allowed_late_start_seconds and not _late_start_exception_valid(
+        session_day, allowed_late_start_seconds, authorization_reference
+    ):
+        raise RuntimeError("the requested late-start exception is not authorized")
+    latest_start = session_open + timedelta(seconds=allowed_late_start_seconds)
+    if now > latest_start:
         raise RuntimeError(
             f"Gate 2 cannot cover the full regular session for {session_day.isoformat()}: "
             f"the session opened at {session_open.isoformat()}. "
@@ -1528,7 +1585,18 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
         raise RuntimeError(f"missing verified subscription keys: {', '.join(missing)}")
     session_day = date.fromisoformat(args.session_date)
     now = datetime.now(timezone.utc)
-    session_open, session_close = validate_session_start(session_day, now)
+    authorized_late_start_seconds = float(
+        getattr(args, "authorized_late_start_seconds", 0.0)
+    )
+    late_start_authorization_reference = str(
+        getattr(args, "late_start_authorization_reference", "") or ""
+    )
+    session_open, session_close = validate_session_start(
+        session_day,
+        now,
+        allowed_late_start_seconds=authorized_late_start_seconds,
+        authorization_reference=late_start_authorization_reference,
+    )
     clock_status = clock_synchronization_status()
     if not clock_status["synchronized"]:
         raise RuntimeError(
@@ -1572,6 +1640,8 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
         session_open=session_open,
         session_close=session_close,
         started_at=now,
+        authorized_late_start_seconds=authorized_late_start_seconds,
+        late_start_authorization_reference=late_start_authorization_reference,
         clock_synchronization=clock_status,
         requested_subscriptions=sorted(
             [f"HDFSCNT0:{symbol}" for symbol in symbols]
@@ -1707,6 +1777,8 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
             output_dir=args.gate3_output_dir,
             strategy_rules_path=args.gate3_strategy_rules,
             account_equity=float(args.gate3_account_equity),
+            authorized_late_start_seconds=authorized_late_start_seconds,
+            late_start_authorization_reference=late_start_authorization_reference,
         )
     safety_audit = begin_runtime_safety_audit()
     runner = LiveGate2Runner(
@@ -1967,10 +2039,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=(
             Path(__file__).resolve().parents[1]
             / "rulebooks"
-            / "US Swing Trading Rulebook.md"
+            / "technical_rules.md"
         ),
     )
     parser.add_argument("--gate3-account-equity", type=float, default=1_000_000.0)
+    parser.add_argument("--authorized-late-start-seconds", type=float, default=0.0)
+    parser.add_argument("--late-start-authorization-reference", default="")
     args = parser.parse_args(argv)
     root = Path(__file__).resolve().parents[1]
     for name in (

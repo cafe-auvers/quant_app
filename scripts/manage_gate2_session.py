@@ -215,6 +215,15 @@ def _runner_command(config: Mapping[str, Any]) -> list[str]:
                 str(options["gate3_account_equity"]),
             ]
         )
+    if float(options.get("authorized_late_start_seconds") or 0.0) > 0:
+        command.extend(
+            [
+                "--authorized-late-start-seconds",
+                str(options["authorized_late_start_seconds"]),
+                "--late-start-authorization-reference",
+                str(options["late_start_authorization_reference"]),
+            ]
+        )
     return command
 
 
@@ -383,7 +392,7 @@ def _create_session(args: argparse.Namespace) -> Path:
             getattr(
                 args,
                 "gate3_strategy_rules",
-                REPO_ROOT / "rulebooks" / "US Swing Trading Rulebook.md",
+                REPO_ROOT / "rulebooks" / "technical_rules.md",
             ),
             "Gate-3 strategy rulebook",
         )
@@ -438,6 +447,12 @@ def _create_session(args: argparse.Namespace) -> Path:
             "status_seconds": args.status_seconds,
             "gate3_account_equity": float(
                 getattr(args, "gate3_account_equity", 1_000_000.0)
+            ),
+            "authorized_late_start_seconds": float(
+                getattr(args, "authorized_late_start_seconds", 0.0)
+            ),
+            "late_start_authorization_reference": str(
+                getattr(args, "late_start_authorization_reference", "") or ""
             ),
         },
     }
@@ -834,9 +849,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     start.add_argument(
         "--gate3-strategy-rules",
         type=Path,
-        default=REPO_ROOT / "rulebooks" / "US Swing Trading Rulebook.md",
+        default=REPO_ROOT / "rulebooks" / "technical_rules.md",
     )
     start.add_argument("--gate3-account-equity", type=float, default=1_000_000.0)
+    start.add_argument("--authorized-late-start-seconds", type=float, default=0.0)
+    start.add_argument("--late-start-authorization-reference", default="")
 
     notice = subparsers.add_parser(
         "start-notice",

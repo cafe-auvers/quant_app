@@ -81,6 +81,41 @@ def test_runner_command_enables_combined_gate3_without_a_second_runner(tmp_path)
     )
 
 
+def test_runner_command_propagates_owner_authorized_late_start(tmp_path):
+    config = {
+        "python_executable": "python.exe",
+        "paths": {
+            "gate1_report": str(tmp_path / "gate1.json"),
+            "capability_manifest": str(tmp_path / "manifest.json"),
+            "redacted_evidence": [str(tmp_path / "frames.json")],
+            "runtime_log": str(tmp_path / "runtime.log"),
+            "live_status": str(tmp_path / "status.json"),
+            "report": str(tmp_path / "report.json"),
+        },
+        "options": {
+            "environment": "PROD",
+            "symbols": ["RNG"],
+            "session_date": "2026-09-22",
+            "reconnect_after_seconds": [3600.0],
+            "silent_stale_probe_after_seconds": 5400.0,
+            "poll_seconds": 0.1,
+            "watchdog_timeout_seconds": 2.0,
+            "status_seconds": 30.0,
+            "authorized_late_start_seconds": 3600.0,
+            "late_start_authorization_reference": (
+                "OWNER_AUTHORIZED_2026-09-22_FIRST_HOUR"
+            ),
+        },
+    }
+
+    command = manage_gate2_session._runner_command(config)
+
+    assert command[command.index("--authorized-late-start-seconds") + 1] == "3600.0"
+    assert command[command.index("--late-start-authorization-reference") + 1] == (
+        "OWNER_AUTHORIZED_2026-09-22_FIRST_HOUR"
+    )
+
+
 def test_notice_runner_command_uses_only_read_only_capture_outputs(tmp_path):
     config = {
         "mode": "NOTICE",
