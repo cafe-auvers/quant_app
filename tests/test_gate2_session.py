@@ -45,6 +45,42 @@ def test_runner_command_routes_every_artifact_to_the_session_directory(tmp_path)
     assert command.count("--redacted-evidence") == 1
 
 
+def test_runner_command_enables_combined_gate3_without_a_second_runner(tmp_path):
+    config = {
+        "mode": "COMBINED_GATE2_GATE3",
+        "python_executable": "python.exe",
+        "paths": {
+            "gate1_report": str(tmp_path / "gate1.json"),
+            "capability_manifest": str(tmp_path / "manifest.json"),
+            "redacted_evidence": [str(tmp_path / "frames.json")],
+            "runtime_log": str(tmp_path / "runtime.log"),
+            "live_status": str(tmp_path / "status.json"),
+            "report": str(tmp_path / "gate2.json"),
+            "gate3_output_dir": str(tmp_path / "gate3"),
+            "gate3_strategy_rules": str(tmp_path / "rules.md"),
+        },
+        "options": {
+            "environment": "PROD",
+            "symbols": ["AAPL"],
+            "session_date": "2026-09-03",
+            "reconnect_after_seconds": [3600.0],
+            "silent_stale_probe_after_seconds": 5400.0,
+            "poll_seconds": 0.1,
+            "watchdog_timeout_seconds": 2.0,
+            "status_seconds": 30.0,
+            "gate3_account_equity": 1_000_000.0,
+        },
+    }
+
+    command = manage_gate2_session._runner_command(config)
+
+    assert "run_gate2_soak.py" in command[1]
+    assert "run_gate3_shadow.py" not in " ".join(command)
+    assert command[command.index("--gate3-output-dir") + 1] == str(
+        tmp_path / "gate3"
+    )
+
+
 def test_notice_runner_command_uses_only_read_only_capture_outputs(tmp_path):
     config = {
         "mode": "NOTICE",

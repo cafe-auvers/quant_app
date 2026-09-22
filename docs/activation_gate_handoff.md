@@ -24,8 +24,8 @@ applicable later gate and a separate operator promotion both pass.
 |---|---|---|
 | 1. Deterministic simulation | **CLOSED / PASSED** | The exact clean commit, dependency identity, Python 3.11/3.12 CI matrix, every selected and required scenario, all group minimums, zero skips/unclassified/invariant violations, and closed activation defaults must all pass together. |
 | 2. Live KIS read-only protocol | **NEXT / NOT PASSED** | Gate 1 must remain valid on the exact qualification commit, the deployed checkout and reviewed capability evidence must match it, and one complete regular session must pass every live protocol metric with zero broker mutations and approved independent review. |
-| 3. Shadow execution | **NOT QUALIFIED** | Gate 2 must pass, real quotes must drive the frozen production decision runtime, every final-boundary mutation candidate must become an isolated `WOULD_*` record, all branches must be covered, and no real mutation, fake fill, production-ledger contamination, or unresolved oracle difference may occur. |
-| 4. Controlled live | **NOT QUALIFIED** | Gate 3 and execution-specific KIS capability evidence must pass, then at least three supervised regular-session dates must satisfy the minimum-size controlled-live envelope with one owner, manual arming, exact risk/ownership/reconciliation, zero duplicate or unowned mutations, delivered alerts, and approved review. |
+| 3. Shadow execution | **NOT QUALIFIED** | Gate 2 and Gate 3 may collect from one Gate-2-owned WebSocket session; Gate 2 is adjudicated first, then every shadow predicate and independent review must pass. |
+| 4. Controlled live | **NOT QUALIFIED** | The first pass requires three supervised dates and complete lifecycle coverage. After that baseline, an exact reviewed evidence-only change requires one new supervised delta date; production or unknown changes require three. |
 | 5. Unattended qualification | **NOT QUALIFIED** | Gate 4 must pass, then five consecutive full sessions—including restart, lease-handoff, and forced-reconnect drills—must complete with zero critical safety failures, working protective exits and external watchdog/alerts, matching broker truth, and approved review. |
 
 Passing a gate does not arm or promote the application:
@@ -82,11 +82,12 @@ exact full SHA.
   owned cancellation before revalidation.
 - Gate 3 has an append-only, redacted, physically isolated shadow mutation
   boundary, headless production-runtime runner, captured-live replay collector,
-  and cumulative validator.
+  cumulative validator, and combined Gate-2/Gate-3 single-WebSocket mode.
 - Gate 4 has an opt-in runtime collector for supervised session, broker
   lifecycle, reconciliation, position-protection, disarm, and external-alert
-  evidence. Gate 5 has a cumulative fail-closed validator but still needs its
-  later operational collector.
+  evidence plus reviewed one-session evidence-only requalification after an
+  initial three-session pass. Gate 5 has a cumulative fail-closed validator but
+  still needs its later operational collector.
 - Gate qualification remains separate from operator promotion; validation
   never changes activation state.
 
@@ -102,8 +103,8 @@ confirm the exact current Gate 1 commit
   -> verify mutation-blocked Gate 2 activation snapshot
   -> capture real trade, quote, timestamp, sequence, and encrypted notice data
   -> force reconnect and prove 100% critical re-ACK in under 10 seconds
-  -> complete the full regular-session soak
-  -> independently review and validate the Gate 2 evidence bundle
+  -> complete the combined Gate-2/Gate-3 full-session collection
+  -> validate Gate 2 first, then independently review Gate 3
 ```
 
 The required mutation-blocked snapshot is:

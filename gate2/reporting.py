@@ -14,7 +14,7 @@ import time as wall_time
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 from zoneinfo import ZoneInfo
 
@@ -866,10 +866,12 @@ class LiveGate2Runner:
         service: KisRealtimeMarketDataService,
         evidence: Gate2Evidence,
         safety_audit: RuntimeSafetyAuditSession,
+        quote_observer: Callable[[Sequence[QuoteSnapshot]], None] | None = None,
     ):
         self.service = service
         self.evidence = evidence
         self.safety_audit = safety_audit
+        self.quote_observer = quote_observer
         self._expected_disconnects = 0
         self._operation_states: dict[tuple[int, str, str], str] = {}
         self._silent_probe_phase = ""
@@ -1012,7 +1014,10 @@ class LiveGate2Runner:
 
     def poll_and_sample(self, now: datetime | None = None) -> datetime:
         """Drain accepted events before evaluating Gate-2 service state."""
-        self.service.poll_once()
+        quotes = self.service.poll_once()
+        observer = getattr(self, "quote_observer", None)
+        if observer is not None:
+            observer(quotes or ())
         sampled_at = now or datetime.now(timezone.utc)
         self.sample(sampled_at)
         return sampled_at
@@ -1681,8 +1686,35 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
     service.configure_desired_channels(
         trade_priorities=priority, quote_priorities=priority
     )
+    gate3_observer = None
+    if getattr(args, "gate3_output_dir", None) is not None:
+        if args.environment != "PROD":
+            raise RuntimeError(
+                "combined Gate 2/Gate 3 collection is supported only in PROD"
+            )
+        # Imported lazily to keep the standalone Gate-2 reporter independent
+        # and to avoid making Gate 3 another WebSocket owner.
+        from gate3.runner import CombinedGate3Observer
+
+        gate3_observer = CombinedGate3Observer(
+            service=service,
+            commit_sha=commit,
+            session_day=session_day,
+            session_open=session_open,
+            session_close=session_close,
+            started_at=now,
+            symbols=symbols,
+            output_dir=args.gate3_output_dir,
+            strategy_rules_path=args.gate3_strategy_rules,
+            account_equity=float(args.gate3_account_equity),
+        )
     safety_audit = begin_runtime_safety_audit()
-    runner = LiveGate2Runner(service, evidence, safety_audit)
+    runner = LiveGate2Runner(
+        service,
+        evidence,
+        safety_audit,
+        quote_observer=(gate3_observer.observe if gate3_observer is not None else None),
+    )
     reconnect_offsets = sorted(float(value) for value in args.reconnect_after_seconds)
     next_reconnect = 0
     stop_probe_complete = False
@@ -1692,6 +1724,7 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
     watchdog = _ProgressWatchdog(evidence, args.watchdog_timeout_seconds)
     runtime_failure = False
     last_status_write = 0.0
+    safety_snapshot = None
 
     def record_runtime_failure(stage: str, exc: BaseException) -> None:
         nonlocal runtime_failure
@@ -1828,6 +1861,16 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
             )
         except Exception as exc:
             record_runtime_failure("safety_audit_close", exc)
+        if gate3_observer is not None:
+            gate3_observer.finish(
+                session_day=session_day,
+                ended_at=evidence.ended_at,
+                broker_mutation_attempt_count=(
+                    safety_snapshot.broker_mutation_attempt_count
+                    if safety_snapshot is not None
+                    else None
+                ),
+            )
         root_logger.removeHandler(log_handler)
         root_logger.setLevel(previous_root_level)
         log_handler.flush()
@@ -1849,7 +1892,16 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
     evidence.log_scan_completed = True
     evidence.log_redaction_count = redacting_formatter.redaction_count
     report = build_report(evidence)
+    if gate3_observer is not None:
+        report["combined_collection"] = {
+            "mode": "COMBINED_GATE2_GATE3_SINGLE_WEBSOCKET",
+            "gate3_output_dir": str(gate3_observer.output_dir),
+            "sole_websocket_owner": "GATE_2",
+        }
     _write_report(args.output, report)
+    gate3_report = None
+    if gate3_observer is not None:
+        gate3_report = gate3_observer.write_reports(gate2_report=report)
     _write_live_status(
         status_path,
         evidence,
@@ -1859,6 +1911,12 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
         report=report,
     )
     print(f"Gate 2 {report['result']}: report={args.output}")
+    if gate3_report is not None:
+        print(
+            "Gate 3 "
+            f"{gate3_report['qualification_state']}: "
+            f"report={gate3_observer.output_dir / 'gate3_report.json'}"
+        )
     return 0 if report["result"] == "PASSED" and not runtime_failure else 1
 
 
@@ -1895,6 +1953,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="atomic live checkpoint JSON (defaults beside --output)",
     )
     parser.add_argument("--status-seconds", type=float, default=30.0)
+    parser.add_argument(
+        "--gate3-output-dir",
+        type=Path,
+        help=(
+            "collect Gate-3 shadow evidence from this Gate-2-owned WebSocket "
+            "session and write it to this external directory"
+        ),
+    )
+    parser.add_argument(
+        "--gate3-strategy-rules",
+        type=Path,
+        default=(
+            Path(__file__).resolve().parents[1]
+            / "rulebooks"
+            / "US Swing Trading Rulebook.md"
+        ),
+    )
+    parser.add_argument("--gate3-account-equity", type=float, default=1_000_000.0)
     args = parser.parse_args(argv)
     root = Path(__file__).resolve().parents[1]
     for name in (
@@ -1903,6 +1979,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "log_output",
         "output",
         "status_output",
+        "gate3_output_dir",
+        "gate3_strategy_rules",
     ):
         value = getattr(args, name)
         if value is not None and not value.is_absolute():

@@ -652,6 +652,20 @@ def test_gate2_runner_drains_accepted_events_before_sampling():
     assert operations == ["poll", ("sample", sampled_at)]
 
 
+def test_gate2_runner_forwards_the_same_accepted_batch_to_combined_observer():
+    sampled_at = dt.datetime(2026, 8, 17, 13, 30, tzinfo=dt.timezone.utc)
+    quote = object()
+    observed = []
+    runner = object.__new__(LiveGate2Runner)
+    runner.service = SimpleNamespace(poll_once=lambda: [quote])
+    runner.quote_observer = lambda quotes: observed.extend(quotes)
+    runner.sample = lambda _observed_at: None
+
+    runner.poll_and_sample(sampled_at)
+
+    assert observed == [quote]
+
+
 def test_gate2_silent_stale_probe_always_suppresses_the_quote_channel():
     now = dt.datetime(2026, 8, 17, 14, 0, tzinfo=dt.timezone.utc)
     calls = []

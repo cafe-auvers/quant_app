@@ -204,6 +204,17 @@ def _runner_command(config: Mapping[str, Any]) -> list[str]:
         command.extend(["--reconnect-after-seconds", str(value)])
     for value in paths["redacted_evidence"]:
         command.extend(["--redacted-evidence", str(value)])
+    if paths.get("gate3_output_dir"):
+        command.extend(
+            [
+                "--gate3-output-dir",
+                str(paths["gate3_output_dir"]),
+                "--gate3-strategy-rules",
+                str(paths["gate3_strategy_rules"]),
+                "--gate3-account-equity",
+                str(options["gate3_account_equity"]),
+            ]
+        )
     return command
 
 
@@ -249,7 +260,7 @@ def _session_payload(
     keep_awake: bool = False,
     mode: str = "SOAK",
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "schema_version": 1,
         "mode": mode,
         "state": state,
@@ -272,6 +283,16 @@ def _session_payload(
             "notice_evidence": str(session_dir / "notice_evidence.json"),
         },
     }
+    if mode == "COMBINED_GATE2_GATE3":
+        payload["artifacts"].update(
+            {
+                "gate3_evidence": str(session_dir / "gate3" / "gate3_evidence.json"),
+                "gate3_report": str(session_dir / "gate3" / "gate3_report.json"),
+                "gate3_journal": str(session_dir / "gate3" / "gate3.evidence.jsonl"),
+                "gate3_shadow_store": str(session_dir / "gate3" / "gate3.shadow.jsonl"),
+            }
+        )
+    return payload
 
 
 def _launch_configured_session(
@@ -353,6 +374,19 @@ def _create_session(args: argparse.Namespace) -> Path:
     evidence_root = _require_external_root(args.evidence_root)
     gate1 = _require_file(args.gate1_report, "Gate-1 report")
     manifest = _require_file(args.capability_manifest, "capability manifest")
+    strategy_rules = None
+    combine_gate3 = bool(getattr(args, "combine_gate3", False))
+    if combine_gate3:
+        if args.environment != "PROD":
+            raise RuntimeError("combined Gate 2/Gate 3 collection requires PROD")
+        strategy_rules = _require_file(
+            getattr(
+                args,
+                "gate3_strategy_rules",
+                REPO_ROOT / "rulebooks" / "US Swing Trading Rulebook.md",
+            ),
+            "Gate-3 strategy rulebook",
+        )
     redacted = [
         _require_external_file(path, "redacted evidence")
         for path in args.redacted_evidence
@@ -378,9 +412,16 @@ def _create_session(args: argparse.Namespace) -> Path:
         "live_status": str(session_dir / "live_status.json"),
         "report": str(session_dir / "gate2_report.json"),
     }
+    if combine_gate3:
+        paths.update(
+            {
+                "gate3_output_dir": str(session_dir / "gate3"),
+                "gate3_strategy_rules": str(strategy_rules),
+            }
+        )
     config = {
         "schema_version": 1,
-        "mode": "SOAK",
+        "mode": "COMBINED_GATE2_GATE3" if combine_gate3 else "SOAK",
         "created_at": started_at,
         "commit_sha": commit,
         "repo_root": str(REPO_ROOT),
@@ -395,6 +436,9 @@ def _create_session(args: argparse.Namespace) -> Path:
             "poll_seconds": args.poll_seconds,
             "watchdog_timeout_seconds": args.watchdog_timeout_seconds,
             "status_seconds": args.status_seconds,
+            "gate3_account_equity": float(
+                getattr(args, "gate3_account_equity", 1_000_000.0)
+            ),
         },
     }
     return _launch_configured_session(
@@ -505,6 +549,11 @@ def _run_worker(config_path: Path) -> int:
             failed_metrics = []
         else:
             report = _read_json(Path(config["paths"]["report"]))
+            gate3_report = (
+                _read_json(Path(config["paths"]["gate3_output_dir"]) / "gate3_report.json")
+                if config["paths"].get("gate3_output_dir")
+                else {}
+            )
             result = str(report.get("result") or live_status.get("result") or "")
             if result == "PASSED" and exit_code == 0:
                 state = "PASSED"
@@ -519,6 +568,11 @@ def _run_worker(config_path: Path) -> int:
             else:
                 blockers = ["runner_exited_without_report"]
             failed_metrics = list(live_status.get("failed_metrics", []))
+            if gate3_report:
+                session["gate3_result"] = gate3_report.get("result")
+                session["gate3_qualification_state"] = gate3_report.get(
+                    "qualification_state"
+                )
         session.update(
             {
                 "state": state,
@@ -593,6 +647,7 @@ def summarize_session(session_dir: Path) -> dict[str, Any]:
     live = _read_json(session_dir / "live_status.json")
     report = _read_json(session_dir / "gate2_report.json")
     notice_evidence = _read_json(session_dir / "notice_evidence.json")
+    gate3_report = _read_json(session_dir / "gate3" / "gate3_report.json")
     recorded_state = str(session.get("state") or "UNKNOWN")
     alive = (
         _process_alive(session.get("worker_pid"))
@@ -652,6 +707,12 @@ def summarize_session(session_dir: Path) -> dict[str, Any]:
         "checkpoint_age_seconds": checkpoint_age,
         "result": report.get("result") or session.get("result"),
         "mode": session.get("mode", "SOAK"),
+        "gate3": {
+            "result": gate3_report.get("result") or session.get("gate3_result"),
+            "qualification_state": gate3_report.get("qualification_state")
+            or session.get("gate3_qualification_state"),
+            "violation_count": len(gate3_report.get("invariant_violations", [])),
+        },
         "notice": {
             "observed": bool(notice_evidence.get("notice_observation"))
             or bool(live.get("notice_observed")),
@@ -701,6 +762,14 @@ def _print_summary(summary: Mapping[str, Any]) -> None:
             print("Notice validation errors:")
             for error in notice["errors"]:
                 print(f"  - {error}")
+    elif summary.get("mode") == "COMBINED_GATE2_GATE3":
+        gate3 = summary.get("gate3") or {}
+        print(
+            "Gate 3: "
+            f"state={gate3.get('qualification_state') or 'NOT_REPORTED'} "
+            f"result={gate3.get('result') or 'NOT_REPORTED'} "
+            f"violations={gate3.get('violation_count', 0)}"
+        )
     if summary.get("checkpoint_at"):
         print(
             "Last checkpoint: "
@@ -757,6 +826,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     start.add_argument("--status-seconds", type=float, default=30.0)
     start.add_argument("--evidence-root", type=Path, default=DEFAULT_EVIDENCE_ROOT)
     start.add_argument("--python-executable", default=sys.executable)
+    start.add_argument(
+        "--combine-gate3",
+        action="store_true",
+        help="collect Gate-2 and Gate-3 evidence from one WebSocket session",
+    )
+    start.add_argument(
+        "--gate3-strategy-rules",
+        type=Path,
+        default=REPO_ROOT / "rulebooks" / "US Swing Trading Rulebook.md",
+    )
+    start.add_argument("--gate3-account-equity", type=float, default=1_000_000.0)
 
     notice = subparsers.add_parser(
         "start-notice",

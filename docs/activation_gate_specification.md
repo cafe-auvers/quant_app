@@ -28,7 +28,7 @@ commit's qualification until the same exact-SHA check passes again.
 |---|---|---|
 | 1. Deterministic simulation | **CLOSED / PASSED for the current protected `master` exact-SHA report** | Re-run the protected Python 3.11/3.12 matrix and Gate-1 report after every later commit. |
 | 2. Live KIS read-only protocol qualification | **BLOCKED / NOT PASSED** | Close the live capability evidence and complete one full-session evidence bundle. |
-| 3. Shadow execution | **RUNNER, ISOLATED STORE, AND VALIDATOR IMPLEMENTED / NOT QUALIFIED** | Complete Gate 2 on the exact release, then collect one real-quote session plus captured-live branch coverage and review. |
+| 3. Shadow execution | **RUNNER, ISOLATED STORE, AND VALIDATOR IMPLEMENTED / NOT QUALIFIED** | Collect Gate-2 protocol and Gate-3 shadow evidence together through the single-owner runner; adjudicate Gate 2 first, then review Gate 3. |
 | 4. Controlled live | **RUNTIME COLLECTOR AND FAIL-CLOSED VALIDATOR IMPLEMENTED / NOT QUALIFIED** | Complete execution-capability evidence and at least three supervised regular-session dates. |
 | 5. Unattended qualification | **FAIL-CLOSED REPORT/PROMOTION VALIDATORS IMPLEMENTED / NOT QUALIFIED** | After Gate 4, complete five consecutive NYSE sessions, all required drills, alert/watchdog proof, independent review, and a separate operator promotion decision. |
 
@@ -71,8 +71,8 @@ evidence and do not authorize a KIS mutation.
 ```text
 resolve Gate-2 live KIS protocol blockers
   -> review the exact-commit capability manifest and evidence digests
-  -> run the full read-only Gate-2 session
-  -> independently review and validate the Gate-2 evidence bundle
+  -> run the combined read-only Gate-2/Gate-3 single-WebSocket session
+  -> validate Gate 2 first, then independently review Gate 3
 ```
 
 Gate 2 is now the first unavoidable live-environment step. Gates 3, 4, and 5
@@ -116,22 +116,35 @@ AND deployed identity matches the approved evidence identity
 Passing a report must never edit activation configuration, arm a trading
 session, or promote the runtime automatically.
 
+Gate dependencies order adjudication, not necessarily collection. Gate 2 and
+Gate 3 may collect during the same complete regular session only when Gate 2
+is the sole WebSocket owner and forwards the exact accepted quote batches to
+an isolated Gate-3 observer. The Gate-3 report is blocked if Gate 2 fails and
+cannot become `PASSED` until the resulting Gate-2 report passes and Gate 3 is
+independently reviewed. Launching two KIS clients is not combined collection.
+
 ### Invalidation
 
-- Any tracked source, test, dependency, schema, strategy, or documentation
-  commit creates a new SHA and invalidates the prior exact-commit chain for a
-  new release candidate.
+- Any tracked change creates a new release SHA and requires a new Gate-1
+  report. Gate-2 and Gate-3 evidence for that release remains exact-commit,
+  but their observations may be collected together by the reviewed
+  single-WebSocket path.
 - A WebSocket adapter, capability interpretation, symbol-key, or qualification
   configuration change invalidates Gate 2 and every later gate.
 - A decision-rule or shadow-runtime change invalidates Gate 1, Gate 3, and
-  every later gate. Under the repository's strict exact-commit policy, a new
-  commit also requires a fresh Gate-2 chain unless a future reviewed policy
-  explicitly defines an evidence-preserving equivalence procedure.
+  every later gate. The combined runner recollects Gate 2 and Gate 3 together
+  on the new exact commit instead of consuming two separate market dates.
 - An execution-gateway, reconciliation, ownership, lease, mutation-budget,
   capital, or risk change invalidates Gate 1, Gate 4, and Gate 5, plus any
   earlier exact-commit evidence required by their chain.
 - Failed, partial, aborted, or manually repaired qualification sessions do not
   count as passes.
+- After an initial full Gate-4 pass, a reviewed change-impact manifest may
+  preserve its historical entry/protection/cancel coverage. Changes confined
+  to enumerated evidence tooling, tests, or documentation require one new
+  supervised delta session. Any production-affecting or unknown path requires
+  three new supervised sessions. The manifest's changed paths must exactly
+  match the baseline-to-target Git diff; impact cannot be manually downgraded.
 
 ### Exposure-increasing BUY versus protective actions
 
@@ -324,6 +337,11 @@ branch coverage using captured-live replay for branches that do not naturally
 occur during the session. Replay output must remain shadow-only and must never
 be represented as a broker acknowledgement or fill.
 
+The complete session may be the same session used for Gate 2. In that mode,
+Gate 2 owns the sole KIS WebSocket and performs its reconnect/stale probes;
+Gate 3 is an in-process observer of the accepted quote batches. Reports are
+still evaluated in order: a failed Gate 2 leaves Gate 3 diagnostic-only.
+
 Before Gate 3, the intended ORH pullback execution behavior and the pending
 1-minute-to-5-minute better-plan cancellation/replacement behavior must be
 implemented, tested, and frozen. Gate-3 decision comparison is meaningless if
@@ -376,6 +394,15 @@ correctly reconciled and protected under the reviewed swing-trading plan. A
 controlled cancellation lifecycle must also be observed. Natural partial
 fills, rejections, or ambiguities must be handled correctly whenever they
 occur; they must never be forced merely to satisfy coverage.
+
+The three-date requirement establishes the first Gate-4 baseline. After that
+baseline passes, a new commit whose exact Git diff is classified and
+independently approved as `EVIDENCE_ONLY` requires one new supervised delta
+date; the approved baseline supplies the already-proven genuine
+entry/protection/cancellation coverage. A current delta entry, if one occurs,
+must still satisfy every card, notional, risk, ownership, and lifecycle rule.
+Production execution, strategy, risk, persistence, configuration, dependency,
+or unclassified changes require the full three new dates.
 
 The existing optional pre-Gate-2 controlled-live pilot is an exception path,
 not a gate pass. It requires separately recorded risk acceptance and cannot be

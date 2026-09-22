@@ -6,26 +6,50 @@ and observed; it does not waive evidence or authorize trading.
 
 | Gate | Required observation | Operator time | Tooling still needed |
 |---|---|---|---|
-| 2 | One complete regular session with every protocol metric passing | Prepare before open; inspect the saved result afterward. The detached read-only worker keeps Windows awake. | Use the local preflight below before launching. |
-| 3 | One complete session through the final decision runtime, plus captured-live replay coverage | Runs headlessly for the complete session with every final mutation intercepted; independent review/finalization follows the run. | Implemented by `scripts/run_gate3_shadow.py`; genuine live evidence is still required. |
-| 4 | At least three supervised regular-session dates, a genuine strategy entry outcome and a cancellation lifecycle | Supervise while live activity is active. The contract does not require three full nights. Ending a window still requires the reviewed reconciliation and position-protection procedure. | Implemented by the opt-in runtime journal and `scripts/manage_gate4_session.py`; reviewed execution-capability and live lifecycle evidence are still required. |
+| 2 + 3 | One combined complete regular session: every Gate-2 protocol metric plus Gate-3 shadow/replay coverage | Prepare before open; inspect Gate 2 first and independently finalize Gate 3 afterward. One process owns the KIS WebSocket. | Use `manage_gate2_session.py start --combine-gate3`. |
+| 4 | Initial pass: at least three supervised regular-session dates, a genuine strategy entry outcome and a cancellation lifecycle. Later evidence-only requalification: one supervised delta date. | Supervise while live activity is active. Ending a window still requires the reviewed reconciliation and position-protection procedure. | Implemented by the opt-in runtime journal and `scripts/manage_gate4_session.py`; delta mode also requires an exact reviewed change-impact manifest and passed baseline. |
 | 5 | Five consecutive full sessions, restart/handoff/reconnect drills, external watchdog and alert proof | Unattended sessions with planned drill and review work | Automate session evidence and drill records; verify the watchdog outside the trading process. A configured webhook is not delivery/watchdog proof. |
 
 ## Finish the tooling before freezing the qualification release
 
-Freeze the release after testing the Gate-3 runner and Gate-4 collector, certify Gate 1,
-collect Gate 2, collect Gate 3, supervise Gate 4 and run Gate 5. Allow roughly
-ten trading-session dates for that sequential campaign, plus implementation,
-review and any retries; strategy-triggered coverage can take longer.
+Freeze the release after testing the combined runner and Gate-4 collector,
+certify Gate 1, collect Gate 2 and Gate 3 together, supervise Gate 4 and run
+Gate 5. The initial campaign needs one combined Gate-2/Gate-3 date, at least
+three Gate-4 dates and five Gate-5 dates, plus review and any retries;
+strategy-triggered coverage can take longer.
 
-Under the existing specification, every tracked change creates a new release
-identity, including documentation or tests. Completing Gate 2 and only then
-implementing Gate 3 requires another Gate-2 qualification on the new commit.
-An older session remains useful diagnostic evidence, but does not qualify the
-new release automatically. Any future policy for preserving equivalent evidence
-needs its own reviewed specification and validator change.
+Every commit still receives a new release identity and Gate-1 report. Gate 2
+and Gate 3 remain exact-commit but share one collection date. After Gate 4 has
+passed once, the reviewed requalification policy below prevents an
+evidence-tool-only change from discarding its historical three-date coverage.
 
-## Gate 3: headless shadow session
+## Gate 2 + Gate 3: one headless session
+
+Use the detached Gate-2 manager with `--combine-gate3`. It starts one KIS
+client, performs all Gate-2 continuity/reconnect/stale/notice checks, and sends
+the same accepted quote batches to the isolated Gate-3 shadow runtime:
+
+```powershell
+python scripts/manage_gate2_session.py start `
+  --confirm-read-only `
+  --combine-gate3 `
+  --environment PROD `
+  --symbols AAPL `
+  --session-date YYYY-MM-DD `
+  --gate1-report C:\quant_evidence\gate1\gate1_report.json `
+  --capability-manifest C:\quant_evidence\gate2\gate2_capabilities.json `
+  --redacted-evidence C:\quant_evidence\gate2\regular-session-frames.json `
+  --reconnect-after-seconds 3600 `
+  --silent-stale-probe-after-seconds 5400
+```
+
+The session writes `gate2_report.json` and a `gate3` subdirectory. Gate 3 is
+reported as `BLOCKED_BY_GATE2`, `FAILED`, or
+`EVIDENCE_COMPLETE_PENDING_REVIEW`. When Gate 2 passes and Gate 3 has no other
+violation, apply the independent Gate-3 review with the existing
+`--finalize-only` command. No market-session rerun is needed for review.
+
+### Standalone Gate 3 fallback
 
 Gate 3 must use the same clean exact commit as the passed Gate-2 report. It
 also requires at least one canonical Trade Card for the reviewed symbol; the
@@ -113,9 +137,27 @@ python scripts/manage_gate4_session.py finalize `
   --output C:\quant_evidence\gate4\gate4_report.json
 ```
 
-Gate 4 cannot close after only one date under the normative contract: it needs
-at least three supervised regular-session dates. No collector or scheduler may
-compress or backfill that requirement.
+The first Gate-4 pass always requires at least three supervised dates. Once it
+passes, build a draft manifest for a later commit:
+
+```powershell
+python scripts/build_gate4_requalification_manifest.py `
+  --baseline-gate4-report C:\quant_evidence\gate4\baseline\gate4_report.json `
+  --output C:\quant_evidence\gate4\delta\change_impact.json
+```
+
+The generated manifest is `PENDING` until independently reviewed. If its exact
+Git diff is `EVIDENCE_ONLY`, collect one new supervised date and add these
+arguments to `manage_gate4_session.py finalize`:
+
+```text
+--baseline-gate4-report <passed-baseline-report>
+--change-impact-manifest <approved-exact-diff-manifest>
+```
+
+Any production-affecting or unknown changed path mechanically keeps the
+three-new-session requirement. Evidence cannot be backfilled or manually
+reclassified downward.
 
 ## Check Gate 2 locally before reserving a session
 

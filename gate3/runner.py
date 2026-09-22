@@ -311,6 +311,190 @@ class ProductionShadowDecisionRuntime:
         self.isolated_engine.dispose()
 
 
+class CombinedGate3Observer:
+    """Collect Gate-3 evidence from the Gate-2-owned market-data service.
+
+    The observer never starts or stops the service.  Gate 2 remains the sole
+    WebSocket owner and forwards each accepted batch here after polling.  A
+    shadow failure is retained as Gate-3 evidence without aborting Gate 2's
+    independent transport qualification.
+    """
+
+    def __init__(
+        self,
+        *,
+        service: RealtimeMarketDataService,
+        commit_sha: str,
+        session_day: date,
+        session_open: datetime,
+        session_close: datetime,
+        started_at: datetime,
+        symbols: Sequence[str],
+        output_dir: Path,
+        strategy_rules_path: Path,
+        account_equity: float,
+    ) -> None:
+        self.output_dir = _require_external_output(output_dir)
+        if self.output_dir.exists():
+            raise RuntimeError(
+                f"combined Gate-3 evidence directory already exists: {self.output_dir}"
+            )
+        if not strategy_rules_path.is_file():
+            raise RuntimeError(
+                f"Gate-3 strategy rulebook is missing: {strategy_rules_path}"
+            )
+        self.output_dir.mkdir(parents=True)
+        self.strategy_rules_path = strategy_rules_path
+        self.collector = Gate3EvidenceCollector(
+            journal_path=self.output_dir / "gate3.evidence.jsonl",
+            shadow_store_path=self.output_dir / "gate3.shadow.jsonl",
+            commit_sha=commit_sha,
+            production_paths=(ROOT / "data",),
+        )
+        self.collector.record(
+            "SESSION_STARTED",
+            session_date=session_day.isoformat(),
+            session_open=session_open.isoformat(),
+            session_close=session_close.isoformat(),
+            started_at=started_at.isoformat(),
+            collection_mode="COMBINED_GATE2_GATE3_SINGLE_WEBSOCKET",
+        )
+        self.mysql_engine = init_mysql_engine(ensure_schema=False)
+        if self.mysql_engine is None:
+            raise RuntimeError(
+                "combined Gate 2/Gate 3 collection requires read-only canonical MySQL"
+            )
+        try:
+            cards = load_production_cards_read_only(
+                self.mysql_engine, symbols=symbols
+            )
+            if not cards:
+                raise RuntimeError(
+                    "combined Gate 2/Gate 3 collection requires at least one "
+                    "canonical production trade card for the reviewed symbols"
+                )
+            self.before = snapshot_production_ledgers(self.mysql_engine)
+            self.collector.record(
+                "PRODUCTION_LEDGER_SNAPSHOT", phase="BEFORE", digests=self.before
+            )
+            self.runtime = ProductionShadowDecisionRuntime(
+                collector=self.collector,
+                market_data=service,
+                cards=cards,
+                isolated_database_path=self.output_dir / "gate3_isolated.sqlite3",
+                account_equity=account_equity,
+            )
+        except Exception:
+            self.mysql_engine.dispose()
+            raise
+        self.runtime_errors: list[str] = []
+        self.observation_failed = False
+        self.finished = False
+
+    @staticmethod
+    def _error_fingerprint(stage: str, exc: BaseException) -> str:
+        digest = hashlib.sha256(
+            f"{stage}:{type(exc).__name__}:{exc}".encode(
+                "utf-8", errors="replace"
+            )
+        ).hexdigest()
+        return f"{stage}:{type(exc).__name__}:{digest}"
+
+    def observe(self, quotes: Sequence[QuoteSnapshot]) -> None:
+        if self.finished or self.observation_failed:
+            return
+        try:
+            self.runtime.evaluate(quotes)
+        except Exception as exc:
+            self.runtime_errors.append(self._error_fingerprint("observe", exc))
+            self.observation_failed = True
+
+    def finish(
+        self,
+        *,
+        session_day: date,
+        ended_at: datetime,
+        broker_mutation_attempt_count: int | None,
+    ) -> None:
+        if self.finished:
+            return
+        after: dict[str, str] | None = None
+        try:
+            if not self.observation_failed:
+                run_captured_live_replay(self.collector)
+        except Exception as exc:
+            self.runtime_errors.append(self._error_fingerprint("replay", exc))
+        try:
+            self.runtime.close()
+        except Exception as exc:
+            self.runtime_errors.append(self._error_fingerprint("runtime_close", exc))
+        try:
+            after = snapshot_production_ledgers(self.mysql_engine)
+            self.collector.record(
+                "PRODUCTION_LEDGER_SNAPSHOT", phase="AFTER", digests=after
+            )
+        except Exception as exc:
+            self.runtime_errors.append(self._error_fingerprint("ledger_snapshot", exc))
+        finally:
+            self.mysql_engine.dispose()
+        mutation_count = (
+            int(broker_mutation_attempt_count)
+            if broker_mutation_attempt_count is not None
+            else -1
+        )
+        self.collector.record(
+            "SESSION_ENDED",
+            session_date=session_day.isoformat(),
+            ended_at=ended_at.isoformat(),
+            counters={
+                "broker_mutation_attempt_count": mutation_count,
+                "fake_broker_ack_count": 0,
+                "fake_fill_count": 0,
+                "production_ledger_write_count": int(
+                    after is None or self.before != after
+                ),
+                "runtime_error_count": len(self.runtime_errors),
+            },
+            runtime_errors=list(self.runtime_errors),
+            collection_mode="COMBINED_GATE2_GATE3_SINGLE_WEBSOCKET",
+        )
+        self.finished = True
+
+    def write_reports(
+        self,
+        *,
+        gate2_report: Mapping[str, Any],
+        review: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if not self.finished:
+            raise RuntimeError("combined Gate-3 capture must finish before reporting")
+        evidence = self.collector.build_evidence(
+            gate2_report_sha256=canonical_report_sha256(gate2_report),
+            strategy_rules_path=self.strategy_rules_path,
+            review=review or {},
+        )
+        evidence["collection_mode"] = "COMBINED_GATE2_GATE3_SINGLE_WEBSOCKET"
+        report = build_report(evidence, upstream_gate2_report=gate2_report)
+        unresolved = {
+            str(item.get("property") or "")
+            for item in report.get("invariant_violations", [])
+            if isinstance(item, Mapping)
+        }
+        if report.get("result") == "PASSED":
+            qualification_state = "PASSED"
+        elif gate2_report.get("result") != "PASSED":
+            qualification_state = "BLOCKED_BY_GATE2"
+        elif unresolved == {"independent_review_approved"}:
+            qualification_state = "EVIDENCE_COMPLETE_PENDING_REVIEW"
+        else:
+            qualification_state = "FAILED"
+        report["collection_mode"] = evidence["collection_mode"]
+        report["qualification_state"] = qualification_state
+        _write_json(self.output_dir / "gate3_evidence.json", evidence)
+        _write_json(self.output_dir / "gate3_report.json", report)
+        return report
+
+
 def _observe_oracle(
     collector: Gate3EvidenceCollector,
     *,
@@ -584,6 +768,10 @@ def finalize_existing(args: argparse.Namespace) -> int:
         review=review,
     )
     report = build_report(evidence, upstream_gate2_report=gate2_report)
+    report["collection_mode"] = evidence.get("collection_mode")
+    report["qualification_state"] = (
+        "PASSED" if report.get("result") == "PASSED" else "FAILED"
+    )
     _write_json(output_dir / "gate3_evidence.json", evidence)
     _write_json(output_dir / "gate3_report.json", report)
     print(
@@ -723,6 +911,10 @@ def run_live(args: argparse.Namespace) -> int:
         review={},
     )
     report = build_report(evidence, upstream_gate2_report=gate2_report)
+    report["collection_mode"] = evidence.get("collection_mode")
+    report["qualification_state"] = (
+        "PASSED" if report.get("result") == "PASSED" else "FAILED"
+    )
     _write_json(output_dir / "gate3_evidence.json", evidence)
     _write_json(output_dir / "gate3_report.json", report)
     print(
@@ -762,6 +954,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 __all__ = [
+    "CombinedGate3Observer",
     "ProductionShadowDecisionRuntime",
     "load_production_cards_read_only",
     "main",

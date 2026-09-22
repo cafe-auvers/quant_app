@@ -365,6 +365,7 @@ class Gate4EvidenceCollector:
             "max_observed_entry_notional": max(notionals) if notionals else 0.0,
             "approved_symbols": sorted(approved_symbols),
             "observed_entry_symbols": sorted(observed_symbols),
+            "entry_candidate_count": len(entries),
             "strategy_entry_terminal_outcome_count": len(entry_terminals),
             "safe_exit_or_protected_position_count": len(protected_positions),
             "controlled_cancel_lifecycle_count": len(cancellations),
