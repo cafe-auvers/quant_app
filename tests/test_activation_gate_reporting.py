@@ -227,6 +227,88 @@ def test_gate4_accepts_more_than_the_three_session_minimum():
     assert report["result"] == "PASSED"
 
 
+def _gate4_delta_inputs(changed_paths):
+    baseline = _passing_gate4()
+    current_commit = "b" * 40
+    upstream = {
+        "gate": "GATE_3_SHADOW_EXECUTION",
+        "result": "PASSED",
+        "commit_sha": current_commit,
+    }
+    evidence = dict(baseline["evidence"])
+    evidence.update(
+        {
+            "commit_sha": current_commit,
+            "gate3_report_sha256": canonical_report_sha256(upstream),
+            "supervised_regular_session_dates": ["2026-08-27"],
+            "entry_candidate_count": 0,
+            "every_entry_has_active_trade_card": False,
+            "every_buy_below_notional_cap": False,
+            "portfolio_risk_rechecked_atomically": False,
+            "reviewed_entry_notional_cap": 0.0,
+            "max_observed_entry_notional": 0.0,
+            "observed_entry_symbols": [],
+            "strategy_entry_terminal_outcome_count": 0,
+            "safe_exit_or_protected_position_count": 0,
+            "controlled_cancel_lifecycle_count": 0,
+        }
+    )
+    from activation_gates.requalification import (
+        gate4_change_impact,
+        required_gate4_supervised_sessions,
+    )
+
+    impact = gate4_change_impact(changed_paths)
+    manifest = {
+        "baseline_commit_sha": COMMIT,
+        "target_commit_sha": current_commit,
+        "baseline_gate4_report_sha256": canonical_report_sha256(baseline),
+        "changed_paths": changed_paths,
+        "impact": impact,
+        "required_supervised_sessions": required_gate4_supervised_sessions(impact),
+        "review": _review(),
+    }
+    return baseline, upstream, evidence, manifest
+
+
+def test_gate4_evidence_only_change_uses_one_delta_session_and_baseline_coverage():
+    baseline, upstream, evidence, manifest = _gate4_delta_inputs(
+        ["gate3/runner.py", "tests/test_activation_gate_reporting.py"]
+    )
+
+    report = build_gate4(
+        evidence,
+        upstream_gate3_report=upstream,
+        baseline_gate4_report=baseline,
+        change_impact_manifest=manifest,
+    )
+
+    assert report["result"] == "PASSED"
+    assert report["qualification_mode"] == "DELTA_REQUALIFICATION"
+    assert report["required_supervised_session_count"] == 1
+    assert report["change_impact"] == "EVIDENCE_ONLY"
+
+
+def test_gate4_production_change_still_requires_three_new_sessions():
+    baseline, upstream, evidence, manifest = _gate4_delta_inputs(
+        ["src/services/trading_engine.py"]
+    )
+
+    report = build_gate4(
+        evidence,
+        upstream_gate3_report=upstream,
+        baseline_gate4_report=baseline,
+        change_impact_manifest=manifest,
+    )
+
+    assert report["result"] == "FAILED"
+    assert report["required_supervised_session_count"] == 3
+    assert any(
+        item["property"] == "supervised_session_count"
+        for item in report["invariant_violations"]
+    )
+
+
 def test_malformed_nested_evidence_fails_closed_without_validator_exception():
     gate2 = _gate2_report()
     gate3_evidence = dict(_passing_gate3()["evidence"])

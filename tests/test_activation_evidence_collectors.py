@@ -10,7 +10,11 @@ from activation_gates.evidence import canonical_report_sha256
 from activation_gates.journal import AppendOnlyEvidenceJournal
 from gate3.collector import GATE3_EVIDENCE_EVENTS, GATE3_NAME, Gate3EvidenceCollector
 from gate3.reporting import build_report as build_gate3_report
-from gate3.runner import ProductionShadowDecisionRuntime, run_captured_live_replay
+from gate3.runner import (
+    CombinedGate3Observer,
+    ProductionShadowDecisionRuntime,
+    run_captured_live_replay,
+)
 from gate4.capabilities import (
     REQUIRED_EXECUTION_CAPABILITIES,
     load_verified_execution_capabilities,
@@ -148,6 +152,69 @@ def test_gate3_collector_builds_passing_evidence_from_journals(tmp_path):
         for event in collector.shadow_store.read_all()
         if event.limit_price > 0
     )
+
+
+def test_combined_gate3_observer_isolates_shadow_evaluation_failure():
+    observer = object.__new__(CombinedGate3Observer)
+    observer.finished = False
+    observer.observation_failed = False
+    observer.runtime_errors = []
+
+    class FailingRuntime:
+        def evaluate(self, _quotes):
+            raise RuntimeError("shadow-only failure")
+
+    observer.runtime = FailingRuntime()
+
+    observer.observe([object()])
+
+    assert observer.observation_failed is True
+    assert len(observer.runtime_errors) == 1
+    assert "shadow-only failure" not in observer.runtime_errors[0]
+
+
+@pytest.mark.parametrize(
+    ("gate2_result", "violations", "expected_state"),
+    [
+        ("FAILED", [{"property": "compatible_upstream_gate"}], "BLOCKED_BY_GATE2"),
+        (
+            "PASSED",
+            [{"property": "independent_review_approved"}],
+            "EVIDENCE_COMPLETE_PENDING_REVIEW",
+        ),
+    ],
+)
+def test_combined_gate3_reports_are_adjudicated_after_gate2(
+    tmp_path, monkeypatch, gate2_result, violations, expected_state
+):
+    observer = object.__new__(CombinedGate3Observer)
+    observer.finished = True
+    observer.output_dir = tmp_path
+    observer.strategy_rules_path = tmp_path / "rules.md"
+    observer.strategy_rules_path.write_text("rules", encoding="utf-8")
+    observer.collector = type(
+        "Collector",
+        (),
+        {"build_evidence": lambda self, **_kwargs: {"commit_sha": COMMIT}},
+    )()
+    monkeypatch.setattr(
+        "gate3.runner.build_report",
+        lambda _evidence, upstream_gate2_report: {
+            "result": "FAILED",
+            "invariant_violations": violations,
+            "commit_sha": upstream_gate2_report["commit_sha"],
+        },
+    )
+
+    report = observer.write_reports(
+        gate2_report={
+            "gate": "GATE_2_LIVE_KIS_READ_ONLY_SOAK",
+            "result": gate2_result,
+            "commit_sha": COMMIT,
+        }
+    )
+
+    assert report["qualification_state"] == expected_state
 
 
 def test_gate4_collector_derives_three_session_lifecycle(tmp_path):

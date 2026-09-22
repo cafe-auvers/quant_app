@@ -182,11 +182,13 @@ under `%USERPROFILE%\quant_evidence\gate2_sessions` containing:
 
 Once the genuine notice evidence has been independently reviewed and included
 in an exact-commit approved capability manifest, launch the certified soak in
-the same detached form:
+the same detached form. Add `--combine-gate3` to collect Gate-3 evidence from
+the same accepted quote stream without opening another WebSocket:
 
 ```powershell
 python scripts/manage_gate2_session.py start `
   --confirm-read-only `
+  --combine-gate3 `
   --environment PROD `
   --symbols AAPL,MSFT `
   --session-date YYYY-MM-DD `
@@ -201,6 +203,10 @@ Do not run another WebSocket client for the same app-key session. The full soak
 still fails closed unless the exact read-only activation snapshot, clean
 worktree, exact-head Gate-1 report, reviewed manifest, evidence digests, symbol
 keys, and all other preflight requirements in this checklist are valid.
+With `--combine-gate3`, Gate 2 remains the sole WebSocket owner. The Gate-3
+observer is isolated in-process; its failure is recorded in Gate-3 evidence
+and does not rewrite Gate-2 transport measurements. Gate-3 qualification is
+blocked unless the resulting Gate-2 report passes.
 
 ## Acceptance metrics
 

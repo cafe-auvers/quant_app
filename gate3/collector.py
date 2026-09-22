@@ -250,6 +250,7 @@ class Gate3EvidenceCollector:
             "observed_decision_branches": observed_branches,
             "fence_results": fence_results,
             "session_date": started.get("session_date"),
+            "collection_mode": started.get("collection_mode") or "STANDALONE_GATE3",
             "review": dict(review or {}),
         }
 

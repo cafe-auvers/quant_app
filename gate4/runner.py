@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from activation_gates.evidence import canonical_report_sha256
+from activation_gates.requalification import normalized_changed_paths
 from gate4.capabilities import load_verified_execution_capabilities
 from gate4.collector import Gate4EvidenceCollector
 from gate4.reporting import build_report
@@ -195,15 +196,60 @@ def finalize(args: argparse.Namespace) -> int:
     )
     collector = _collector(args.journal, commit)
     review = _load(args.review)
+    baseline_gate4 = None
+    change_impact = None
+    if args.baseline_gate4_report is not None or args.change_impact_manifest is not None:
+        if args.baseline_gate4_report is None or args.change_impact_manifest is None:
+            raise RuntimeError(
+                "--baseline-gate4-report and --change-impact-manifest are required together"
+            )
+        _require_external_path(args.baseline_gate4_report)
+        _require_external_path(args.change_impact_manifest)
+        baseline_gate4 = _load(args.baseline_gate4_report)
+        change_impact = _load(args.change_impact_manifest)
+        baseline_commit = str(baseline_gate4.get("commit_sha") or "").strip().lower()
+        ancestor = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", baseline_commit, commit],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if ancestor.returncode != 0:
+            raise RuntimeError(
+                "Gate-4 requalification baseline must be an ancestor of the target commit"
+            )
+        actual_changed_paths = normalized_changed_paths(
+            _git("diff", "--name-only", baseline_commit, commit).splitlines()
+        )
+        recorded_changed_paths = normalized_changed_paths(
+            change_impact.get("changed_paths", [])
+            if isinstance(change_impact.get("changed_paths"), (list, tuple))
+            else []
+        )
+        if not actual_changed_paths or actual_changed_paths != recorded_changed_paths:
+            raise RuntimeError(
+                "change-impact manifest paths do not exactly match the baseline-to-target Git diff"
+            )
     evidence = collector.build_evidence(
         gate3_report_sha256=canonical_report_sha256(gate3),
         controlled_live_config_sha256=_sha256(args.controlled_live_config),
         risk_limits_sha256=_sha256(args.risk_limits),
         review=review,
     )
+    if baseline_gate4 is not None and change_impact is not None:
+        evidence["baseline_gate4_report_sha256"] = canonical_report_sha256(
+            baseline_gate4
+        )
+        evidence["change_impact_manifest"] = dict(change_impact)
     if evidence.get("capability_evidence_sha256") != capability.sha256:
         raise RuntimeError("Gate-4 journal capability digest does not match the manifest")
-    report = build_report(evidence, upstream_gate3_report=gate3)
+    report = build_report(
+        evidence,
+        upstream_gate3_report=gate3,
+        baseline_gate4_report=baseline_gate4,
+        change_impact_manifest=change_impact,
+    )
     _require_external_path(args.output)
     _write_json(args.output, report)
     evidence_path = args.output.with_name(f"{args.output.stem}_evidence.json")
@@ -242,6 +288,8 @@ def build_parser() -> argparse.ArgumentParser:
     finalize_parser.add_argument("--controlled-live-config", type=Path, required=True)
     finalize_parser.add_argument("--risk-limits", type=Path, required=True)
     finalize_parser.add_argument("--review", type=Path)
+    finalize_parser.add_argument("--baseline-gate4-report", type=Path)
+    finalize_parser.add_argument("--change-impact-manifest", type=Path)
     finalize_parser.add_argument("--output", type=Path, required=True)
     finalize_parser.set_defaults(handler=finalize)
     return parser
