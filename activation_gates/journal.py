@@ -82,9 +82,11 @@ class EvidenceJournalAudit:
 class AppendOnlyEvidenceJournal:
     """An fsync'd JSONL hash chain for one gate and exact release.
 
-    Existing data is fully audited before another row may be appended.  This
-    prevents a restarted collector from extending a corrupt, mixed-release or
-    manually edited journal as though it were qualifying evidence.
+    Existing data is fully audited before the first append and whenever the
+    file changes outside this instance. Subsequent in-process appends extend a
+    cached, validated tail in constant time. Final evidence generation audits
+    the complete file again, so corruption remains fail-closed without making
+    a live collector rescan an ever-growing journal for every quote.
     """
 
     def __init__(
@@ -110,6 +112,32 @@ class AppendOnlyEvidenceJournal:
         self.commit_sha = normalized_commit
         self.allowed_event_types = allowed
         self._lock = threading.RLock()
+        self._append_cache_initialized = False
+        self._append_file_identity: tuple[int, int, int] | None = None
+        self._append_tail_sha256 = ZERO_SHA256
+
+    def _file_identity(self) -> tuple[int, int, int] | None:
+        try:
+            stat = self.path.stat()
+        except FileNotFoundError:
+            return None
+        return (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+    def _validated_append_tail(self) -> str:
+        identity = self._file_identity()
+        if self._append_cache_initialized and identity == self._append_file_identity:
+            return self._append_tail_sha256
+
+        audit = self.audit()
+        if not audit.passed:
+            raise RuntimeError("Refusing to extend a corrupt evidence journal")
+        rows = self.read_all()
+        self._append_tail_sha256 = (
+            rows[-1].event_sha256 if rows else ZERO_SHA256
+        )
+        self._append_file_identity = identity
+        self._append_cache_initialized = True
+        return self._append_tail_sha256
 
     def append(
         self,
@@ -129,13 +157,7 @@ class AppendOnlyEvidenceJournal:
             raise ValueError("Evidence event timestamps must be timezone-aware")
 
         with self._lock:
-            audit = self.audit()
-            if not audit.passed:
-                raise RuntimeError("Refusing to extend a corrupt evidence journal")
-            previous = ZERO_SHA256
-            rows = self.read_all()
-            if rows:
-                previous = rows[-1].event_sha256
+            previous = self._validated_append_tail()
             unsigned = {
                 "schema_version": 1,
                 "event_id": str(event_id or uuid4().hex),
@@ -156,6 +178,8 @@ class AppendOnlyEvidenceJournal:
                 handle.write(line + "\n")
                 handle.flush()
                 os.fsync(handle.fileno())
+            self._append_tail_sha256 = event.event_sha256
+            self._append_file_identity = self._file_identity()
             return event
 
     def read_all(self) -> list[EvidenceJournalEvent]:

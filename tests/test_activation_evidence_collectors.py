@@ -68,6 +68,68 @@ def test_append_only_evidence_journal_detects_tampering(tmp_path):
         journal.append("SESSION_ENDED", {"session_date": "2026-08-25"})
 
 
+def test_evidence_journal_does_not_rescan_unchanged_file_per_append(
+    tmp_path, monkeypatch
+):
+    journal = AppendOnlyEvidenceJournal(
+        tmp_path / "gate3.evidence.jsonl",
+        gate=GATE3_NAME,
+        commit_sha=COMMIT,
+        allowed_event_types=GATE3_EVIDENCE_EVENTS,
+    )
+    original_audit = journal.audit
+    original_read_all = journal.read_all
+    audit_calls = 0
+    read_calls = 0
+
+    def counted_audit():
+        nonlocal audit_calls
+        audit_calls += 1
+        return original_audit()
+
+    def counted_read_all():
+        nonlocal read_calls
+        read_calls += 1
+        return original_read_all()
+
+    monkeypatch.setattr(journal, "audit", counted_audit)
+    monkeypatch.setattr(journal, "read_all", counted_read_all)
+
+    for index in range(100):
+        journal.append(
+            "REAL_QUOTE_EVALUATED",
+            {"symbol": "RNG", "sequence": index},
+        )
+
+    assert audit_calls == 1
+    assert read_calls == 1
+    assert len(original_read_all()) == 100
+
+
+def test_evidence_journal_restart_audits_and_extends_valid_tail(tmp_path):
+    path = tmp_path / "gate3.evidence.jsonl"
+    first = AppendOnlyEvidenceJournal(
+        path,
+        gate=GATE3_NAME,
+        commit_sha=COMMIT,
+        allowed_event_types=GATE3_EVIDENCE_EVENTS,
+    )
+    prior = first.append("SESSION_STARTED", {"session_date": "2026-08-24"})
+
+    restarted = AppendOnlyEvidenceJournal(
+        path,
+        gate=GATE3_NAME,
+        commit_sha=COMMIT,
+        allowed_event_types=GATE3_EVIDENCE_EVENTS,
+    )
+    appended = restarted.append(
+        "SESSION_ENDED", {"session_date": "2026-08-24"}
+    )
+
+    assert appended.previous_event_sha256 == prior.event_sha256
+    assert restarted.audit().passed is True
+
+
 def test_gate3_collector_builds_passing_evidence_from_journals(tmp_path):
     collector = Gate3EvidenceCollector(
         journal_path=tmp_path / "gate3.evidence.jsonl",
