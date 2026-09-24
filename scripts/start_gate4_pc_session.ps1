@@ -111,6 +111,40 @@ public static class Gate4Mouse {
 }
 "@
     }
+
+    function Invoke-AutomationElement(
+        [System.Windows.Automation.AutomationElement]$Element,
+        [string]$Description
+    ) {
+        try {
+            $pattern = $Element.GetCurrentPattern(
+                [System.Windows.Automation.InvokePattern]::Pattern
+            )
+            $pattern.Invoke()
+            return
+        } catch {
+            try {
+                $legacy = $Element.GetCurrentPattern(
+                    [System.Windows.Automation.LegacyIAccessiblePattern]::Pattern
+                )
+                $legacy.DoDefaultAction()
+                return
+            } catch {
+                $elementBounds = $Element.Current.BoundingRectangle
+                if ($elementBounds.IsEmpty) {
+                    throw "$Description has no invokable pattern or clickable bounds"
+                }
+                [void][Gate4Mouse]::SetCursorPos(
+                    [int]($elementBounds.X + ($elementBounds.Width / 2)),
+                    [int]($elementBounds.Y + ($elementBounds.Height / 2))
+                )
+                [Gate4Mouse]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)
+                Start-Sleep -Milliseconds 120
+                [Gate4Mouse]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)
+            }
+        }
+    }
+
     $root = [System.Windows.Automation.AutomationElement]::RootElement
     $windowCondition = New-Object System.Windows.Automation.PropertyCondition(
         [System.Windows.Automation.AutomationElement]::NameProperty,
@@ -121,16 +155,23 @@ public static class Gate4Mouse {
         $windowCondition
     )
     if (-not $window) { throw "Stock Dashboard window was not found" }
-    $bounds = $window.Current.BoundingRectangle
     [void][Gate4Mouse]::SetForegroundWindow([IntPtr]$window.Current.NativeWindowHandle)
     Start-Sleep -Milliseconds 500
-    [void][Gate4Mouse]::SetCursorPos(
-        [int]($bounds.X + ($bounds.Width / 2)),
-        [int]($bounds.Y + 11)
+
+    $buttonCondition = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Button
     )
-    [Gate4Mouse]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)
-    Start-Sleep -Milliseconds 120
-    [Gate4Mouse]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)
+    $armButton = @(
+        $window.FindAll(
+            [System.Windows.Automation.TreeScope]::Descendants,
+            $buttonCondition
+        ) | Where-Object {
+            $_.Current.Name -like "LIVE TRADING*" -and $_.Current.IsEnabled
+        }
+    ) | Select-Object -First 1
+    if (-not $armButton) { throw "Enabled Live Trading button was not found" }
+    Invoke-AutomationElement $armButton "Live Trading button"
     Start-Sleep -Seconds 2
 
     $dialogCondition = New-Object System.Windows.Automation.PropertyCondition(
@@ -142,15 +183,18 @@ public static class Gate4Mouse {
         $dialogCondition
     )
     if (-not $dialog) { throw "Live-trading confirmation dialog did not open" }
-    $dialogBounds = $dialog.Current.BoundingRectangle
     [void][Gate4Mouse]::SetForegroundWindow([IntPtr]$dialog.Current.NativeWindowHandle)
-    [void][Gate4Mouse]::SetCursorPos(
-        [int]($dialogBounds.X + $dialogBounds.Width - 103),
-        [int]($dialogBounds.Y + $dialogBounds.Height - 28)
-    )
-    [Gate4Mouse]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)
-    Start-Sleep -Milliseconds 120
-    [Gate4Mouse]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)
+    $yesButton = @(
+        $dialog.FindAll(
+            [System.Windows.Automation.TreeScope]::Descendants,
+            $buttonCondition
+        ) | Where-Object {
+            $_.Current.IsEnabled -and
+            ($_.Current.Name -match "^(?:&?Yes|Y&es)$")
+        }
+    ) | Select-Object -First 1
+    if (-not $yesButton) { throw "Enabled Yes button was not found" }
+    Invoke-AutomationElement $yesButton "Live Trading confirmation button"
 }
 
 try {
