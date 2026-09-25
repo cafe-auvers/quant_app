@@ -240,13 +240,30 @@ public static class Gate4Mouse {
     $armButton = @(
         $window.FindAll(
             [System.Windows.Automation.TreeScope]::Descendants,
-            $buttonCondition
+            [System.Windows.Automation.Condition]::TrueCondition
         ) | Where-Object {
             $_.Current.Name -like "LIVE TRADING*" -and $_.Current.IsEnabled
         }
     ) | Select-Object -First 1
-    if (-not $armButton) { throw "Enabled Live Trading button was not found" }
-    Invoke-AutomationElement $armButton "Live Trading button"
+    if ($armButton) {
+        Invoke-AutomationElement $armButton "Live Trading button"
+    } else {
+        # Qt does not expose a checkable QPushButton hosted in QMenuBar's
+        # corner widget through UI Automation on this PC. The dashboard uses
+        # a fixed maximized layout; derive the reviewed button center from the
+        # window bounds instead of an absolute screen coordinate.
+        $bounds = $window.Current.BoundingRectangle
+        if ($bounds.IsEmpty -or $bounds.Width -lt 1200 -or $bounds.Height -lt 700) {
+            throw "Live Trading control was not accessible and dashboard bounds are unsafe"
+        }
+        [void][Gate4Mouse]::SetCursorPos(
+            [int]($bounds.X + ($bounds.Width * 0.515)),
+            [int]($bounds.Y + 12)
+        )
+        [Gate4Mouse]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)
+        Start-Sleep -Milliseconds 120
+        [Gate4Mouse]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)
+    }
     Start-Sleep -Seconds 2
 
     $dialogCondition = New-Object System.Windows.Automation.PropertyCondition(
