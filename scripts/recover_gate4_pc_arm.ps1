@@ -38,6 +38,83 @@ function Get-SessionEvents {
     )
 }
 
+function Invoke-ExecutionOwnerPcUi {
+    Add-Type -AssemblyName UIAutomationClient
+    Add-Type -AssemblyName UIAutomationTypes
+    if (-not ("Gate4RecoveryMouse" -as [type])) {
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class Gate4RecoveryMouse {
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint x, uint y, uint d, UIntPtr e);
+}
+"@
+    }
+
+    $root = [System.Windows.Automation.AutomationElement]::RootElement
+    $windowCondition = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::NameProperty,
+        "Stock Dashboard"
+    )
+    $window = $root.FindFirst(
+        [System.Windows.Automation.TreeScope]::Descendants,
+        $windowCondition
+    )
+    if (-not $window) { throw "Stock Dashboard window was not found" }
+    [void][Gate4RecoveryMouse]::SetForegroundWindow(
+        [IntPtr]$window.Current.NativeWindowHandle
+    )
+    Start-Sleep -Milliseconds 500
+
+    $buttonCondition = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Button
+    )
+    $pcButtons = @(
+        $window.FindAll(
+            [System.Windows.Automation.TreeScope]::Descendants,
+            $buttonCondition
+        ) | Where-Object {
+            $_.Current.Name -eq "PC" -and
+            $_.Current.IsEnabled -and
+            -not $_.Current.IsOffscreen
+        } | Sort-Object {
+            $_.Current.BoundingRectangle.X
+        }
+    )
+    if ($pcButtons.Count -eq 0) {
+        throw "Enabled Execution Owner PC button was not found"
+    }
+    $button = $pcButtons[0]
+    try {
+        $pattern = $button.GetCurrentPattern(
+            [System.Windows.Automation.InvokePattern]::Pattern
+        )
+        $pattern.Invoke()
+    } catch {
+        try {
+            $legacy = $button.GetCurrentPattern(
+                [System.Windows.Automation.LegacyIAccessiblePattern]::Pattern
+            )
+            $legacy.DoDefaultAction()
+        } catch {
+            $bounds = $button.Current.BoundingRectangle
+            if ($bounds.IsEmpty) {
+                throw "Execution Owner PC button is not invokable"
+            }
+            [void][Gate4RecoveryMouse]::SetCursorPos(
+                [int]($bounds.X + ($bounds.Width / 2)),
+                [int]($bounds.Y + ($bounds.Height / 2))
+            )
+            [Gate4RecoveryMouse]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)
+            Start-Sleep -Milliseconds 120
+            [Gate4RecoveryMouse]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)
+        }
+    }
+}
+
 function Invoke-ManualArmUi {
     Add-Type -AssemblyName UIAutomationClient
     Add-Type -AssemblyName UIAutomationTypes
@@ -158,6 +235,9 @@ try {
         Write-Gate4Log "Gate 4 session was already armed"
         exit 0
     }
+
+    Invoke-ExecutionOwnerPcUi
+    Write-Gate4Log "Requested the normal Execution Owner PC handoff through the dashboard"
 
     $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
     do {
