@@ -23,6 +23,7 @@ param(
     [int]$RetryMinutes = 15,
 
     [string]$ApprovedBy = "tonyh-owner-operator",
+    [string]$ApprovedSymbol = "",
     [string]$LogPath = (Join-Path $env:LOCALAPPDATA "quant_app\gate4_cap_deployment.log")
 )
 
@@ -36,6 +37,10 @@ $capText = $EntryNotional.ToString(
     "0.00",
     [Globalization.CultureInfo]::InvariantCulture
 )
+$approvedSymbolText = ([string]$ApprovedSymbol).Trim().ToUpperInvariant()
+if ($approvedSymbolText -and $approvedSymbolText -notmatch '^[A-Z0-9.-]{1,20}$') {
+    throw "ApprovedSymbol is invalid"
+}
 $deadline = (Get-Date).AddMinutes($RetryMinutes)
 
 function Write-DeploymentLog([string]$Message) {
@@ -54,9 +59,10 @@ while ($true) {
                 $RepositoryRoot,
                 $EvidenceBundle,
                 $capText,
-                $ApprovedBy
+                $ApprovedBy,
+                $approvedSymbolText
             ) -ScriptBlock {
-                param($repo, $bundle, $approvedCap, $approvedBy)
+                param($repo, $bundle, $approvedCap, $approvedBy, $approvedSymbol)
 
                 $ErrorActionPreference = "Stop"
                 $python = Join-Path $repo "venv\Scripts\python.exe"
@@ -155,6 +161,9 @@ while ($true) {
                     approved_at = [DateTimeOffset]::Now.ToString("o")
                     approved_by = $approvedBy
                     approved_entry_notional_usd = [double]$approved
+                    approved_symbols = @(
+                        if ($approvedSymbol) { $approvedSymbol }
+                    )
                     runtime_commit_sha = $head
                     preflight_path = $preflightPath
                     control_off_during_change = $true
@@ -168,6 +177,7 @@ while ($true) {
 
                 [pscustomobject]@{
                     approved_entry_notional_usd = [double]$approved
+                    approved_symbol = $approvedSymbol
                     effective_entry_notional_usd = [double]$effective
                     runtime_commit_sha = $head
                     control_off = $true
