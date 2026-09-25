@@ -2220,7 +2220,7 @@ class MainWindow(
                 # unacknowledged stop breach survives recomposition.
                 self._capture_buyboard_market_data_for_restart(worker)
                 self._buyboard_runtime_restart_requested = True
-                worker.request_stop()
+                worker.request_stop(finalize_gate4_session=False)
                 worker.requestInterruption()
                 return
 
@@ -2311,7 +2311,7 @@ class MainWindow(
             return
         self._capture_buyboard_market_data_for_restart(worker)
         self._buyboard_runtime_restart_requested = True
-        worker.request_stop()
+        worker.request_stop(finalize_gate4_session=False)
         worker.requestInterruption()
 
     def _state_sync_allows_order_submission(self) -> bool:

@@ -60,7 +60,9 @@ from src.services.kis_ws_symbol_keys import (  # noqa: E402
     KisWsSymbolKeyStore,
 )
 from src.services.trading_state import is_trading_locked_disabled  # noqa: E402
-from src.infrastructure.database.engine import init_mysql_engine  # noqa: E402
+from src.infrastructure.database.coordination_engine import (  # noqa: E402
+    init_coordination_engine,
+)
 
 
 class Preflight:
@@ -282,7 +284,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     def _check_mysql() -> None:
-        engine = init_mysql_engine(log_unavailable=False, ensure_schema=False)
+        engine = init_coordination_engine(ensure_schema=False)
         if engine is None:
             raise RuntimeError("configured PC MySQL is unavailable")
         try:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from datetime import datetime, timezone
 
 import pytest
 from sqlalchemy import create_engine
@@ -274,6 +275,7 @@ def test_flat_closed_card_breakout_starts_a_fresh_buylist_cycle(
             filled_quantity=5,
             remaining_quantity=0,
             average_fill_price=98.5,
+            prepared_at="2026-01-01T00:00:00+00:00",
         ),
     )
 
@@ -299,6 +301,136 @@ def test_flat_closed_card_breakout_starts_a_fresh_buylist_cycle(
     assert result.card.entry_client_order_id == ""
     assert result.card.return_to_buylist_after_close is False
     assert result.card.warnings == []
+
+
+def test_completed_cycle_fill_does_not_lock_later_breakout_revision(engine):
+    card = _seed(
+        engine,
+        board_status=BoardStatus.CLOSED,
+        breakout_price=100.0,
+        position_runtime_status=PositionRuntimeStatus.CLOSED,
+    )
+    record_execution_order(
+        engine,
+        ExecutionOrderRecord(
+            environment="PROD",
+            account_no="1",
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            intent=OrderIntent.ENTRY,
+            client_order_id="completed-cycle-entry",
+            broker_order_id="completed-cycle-broker-order",
+            broker_identity_status=BrokerIdentityStatus.EXACT,
+            status=ExecutionOrderStatus.FILLED,
+            submitted_quantity=5,
+            filled_quantity=5,
+            remaining_quantity=0,
+            average_fill_price=98.5,
+            prepared_at="2026-01-01T00:00:00+00:00",
+        ),
+    )
+
+    restarted = request_board_action(
+        engine,
+        _set(card, price=102.0),
+        context=_context(),
+    )
+    revised = request_board_action(
+        engine,
+        _set(restarted.card, price=103.0),
+        context=_context(),
+    )
+
+    assert revised.card.board_status == BoardStatus.BUYLIST
+    assert revised.card.breakout_price == 103.0
+    assert revised.card.broker_quantity == 0
+    assert revised.card.position_runtime_status == PositionRuntimeStatus.NONE
+
+
+def test_legacy_flat_buylist_ignores_fill_before_current_planning_cycle(engine):
+    card = _seed(
+        engine,
+        board_status=BoardStatus.BUYLIST,
+        breakout_price=100.0,
+        created_at=datetime(2026, 8, 21, tzinfo=timezone.utc),
+        board_status_updated_at=datetime(2026, 8, 28, tzinfo=timezone.utc),
+        position_runtime_status=PositionRuntimeStatus.NONE,
+        broker_quantity=0,
+        orderable_quantity=0,
+        average_entry_price=0.0,
+    )
+    record_execution_order(
+        engine,
+        ExecutionOrderRecord(
+            environment="PROD",
+            account_no="1",
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            intent=OrderIntent.ENTRY,
+            client_order_id="historical-entry",
+            broker_order_id="historical-broker-order",
+            broker_identity_status=BrokerIdentityStatus.EXACT,
+            status=ExecutionOrderStatus.FILLED,
+            submitted_quantity=5,
+            filled_quantity=5,
+            remaining_quantity=0,
+            average_fill_price=98.5,
+            prepared_at="2026-08-11T14:20:38+00:00",
+        ),
+    )
+
+    revised = request_board_action(
+        engine,
+        _set(card, price=102.0),
+        context=_context(),
+    )
+
+    assert revised.card.breakout_price == 102.0
+
+
+@pytest.mark.parametrize(
+    "status,prepared_at",
+    [
+        (ExecutionOrderStatus.PARTIALLY_FILLED, "2026-08-11T14:20:38+00:00"),
+        (ExecutionOrderStatus.FILLED, "not-a-timestamp"),
+    ],
+)
+def test_old_active_or_unparseable_fill_still_locks_breakout(
+    engine, status, prepared_at
+):
+    card = _seed(
+        engine,
+        board_status=BoardStatus.BUYLIST,
+        breakout_price=100.0,
+        created_at=datetime(2026, 8, 21, tzinfo=timezone.utc),
+        board_status_updated_at=datetime(2026, 8, 28, tzinfo=timezone.utc),
+    )
+    record_execution_order(
+        engine,
+        ExecutionOrderRecord(
+            environment="PROD",
+            account_no="1",
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            intent=OrderIntent.ENTRY,
+            client_order_id=f"unsafe-{status.value.lower()}",
+            broker_order_id=f"unsafe-broker-{status.value.lower()}",
+            broker_identity_status=BrokerIdentityStatus.EXACT,
+            status=status,
+            submitted_quantity=5,
+            filled_quantity=1 if status == ExecutionOrderStatus.PARTIALLY_FILLED else 5,
+            remaining_quantity=4 if status == ExecutionOrderStatus.PARTIALLY_FILLED else 0,
+            average_fill_price=98.5,
+            prepared_at=prepared_at,
+        ),
+    )
+
+    with pytest.raises(BoardCommandRejectedError, match="fill or position"):
+        request_board_action(
+            engine,
+            _set(card, price=102.0),
+            context=_context(),
+        )
 
 
 @pytest.mark.parametrize(
