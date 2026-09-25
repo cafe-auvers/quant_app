@@ -60,20 +60,25 @@ def main(argv: list[str] | None = None) -> int:
 
     collector = None if args.no_evidence else configured_collector()
     dated_events = []
+    session_already_closed = False
     if collector is not None:
         dated_events = [
             event
             for event in collector.journal.read_all()
             if event.payload.get("session_date") == session_date.isoformat()
         ]
-        if any(event.event_type == "SESSION_ENDED" for event in dated_events):
-            print(f"Gate 4 session {session_date.isoformat()} is already closed.")
-            return 0
-        starts = sum(event.event_type == "SESSION_STARTED" for event in dated_events)
-        if starts != 1:
-            raise RuntimeError(
-                "Gate-4 disarm evidence requires exactly one open supervised session"
+        session_already_closed = any(
+            event.event_type == "SESSION_ENDED" for event in dated_events
+        )
+        if not session_already_closed:
+            starts = sum(
+                event.event_type == "SESSION_STARTED" for event in dated_events
             )
+            if starts != 1:
+                raise RuntimeError(
+                    "Gate-4 disarm evidence requires exactly one open "
+                    "supervised session"
+                )
 
     engine = init_coordination_engine(ensure_schema=False, raise_on_error=True)
     try:
@@ -98,7 +103,7 @@ def main(argv: list[str] | None = None) -> int:
         engine.dispose()
 
     trading_state.set_trading_enabled(False)
-    if collector is not None:
+    if collector is not None and not session_already_closed:
         if not any(event.event_type == "DISARMED" for event in dated_events):
             observe_gate4_event("DISARMED", source="OWNER_AUTHORIZED_OPERATION")
         if not any(event.event_type == "DISARM_PROBE" for event in dated_events):
@@ -118,9 +123,14 @@ def main(argv: list[str] | None = None) -> int:
                 broker_called=False,
             )
 
+    closure = (
+        " The supervised session was already closed."
+        if session_already_closed
+        else ""
+    )
     print(
         f"Gate 4 shared trading is OFF for {session_date.isoformat()} "
-        f"(revision {verified.control.revision})."
+        f"(revision {verified.control.revision}).{closure}"
     )
     return 0
 

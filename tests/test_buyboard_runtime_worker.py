@@ -2089,6 +2089,29 @@ def test_runtime_shutdown_orders_journal_reconciliation_and_market_data_close(
     assert worker.shutdown_prepared is True
 
 
+def test_internal_runtime_restart_does_not_end_gate4_session(tmp_path, monkeypatch):
+    worker, _ = _worker(tmp_path)
+    observed = []
+    worker.runtime = None
+    worker._journal_flush = lambda: None
+    monkeypatch.setattr(
+        worker,
+        "_set_device_state",
+        lambda state, **_kwargs: setattr(worker, "device_state", state),
+    )
+    monkeypatch.setattr(
+        "gate4.runtime_observer.observe_gate4_event",
+        lambda event_type, **payload: observed.append((event_type, payload)),
+    )
+
+    worker.request_stop(finalize_gate4_session=False)
+    worker._perform_shutdown_sequence()
+
+    assert observed == []
+    assert worker.device_state == RuntimeDeviceState.STOPPED
+    assert worker.shutdown_prepared is True
+
+
 def test_standby_stop_breach_survives_promotion_and_initiates_sell_all_once(
     tmp_path
 ):

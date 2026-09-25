@@ -647,8 +647,8 @@ def test_queue_reload_restart_preserves_market_data_and_stops_worker():
             return True
 
         @staticmethod
-        def request_stop():
-            calls.append("stop")
+        def request_stop(*, finalize_gate4_session=True):
+            calls.append(("stop", finalize_gate4_session))
 
         @staticmethod
         def requestInterruption():
@@ -662,7 +662,7 @@ def test_queue_reload_restart_preserves_market_data_and_stops_worker():
 
     assert window._buyboard_market_data_handoff is market_data
     assert window._buyboard_runtime_restart_requested is True
-    assert calls == ["stop", "interrupt"]
+    assert calls == [("stop", False), "interrupt"]
 
 
 def test_auto_claim_triggered_when_enabled_and_should_claim_says_yes(monkeypatch):

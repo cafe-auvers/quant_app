@@ -34,7 +34,8 @@ function Get-SessionEvents {
 function Request-DashboardClose {
     Add-Type -AssemblyName UIAutomationClient
     Add-Type -AssemblyName UIAutomationTypes
-    Add-Type -TypeDefinition @"
+    if (-not ("Gate4SessionClose" -as [type])) {
+        Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
 public static class Gate4SessionClose {
@@ -42,6 +43,7 @@ public static class Gate4SessionClose {
     public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
 }
 "@
+    }
     $condition = New-Object System.Windows.Automation.PropertyCondition(
         [System.Windows.Automation.AutomationElement]::NameProperty,
         "Stock Dashboard"
@@ -50,13 +52,14 @@ public static class Gate4SessionClose {
         [System.Windows.Automation.TreeScope]::Descendants,
         $condition
     )
-    if (-not $window) { throw "Stock Dashboard window was not found" }
+    if (-not $window) { return $false }
     [void][Gate4SessionClose]::PostMessage(
         [IntPtr]$window.Current.NativeWindowHandle,
         16,
         [IntPtr]::Zero,
         [IntPtr]::Zero
     )
+    return $true
 }
 
 try {
@@ -71,10 +74,17 @@ try {
         throw "Controlled close refused because the broker/order state is not flat"
     }
 
-    Request-DashboardClose
-    $deadline = (Get-Date).AddSeconds(75)
+    $dashboardWasRunning = (Get-DashboardProcesses).Count -gt 0
+    if ($dashboardWasRunning) {
+        if (-not (Request-DashboardClose)) {
+            throw "Dashboard process is running but its window was not found"
+        }
+    } else {
+        Write-Gate4Log "Dashboard already absent; verifying prior clean session closure"
+    }
+
+    $deadline = (Get-Date).AddSeconds($(if ($dashboardWasRunning) { 75 } else { 1 }))
     do {
-        Start-Sleep -Seconds 1
         $events = Get-SessionEvents
         $final = @($events | Where-Object {
             $_.event_type -eq "FINAL_RECONCILIATION" -and
@@ -84,6 +94,9 @@ try {
             $_.event_type -eq "SESSION_ENDED" -and
             $_.payload.clean_shutdown -eq $true
         })
+        if ($final.Count -eq 0 -or $ended.Count -eq 0) {
+            Start-Sleep -Seconds 1
+        }
     } while (($final.Count -eq 0 -or $ended.Count -eq 0) -and (Get-Date) -lt $deadline)
     if ($final.Count -eq 0 -or $ended.Count -eq 0) {
         throw "Final reconciliation or clean SESSION_ENDED was not recorded"
@@ -106,6 +119,15 @@ try {
     }
     if ((Get-DashboardProcesses).Count -gt 0) {
         throw "Dashboard process remained after the verified controlled close"
+    }
+
+    # Application shutdown normally releases ownership. Re-run the flat-state
+    # release idempotently so an already-closed dashboard cannot leave a stale
+    # execution lease behind.
+    & $python (Join-Path $bundle "release_execution_owner_if_flat.py") `
+        --repository $repo *>> $log
+    if ($LASTEXITCODE -ne 0) {
+        throw "Execution ownership was not released after controlled close"
     }
 
     $runtime = Get-Content -Raw -LiteralPath $config | ConvertFrom-Json

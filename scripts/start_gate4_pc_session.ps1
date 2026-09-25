@@ -13,6 +13,7 @@ $config = Join-Path $repo "config\runtime.local.json"
 $journal = Join-Path $bundle "gate4.evidence.jsonl"
 $log = Join-Path $bundle ("gate4_" + $SessionDate + "_start.log")
 $utf8 = New-Object System.Text.UTF8Encoding($false)
+$collectionConfiguredByThisRun = $false
 
 function Write-Gate4Log([string]$Message) {
     Add-Content -LiteralPath $log -Value ((Get-Date).ToString("o") + " " + $Message) -Encoding UTF8
@@ -33,6 +34,52 @@ function Get-DashboardProcesses {
     @(Get-CimInstance Win32_Process | Where-Object {
         $_.CommandLine -match "quant_app\\main\.py"
     })
+}
+
+function Test-Truthy([object]$Value) {
+    if ($null -eq $Value) { return $false }
+    return @("1", "true", "yes", "on") -contains (
+        ([string]$Value).Trim().ToLowerInvariant()
+    )
+}
+
+function Get-OpenGate4SessionDates([string]$JournalPath) {
+    if (-not $JournalPath -or -not (Test-Path -LiteralPath $JournalPath)) {
+        return @()
+    }
+    $events = @(
+        Get-Content -LiteralPath $JournalPath | ForEach-Object {
+            try { $_ | ConvertFrom-Json } catch { $null }
+        } | Where-Object {
+            $_.payload.session_date -and
+            $_.event_type -in @("SESSION_STARTED", "SESSION_ENDED")
+        }
+    )
+    @(
+        $events | Group-Object { $_.payload.session_date } | Where-Object {
+            $starts = @($_.Group | Where-Object { $_.event_type -eq "SESSION_STARTED" })
+            $ends = @($_.Group | Where-Object { $_.event_type -eq "SESSION_ENDED" })
+            $starts.Count -gt $ends.Count
+        } | ForEach-Object { $_.Name }
+    )
+}
+
+function Assert-NoActiveGate4Runtime {
+    if ((Get-DashboardProcesses).Count -eq 0) { return }
+    $runtime = Get-Content -Raw -LiteralPath $config | ConvertFrom-Json
+    $configuredJournal = [string]$runtime.GATE4_EVIDENCE_JOURNAL_PATH
+    $openDates = @(Get-OpenGate4SessionDates $configuredJournal)
+    if ((Test-Truthy $runtime.GATE4_QUALIFICATION_ENABLED) -or $openDates.Count -gt 0) {
+        $detail = if ($openDates.Count -gt 0) {
+            "open supervised date(s): " + ($openDates -join ", ")
+        } else {
+            "Gate-4 collection is enabled"
+        }
+        throw (
+            "Refusing to replace an active Gate-4 dashboard ($detail). " +
+            "Close the current session normally before starting another one."
+        )
+    }
 }
 
 function Request-DashboardClose {
@@ -292,7 +339,12 @@ public static class Gate4Mouse {
 try {
     Set-Location -LiteralPath $repo
     Write-Gate4Log "Gate 4 supervised start beginning"
+    # This check must precede every configuration, disarm, ownership, and
+    # process mutation. It makes an accidentally replayed one-shot task
+    # harmless while a supervised runtime is already active.
+    Assert-NoActiveGate4Runtime
     Set-Gate4Collection $false
+    $collectionConfiguredByThisRun = $true
     & $python (Join-Path $bundle "disarm_gate4_session.py") `
         --repository $repo --session-date $SessionDate --no-evidence *>> $log
     if ($LASTEXITCODE -ne 0) { throw "Could not establish shared OFF state" }
@@ -357,7 +409,14 @@ try {
     if ($arms.Count -eq 0) { throw "Manual UI arm was not recorded" }
     Write-Gate4Log "Gate 4 runtime ACTIVE and manually armed through the dashboard"
 } catch {
-    Write-Gate4Log ("BLOCKED: " + $_.Exception.Message)
-    Set-Gate4Collection $false
-    throw
+    $failure = $_
+    Write-Gate4Log ("BLOCKED: " + $failure.Exception.Message)
+    if ($collectionConfiguredByThisRun) {
+        try {
+            Set-Gate4Collection $false
+        } catch {
+            Write-Gate4Log ("WARNING: Could not disable Gate-4 collection: " + $_.Exception.Message)
+        }
+    }
+    throw $failure
 }
