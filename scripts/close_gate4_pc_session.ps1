@@ -65,7 +65,7 @@ public static class Gate4SessionClose {
 try {
     Set-Location -LiteralPath $repo
     Write-Gate4Log "Gate 4 controlled close beginning"
-    & $python (Join-Path $bundle "disarm_gate4_session.py") `
+    & $python (Join-Path $PSScriptRoot "disarm_gate4_session.py") `
         --repository $repo --session-date $SessionDate *>> $log
     if ($LASTEXITCODE -ne 0) { throw "Gate 4 disarm/probe failed" }
     & $python (Join-Path $bundle "release_execution_owner_if_flat.py") `

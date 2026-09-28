@@ -345,7 +345,7 @@ try {
     Assert-NoActiveGate4Runtime
     Set-Gate4Collection $false
     $collectionConfiguredByThisRun = $true
-    & $python (Join-Path $bundle "disarm_gate4_session.py") `
+    & $python (Join-Path $PSScriptRoot "disarm_gate4_session.py") `
         --repository $repo --session-date $SessionDate --no-evidence *>> $log
     if ($LASTEXITCODE -ne 0) { throw "Could not establish shared OFF state" }
     Stop-ExistingDashboard
@@ -378,6 +378,9 @@ try {
         -WorkingDirectory $repo -RedirectStandardOutput $stdout `
         -RedirectStandardError $stderr
 
+    # Let the dashboard initialize in standby first, then use its normal
+    # ownership handoff. Starting directly as owner makes the legacy exact
+    # release replace its startup worker and incorrectly close Gate 4.
     $claimDeadline = (Get-Date).AddSeconds(60)
     $claimRequested = $false
     do {

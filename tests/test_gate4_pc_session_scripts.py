@@ -41,6 +41,17 @@ def test_gate4_close_accepts_absent_dashboard_only_with_clean_evidence():
     assert closure_check < owner_release
 
 
+def test_gate4_session_scripts_use_the_deployed_disarm_helper():
+    start = START.read_text(encoding="utf-8")
+    close = CLOSE.read_text(encoding="utf-8")
+
+    expected = '(Join-Path $PSScriptRoot "disarm_gate4_session.py")'
+    assert expected in start
+    assert expected in close
+    assert '(Join-Path $bundle "disarm_gate4_session.py")' not in start
+    assert '(Join-Path $bundle "disarm_gate4_session.py")' not in close
+
+
 def test_disarm_still_turns_shared_control_off_after_session_already_closed():
     text = DISARM.read_text(encoding="utf-8")
     closed_check = text.index("session_already_closed = any(")
