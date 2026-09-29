@@ -236,7 +236,7 @@ class AppendOnlyEvidenceJournal:
                 unknown_types += 1
             else:
                 counts[event.event_type] += 1
-        return EvidenceJournalAudit(
+        result = EvidenceJournalAudit(
             row_count=row_count,
             event_counts=counts,
             parse_error_count=parse_errors,
@@ -246,6 +246,14 @@ class AppendOnlyEvidenceJournal:
             unknown_event_type_count=unknown_types,
             sha256=self.sha256(),
         )
+        if not result.passed:
+            # A failed explicit audit must poison the fast append path even
+            # when a same-size rewrite retains coarse filesystem timestamps.
+            # The next append will therefore re-audit and fail closed.
+            with self._lock:
+                self._append_cache_initialized = False
+                self._append_file_identity = None
+        return result
 
 
 __all__ = [

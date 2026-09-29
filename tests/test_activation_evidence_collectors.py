@@ -43,7 +43,7 @@ def _review():
     }
 
 
-def test_append_only_evidence_journal_detects_tampering(tmp_path):
+def test_append_only_evidence_journal_detects_tampering(tmp_path, monkeypatch):
     path = tmp_path / "gate3.evidence.jsonl"
     journal = AppendOnlyEvidenceJournal(
         path,
@@ -55,6 +55,8 @@ def test_append_only_evidence_journal_detects_tampering(tmp_path):
     journal.append("SESSION_ENDED", {"session_date": "2026-08-24"})
 
     assert journal.audit().passed is True
+    cached_identity = journal._append_file_identity
+    monkeypatch.setattr(journal, "_file_identity", lambda: cached_identity)
     rows = path.read_text(encoding="utf-8").splitlines()
     payload = json.loads(rows[0])
     payload["payload"]["session_date"] = "2026-08-25"
