@@ -65,6 +65,13 @@ KST_ZONE = ZoneInfo("Asia/Seoul")
 # 2-second execution-freshness fence.
 GATE2_RECEIVE_LAG_P95_LIMIT_MS = 1_500.0
 GATE2_RECEIVE_LAG_P99_LIMIT_MS = 3_500.0
+# Broker timestamps are whole-second wall-clock values, so the qualification
+# host must remain closely disciplined to an independent NTP source.  A
+# service-level "synchronized" flag alone is insufficient: Windows can retain
+# that state while its special-poll interval allows material clock drift.
+GATE2_CLOCK_OFFSET_LIMIT_MS = 50.0
+GATE2_CLOCK_OFFSET_SAMPLE_COUNT = 5
+GATE2_CLOCK_REFERENCE = "time.cloudflare.com"
 # Structural continuity targets 100%.  The reviewed Gate-2 floor tolerates at
 # most five unavailable samples per 10,000 observed samples (99.95%) while
 # execution readiness remains independently fail-closed on every bad sample.
@@ -144,17 +151,62 @@ def clock_synchronization_status() -> dict[str, object]:
         f"0x{reference_match.group(1).upper()}" if reference_match else None
     )
     leap_indicator = int(leap_match.group(1)) if leap_match else None
-    synchronized = bool(
+    service_synchronized = bool(
         completed.returncode == 0
         and reference_id not in {None, "0x00000000"}
         and leap_indicator == 0
     )
+    offsets_ms: list[float] = []
+    if service_synchronized:
+        try:
+            offset_probe = subprocess.run(
+                [
+                    "w32tm",
+                    "/stripchart",
+                    f"/computer:{GATE2_CLOCK_REFERENCE}",
+                    "/dataonly",
+                    f"/samples:{GATE2_CLOCK_OFFSET_SAMPLE_COUNT}",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError):
+            offset_probe = None
+        if offset_probe is not None and offset_probe.returncode == 0:
+            for line in (offset_probe.stdout or "").splitlines():
+                match = re.search(r"([+-]\d+(?:[.,]\d+)?)s\s*$", line.strip())
+                if match:
+                    offsets_ms.append(
+                        abs(float(match.group(1).replace(",", "."))) * 1_000.0
+                    )
+
+    offset_abs_max_ms = max(offsets_ms) if offsets_ms else None
+    offset_verified = bool(
+        len(offsets_ms) == GATE2_CLOCK_OFFSET_SAMPLE_COUNT
+        and offset_abs_max_ms is not None
+        and offset_abs_max_ms <= GATE2_CLOCK_OFFSET_LIMIT_MS
+    )
+    synchronized = bool(service_synchronized and offset_verified)
+    if not service_synchronized:
+        reason = "windows_time_unsynchronized"
+    elif len(offsets_ms) != GATE2_CLOCK_OFFSET_SAMPLE_COUNT:
+        reason = "windows_time_offset_unavailable"
+    elif not offset_verified:
+        reason = "windows_time_offset_exceeds_limit"
+    else:
+        reason = "synchronized"
     return {
         "checked": True,
         "synchronized": synchronized,
         "reference_id": reference_id,
         "leap_indicator": leap_indicator,
-        "reason": "synchronized" if synchronized else "windows_time_unsynchronized",
+        "offset_reference": GATE2_CLOCK_REFERENCE,
+        "offset_sample_count": len(offsets_ms),
+        "offset_abs_max_ms": offset_abs_max_ms,
+        "offset_limit_ms": GATE2_CLOCK_OFFSET_LIMIT_MS,
+        "reason": reason,
     }
 
 
@@ -1600,7 +1652,8 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
     clock_status = clock_synchronization_status()
     if not clock_status["synchronized"]:
         raise RuntimeError(
-            "Gate 2 requires a Windows clock synchronized to an NTP source"
+            "Gate 2 requires a Windows clock synchronized and within the "
+            "measured NTP-offset limit"
         )
     capability_manifest = load_verified_capability_manifest(
         args.capability_manifest,

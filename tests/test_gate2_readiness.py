@@ -72,6 +72,10 @@ def local_ready(tmp_path, monkeypatch):
             "synchronized": True,
             "reference_id": "0x01020304",
             "leap_indicator": 0,
+            "offset_reference": "time.cloudflare.com",
+            "offset_sample_count": 5,
+            "offset_abs_max_ms": 5.0,
+            "offset_limit_ms": 50.0,
             "reason": "synchronized",
         },
     )
@@ -175,15 +179,30 @@ def test_windows_clock_status_requires_a_nonzero_reference_and_no_leap_warning(
     from gate2 import reporting
 
     monkeypatch.setattr(reporting.os, "name", "nt")
+
+    def synchronized_run(command, **kwargs):
+        if "/stripchart" in command:
+            return SimpleNamespace(
+                returncode=0,
+                stdout="\n".join(
+                    f"12:00:0{index}, +00.00{index + 1}0000s"
+                    for index in range(reporting.GATE2_CLOCK_OFFSET_SAMPLE_COUNT)
+                ),
+            )
+        return SimpleNamespace(
+            returncode=0,
+            stdout="Leap Indicator: 0(no warning)\nReferenceId: 0x34E772B7\n",
+        )
+
     monkeypatch.setattr(
         reporting.subprocess,
         "run",
-        lambda *args, **kwargs: SimpleNamespace(
-            returncode=0,
-            stdout="Leap Indicator: 0(no warning)\nReferenceId: 0x34E772B7\n",
-        ),
+        synchronized_run,
     )
-    assert reporting.clock_synchronization_status()["synchronized"] is True
+    good = reporting.clock_synchronization_status()
+    assert good["synchronized"] is True
+    assert good["offset_sample_count"] == reporting.GATE2_CLOCK_OFFSET_SAMPLE_COUNT
+    assert good["offset_abs_max_ms"] == pytest.approx(5.0)
 
     monkeypatch.setattr(
         reporting.subprocess,
@@ -196,6 +215,34 @@ def test_windows_clock_status_requires_a_nonzero_reference_and_no_leap_warning(
     status = reporting.clock_synchronization_status()
     assert status["synchronized"] is False
     assert status["reason"] == "windows_time_unsynchronized"
+
+
+def test_windows_clock_status_rejects_material_ntp_offset(monkeypatch):
+    from gate2 import reporting
+
+    monkeypatch.setattr(reporting.os, "name", "nt")
+
+    def run(command, **kwargs):
+        if "/stripchart" in command:
+            return SimpleNamespace(
+                returncode=0,
+                stdout="\n".join(
+                    f"12:00:0{index}, +00.1{index}00000s"
+                    for index in range(reporting.GATE2_CLOCK_OFFSET_SAMPLE_COUNT)
+                ),
+            )
+        return SimpleNamespace(
+            returncode=0,
+            stdout="Leap Indicator: 0(no warning)\nReferenceId: 0x34E772B7\n",
+        )
+
+    monkeypatch.setattr(reporting.subprocess, "run", run)
+
+    status = reporting.clock_synchronization_status()
+
+    assert status["synchronized"] is False
+    assert status["reason"] == "windows_time_offset_exceeds_limit"
+    assert status["offset_abs_max_ms"] > reporting.GATE2_CLOCK_OFFSET_LIMIT_MS
 
 
 @pytest.mark.parametrize("poll", [float("nan"), float("inf"), 0, -1, 0.3])

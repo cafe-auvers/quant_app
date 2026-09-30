@@ -181,7 +181,8 @@ def check_readiness(
     check(
         "clock_synchronization",
         bool(clock_status.get("synchronized")),
-        "Windows clock must be synchronized to an NTP source before a Gate-2 soak.",
+        "Windows clock must be synchronized and within the measured NTP-offset "
+        "limit before a Gate-2 soak.",
         **clock_status,
     )
 
