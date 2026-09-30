@@ -246,8 +246,9 @@ def test_hourly_run_never_invokes_daily_market_alignment(monkeypatch):
     assert state.completed == ["hourly_history"]
 
 
-def test_run_1d_does_not_mark_failed_derived_cache_complete(monkeypatch):
+def test_run_1d_chart_failure_does_not_block_scanner_refresh(monkeypatch):
     state = _State()
+    scanner_calls = []
     monkeypatch.setattr(
         historical, "get_price_history_watermarks", lambda *args, **kwargs: {}
     )
@@ -259,6 +260,14 @@ def test_run_1d_does_not_mark_failed_derived_cache_complete(monkeypatch):
         "get_chart_indicator_refresh_plan",
         lambda *args, **kwargs: {"AAPL": historical.dt.datetime(2026, 6, 23)},
     )
+    monkeypatch.setattr(
+        historical,
+        "refresh_scanner_metrics_to_db",
+        lambda tickers, *args, **kwargs: scanner_calls.append(list(tickers)) or [],
+    )
+    monkeypatch.setattr(
+        historical, "is_scanner_metrics_snapshot_current", lambda *args, **kwargs: True
+    )
 
     with pytest.raises(RuntimeError, match="Chart indicators remain incomplete"):
         historical.run_1d(
@@ -267,7 +276,9 @@ def test_run_1d_does_not_mark_failed_derived_cache_complete(monkeypatch):
 
     assert "daily_history" in state.completed
     assert "chart_indicators" not in state.completed
-    assert "scanner_metrics" not in state.completed
+    assert "scanner_metrics" in state.completed
+    assert scanner_calls == [["SPY", "AAPL"]]
+    assert any("continuing with scanner metrics" in message for message in state.logs)
 
 
 def test_run_1d_does_not_mark_failed_scanner_snapshot_complete(monkeypatch):

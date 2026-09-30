@@ -307,53 +307,70 @@ def run_1d(
         engine, universe_tickers, interval="1d", strict=True
     )
 
+    # Chart indicators and scanner metrics both depend on the same daily price
+    # history, but neither cache depends on the other. Attempt both before
+    # failing the run so a partial chart-indicator problem cannot leave the
+    # scanner stale for the entire universe.
+    chart_error = None
     state.set_phase("chart_indicators")
-    chart_refresh_plan = get_chart_indicator_refresh_plan(
-        engine,
-        universe_tickers,
-        reference_symbol=REFERENCE_SYMBOL,
-        force=force_derived,
-        history_watermarks=derived_watermarks,
-    )
-    refresh_chart_indicators_to_db(
-        universe_tickers,
-        engine,
-        reference_symbol=REFERENCE_SYMBOL,
-        log_callback=state.log,
-        force=force_derived,
-        history_watermarks=derived_watermarks,
-        refresh_plan=chart_refresh_plan,
-    )
-    remaining_chart_work = {}
-    if chart_refresh_plan:
-        remaining_chart_work = get_chart_indicator_refresh_plan(
+    try:
+        chart_refresh_plan = get_chart_indicator_refresh_plan(
             engine,
-            list(chart_refresh_plan),
+            universe_tickers,
             reference_symbol=REFERENCE_SYMBOL,
+            force=force_derived,
             history_watermarks=derived_watermarks,
         )
-    if remaining_chart_work:
-        raise RuntimeError(
-            f"Chart indicators remain incomplete for {len(remaining_chart_work)} symbol(s)."
+        refresh_chart_indicators_to_db(
+            universe_tickers,
+            engine,
+            reference_symbol=REFERENCE_SYMBOL,
+            log_callback=state.log,
+            force=force_derived,
+            history_watermarks=derived_watermarks,
+            refresh_plan=chart_refresh_plan,
         )
-    state.complete_phase("chart_indicators")
+        remaining_chart_work = {}
+        if chart_refresh_plan:
+            remaining_chart_work = get_chart_indicator_refresh_plan(
+                engine,
+                list(chart_refresh_plan),
+                reference_symbol=REFERENCE_SYMBOL,
+                history_watermarks=derived_watermarks,
+            )
+        if remaining_chart_work:
+            raise RuntimeError(
+                f"Chart indicators remain incomplete for {len(remaining_chart_work)} symbol(s)."
+            )
+        state.complete_phase("chart_indicators")
+    except Exception as exc:
+        chart_error = exc
+        state.log(f"Chart indicator refresh incomplete; continuing with scanner metrics: {exc}")
 
+    scanner_error = None
     state.set_phase("scanner_metrics")
-    refresh_scanner_metrics_to_db(
-        universe_tickers,
-        engine,
-        log_callback=state.log,
-        force=force_derived,
-        history_watermarks=derived_watermarks,
-    )
-    if not is_scanner_metrics_snapshot_current(
-        engine,
-        universe_tickers,
-        history_watermarks=derived_watermarks,
-        strict=True,
-    ):
-        raise RuntimeError("Scanner metrics snapshot remains incomplete.")
-    state.complete_phase("scanner_metrics")
+    try:
+        refresh_scanner_metrics_to_db(
+            universe_tickers,
+            engine,
+            log_callback=state.log,
+            force=force_derived,
+            history_watermarks=derived_watermarks,
+        )
+        if not is_scanner_metrics_snapshot_current(
+            engine,
+            universe_tickers,
+            history_watermarks=derived_watermarks,
+            strict=True,
+        ):
+            raise RuntimeError("Scanner metrics snapshot remains incomplete.")
+        state.complete_phase("scanner_metrics")
+    except Exception as exc:
+        scanner_error = exc
+
+    if chart_error is not None or scanner_error is not None:
+        errors = [str(error) for error in (chart_error, scanner_error) if error is not None]
+        raise RuntimeError("; ".join(errors))
 
     # Profiles are supplemental and never invalidate otherwise-current price
     # or scanner data. Seed rows are created during schema initialization;
