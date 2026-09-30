@@ -530,19 +530,60 @@ def _mirror_scope_hash(
 def _scoped_symbol_chunks(
     spec: _ReconcileTableSpec,
     hourly_symbols: Optional[List[str]],
+    *,
+    engine: Optional[Engine] = None,
+    table: Optional[Table] = None,
+    cancellation_callback: Optional[Callable[[], bool]] = None,
+    connection=None,
 ) -> List[Optional[List[str]]]:
-    if spec.table_name != "hourly_price_history" or hourly_symbols is None:
-        return [None]
-    symbols = list(
-        dict.fromkeys(
-            str(symbol).strip().upper()
-            for symbol in hourly_symbols
-            if symbol is not None and str(symbol).strip()
+    if spec.table_name == "hourly_price_history" and hourly_symbols is not None:
+        symbols = list(
+            dict.fromkeys(
+                str(symbol).strip().upper()
+                for symbol in hourly_symbols
+                if symbol is not None and str(symbol).strip()
+            )
         )
-    )
+        if not symbols:
+            return []
+        return list(
+            _record_chunks(symbols, HOURLY_CACHE_QUERY_SYMBOL_CHUNK_SIZE)
+        )
+
+    # A combined COUNT(*) + MAX(revision) across a whole table can force MySQL
+    # to scan far past the deliberately short dashboard read timeout.  Every
+    # symbol-keyed mirror table has an index starting with symbol, so discover
+    # that small key set first and keep every subsequent aggregate and copy
+    # query bounded to indexed symbol chunks.  Tables without a symbol column
+    # are small generation/manifest tables and retain one aggregate query.
+    if (
+        table is None
+        or engine is None
+        or "symbol" not in table.c
+    ):
+        return [None]
+
+    def read_symbols(conn) -> List[str]:
+        if cancellation_callback is not None and cancellation_callback():
+            raise InterruptedError("Local mirror synchronization was cancelled.")
+        return list(
+            dict.fromkeys(
+                str(symbol).strip().upper()
+                for symbol in conn.execute(
+                    select(table.c.symbol).distinct().order_by(table.c.symbol)
+                ).scalars()
+                if symbol is not None and str(symbol).strip()
+            )
+        )
+
+    if connection is not None:
+        symbols = read_symbols(connection)
+    else:
+        with engine.connect() as conn:
+            symbols = read_symbols(conn)
     if not symbols:
         return []
-    return list(_record_chunks(symbols, HOURLY_CACHE_QUERY_SYMBOL_CHUNK_SIZE))
+    return list(_record_chunks(symbols, CACHE_QUERY_SYMBOL_CHUNK_SIZE))
 
 
 def _scoped_table_signature(
@@ -558,7 +599,14 @@ def _scoped_table_signature(
     if not inspect(bind).has_table(spec.table_name):
         return _MirrorTableSignature(0, None)
     table = Table(spec.table_name, MetaData(), autoload_with=bind)
-    symbol_chunks = _scoped_symbol_chunks(spec, hourly_symbols)
+    symbol_chunks = _scoped_symbol_chunks(
+        spec,
+        hourly_symbols,
+        engine=engine,
+        table=table,
+        cancellation_callback=cancellation_callback,
+        connection=connection,
+    )
     if not symbol_chunks:
         return _MirrorTableSignature(0, None)
 
@@ -649,7 +697,13 @@ def _scoped_changed_row_count(
     cancellation_callback: Optional[Callable[[], bool]],
 ) -> int:
     table = Table(spec.table_name, MetaData(), autoload_with=engine)
-    symbol_chunks = _scoped_symbol_chunks(spec, hourly_symbols)
+    symbol_chunks = _scoped_symbol_chunks(
+        spec,
+        hourly_symbols,
+        engine=engine,
+        table=table,
+        cancellation_callback=cancellation_callback,
+    )
     total = 0
     with engine.connect() as conn:
         for symbol_chunk in symbol_chunks:
@@ -680,7 +734,13 @@ def _copy_scoped_changed_rows_to_local(
     pc_table = Table(spec.table_name, MetaData(), autoload_with=pc_engine)
     local_table = Table(spec.table_name, MetaData(), autoload_with=local_conn)
     _validate_reconcile_table_schema(pc_table, local_table, spec)
-    symbol_chunks = _scoped_symbol_chunks(spec, hourly_symbols)
+    symbol_chunks = _scoped_symbol_chunks(
+        spec,
+        hourly_symbols,
+        engine=pc_engine,
+        table=pc_table,
+        cancellation_callback=cancellation_callback,
+    )
     rows_written = 0
     with pc_engine.connect() as pc_conn:
         streaming_conn = pc_conn.execution_options(stream_results=True)
@@ -741,7 +801,14 @@ def _scoped_partition_revision_summaries(
     bind = connection if connection is not None else engine
     table = Table(spec.table_name, MetaData(), autoload_with=bind)
     partition_columns = [table.c[name] for name in spec.partition_columns]
-    symbol_chunks = _scoped_symbol_chunks(spec, hourly_symbols)
+    symbol_chunks = _scoped_symbol_chunks(
+        spec,
+        hourly_symbols,
+        engine=engine,
+        table=table,
+        cancellation_callback=cancellation_callback,
+        connection=connection,
+    )
 
     def read_summaries(conn) -> Dict[Tuple[object, ...], _PartitionFingerprint]:
         summaries: Dict[Tuple[object, ...], _PartitionFingerprint] = {}
@@ -1873,4 +1940,3 @@ def sync_local_mirror_from_pc_checkpointed(
     finally:
         if local_conn is not None:
             local_conn.close()
-

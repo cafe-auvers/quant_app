@@ -513,6 +513,7 @@ def _runtime_transition_window(pc_engine, *, local_engine=None):
     summary_updates = []
     window.append_log = logs.append
     window.update_dashboard_summary = lambda: summary_updates.append(True)
+    window.run_all_scanners = lambda **_kwargs: None
     return window, manager, logs, summary_updates
 
 
@@ -857,8 +858,10 @@ def test_local_mirror_to_pc_recovery_switches_immediately_and_starts_backup(
     )
     state_sync_starts = []
     mirror_sync_starts = []
+    scanner_starts = []
     window._start_state_sync = lambda: state_sync_starts.append(True)
     window._start_background_local_mirror_sync = mirror_sync_starts.append
+    window.run_all_scanners = lambda **kwargs: scanner_starts.append(kwargs)
     _RecoveryWorkerStub.instances = []
     monkeypatch.setattr(main_window, "DatabaseRecoveryWorker", _RecoveryWorkerStub)
 
@@ -880,6 +883,7 @@ def test_local_mirror_to_pc_recovery_switches_immediately_and_starts_backup(
         (pc_engine, "laptop-id", False),
     ]
     assert state_sync_starts == [True]
+    assert scanner_starts == [{"show_warnings": False}]
     assert mirror_sync_starts == [pc_engine]
     assert _RecoveryWorkerStub.instances == []
     assert summary_updates == [True, True]

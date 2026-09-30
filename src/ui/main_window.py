@@ -4894,6 +4894,12 @@ class MainWindow(
             self._start_market_data_status_refresh(force=True)
             if not self._using_local_operational_authority():
                 self._start_state_sync()
+            if previous_source != "pc":
+                # Results produced while the PC was offline belong to the
+                # fallback snapshot.  Re-query immediately after routing to
+                # PC MySQL so the table cannot remain visibly empty until the
+                # operator happens to press Scan again.
+                self.run_all_scanners(show_warnings=False)
             self._start_background_local_mirror_sync(engine)
         except Exception:
             # This method runs from Qt signal handlers.  A secondary UI or
