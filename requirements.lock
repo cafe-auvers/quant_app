@@ -841,10 +841,12 @@ tzdata==2026.3 \
     # via
     #   -r requirements.txt
     #   pandas
-urllib3==2.7.0 \
-    --hash=sha256:231e0ec3b63ceb14667c67be60f2f2c40a518cb38b03af60abc813da26505f4c \
-    --hash=sha256:9fb4c81ebbb1ce9531cce37674bbc6f1360472bc18ca9a553ede278ef7276897
-    # via requests
+urllib3==2.8.0 \
+    --hash=sha256:0cf3cae568d36aa9576b28dfb35f11328f1cb974ca7647d9475ebb86c75ac6e3 \
+    --hash=sha256:63bf2ead4c879426ebf22ef2a781eeb4aa3b4ae798a0435506f8687fd5bb9b63
+    # via
+    #   -r requirements.txt
+    #   requests
 websockets==17.0.1 \
     --hash=sha256:02ed63bf26dda9fa27df730a41f6664586c4ee05972c8fb667ce1725b3fd13d3 \
     --hash=sha256:02f0b037a737d0cb0c33866c97bcd1a0b73170dfbf42d69d8fb86f51002fd5ae \
@@ -954,7 +956,9 @@ websockets==17.0.1 \
     --hash=sha256:f47b0815af3948ec6a440b3afa02f05b18cc0939549e91b5c677b5d9c2c8472a \
     --hash=sha256:f991247276797d0c61ab7770bc9791eadc16f683b4d83517f624932adc1a8bab \
     --hash=sha256:ffad64ce7ad3703d652a3fd9af26238377d24ce52c6ad8ff35d26d82f61f493f
-    # via yfinance
+    # via
+    #   -r requirements.txt
+    #   yfinance
 yfinance==0.2.66 \
     --hash=sha256:511a1a40a687f277aae3a02543009a8aeaa292fce5509671f58915078aebb5c7 \
     --hash=sha256:fae354cc1649109444b2c84194724afcc52c2a7799551ce44c739424ded6af9c

@@ -2,6 +2,7 @@ PyQt5>=5.15.10,<5.16
 PyQt5-sip>=12.13.0,<13
 PyQtWebEngine>=5.15.6,<5.16
 requests>=2.32.2,<3
+urllib3>=2.8.0,<3
 pandas>=2.2.2,<3
 numpy>=1.26.4,<2
 yfinance>=0.2.66,<0.3
