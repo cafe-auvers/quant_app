@@ -254,6 +254,15 @@ class Gate3EvidenceCollector:
                 ended_counters.get("production_ledger_write_count") or 0
             ),
             "runtime_error_count": int(ended_counters.get("runtime_error_count") or 0),
+            "observer_enqueued_quote_count": int(
+                ended_counters.get("observer_enqueued_quote_count") or 0
+            ),
+            "observer_processed_quote_count": int(
+                ended_counters.get("observer_processed_quote_count") or 0
+            ),
+            "observer_max_queue_depth": int(
+                ended_counters.get("observer_max_queue_depth") or 0
+            ),
             "unresolved_oracle_difference_count": unresolved,
             "shadow_event_parse_error_count": shadow_audit.parse_error_count,
             "shadow_event_label_mismatch_count": shadow_audit.label_mismatch_count,

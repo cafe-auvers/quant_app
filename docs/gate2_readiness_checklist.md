@@ -223,10 +223,15 @@ blocked unless the resulting Gate-2 report passes.
 | Duplicate-subscription corruption | 0 | actual generation/TR/key operations and duplicate-request probe |
 | Missed synthetic stop breaches | 0 | injected/latched/consumed IDs |
 | Queue/accumulator deadlocks | 0 | independent watchdog/cycle progress |
-| Regular-session receive lag p95 | < 1.5 seconds | broker-event to receive |
+| Regular-session receive lag p95 | ≤ 2 seconds | broker-event to receive |
 | Regular-session receive lag p99 | < 3.5 seconds | broker-event to receive |
 | Secret/approval-key leakage | 0 | full captured-log scan including issued approval key |
 | Broker mutations | Initialized audit source and 0 attempts | sole real `KisBroker` mutation-boundary audit |
+
+The two-second p95 allowance accounts for KIS WS0's whole-second event
+timestamps and the reviewed strategy tolerance. Every live entry decision
+continues to enforce its independent broker-event and local-receive freshness
+fences.
 
 ## Machine-readable evidence bundle
 

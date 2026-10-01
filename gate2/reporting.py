@@ -62,8 +62,10 @@ from src.utils.market_calendar import (
 KST_ZONE = ZoneInfo("Asia/Seoul")
 # KIS WS0 timestamps are whole-second values.  These reviewed limits are for
 # the regular-session-only measurement window and do not relax the separate
-# 2-second execution-freshness fence.
-GATE2_RECEIVE_LAG_P95_LIMIT_MS = 1_500.0
+# execution-freshness fence applied to every live entry decision.  The p95
+# permits the owner's reviewed two-second feed tolerance; the p99 still
+# catches a materially degraded tail.
+GATE2_RECEIVE_LAG_P95_LIMIT_MS = 2_000.0
 GATE2_RECEIVE_LAG_P99_LIMIT_MS = 3_500.0
 # Broker timestamps are whole-second wall-clock values, so the qualification
 # host must remain closely disciplined to an independent NTP source.  A
@@ -292,6 +294,7 @@ class Gate2Evidence:
     deadlock_count: int = 0
     watchdog_max_gap_seconds: float = 0.0
     watchdog_timeout_seconds: float = 0.0
+    watchdog_stalls: list[dict[str, object]] = field(default_factory=list)
     continuity_sample_count: int = 0
     continuity_unexpected_unready_count: int = 0
     continuity_started_at: str = ""
@@ -650,7 +653,7 @@ def build_report(evidence: Gate2Evidence) -> dict:
         "receive_lag_p95_ms": _metric(
             value=receive.get("p95", 0.0),
             threshold=(
-                "regular-session broker-event receive lag < "
+                "regular-session broker-event receive lag <= "
                 f"{GATE2_RECEIVE_LAG_P95_LIMIT_MS:g}ms"
             ),
             passed=(
@@ -658,7 +661,7 @@ def build_report(evidence: Gate2Evidence) -> dict:
                 and evidence.latency_window_start_delay_seconds
                 <= 3.0 + permitted_late_seconds
                 and receive.get("count", 0) > 0
-                and receive.get("p95", 0.0) < GATE2_RECEIVE_LAG_P95_LIMIT_MS
+                and receive.get("p95", 0.0) <= GATE2_RECEIVE_LAG_P95_LIMIT_MS
             ),
         ),
         "receive_lag_p99_ms": _metric(
@@ -834,6 +837,7 @@ def build_report(evidence: Gate2Evidence) -> dict:
         "watchdog_cycles": evidence.watchdog_cycles,
         "watchdog_max_gap_seconds": evidence.watchdog_max_gap_seconds,
         "watchdog_timeout_seconds": evidence.watchdog_timeout_seconds,
+        "watchdog_stalls": list(evidence.watchdog_stalls),
         "continuity_sample_count": evidence.continuity_sample_count,
         "continuity_started_at": evidence.continuity_started_at,
         "continuity_start_delay_seconds": evidence.continuity_start_delay_seconds,
@@ -1342,6 +1346,7 @@ class _ProgressWatchdog:
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._alarm = False
+        self._last_progress_stage = "initialized"
         self._thread = threading.Thread(
             target=self._run, name="Gate2ProgressWatchdog", daemon=True
         )
@@ -1350,9 +1355,10 @@ class _ProgressWatchdog:
     def start(self) -> None:
         self._thread.start()
 
-    def progress(self) -> None:
+    def progress(self, stage: str = "sampling_loop") -> None:
         with self._lock:
             self._last_progress = wall_time.monotonic()
+            self._last_progress_stage = str(stage or "sampling_loop")
             self._alarm = False
 
     def stop(self) -> None:
@@ -1369,6 +1375,13 @@ class _ProgressWatchdog:
                 )
                 if gap > self._timeout and not self._alarm:
                     self._evidence.deadlock_count += 1
+                    self._evidence.watchdog_stalls.append(
+                        {
+                            "detected_at": _iso(datetime.now(timezone.utc)),
+                            "gap_seconds": round(gap, 6),
+                            "last_progress_stage": self._last_progress_stage,
+                        }
+                    )
                     self._alarm = True
 
 
@@ -1505,6 +1518,7 @@ def build_live_status(
             "deadlocks": evidence.deadlock_count,
             "max_gap_seconds": evidence.watchdog_max_gap_seconds,
             "timeout_seconds": evidence.watchdog_timeout_seconds,
+            "stalls": list(evidence.watchdog_stalls),
         },
         "operator_abort_reasons": list(evidence.operator_abort_reasons),
         "log": {"path": str(log_path), "bytes_written": log_bytes},
@@ -1890,9 +1904,10 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
                     0.0, (latency_window_started_at - session_open).total_seconds()
                 )
                 latency_window_started = True
+            watchdog.progress("poll_and_sample_started")
             sampled_at = runner.poll_and_sample()
             elapsed = (sampled_at - evidence.started_at).total_seconds()
-            watchdog.progress()
+            watchdog.progress("poll_and_sample_complete")
             frame_ready = all(
                 evidence.frame_counts_by_tr_id.get(tr_id, 0) > 0
                 for tr_id in ("HDFSCNT0", "HDFSASP0")
@@ -1944,7 +1959,9 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
                     log_path=log_path,
                 )
                 last_status_write = monotonic_now
+                watchdog.progress("live_status_write_complete")
             wall_time.sleep(args.poll_seconds)
+            watchdog.progress("loop_sleep_complete")
     except KeyboardInterrupt:
         evidence.operator_abort_reasons.append("operator interrupted soak")
     except Exception as exc:
@@ -1953,7 +1970,7 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
         evidence.ended_at = datetime.now(timezone.utc)
         try:
             runner.poll_and_sample(evidence.ended_at)
-            watchdog.progress()
+            watchdog.progress("final_sample_complete")
             runner.finalize()
         except Exception as exc:
             record_runtime_failure("final_sample", exc)

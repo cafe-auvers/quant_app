@@ -589,9 +589,9 @@ def test_gate2_report_passes_only_complete_read_only_session_evidence():
     assert report["metrics"]["critical_subscription_ack"]["result"] == "PASSED"
 
 
-def test_gate2_receive_lag_limits_are_strict_and_regular_session_bounded():
+def test_gate2_receive_lag_limits_are_regular_session_bounded():
     evidence = _passing_gate2_evidence()
-    evidence.receive_lag_ms["p95"] = GATE2_RECEIVE_LAG_P95_LIMIT_MS - 0.1
+    evidence.receive_lag_ms["p95"] = GATE2_RECEIVE_LAG_P95_LIMIT_MS
     evidence.receive_lag_ms["p99"] = GATE2_RECEIVE_LAG_P99_LIMIT_MS - 0.1
 
     report = build_report(evidence)
@@ -599,7 +599,7 @@ def test_gate2_receive_lag_limits_are_strict_and_regular_session_bounded():
     assert report["metrics"]["receive_lag_p95_ms"]["result"] == "PASSED"
     assert report["metrics"]["receive_lag_p99_ms"]["result"] == "PASSED"
 
-    evidence.receive_lag_ms["p95"] = GATE2_RECEIVE_LAG_P95_LIMIT_MS
+    evidence.receive_lag_ms["p95"] = GATE2_RECEIVE_LAG_P95_LIMIT_MS + 0.1
     evidence.receive_lag_ms["p99"] = GATE2_RECEIVE_LAG_P99_LIMIT_MS
     report = build_report(evidence)
 
@@ -889,6 +889,26 @@ def test_gate2_progress_watchdog_produces_independent_measurement_cycles():
 
     assert evidence.watchdog_cycles > 0
     assert 0 < evidence.watchdog_max_gap_seconds <= 0.5
+
+
+def test_gate2_progress_watchdog_records_stall_stage():
+    evidence = _passing_gate2_evidence()
+    evidence.watchdog_cycles = 0
+    evidence.watchdog_max_gap_seconds = 0.0
+    evidence.watchdog_stalls = []
+    watchdog = _ProgressWatchdog(evidence, 0.5)
+
+    watchdog.start()
+    watchdog.progress("gate3_observer_started")
+    time.sleep(0.65)
+    watchdog.stop()
+
+    assert evidence.deadlock_count == 1
+    assert len(evidence.watchdog_stalls) == 1
+    assert evidence.watchdog_stalls[0]["last_progress_stage"] == (
+        "gate3_observer_started"
+    )
+    assert evidence.watchdog_stalls[0]["gap_seconds"] > 0.5
 
 
 def test_gate2_capability_manifest_requires_reviewed_matching_nonempty_evidence(

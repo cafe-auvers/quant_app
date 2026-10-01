@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import queue
+import threading
+import time
 from datetime import datetime, timezone
 
 import pytest
@@ -235,6 +238,47 @@ def test_combined_gate3_observer_isolates_shadow_evaluation_failure():
     assert observer.observation_failed is True
     assert len(observer.runtime_errors) == 1
     assert "shadow-only failure" not in observer.runtime_errors[0]
+
+
+def test_combined_gate3_observer_does_not_block_gate2_sampling_loop():
+    observer = object.__new__(CombinedGate3Observer)
+    observer.finished = False
+    observer.observation_failed = False
+    observer.runtime_errors = []
+    observer._observer_lock = threading.Lock()
+    observer._quote_queue = queue.Queue(maxsize=4)
+    observer._observer_stop = threading.Event()
+    observer._enqueued_quote_count = 0
+    observer._processed_quote_count = 0
+    observer._max_queue_depth = 0
+    evaluation_started = threading.Event()
+    release_evaluation = threading.Event()
+
+    class BlockingRuntime:
+        def evaluate(self, quotes):
+            if not quotes:
+                return
+            evaluation_started.set()
+            assert release_evaluation.wait(timeout=2.0)
+
+    observer.runtime = BlockingRuntime()
+    observer._observer_thread = threading.Thread(
+        target=observer._run_observer,
+        daemon=True,
+    )
+    observer._observer_thread.start()
+
+    started = time.monotonic()
+    observer.observe([object()])
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.1
+    assert evaluation_started.wait(timeout=1.0)
+    release_evaluation.set()
+    observer._finish_observer_worker()
+    assert observer._enqueued_quote_count == 1
+    assert observer._processed_quote_count == 1
+    assert observer.observation_failed is False
 
 
 @pytest.mark.parametrize(
