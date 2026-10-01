@@ -28,6 +28,7 @@ from src.core.trade_card_state import (
 from src.services import trade_card_repository
 from src.services.buylist_membership_service import reconcile_buylist_item
 from src.services.position_manager import PositionManager, extract_overseas_holdings
+from src.utils.market_calendar import current_or_next_nyse_session_date
 
 
 @dataclass(frozen=True)
@@ -132,6 +133,9 @@ def bootstrap_trade_cards_from_current_state(
     skipped_watchlist_symbols: list[str] = []
     canonical_snapshot_current = True
     fallback_account = _normalized_account(default_account_no)
+    active_watchlist_session = getattr(watchlist, "active_session_date", None)
+    if active_watchlist_session is None:
+        active_watchlist_session = current_or_next_nyse_session_date()
 
     # Reuse the shared membership service used by direct Buylist additions.
     # Its asymmetric rule allows only missing-row creation or the legal
@@ -245,6 +249,7 @@ def bootstrap_trade_cards_from_current_state(
                 for _attempt in range(2):
                     revived = copy.deepcopy(current)
                     revived.watchlist_member = True
+                    revived.watchlist_session_date = active_watchlist_session
                     revived.buylist_member = False
                     revived.name = str(
                         getattr(item, "name", "") or revived.name or symbol
@@ -297,6 +302,7 @@ def bootstrap_trade_cards_from_current_state(
             name=str(getattr(item, "name", "") or symbol),
             board_status=BoardStatus.WATCHLIST,
             watchlist_member=True,
+            watchlist_session_date=active_watchlist_session,
             buylist_member=False,
             breakout_price=getattr(item, "breakout_price", None),
             # The retired Watchlist ORB table is not execution authority.

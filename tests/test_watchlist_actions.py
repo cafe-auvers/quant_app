@@ -1,3 +1,8 @@
+import copy
+import time
+
+from PyQt5.QtCore import QCoreApplication
+
 from src.core.board_workflow import BoardCardProjection, MoveToWatchlist
 from src.core.trade_card_state import BoardStatus, StopType, TradeCardState
 from src.core.watchlist import BuylistManager, Watchlist
@@ -128,6 +133,7 @@ def test_tradingview_w_adds_watchlist_membership_to_buylist_symbol():
 def test_tradingview_watchlist_button_toggles_for_buylist_symbol():
     window = _Window()
     window.watchlist = Watchlist()
+    window.watchlist.add("WEX", "WEX Inc.")
     window.tradingview_add_watchlist_button = _Button()
     window.tradingview_symbol_combo = type(
         "Combo", (), {"currentText": lambda self: "WEX"}
@@ -151,6 +157,7 @@ def test_tradingview_watchlist_button_toggles_for_buylist_symbol():
 def test_tradingview_watchlist_button_can_remove_buylist_with_execution_evidence():
     window = _Window()
     window.watchlist = Watchlist()
+    window.watchlist.add("WEX", "WEX Inc.")
     window.tradingview_add_watchlist_button = _Button()
     window.tradingview_symbol_combo = type(
         "Combo", (), {"currentText": lambda self: "WEX"}
@@ -203,7 +210,7 @@ def test_passive_add_without_selected_account_fails_before_worker(
     assert warnings and "not changed" in warnings[-1]
 
 
-def test_chart_queue_moves_buylist_back_to_watchlist_command():
+def test_chart_queue_removes_buylist_and_returns_to_current_watchlist():
     window = _Window()
     projection = BoardCardProjection(card=_card(BoardStatus.BUYLIST))
     window.watchlist = Watchlist()
@@ -317,6 +324,7 @@ def test_projection_does_not_sync_during_active_board_interaction():
 def test_chart_queue_button_labels_each_passive_stage_explicitly():
     window = _Window()
     window.watchlist = Watchlist()
+    window.watchlist.add("WEX", "WEX Inc.").breakout_price = 25.0
     window._planning_membership_pending = False
     window._chart_positive_price = lambda value: float(value) if value else None
     button = _Button()
@@ -332,7 +340,7 @@ def test_chart_queue_button_labels_each_passive_stage_explicitly():
         card=_card(BoardStatus.BUYLIST)
     )
     window._apply_chart_queue_btn_state("WEX", button)
-    assert button.text == "Move to Watchlist (Q)"
+    assert button.text == "Remove from Buylist (Q)"
     assert button.enabled
 
 
@@ -518,3 +526,126 @@ def test_worker_completion_preserves_unrelated_state_added_during_sql_wait():
     assert window.watchlist.get("NEW") is not None
     assert window.watchlist.get("WEX") is not None
     assert window.buylist_manager.get("WEX", "PROD") is not None
+
+
+class _SourceCombo:
+    def __init__(self, value):
+        self.value = value
+
+    def currentData(self):
+        return self.value
+
+
+def _optimistic_window():
+    window = _Window()
+    window.watchlist = Watchlist()
+    window.buylist_manager = BuylistManager()
+    window.sidebar_source_combo = _SourceCombo({"type": "universe"})
+    window.source_refreshes = []
+    window.refresh_sidebar_sources = (
+        lambda selected_source=None: window.source_refreshes.append(selected_source)
+    )
+    window.populate_tradingview_watchlist_symbols = lambda: None
+    window.update_dashboard_summary = lambda: None
+    window._update_sidebar_watchlist_actions = lambda: None
+    window._save_state = lambda: None
+    window.append_log = lambda _message: None
+    return window
+
+
+def test_watchlist_add_paints_immediately_and_failure_rolls_back_without_navigation(
+    monkeypatch,
+):
+    window = _optimistic_window()
+    request = PlanningMembershipRequest(
+        operation="add",
+        symbol="WEX",
+        watchlist=Watchlist(),
+        buylist_manager=BuylistManager(),
+        engine=object(),
+        default_account_no="12345678",
+        name="WEX Inc.",
+    )
+    warnings = []
+    monkeypatch.setattr(
+        "src.ui.mixins.watchlist_actions_mixin.QMessageBox.warning",
+        lambda *_args: warnings.append(_args[-1]),
+    )
+
+    window._apply_optimistic_planning_membership(request)
+
+    assert window.watchlist.get("WEX") is not None
+    assert window.source_refreshes == [{"type": "universe"}]
+
+    window._planning_membership_pending = True
+    window._on_planning_membership_completed(
+        PlanningMembershipOutcome(request=request, error="database unavailable")
+    )
+
+    assert window.watchlist.get("WEX") is None
+    assert all(value == {"type": "universe"} for value in window.source_refreshes)
+    assert warnings == ["database unavailable"]
+
+
+def test_buylist_promotion_paints_local_row_without_leaving_universe():
+    window = _optimistic_window()
+    window.watchlist.add("WEX", "WEX Inc.").breakout_price = 25.0
+    request = PlanningMembershipRequest(
+        operation="promote",
+        symbol="WEX",
+        watchlist=copy.deepcopy(window.watchlist),
+        buylist_manager=BuylistManager(),
+        engine=object(),
+        default_account_no="12345678",
+    )
+
+    window._apply_optimistic_planning_membership(request)
+
+    assert window.buylist_manager.get("WEX", "PROD") is not None
+    assert window.watchlist.get("WEX") is not None
+    assert window.source_refreshes == [{"type": "universe"}]
+
+
+def test_slow_membership_save_does_not_delay_visible_watchlist_add(monkeypatch):
+    from src.services import planning_membership_service
+    from src.services.planning_membership_service import PlanningMembershipResult
+
+    app = QCoreApplication.instance() or QCoreApplication([])
+    window = _optimistic_window()
+    window._buyboard_engine = lambda: object()
+    window._selected_dashboard_kis_profile = lambda: {
+        "environment": "PROD",
+        "account_no": "12345678",
+    }
+    window._buyboard_orb_buffer_pct = lambda: 0.001
+    completed = []
+    window.append_log = lambda message: completed.append(message)
+
+    def slow_add(*_args, **_kwargs):
+        time.sleep(0.5)
+        return PlanningMembershipResult(
+            action="added_to_watchlist",
+            symbol="WEX",
+            changed=True,
+        )
+
+    monkeypatch.setattr(
+        planning_membership_service, "add_watchlist_candidate", slow_add
+    )
+
+    started_at = time.perf_counter()
+    assert window._add_watchlist_candidate("WEX", name="WEX Inc.")
+    dispatch_ms = (time.perf_counter() - started_at) * 1000.0
+
+    assert dispatch_ms < 50.0
+    assert window.watchlist.get("WEX") is not None
+    assert window.source_refreshes == [{"type": "universe"}]
+
+    deadline = time.monotonic() + 2.0
+    while not completed and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.005)
+    worker = window._planning_membership_worker
+    assert worker.wait(1000)
+    app.processEvents()
+    assert completed

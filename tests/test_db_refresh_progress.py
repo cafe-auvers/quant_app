@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from sqlalchemy import Boolean, MetaData, create_engine, false
+from sqlalchemy import Boolean, MetaData, create_engine, event, false
 from sqlalchemy.dialects import mysql, sqlite
 
 import src.utils.data_loader as data_loader
@@ -9,6 +9,17 @@ from src.infrastructure.database.repositories import chart_indicators, scanner
 from src.infrastructure.database.schema import (_get_scanner_metrics_table,
                                                 _get_stock_profiles_table)
 from src.ui.filter_catalog import FILTER_CATALOG
+
+
+def _assert_current_scanner_funnel(funnel, *, date, universe_count, rule_counts):
+    assert funnel == {
+        "universe_count": universe_count,
+        "rule_counts": rule_counts,
+        "snapshot_date": date.date().isoformat(),
+        "expected_snapshot_date": date.date().isoformat(),
+        "stale_market_sessions": 0,
+        "stale_calendar_days": 0,
+    }
 
 
 def test_chart_indicator_refresh_logs_progress(monkeypatch):
@@ -163,7 +174,107 @@ def test_scanner_query_filters_in_sql_and_returns_sequential_funnel_counts():
     )
 
     assert [item["symbol"] for item in results] == ["PASS"]
-    assert funnel == {"universe_count": 3, "rule_counts": [2, 1]}
+    _assert_current_scanner_funnel(
+        funnel,
+        date=date,
+        universe_count=3,
+        rule_counts=[2, 1],
+    )
+
+
+def test_scanner_query_uses_latest_completed_snapshot_when_expected_date_is_missing():
+    engine = create_engine("sqlite:///:memory:", future=True)
+    snapshot_date = pd.Timestamp("2026-01-09").to_pydatetime()
+    expected_date = pd.Timestamp("2026-01-12").to_pydatetime()
+    metrics = [
+        {
+            "symbol": "PASS",
+            "price_history_days": 20,
+            "volume": 200_000,
+        },
+        {
+            "symbol": "LOW_VOLUME",
+            "price_history_days": 20,
+            "volume": 50_000,
+        },
+    ]
+    assert scanner.save_scanner_metrics_snapshot_to_db(
+        metrics,
+        snapshot_date,
+        "test-fingerprint",
+        engine,
+        snapshot_symbols=[item["symbol"] for item in metrics],
+        strict=True,
+    ) == ["PASS", "LOW_VOLUME"]
+
+    results, funnel = scanner.query_scanner_metrics_with_funnel(
+        [item["symbol"] for item in metrics],
+        engine,
+        [{"attribute": "volume", "operator": ">=", "threshold": 100_000}],
+        date=expected_date,
+    )
+
+    assert [item["symbol"] for item in results] == ["PASS"]
+    assert funnel == {
+        "universe_count": 2,
+        "rule_counts": [1],
+        "snapshot_date": "2026-01-09",
+        "expected_snapshot_date": "2026-01-12",
+        "stale_market_sessions": 1,
+        "stale_calendar_days": 3,
+    }
+
+
+def test_scanner_mysql_query_keeps_full_universe_statements_bounded(monkeypatch):
+    engine = create_engine("sqlite:///:memory:", future=True)
+    date = pd.Timestamp("2026-01-05").to_pydatetime()
+    symbols = ["AAA", "BBB", "CCC", "DDD", "EEE"]
+    assert scanner.save_scanner_metrics_batch_to_db(
+        [
+            {
+                "symbol": symbol,
+                "price_history_days": 20,
+                "volume": 100_000,
+            }
+            for symbol in symbols
+        ],
+        date,
+        engine,
+    ) == symbols
+    monkeypatch.setattr(scanner, "SCANNER_QUERY_SYMBOL_CHUNK_SIZE", 2)
+
+    class MysqlRoute:
+        dialect = type("Dialect", (), {"name": "mysql"})()
+
+        @staticmethod
+        def connect():
+            return engine.connect()
+
+    statements = []
+
+    def record_statement(_conn, _cursor, statement, _parameters, _context, _many):
+        if "scanner_metrics" in statement.lower():
+            statements.append(" ".join(statement.lower().split()))
+
+    event.listen(engine, "before_cursor_execute", record_statement)
+    try:
+        results, funnel = scanner.query_scanner_metrics_with_funnel(
+            symbols,
+            MysqlRoute(),
+            [{"attribute": "volume", "operator": ">=", "threshold": 1}],
+            date=date,
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", record_statement)
+
+    assert {result["symbol"] for result in results} == set(symbols)
+    _assert_current_scanner_funnel(
+        funnel,
+        date=date,
+        universe_count=5,
+        rule_counts=[5],
+    )
+    assert len(statements) == 6
 
 
 def test_scanner_query_rejects_unknown_columns_instead_of_interpolating_sql():
@@ -183,7 +294,12 @@ def test_scanner_query_rejects_unknown_columns_instead_of_interpolating_sql():
     )
 
     assert results == []
-    assert funnel == {"universe_count": 1, "rule_counts": [0]}
+    _assert_current_scanner_funnel(
+        funnel,
+        date=date,
+        universe_count=1,
+        rule_counts=[0],
+    )
 
 
 def test_every_catalog_filter_compiles_for_sqlite_and_mysql():
@@ -272,7 +388,12 @@ def test_scanner_name_filter_joins_profiles_and_returns_company_name():
     assert [(item["symbol"], item["name"]) for item in results] == [
         ("AAPL", "Apple Inc.")
     ]
-    assert funnel == {"universe_count": 2, "rule_counts": [1, 1]}
+    _assert_current_scanner_funnel(
+        funnel,
+        date=date,
+        universe_count=2,
+        rule_counts=[1, 1],
+    )
 
 
 def test_boolean_filter_operators_preserve_python_comparison_semantics():
@@ -309,7 +430,9 @@ def test_boolean_filter_operators_preserve_python_comparison_semantics():
             date=date,
         )
         assert {item["symbol"] for item in results} == expected_symbols
-        assert funnel == {
-            "universe_count": 2,
-            "rule_counts": [len(expected_symbols)],
-        }
+        _assert_current_scanner_funnel(
+            funnel,
+            date=date,
+            universe_count=2,
+            rule_counts=[len(expected_symbols)],
+        )

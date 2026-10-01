@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QDoubleValidator, QIntValidator, QKeySequence
-from PyQt5.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox,
+from PyQt5.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QCompleter,
                              QFormLayout, QGroupBox, QHBoxLayout, QHeaderView,
                              QLabel, QLineEdit, QPushButton, QShortcut, QSlider,
                              QTableWidget, QTextEdit, QVBoxLayout)
@@ -40,6 +40,35 @@ TRADINGVIEW_REFRESH_INTERVAL_SECONDS = 5 * 60
 KIS_DAILY_CHART_FAILURE_COOLDOWN_SECONDS = 30 * 60
 US_MARKET_OPEN_TIME = dt.time(9, 30)
 US_MARKET_CLOSE_TIME = dt.time(16, 0)
+
+
+def configure_symbol_entry_combo(combo: QComboBox) -> None:
+    """Keep editable symbol entry focused while showing prefix suggestions."""
+
+    combo.setEditable(True)
+    combo.setInsertPolicy(QComboBox.NoInsert)
+    completer = combo.completer()
+    if completer is None:
+        return
+    completer.setCaseSensitivity(Qt.CaseInsensitive)
+    completer.setFilterMode(Qt.MatchStartsWith)
+    completer.setCompletionMode(QCompleter.PopupCompletion)
+
+
+class ShortcutSafeSymbolComboBox(QComboBox):
+    """Do not let single-letter chart shortcuts select an accidental symbol."""
+
+    def keyPressEvent(self, event) -> None:
+        text = str(event.text() or "")
+        if (
+            not self.isEditable()
+            and event.modifiers() == Qt.NoModifier
+            and len(text) == 1
+            and text.isalpha()
+        ):
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
 
 class ChartsLayoutMixin:
@@ -281,7 +310,7 @@ class ChartsLayoutMixin:
         layout = QVBoxLayout()
         controls_layout = QHBoxLayout()
 
-        self.intraday_symbol_combo = QComboBox()
+        self.intraday_symbol_combo = ShortcutSafeSymbolComboBox()
         self.populate_intraday_watchlist_symbols()
         self.intraday_interval_combo = QComboBox()
         self.intraday_interval_combo.addItems(["5m", "30m", "1h"])
@@ -390,53 +419,53 @@ class ChartsLayoutMixin:
         )
 
         self.intraday_up_shortcut = QShortcut(
-            QKeySequence(Qt.Key_Up), self.intraday_charts_widget
+            QKeySequence(Qt.Key_Up), self.intraday_chart_view
         )
         self.intraday_up_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.intraday_up_shortcut.activated.connect(
             lambda: self.step_intraday_watchlist_symbol(-1)
         )
         self.intraday_down_shortcut = QShortcut(
-            QKeySequence(Qt.Key_Down), self.intraday_charts_widget
+            QKeySequence(Qt.Key_Down), self.intraday_chart_view
         )
         self.intraday_down_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.intraday_down_shortcut.activated.connect(
             lambda: self.step_intraday_watchlist_symbol(1)
         )
         self.intraday_target_shortcut = QShortcut(
-            QKeySequence("T"), self.intraday_charts_widget
+            QKeySequence("T"), self.intraday_chart_view
         )
         self.intraday_target_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.intraday_target_shortcut.activated.connect(self.enable_chart_target_mode)
         self.intraday_draw_shortcut = QShortcut(
-            QKeySequence("D"), self.intraday_charts_widget
+            QKeySequence("D"), self.intraday_chart_view
         )
         self.intraday_draw_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.intraday_draw_shortcut.activated.connect(self.enable_chart_drawing_mode)
         self.intraday_erase_shortcut = QShortcut(
-            QKeySequence("E"), self.intraday_charts_widget
+            QKeySequence("E"), self.intraday_chart_view
         )
         self.intraday_erase_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.intraday_erase_shortcut.activated.connect(self.enable_chart_erase_mode)
         self.intraday_full_view_shortcut = QShortcut(
-            QKeySequence("F"), self.intraday_charts_widget
+            QKeySequence("F"), self.intraday_chart_view
         )
         self.intraday_full_view_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.intraday_full_view_shortcut.activated.connect(self.reset_chart_full_view)
         self.intraday_queue_shortcut = QShortcut(
-            QKeySequence("Q"), self.intraday_charts_widget
+            QKeySequence("Q"), self.intraday_chart_view
         )
         self.intraday_queue_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.intraday_queue_shortcut.activated.connect(self._intraday_queue_toggle)
         self.intraday_activate_shortcut = QShortcut(
-            QKeySequence("A"), self.intraday_charts_widget
+            QKeySequence("A"), self.intraday_chart_view
         )
         self.intraday_activate_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.intraday_activate_shortcut.activated.connect(
             self._intraday_activate_toggle
         )
         self.intraday_refresh_shortcut = QShortcut(
-            QKeySequence("R"), self.intraday_charts_widget
+            QKeySequence("R"), self.intraday_chart_view
         )
         self.intraday_refresh_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.intraday_refresh_shortcut.activated.connect(self._intraday_force_refresh)
@@ -497,7 +526,7 @@ class ChartsLayoutMixin:
         controls_layout = QHBoxLayout()
         self.tradingview_symbol_combo = QComboBox()
         self.tradingview_symbol_combo.setMinimumWidth(180)
-        self.tradingview_symbol_combo.setEditable(True)
+        configure_symbol_entry_combo(self.tradingview_symbol_combo)
         self.tradingview_symbol_combo.lineEdit().textEdited.connect(
             self.filter_tradingview_symbol_combo
         )
@@ -639,77 +668,77 @@ class ChartsLayoutMixin:
 
         self.tradingview_widget.setLayout(layout)
         self.tradingview_draw_shortcut = QShortcut(
-            QKeySequence("D"), self.tradingview_widget
+            QKeySequence("D"), self.tradingview_chart_view
         )
         self.tradingview_draw_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.tradingview_draw_shortcut.activated.connect(
             self.toggle_tradingview_line_tool_mode
         )
         self.tradingview_target_shortcut = QShortcut(
-            QKeySequence("T"), self.tradingview_widget
+            QKeySequence("T"), self.tradingview_chart_view
         )
         self.tradingview_target_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.tradingview_target_shortcut.activated.connect(
             self.enable_chart_target_mode
         )
         self.tradingview_queue_shortcut = QShortcut(
-            QKeySequence("Q"), self.tradingview_widget
+            QKeySequence("Q"), self.tradingview_chart_view
         )
         self.tradingview_queue_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.tradingview_queue_shortcut.activated.connect(
             self._tradingview_queue_toggle
         )
         self.tradingview_activate_shortcut = QShortcut(
-            QKeySequence("A"), self.tradingview_widget
+            QKeySequence("A"), self.tradingview_chart_view
         )
         self.tradingview_activate_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.tradingview_activate_shortcut.activated.connect(
             self._tradingview_activate_toggle
         )
         self.tradingview_up_shortcut = QShortcut(
-            QKeySequence(Qt.Key_Up), self.tradingview_widget
+            QKeySequence(Qt.Key_Up), self.tradingview_chart_view
         )
         self.tradingview_up_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.tradingview_up_shortcut.activated.connect(
             lambda: self.step_tradingview_watchlist_symbol(-1)
         )
         self.tradingview_down_shortcut = QShortcut(
-            QKeySequence(Qt.Key_Down), self.tradingview_widget
+            QKeySequence(Qt.Key_Down), self.tradingview_chart_view
         )
         self.tradingview_down_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.tradingview_down_shortcut.activated.connect(
             lambda: self.step_tradingview_watchlist_symbol(1)
         )
         self.tradingview_left_shortcut = QShortcut(
-            QKeySequence(Qt.Key_Left), self.tradingview_widget
+            QKeySequence(Qt.Key_Left), self.tradingview_chart_view
         )
         self.tradingview_left_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.tradingview_left_shortcut.activated.connect(
             lambda: self.pan_tradingview_chart_view(-self._chart_pan_step_bars())
         )
         self.tradingview_right_shortcut = QShortcut(
-            QKeySequence(Qt.Key_Right), self.tradingview_widget
+            QKeySequence(Qt.Key_Right), self.tradingview_chart_view
         )
         self.tradingview_right_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.tradingview_right_shortcut.activated.connect(
             lambda: self.pan_tradingview_chart_view(self._chart_pan_step_bars())
         )
         self.tradingview_full_view_shortcut = QShortcut(
-            QKeySequence("F"), self.tradingview_widget
+            QKeySequence("F"), self.tradingview_chart_view
         )
         self.tradingview_full_view_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.tradingview_full_view_shortcut.activated.connect(
             self.reset_chart_full_view
         )
         self.tradingview_load_shortcut = QShortcut(
-            QKeySequence(Qt.Key_F4), self.tradingview_widget
+            QKeySequence(Qt.Key_F4), self.tradingview_chart_view
         )
         self.tradingview_load_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.tradingview_load_shortcut.activated.connect(
             lambda: self.load_tradingview_chart(force=True, fetch_live=True)
         )
         self.tradingview_refresh_shortcut = QShortcut(
-            QKeySequence("R"), self.tradingview_widget
+            QKeySequence("R"), self.tradingview_chart_view
         )
         self.tradingview_refresh_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.tradingview_refresh_shortcut.activated.connect(

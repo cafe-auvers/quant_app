@@ -184,6 +184,62 @@ def test_scanner_worker_uses_database_where_query_for_configured_rules(monkeypat
     }
 
 
+def test_scanner_worker_retries_all_setups_from_local_mirror(monkeypatch):
+    import src.ui.workers as workers
+    import src.infrastructure.database.repositories.scanner as scanner_repository
+
+    query_calls = []
+
+    def query(tickers, engine, rules):
+        query_calls.append((engine, rules[0]["threshold"]))
+        if engine == "pc":
+            raise RuntimeError("PC query timed out")
+        return (
+            [{"symbol": "AAPL"}],
+            {"universe_count": 2, "rule_counts": [1]},
+        )
+
+    monkeypatch.setattr(
+        scanner_repository,
+        "query_scanner_metrics_with_funnel",
+        query,
+    )
+    completions = []
+    errors = []
+    logs = []
+    worker = workers.ScannerWorker(
+        tickers=["AAPL", "MSFT"],
+        engine="pc",
+        fallback_engine="local",
+        min_volume=0,
+        min_dollar_volume=0,
+        min_adr=0,
+        min_growth_rank=0,
+        min_trend_intensity=0,
+        scanner_rules_by_setup={
+            "First": [
+                {"attribute": "volume", "operator": ">=", "threshold": 1}
+            ],
+            "Second": [
+                {"attribute": "adr_20", "operator": ">=", "threshold": 2}
+            ],
+        },
+    )
+    worker.finished_scan.connect(
+        lambda rows, payload: completions.append((rows, payload))
+    )
+    worker.error_occurred.connect(errors.append)
+    worker.log_message.connect(logs.append)
+
+    worker.run()
+
+    assert query_calls == [("pc", 1), ("local", 1), ("local", 2)]
+    assert errors == []
+    assert set(completions[0][1]["results_by_setup"]) == {"First", "Second"}
+    assert any("retrying" in message for message in logs)
+    assert any("completed from the local mirror" in message for message in logs)
+
+
 def test_database_init_worker_never_raises_connection_errors_into_the_ui(monkeypatch):
     import src.ui.main_window as main_window
     import src.ui.database_workers as database_workers

@@ -11,6 +11,9 @@ token used by the internal coordination pulse:
     guarded shutdown script, not once the PC has actually powered off --
     Invoke-GuardedShutdown.ps1 may still wait for an in-progress refresh to
     finish before the PC actually goes down.
+  - start_pc_service(): uses the separately authenticated WinRM helper to
+    start the listener or PC dashboard. It does not expose process launch as
+    a command on the socket listener.
 
 Waking the PC is intentionally NOT handled here -- see the dashboard's
 "Wake PC" action, which just opens the router's admin page in a browser for
@@ -19,13 +22,16 @@ app, no scripting of the router's undocumented web UI).
 """
 from __future__ import annotations
 
+import json
+import os
 import re
 import socket
+import subprocess
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
-from src.utils.config import get_env_value
+from src.utils.config import ROOT_DIR, get_env_value
 
 DEFAULT_PORT = 47821
 CONNECT_TIMEOUT_SECONDS = 3.0
@@ -62,6 +68,18 @@ class PcListenerStatus:
     coordination_change_tables: tuple[str, ...] = ()
     coordination_change_pulse_supported: bool = False
     coordination_change_pulse_version: int = 0
+
+
+@dataclass(frozen=True)
+class PcServiceStartResult:
+    """Outcome from the laptop's guarded PC service-start helper."""
+
+    success: bool
+    service: str
+    message: str
+    listener_running: bool = False
+    main_running: bool = False
+    qualification_guard_active: bool = False
 
 
 def _change_tables(value: str) -> tuple[str, ...]:
@@ -135,6 +153,89 @@ def check_pc_status(timeout: float = CONNECT_TIMEOUT_SECONDS) -> PcStatus:
     """Compatibility status-only view of :func:`check_pc_listener`."""
 
     return check_pc_listener(timeout=timeout).status
+
+
+def start_pc_service(
+    service: str,
+    *,
+    timeout: float = 45.0,
+) -> PcServiceStartResult:
+    """Start the PC listener or main.py through authenticated WinRM.
+
+    The PowerShell boundary owns the process/task details and independently
+    refuses main.py while Gate-2/Gate-3 qualification is active or imminent.
+    This function is intentionally synchronous and must be called by a worker.
+    """
+
+    normalized = str(service or "").strip().lower()
+    labels = {"listener": "Listener", "main": "Main"}
+    if normalized not in labels:
+        return PcServiceStartResult(
+            False,
+            normalized,
+            "PC service must be 'listener' or 'main'.",
+        )
+    if os.name != "nt":
+        return PcServiceStartResult(
+            False,
+            normalized,
+            "PC service controls require Windows PowerShell.",
+        )
+    script = ROOT_DIR / "scripts" / "start_pc_service_remote.ps1"
+    if not script.is_file():
+        return PcServiceStartResult(
+            False,
+            normalized,
+            f"PC service helper is missing: {script}",
+        )
+    command = [
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        str(script),
+        "-Service",
+        labels[normalized],
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=str(ROOT_DIR),
+            capture_output=True,
+            text=True,
+            timeout=max(5.0, float(timeout)),
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        return PcServiceStartResult(
+            False,
+            normalized,
+            f"Could not run the PC service helper: {exc}",
+        )
+
+    lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+    try:
+        payload = json.loads(lines[-1]) if lines else {}
+    except (json.JSONDecodeError, TypeError):
+        payload = {}
+    if not isinstance(payload, dict) or "success" not in payload:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        return PcServiceStartResult(
+            False,
+            normalized,
+            detail or f"PC service helper exited with code {completed.returncode}.",
+        )
+    return PcServiceStartResult(
+        success=bool(payload.get("success")),
+        service=str(payload.get("service") or normalized),
+        message=str(payload.get("message") or "PC service request completed."),
+        listener_running=bool(payload.get("listener_running")),
+        main_running=bool(payload.get("main_running")),
+        qualification_guard_active=bool(payload.get("qualification_guard_active")),
+    )
 
 
 def notify_pc_coordination_change(

@@ -25,6 +25,11 @@ from src.core.board_workflow import (
     BoardActionContext,
     BoardCardProjection,
     BoardProjectionContext,
+    ClearBreakoutPrice,
+    MoveToBuylist,
+    MoveToWatchlist,
+    ReorderCard,
+    SetBreakoutPrice,
 )
 from src.core.execution_config import is_buyboard_engine_enabled
 from src.core.runtime_readiness import RuntimeDeviceState
@@ -1391,10 +1396,106 @@ class BuyboardMixin:
             if callable(track_worker):
                 track_worker("_buyboard_command_worker", worker)
         self._set_buyboard_card_pending(request.card_key, True)
+        self._apply_optimistic_buyboard_command(request)
         worker.enqueue(request)
         if create_worker:
             worker.start()
         return True
+
+    def _apply_optimistic_buyboard_command(
+        self, request: BuyboardCommandRequest
+    ) -> None:
+        """Render safe planning edits before their background commit finishes."""
+
+        command = request.command
+        if not isinstance(
+            command,
+            (
+                MoveToWatchlist,
+                MoveToBuylist,
+                SetBreakoutPrice,
+                ClearBreakoutPrice,
+                ReorderCard,
+            ),
+        ):
+            return
+        projections = list(
+            self.__dict__.get("_buyboard_current_projections", ()) or ()
+        )
+        match_index = -1
+        original = None
+        for index, value in enumerate(projections):
+            card = getattr(value, "card", value)
+            if (
+                getattr(card, "environment", None) == command.environment
+                and getattr(card, "account_no", None) == command.account_no
+                and getattr(card, "symbol", None) == command.symbol
+            ):
+                match_index = index
+                original = copy.deepcopy(value)
+                break
+        if match_index < 0 or original is None:
+            return
+        preview = copy.deepcopy(original)
+        preview_card = getattr(preview, "card", preview)
+        try:
+            execution_workflow_service._apply_board_mutation(
+                command,
+                preview_card,
+                context=request.action_context,
+                active_orders=(),
+            )
+        except Exception:
+            logger.debug(
+                "Skipped optimistic board preview for %s",
+                type(command).__name__,
+                exc_info=True,
+            )
+            return
+        projections[match_index] = preview
+        snapshots = self.__dict__.setdefault(
+            "_buyboard_optimistic_snapshots", {}
+        )
+        snapshots[command.command_id] = (request.card_key, original)
+        self.__dict__.setdefault("_buyboard_latest_optimistic", {})[
+            request.card_key
+        ] = command.command_id
+        from .board import populate_buyboard_columns
+
+        populate_buyboard_columns(self, projections)
+
+    def _finish_optimistic_buyboard_command(
+        self, result: BuyboardCommandResult
+    ) -> None:
+        command_id = result.request.command.command_id
+        snapshots = self.__dict__.get("_buyboard_optimistic_snapshots", {})
+        snapshot = snapshots.pop(command_id, None)
+        latest = self.__dict__.get("_buyboard_latest_optimistic", {})
+        if latest.get(result.request.card_key) != command_id:
+            return
+        latest.pop(result.request.card_key, None)
+        if result.succeeded or snapshot is None:
+            return
+        _card_key, original = snapshot
+        projections = list(
+            self.__dict__.get("_buyboard_current_projections", ()) or ()
+        )
+        original_card = getattr(original, "card", original)
+        for index, value in enumerate(projections):
+            card = getattr(value, "card", value)
+            if (
+                getattr(card, "environment", None)
+                == getattr(original_card, "environment", None)
+                and getattr(card, "account_no", None)
+                == getattr(original_card, "account_no", None)
+                and getattr(card, "symbol", None)
+                == getattr(original_card, "symbol", None)
+            ):
+                projections[index] = original
+                from .board import populate_buyboard_columns
+
+                populate_buyboard_columns(self, projections)
+                return
 
     def _set_buyboard_card_pending(self, card_key: str, pending: bool) -> None:
         counts = self.__dict__.setdefault("_buyboard_pending_command_counts", {})
@@ -1414,6 +1515,7 @@ class BuyboardMixin:
         from PyQt5.QtWidgets import QMessageBox
 
         self._set_buyboard_card_pending(result.request.card_key, False)
+        self._finish_optimistic_buyboard_command(result)
         if not result.succeeded:
             QMessageBox.warning(self, "Buy Board", result.message)
         elif result.operator_command_queued:
@@ -1422,4 +1524,7 @@ class BuyboardMixin:
                 append_log(
                     f"{type(result.request.command).__name__}: {result.message}"
                 )
-        self.refresh_buyboard()
+        if result.request.card_key not in self.__dict__.get(
+            "_buyboard_pending_command_counts", {}
+        ):
+            self.refresh_buyboard()

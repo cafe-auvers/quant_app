@@ -721,6 +721,61 @@ def test_board_command_with_500ms_database_latency_does_not_block_dispatch(
     assert window.buyboard_columns["buylist"].states[-1] == set()
 
 
+def test_planning_board_move_is_rendered_before_background_commit(monkeypatch):
+    app = QCoreApplication.instance() or QCoreApplication([])
+    window = _CommandWindow()
+    card = TradeCardState(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        board_status=BoardStatus.WATCHLIST,
+        watchlist_member=True,
+    )
+    window._buyboard_current_projections = (BoardCardProjection(card=card),)
+    rendered = []
+    monkeypatch.setattr(
+        buyboard_controller,
+        "_action_context",
+        lambda *_args: BoardActionContext(),
+    )
+    monkeypatch.setattr(
+        buyboard_board,
+        "populate_buyboard_columns",
+        lambda target, values: (
+            setattr(target, "_buyboard_current_projections", tuple(values)),
+            rendered.append(tuple(values)),
+        ),
+    )
+    release = threading.Event()
+    monkeypatch.setattr(
+        buyboard_controller.execution_workflow_service,
+        "request_board_action",
+        lambda *_args, **_kwargs: release.wait(1.0),
+    )
+    command = MoveToBuylist(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        expected_card_version=card.version,
+    )
+
+    assert window._buyboard_dispatch_command(command) is True
+    app.processEvents()
+
+    assert rendered
+    assert rendered[-1][0].card.board_status == BoardStatus.BUYLIST
+    assert not release.is_set()
+
+    release.set()
+    deadline = time.monotonic() + 2.0
+    while not window.results and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.005)
+    worker = window._buyboard_command_worker
+    worker.request_stop()
+    assert worker.wait(1000)
+
+
 def test_board_commands_share_one_serial_worker(monkeypatch):
     app = QCoreApplication.instance() or QCoreApplication([])
     window = _CommandWindow()

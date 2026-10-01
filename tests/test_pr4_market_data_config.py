@@ -234,6 +234,13 @@ def test_buy_today_session_date_rolls_post_close_activation_forward():
     assert current_or_next_nyse_session_date(friday_after_close) == dt.date(2026, 8, 24)
 
 
+def test_session_date_at_one_am_kst_still_targets_open_us_session():
+    kst = ZoneInfo("Asia/Seoul")
+    one_am_kst = dt.datetime(2026, 10, 1, 1, 0, tzinfo=kst)
+
+    assert current_or_next_nyse_session_date(one_am_kst) == dt.date(2026, 9, 30)
+
+
 def test_live_factory_requires_both_enable_and_protocol_verification(monkeypatch):
     monkeypatch.setattr(execution_config, "KIS_WS_ENABLED", True)
     monkeypatch.setattr(execution_config, "KIS_WS_PROTOCOL_VERIFIED", False)

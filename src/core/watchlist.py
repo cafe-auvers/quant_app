@@ -1,13 +1,16 @@
 """Trading rules and watchlist management."""
 
 import contextlib
+import copy
 import logging
 import math
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 from zoneinfo import ZoneInfo
+
+from src.utils.market_calendar import current_or_next_nyse_session_date
 
 logger = logging.getLogger(__name__)
 RejectedRecordHandler = Optional[Callable[[int, Any, Exception], None]]
@@ -149,9 +152,22 @@ class TradePlan:
 
 
 class Watchlist:
-    """Watchlist manager."""
+    """Session-dated watchlists with one mutable current-session view.
 
-    def __init__(self, name: str = "Default"):
+    ``items`` deliberately remains the compatibility surface used by the
+    planning and chart workflows.  It always addresses the current NYSE
+    session.  Older sessions can only be read through ``items_for_session``.
+    """
+
+    SCHEMA_VERSION = 2
+    SESSION_DATE_CONVENTION = "nyse_close_to_close"
+
+    def __init__(
+        self,
+        name: str = "Default",
+        *,
+        current_session_date: Optional[date] = None,
+    ):
         """
         Initialize a watchlist.
 
@@ -159,8 +175,66 @@ class Watchlist:
             name: Watchlist name
         """
         self.name = name
-        self.items: List[WatchlistItem] = []
+        self._current_session_date_override = current_session_date
+        self._items_by_session: Dict[str, List[WatchlistItem]] = {}
         self.created_date = _utc_now()
+
+    @property
+    def active_session_date(self) -> date:
+        """The editable watchlist date under the NYSE close-to-close rule."""
+
+        return (
+            self._current_session_date_override
+            or current_or_next_nyse_session_date()
+        )
+
+    @staticmethod
+    def _session_key(session_date: Any) -> str:
+        if isinstance(session_date, datetime):
+            resolved = current_or_next_nyse_session_date(session_date)
+        elif isinstance(session_date, date):
+            resolved = session_date
+        else:
+            resolved = date.fromisoformat(str(session_date))
+        return resolved.isoformat()
+
+    @property
+    def items(self) -> List[WatchlistItem]:
+        """Return the mutable current-session list used by live workflows."""
+
+        return self._items_by_session.setdefault(
+            self.active_session_date.isoformat(), []
+        )
+
+    @items.setter
+    def items(self, value: List[WatchlistItem]) -> None:
+        self._items_by_session[self.active_session_date.isoformat()] = list(value)
+
+    @property
+    def session_dates(self) -> tuple[date, ...]:
+        """Return every persisted watchlist session in chronological order."""
+
+        dates = []
+        for value in self._items_by_session:
+            with contextlib.suppress(ValueError):
+                dates.append(date.fromisoformat(value))
+        return tuple(sorted(dates))
+
+    def items_for_session(self, session_date: Any) -> tuple[WatchlistItem, ...]:
+        """Return a detached, read-only snapshot for ``session_date``."""
+
+        try:
+            key = self._session_key(session_date)
+        except (TypeError, ValueError):
+            return ()
+        return tuple(copy.deepcopy(self._items_by_session.get(key, ())))
+
+    def has_session(self, session_date: Any) -> bool:
+        try:
+            key = self._session_key(session_date)
+        except (TypeError, ValueError):
+            return False
+        return key in self._items_by_session
 
     def add(self, symbol: str, name: str, entry_price=...) -> WatchlistItem:
         """Add or update a stock in the watchlist."""
@@ -201,24 +275,36 @@ class Watchlist:
 
     def to_dict(self) -> Dict:
         """Convert to dictionary for serialization."""
+
+        def serialize_item(item: WatchlistItem) -> Dict[str, Any]:
+            return {
+                "symbol": item.symbol,
+                "name": item.name,
+                "entry_price": item.entry_price,
+                "breakout_price": item.breakout_price,
+                "target_price": item.target_price,
+                "stop_loss": item.stop_loss,
+                "notes": item.notes,
+                "added_date": item.added_date.isoformat(),
+                "ai_analysis": item.ai_analysis,
+                "selected_orb_plan": item.selected_orb_plan,
+            }
+
         return {
+            "schema_version": self.SCHEMA_VERSION,
+            "session_date_convention": self.SESSION_DATE_CONVENTION,
             "name": self.name,
             "created_date": self.created_date.isoformat(),
-            "items": [
-                {
-                    "symbol": item.symbol,
-                    "name": item.name,
-                    "entry_price": item.entry_price,
-                    "breakout_price": item.breakout_price,
-                    "target_price": item.target_price,
-                    "stop_loss": item.stop_loss,
-                    "notes": item.notes,
-                    "added_date": item.added_date.isoformat(),
-                    "ai_analysis": item.ai_analysis,
-                    "selected_orb_plan": item.selected_orb_plan,
+            # Kept for older scripts and app builds. It mirrors only the
+            # editable current session; schema-v2 readers use ``sessions``.
+            "items": [serialize_item(item) for item in self.items],
+            "sessions": {
+                session_key: {
+                    "date": session_key,
+                    "items": [serialize_item(item) for item in items],
                 }
-                for item in self.items
-            ],
+                for session_key, items in sorted(self._items_by_session.items())
+            },
         }
 
     @classmethod
@@ -227,9 +313,15 @@ class Watchlist:
         data: Dict,
         *,
         on_rejected: RejectedRecordHandler = None,
+        current_session_date: Optional[date] = None,
     ) -> "Watchlist":
         """Create a watchlist from serialized data."""
-        watchlist = cls(name=data.get("name", "Default"))
+        if not isinstance(data, dict):
+            data = {}
+        watchlist = cls(
+            name=data.get("name", "Default"),
+            current_session_date=current_session_date,
+        )
         created_date = data.get("created_date")
         if created_date:
             with contextlib.suppress(ValueError):
@@ -243,7 +335,12 @@ class Watchlist:
             except (TypeError, ValueError):
                 return None
 
-        for index, raw_item in enumerate(data.get("items", [])):
+        def deserialize_item(
+            raw_item: Any,
+            *,
+            index: int,
+            collection: str,
+        ) -> Optional[WatchlistItem]:
             try:
                 if not isinstance(raw_item, dict):
                     raise TypeError("record is not an object")
@@ -265,27 +362,96 @@ class Watchlist:
                 symbol = str(raw_item.get("symbol", "")).upper()
                 if not symbol:
                     raise ValueError("symbol is required")
-                watchlist.items.append(
-                    WatchlistItem(
-                        symbol=symbol,
-                        name=raw_item.get("name", ""),
-                        entry_price=optional_float(raw_item.get("entry_price")),
-                        stop_loss=optional_float(raw_item.get("stop_loss")),
-                        target_price=legacy_target_price,
-                        breakout_price=migrated_breakout_price,
-                        notes=raw_item.get("notes", ""),
-                        added_date=parsed_added_date,
-                        ai_analysis=raw_item.get("ai_analysis"),
-                        selected_orb_plan=_normalize_selected_orb_plan(
-                            raw_item.get("selected_orb_plan")
-                        ),
-                    )
+                return WatchlistItem(
+                    symbol=symbol,
+                    name=raw_item.get("name", ""),
+                    entry_price=optional_float(raw_item.get("entry_price")),
+                    stop_loss=optional_float(raw_item.get("stop_loss")),
+                    target_price=legacy_target_price,
+                    breakout_price=migrated_breakout_price,
+                    notes=raw_item.get("notes", ""),
+                    added_date=parsed_added_date,
+                    ai_analysis=raw_item.get("ai_analysis"),
+                    selected_orb_plan=_normalize_selected_orb_plan(
+                        raw_item.get("selected_orb_plan")
+                    ),
                 )
             except Exception as exc:
                 _report_rejected_record(
-                    "watchlist", index, raw_item, exc, on_rejected
+                    collection, index, raw_item, exc, on_rejected
                 )
-                continue
+                return None
+
+        sessions = data.get("sessions")
+        if isinstance(sessions, dict):
+            record_index = 0
+            for raw_session_key, raw_session in sessions.items():
+                try:
+                    session_key = cls._session_key(raw_session_key)
+                except (TypeError, ValueError) as exc:
+                    _report_rejected_record(
+                        "watchlist session",
+                        record_index,
+                        {"date": raw_session_key},
+                        exc,
+                        on_rejected,
+                    )
+                    record_index += 1
+                    continue
+                raw_items = (
+                    raw_session.get("items", [])
+                    if isinstance(raw_session, dict)
+                    else raw_session
+                )
+                if not isinstance(raw_items, list):
+                    _report_rejected_record(
+                        "watchlist session",
+                        record_index,
+                        raw_session,
+                        TypeError("items is not a list"),
+                        on_rejected,
+                    )
+                    record_index += 1
+                    continue
+                restored_items = watchlist._items_by_session.setdefault(
+                    session_key, []
+                )
+                for raw_item in raw_items:
+                    item = deserialize_item(
+                        raw_item,
+                        index=record_index,
+                        collection="watchlist",
+                    )
+                    record_index += 1
+                    if item is not None and not any(
+                        existing.symbol == item.symbol for existing in restored_items
+                    ):
+                        restored_items.append(item)
+        else:
+            # Schema v1 was one ever-growing list. Partition it by the NYSE
+            # session in which each item was added so no historical symbol is
+            # lost while today's working list starts cleanly.
+            raw_items = data.get("items", [])
+            if not isinstance(raw_items, list):
+                raw_items = []
+            for index, raw_item in enumerate(raw_items):
+                item = deserialize_item(
+                    raw_item,
+                    index=index,
+                    collection="watchlist",
+                )
+                if item is None:
+                    continue
+                session_key = current_or_next_nyse_session_date(
+                    item.added_date
+                ).isoformat()
+                restored_items = watchlist._items_by_session.setdefault(
+                    session_key, []
+                )
+                if not any(
+                    existing.symbol == item.symbol for existing in restored_items
+                ):
+                    restored_items.append(item)
         return watchlist
 
 

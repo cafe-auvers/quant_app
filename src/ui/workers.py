@@ -405,6 +405,7 @@ class ScannerWorker(QThread):
         min_trend_intensity: float,
         universe_limit: Optional[int] = None,
         scanner_rules_by_setup: Optional[dict] = None,
+        fallback_engine=None,
     ):
         super().__init__()
         self.tickers = list(tickers or [])
@@ -416,6 +417,7 @@ class ScannerWorker(QThread):
         self.min_trend_intensity = min_trend_intensity
         self.universe_limit = universe_limit
         self.scanner_rules_by_setup = scanner_rules_by_setup
+        self.fallback_engine = fallback_engine
 
     def run(self) -> None:
         try:
@@ -444,18 +446,54 @@ class ScannerWorker(QThread):
                 self.log_message.emit(
                     "Querying scanner snapshot with database filters..."
                 )
-                results_by_setup = {}
-                funnels_by_setup = {}
-                for setup_name, rules in self.scanner_rules_by_setup.items():
-                    if self.isInterruptionRequested():
-                        return
-                    results, funnel = query_scanner_metrics_with_funnel(
-                        self.tickers,
-                        self.engine,
-                        list(rules or []),
+
+                def query_setups(query_engine):
+                    results_by_setup = {}
+                    funnels_by_setup = {}
+                    for setup_name, rules in self.scanner_rules_by_setup.items():
+                        if self.isInterruptionRequested():
+                            return None
+                        results, funnel = query_scanner_metrics_with_funnel(
+                            self.tickers,
+                            query_engine,
+                            list(rules or []),
+                        )
+                        results_by_setup[setup_name] = results
+                        funnels_by_setup[setup_name] = funnel
+                    return results_by_setup, funnels_by_setup
+
+                try:
+                    queried = query_setups(self.engine)
+                except RuntimeError as primary_error:
+                    fallback = self.fallback_engine
+                    if fallback is None or fallback is self.engine:
+                        raise
+                    self.log_message.emit(
+                        "PC scanner query timed out; retrying the complete scan "
+                        "from the local mirror..."
                     )
-                    results_by_setup[setup_name] = results
-                    funnels_by_setup[setup_name] = funnel
+                    try:
+                        queried = query_setups(fallback)
+                    except Exception as fallback_error:
+                        raise RuntimeError(
+                            f"{primary_error}; local mirror retry also failed: "
+                            f"{fallback_error}"
+                        ) from fallback_error
+                    if queried is not None and not any(
+                        int(funnel.get("universe_count") or 0) > 0
+                        for funnel in queried[1].values()
+                    ):
+                        raise RuntimeError(
+                            f"{primary_error}; the local mirror has no scanner "
+                            "snapshot for the current market date"
+                        ) from primary_error
+                    self.log_message.emit(
+                        "Scanner completed from the local mirror after the PC "
+                        "query timeout."
+                    )
+                if queried is None:
+                    return
+                results_by_setup, funnels_by_setup = queried
                 self.finished_scan.emit(
                     [],
                     {
@@ -617,3 +655,18 @@ class PcRemoteStatusWorker(QThread):
                 coordination_notification_delivered=notification_delivered,
             )
         )
+
+
+class PcRemoteServiceStartWorker(QThread):
+    """Start one PC service without blocking the Qt event loop."""
+
+    finished_start = pyqtSignal(object)
+
+    def __init__(self, service: str, parent=None) -> None:
+        super().__init__(parent)
+        self.service = str(service or "").strip().lower()
+
+    def run(self) -> None:
+        from src.services.pc_remote_control import start_pc_service
+
+        self.finished_start.emit(start_pc_service(self.service))

@@ -69,6 +69,7 @@ from src.services.execution_lease_protocol import ExecutionLease
 from src.services.order_ledger import ORDERS_FILE
 from src.services.order_execution_service import submit_guarded_overseas_order
 from src.services.order_reconciliation import cancel_and_reconcile_order
+from src.utils import market_calendar
 
 
 class BoardCommandRejectedError(RuntimeError):
@@ -1174,6 +1175,9 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
         card.breakout_price = float(command.price)
         if card.board_status == BoardStatus.WATCHLIST:
             card.watchlist_member = True
+            card.watchlist_session_date = (
+                market_calendar.current_or_next_nyse_session_date()
+            )
             card.buylist_member = False
         else:
             card.buylist_member = True
@@ -1193,6 +1197,9 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
         card.breakout_price = None
         if card.board_status == BoardStatus.WATCHLIST:
             card.watchlist_member = True
+            card.watchlist_session_date = (
+                market_calendar.current_or_next_nyse_session_date()
+            )
             card.buylist_member = False
         else:
             card.buylist_member = True
@@ -1372,6 +1379,9 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
     if isinstance(command, types.MoveToWatchlist):
         clear_executable_entry_plan()
         card.watchlist_member = True
+        card.watchlist_session_date = (
+            market_calendar.current_or_next_nyse_session_date()
+        )
         card.buylist_member = False
         card.session_date = None
         card.entry_runtime_status = None
@@ -1379,6 +1389,9 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
     elif isinstance(command, types.MoveToBuylist):
         clear_executable_entry_plan()
         card.watchlist_member = True
+        card.watchlist_session_date = (
+            market_calendar.current_or_next_nyse_session_date()
+        )
         card.buylist_member = True
         card.buy_today_note = ""
         card.session_date = None
@@ -1395,9 +1408,7 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
         if context is not None and context.session_date is not None:
             card.session_date = context.session_date
         else:
-            from src.utils.market_calendar import current_or_next_nyse_session_date
-
-            card.session_date = current_or_next_nyse_session_date()
+            card.session_date = market_calendar.current_or_next_nyse_session_date()
         monitoring_command = build_entry_monitoring_command(
             environment=card.environment,
             account_no=card.account_no,
@@ -1544,6 +1555,9 @@ def request_board_action(
                     symbol=command.symbol,
                     board_status=BoardStatus.WATCHLIST,
                     watchlist_member=True,
+                    watchlist_session_date=(
+                        market_calendar.current_or_next_nyse_session_date()
+                    ),
                     buylist_member=False,
                 )
                 _apply_board_mutation(

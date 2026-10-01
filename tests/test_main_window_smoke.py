@@ -1,9 +1,10 @@
 import os
+import datetime as dt
 from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import QDate, Qt, QTimer
 from PyQt5.QtWidgets import QApplication, QPushButton
 
 from src.core.trade_card_state import BoardStatus, TradeCardState
@@ -25,8 +26,32 @@ def test_main_window_constructs_and_closes_offscreen_without_external_io(monkeyp
     global _APP
     _APP = QApplication.instance() or QApplication([])
 
-    watchlist = Watchlist()
-    watchlist.add("STIM", "Neuronetics")
+    watchlist = Watchlist.from_dict(
+        {
+            "schema_version": 2,
+            "sessions": {
+                "2026-09-29": {
+                    "items": [
+                        {
+                            "symbol": "AAPL",
+                            "name": "Apple",
+                            "added_date": "2026-09-29T18:00:00+00:00",
+                        }
+                    ]
+                },
+                "2026-09-30": {
+                    "items": [
+                        {
+                            "symbol": "STIM",
+                            "name": "Neuronetics",
+                            "added_date": "2026-09-30T18:00:00+00:00",
+                        }
+                    ]
+                },
+            },
+        },
+        current_session_date=dt.date(2026, 9, 30),
+    )
 
     monkeypatch.setattr(controller_layout, "QWebEngineView", None)
     monkeypatch.setattr(health_panel_module, "QWebEngineView", None)
@@ -129,7 +154,37 @@ def test_main_window_constructs_and_closes_offscreen_without_external_io(monkeyp
     assert not hasattr(window, "live_data_checkbox")
     assert not hasattr(window, "scanner_orb_score_checkbox")
     assert not hasattr(window, "scanner_table")
+    assert window.pc_start_listener_button.text() == "Start Listener"
+    assert window.pc_start_main_button.text() == "Start PC App"
+    assert window.pc_start_listener_button.height() == 23
+    assert window.pc_start_main_button.height() == 23
+    assert (
+        window.pc_start_listener_button.mapTo(window.pc_status_widget, window.pc_start_listener_button.rect().topLeft()).y()
+        == window.pc_start_main_button.mapTo(window.pc_status_widget, window.pc_start_main_button.rect().topLeft()).y()
+    )
+    window._update_pc_service_start_buttons(
+        listener_on=False,
+        main_app_active=False,
+        busy=False,
+    )
+    assert window.pc_start_listener_button.isEnabled()
+    assert window.pc_start_main_button.isEnabled()
     assert window.scanner_universe_count_label.text() == "Universe: —"
+    scanner_label_flags = window.scanner_universe_count_label.textInteractionFlags()
+    assert scanner_label_flags & Qt.TextSelectableByMouse
+    assert scanner_label_flags & Qt.TextSelectableByKeyboard
+    window._display_scanner_snapshot_status(
+        {
+            "snapshot_date": "2026-09-29",
+            "expected_snapshot_date": "2026-09-30",
+            "stale_market_sessions": 1,
+            "stale_calendar_days": 1,
+        }
+    )
+    assert window.scanner_data_status_label.text() == (
+        "Showing scanner snapshot 2026-09-29: 1 market session / "
+        "1 calendar day behind (expected 2026-09-30)."
+    )
     assert len(window.active_rule_count_labels) == len(window.active_rule_widgets)
     assert window._scanner_live_refresh_timer.isSingleShot()
     assert window._scanner_live_refresh_timer.interval() == 300
@@ -183,6 +238,32 @@ def test_main_window_constructs_and_closes_offscreen_without_external_io(monkeyp
     assert "Buy Today" in sidebar_sources
     assert hasattr(window, "sidebar_move_buylist_button")
     assert hasattr(window, "sidebar_remove_watchlist_button")
+    assert window.sidebar_watchlist_date_controls.isHidden()
+
+    watchlist_index = sidebar_sources.index("Watchlist")
+    window.sidebar_source_combo.setCurrentIndex(watchlist_index)
+    QApplication.processEvents()
+    assert window.sidebar_watchlist_date_controls.isVisible()
+    assert window.sidebar_watchlist_date_edit.date() == QDate(2026, 9, 30)
+    assert not window.sidebar_watchlist_current_button.isEnabled()
+    assert window.sidebar_stock_list.count() == 1
+    assert window._get_sidebar_selected_symbol() == "STIM"
+    assert window.sidebar_remove_watchlist_button.isEnabled()
+
+    window.sidebar_watchlist_date_edit.setDate(QDate(2026, 9, 29))
+    QApplication.processEvents()
+    assert window.sidebar_stock_list.count() == 1
+    assert window._get_sidebar_selected_symbol() == "AAPL"
+    historical_data = window._get_sidebar_selected_data()
+    assert historical_data["watchlist_is_current"] is False
+    assert window.sidebar_watchlist_current_button.isEnabled()
+    assert window.sidebar_add_watchlist_button.text() == "Add to Today's Watchlist"
+    assert window.sidebar_add_watchlist_button.isEnabled()
+    assert not window.sidebar_move_buylist_button.isEnabled()
+    assert not window.sidebar_remove_watchlist_button.isEnabled()
+
+    window.sidebar_source_combo.setCurrentIndex(0)
+    QApplication.processEvents()
 
     window._on_scanner_universe_loaded(["ZZZ", "AAPL"])
     assert [

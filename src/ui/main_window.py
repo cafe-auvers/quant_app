@@ -167,7 +167,11 @@ from src.ui.readiness_presenter import (
     buyboard_readiness_display as _buyboard_readiness_display,
     live_execution_status_text as _live_execution_status_text,
 )
-from src.ui.workers import PcRemoteStatusWorker
+from src.ui.selectable_text import (
+    install_selectable_text_support,
+    make_widget_text_selectable,
+)
+from src.ui.workers import PcRemoteServiceStartWorker, PcRemoteStatusWorker
 from src.utils.config import DATA_DIR, ROOT_DIR, get_env_value
 from src.utils.data_loader import get_default_universe
 from src.utils.device_identity import detect_local_device_kind, runtime_device_kind
@@ -242,6 +246,10 @@ class MainWindow(
         # code that touches real Qt widget APIs on `self` outside of a
         # normal event-driven callback should check this first.
         self._qt_base_initialized = True
+        # QLabel text is otherwise display-only in Qt.  Install this before
+        # constructing the dashboard so labels created here, in later refreshes,
+        # and inside QMessageBox dialogs can all be drag-selected and copied.
+        self._selectable_text_filter = install_selectable_text_support()
         # Widget construction must not initiate per-symbol network fallbacks.
         # This marker is cleared only after every synchronous startup refresh
         # has completed and the window is ready to enter the Qt event loop.
@@ -493,6 +501,9 @@ class MainWindow(
         QTimer.singleShot(2500, lambda: self.refresh_usd_krw_rate(show_messages=False))
         QTimer.singleShot(4000, self.reconcile_open_orders)
         self._apply_shortcuts()
+        # Hidden tabs have not emitted Show events yet, so configure their
+        # labels now as well as relying on the filter for later-created text.
+        make_widget_text_selectable(self)
         self._window_initializing = False
 
     def _init_controllers(self) -> None:
@@ -3622,6 +3633,28 @@ class MainWindow(
         )
         self.pc_services_label.setStyleSheet("font-size: 10px; color: #555555;")
 
+        self.pc_start_listener_button = QPushButton("Start Listener")
+        self.pc_start_listener_button.setObjectName("pcStartListenerButton")
+        self.pc_start_listener_button.setEnabled(False)
+        self.pc_start_listener_button.setFixedHeight(23)
+        self.pc_start_listener_button.setToolTip(
+            "Start the restricted PC remote-control listener through authenticated WinRM."
+        )
+        self.pc_start_listener_button.clicked.connect(
+            lambda: self._start_pc_remote_service("listener")
+        )
+        self.pc_start_main_button = QPushButton("Start PC App")
+        self.pc_start_main_button.setObjectName("pcStartMainButton")
+        self.pc_start_main_button.setEnabled(False)
+        self.pc_start_main_button.setFixedHeight(23)
+        self.pc_start_main_button.setToolTip(
+            "Start PC main.py through authenticated WinRM. This is refused "
+            "while Gate 2/3 qualification is running or imminent."
+        )
+        self.pc_start_main_button.clicked.connect(
+            lambda: self._start_pc_remote_service("main")
+        )
+
         pc_status_text_layout = QVBoxLayout()
         pc_status_text_layout.setContentsMargins(0, 0, 0, 0)
         pc_status_text_layout.setSpacing(0)
@@ -3629,6 +3662,15 @@ class MainWindow(
         pc_status_text_layout.addWidget(self.pc_services_label)
         pc_status_layout.addWidget(self.pc_status_dot)
         pc_status_layout.addLayout(pc_status_text_layout)
+        # QTabWidget constrains its corner widget to the tab-bar height.  A
+        # two-row button stack is therefore clipped at normal Windows display
+        # scaling.  Keep both recovery controls on one fixed-height row.
+        pc_service_button_layout = QHBoxLayout()
+        pc_service_button_layout.setContentsMargins(0, 0, 0, 0)
+        pc_service_button_layout.setSpacing(4)
+        pc_service_button_layout.addWidget(self.pc_start_listener_button)
+        pc_service_button_layout.addWidget(self.pc_start_main_button)
+        pc_status_layout.addLayout(pc_service_button_layout)
         self.pc_status_widget.setLayout(pc_status_layout)
 
         outer_corner_layout.addWidget(self.pc_status_widget)
@@ -3664,6 +3706,7 @@ class MainWindow(
         # Poll DB, remote-control listener, and main.py independently. Network
         # and database I/O stay on a worker so the UI thread never blocks.
         self._pc_status_worker: Optional[PcRemoteStatusWorker] = None
+        self.pc_remote_service_start_worker = None
         self.pc_status_timer = QTimer(self)
         self.pc_status_timer.setInterval(5000)
         self.pc_status_timer.timeout.connect(self._poll_pc_status)
@@ -5349,6 +5392,11 @@ class MainWindow(
             # top-up in addition to the periodic safety timer.
             self._sync_active_pc_to_local_mirror()
 
+        self._update_pc_service_start_buttons(
+            listener_on=listener_on,
+            main_app_active=status.main_app_active,
+        )
+
         if button is not None:
             if listener_on:
                 button.setEnabled(True)
@@ -5366,6 +5414,91 @@ class MainWindow(
                 button.setEnabled(True)
                 button.setText("Wake PC")
                 button.setToolTip("Open the router page used to wake the PC.")
+
+    def _update_pc_service_start_buttons(
+        self,
+        *,
+        listener_on: bool,
+        main_app_active: Optional[bool],
+        busy: Optional[bool] = None,
+    ) -> None:
+        """Project PC service state onto the two guarded start controls."""
+
+        listener_button = self.__dict__.get("pc_start_listener_button")
+        main_button = self.__dict__.get("pc_start_main_button")
+        if listener_button is None or main_button is None:
+            return
+        if busy is None:
+            worker = self.__dict__.get("pc_remote_service_start_worker")
+            busy = self._background_worker_running(worker)
+        listener_button.setText("Listener On" if listener_on else "Start Listener")
+        # WinRM is the recovery path when both the database heartbeat and the
+        # socket listener are absent, so apparent PC reachability must not
+        # disable the action that can restore the listener.
+        listener_button.setEnabled(bool(not listener_on and not busy))
+        main_button.setText("PC App On" if main_app_active is True else "Start PC App")
+        main_button.setEnabled(bool(main_app_active is not True and not busy))
+
+    def _start_pc_remote_service(self, service: str) -> None:
+        """Start a guarded PC service from the laptop without blocking Qt."""
+
+        service = str(service or "").strip().lower()
+        if service not in {"listener", "main"}:
+            return
+        worker = self.__dict__.get("pc_remote_service_start_worker")
+        if self._background_worker_running(worker):
+            return
+        if service == "main":
+            answer = QMessageBox.question(
+                self,
+                "Start PC dashboard",
+                "Start main.py on the PC?\n\n"
+                "The request is automatically refused while a Gate 2/3 "
+                "qualification is running or scheduled within 12 hours, so "
+                "the qualification keeps its single KIS WebSocket.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+
+        worker = PcRemoteServiceStartWorker(service, parent=self)
+        self.pc_remote_service_start_worker = worker
+        worker.finished_start.connect(self._on_pc_remote_service_started)
+        self._track_worker("pc_remote_service_start_worker", worker)
+        listener_on = bool(self.__dict__.get("_pc_remote_control_available", False))
+        self._update_pc_service_start_buttons(
+            listener_on=listener_on,
+            main_app_active=self.__dict__.get("_last_pc_main_app_active"),
+            busy=True,
+        )
+        label = "listener" if service == "listener" else "dashboard"
+        self.append_log(f"Requesting PC {label} start...")
+        worker.start()
+
+    @pyqtSlot(object)
+    def _on_pc_remote_service_started(self, result) -> None:
+        """Report a remote start result and immediately refresh PC status."""
+
+        message = str(getattr(result, "message", "") or "PC request completed.")
+        listener_on = bool(getattr(result, "listener_running", False))
+        main_on = bool(getattr(result, "main_running", False))
+        self.append_log(message)
+        self._update_pc_service_start_buttons(
+            listener_on=listener_on,
+            main_app_active=main_on,
+            busy=False,
+        )
+        if bool(getattr(result, "success", False)):
+            QMessageBox.information(self, "PC service started", message)
+        else:
+            title = (
+                "PC dashboard kept off"
+                if bool(getattr(result, "qualification_guard_active", False))
+                else "PC service start failed"
+            )
+            QMessageBox.warning(self, title, message)
+        QTimer.singleShot(1_000, self._poll_pc_status)
 
     def _on_pc_status_button_clicked(self) -> None:
         if getattr(self, "_pc_remote_control_available", False):

@@ -775,7 +775,7 @@ def test_context_menu_has_no_cancel_entry_action_for_open_position(tmp_path, mon
     assert _find_action_by_text(captured_menu["menu"], "Open TradingView Chart") is not None
 
 
-def test_buylist_context_menu_exposes_activation_chart_and_watchlist_demotion(
+def test_buylist_context_menu_exposes_activation_chart_and_buylist_removal(
     tmp_path, monkeypatch
 ):
     _ensure_app()
@@ -798,11 +798,11 @@ def test_buylist_context_menu_exposes_activation_chart_and_watchlist_demotion(
 
     menu = captured_menu["menu"]
     assert _find_action_by_text(menu, "Activate for Buy Today") is not None
-    assert _find_action_by_text(menu, "Move to Watchlist") is not None
+    assert _find_action_by_text(menu, "Remove from Buylist") is not None
     assert _find_action_by_text(menu, "Open TradingView Chart") is not None
 
 
-def test_buylist_context_menu_dispatches_versioned_watchlist_demotion(
+def test_buylist_context_menu_dispatches_versioned_buylist_removal(
     tmp_path, monkeypatch
 ):
     _ensure_app()
@@ -810,10 +810,10 @@ def test_buylist_context_menu_dispatches_versioned_watchlist_demotion(
     card = repo.create_trade_card(engine, _card(board_status=BoardStatus.BUYLIST))
     window = _FakeMainWindow(engine, cards=[card])
 
-    def choose_move(menu, _pos):
-        return _find_action_by_text(menu, "Move to Watchlist")
+    def choose_remove(menu, _pos):
+        return _find_action_by_text(menu, "Remove from Buylist")
 
-    monkeypatch.setattr(QMenu, "exec_", choose_move)
+    monkeypatch.setattr(QMenu, "exec_", choose_remove)
     board_module._handle_card_context_menu(
         window,
         card_drag_payload(BoardCardProjection(card=card)),

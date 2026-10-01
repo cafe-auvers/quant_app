@@ -3,10 +3,14 @@ from __future__ import annotations
 import datetime as dt
 from typing import List, Optional
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import QDate, Qt
+from PyQt5.QtGui import QColor, QTextCharFormat
 from PyQt5.QtWidgets import (
+    QCalendarWidget,
     QComboBox,
+    QDateEdit,
     QDockWidget,
+    QHBoxLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
@@ -46,8 +50,8 @@ class SidebarMixin:
         self.stock_sidebar = QDockWidget("Stocks", self)
         self.stock_sidebar.setAllowedAreas(Qt.LeftDockWidgetArea)
         self.stock_sidebar.setFeatures(QDockWidget.NoDockWidgetFeatures)
-        self.stock_sidebar.setMinimumWidth(150)
-        self.stock_sidebar.setMaximumWidth(190)
+        self.stock_sidebar.setMinimumWidth(190)
+        self.stock_sidebar.setMaximumWidth(240)
 
         sidebar_widget = QWidget()
         sidebar_layout = QVBoxLayout()
@@ -58,6 +62,87 @@ class SidebarMixin:
         self.sidebar_source_combo.setMinimumWidth(145)
         self.sidebar_source_combo.currentIndexChanged.connect(self.refresh_stock_sidebar)
         sidebar_layout.addWidget(self.sidebar_source_combo)
+
+        self.sidebar_watchlist_date_controls = QWidget()
+        date_controls_layout = QHBoxLayout()
+        date_controls_layout.setContentsMargins(0, 0, 0, 0)
+        date_controls_layout.setSpacing(5)
+
+        self.sidebar_watchlist_date_edit = QDateEdit()
+        self.sidebar_watchlist_date_edit.setObjectName(
+            "sidebarWatchlistDateEdit"
+        )
+        self.sidebar_watchlist_date_edit.setCalendarPopup(True)
+        self.sidebar_watchlist_date_edit.setDisplayFormat("yyyy-MM-dd")
+        self.sidebar_watchlist_date_edit.setToolTip(
+            "Choose an NYSE session watchlist. Earlier sessions are fixed "
+            "history."
+        )
+        self.sidebar_watchlist_date_edit.setStyleSheet(
+            "QDateEdit { background: white; border: 1px solid #b8bec5; "
+            "border-radius: 4px; padding: 4px 6px; }"
+        )
+        date_controls_layout.addWidget(self.sidebar_watchlist_date_edit, 1)
+
+        self.sidebar_watchlist_current_button = QPushButton("Current")
+        self.sidebar_watchlist_current_button.setObjectName(
+            "sidebarWatchlistCurrentButton"
+        )
+        self.sidebar_watchlist_current_button.setMaximumWidth(62)
+        self.sidebar_watchlist_current_button.setToolTip(
+            "Return to the editable current-session watchlist."
+        )
+        self.sidebar_watchlist_current_button.clicked.connect(
+            self._select_current_watchlist_session
+        )
+        date_controls_layout.addWidget(self.sidebar_watchlist_current_button)
+        self.sidebar_watchlist_date_controls.setLayout(date_controls_layout)
+        sidebar_layout.addWidget(self.sidebar_watchlist_date_controls)
+
+        self.sidebar_watchlist_date_label = QLabel()
+        self.sidebar_watchlist_date_label.setObjectName(
+            "sidebarWatchlistDateLabel"
+        )
+        self.sidebar_watchlist_date_label.setStyleSheet(
+            "color: #5f6872; font-size: 11px; padding: 0 2px 2px 2px;"
+        )
+        sidebar_layout.addWidget(self.sidebar_watchlist_date_label)
+
+        self.sidebar_watchlist_calendar = (
+            self.sidebar_watchlist_date_edit.calendarWidget()
+        )
+        self.sidebar_watchlist_calendar.setObjectName(
+            "sidebarWatchlistCalendar"
+        )
+        self.sidebar_watchlist_calendar.setGridVisible(False)
+        self.sidebar_watchlist_calendar.setVerticalHeaderFormat(
+            QCalendarWidget.NoVerticalHeader
+        )
+        self.sidebar_watchlist_calendar.setHorizontalHeaderFormat(
+            QCalendarWidget.ShortDayNames
+        )
+        self.sidebar_watchlist_calendar.setToolTip(
+            "Each date is an NYSE session watchlist. The current session is "
+            "editable; earlier sessions are fixed history."
+        )
+        self.sidebar_watchlist_calendar.setMinimumWidth(280)
+        self.sidebar_watchlist_calendar.setStyleSheet(
+            "QCalendarWidget QWidget#qt_calendar_navigationbar {"
+            "background: #eceff1; border: none; }"
+            "QCalendarWidget QToolButton { color: #37474f; "
+            "background: transparent; border: none; font-weight: 600; "
+            "padding: 5px; }"
+            "QCalendarWidget QToolButton:hover { background: #dde2e5; "
+            "border-radius: 3px; }"
+            "QCalendarWidget QAbstractItemView { color: #263238; "
+            "background: white; selection-background-color: #607d8b; "
+            "selection-color: white; outline: none; }"
+        )
+        self._watchlist_calendar_follow_current = True
+        self._watchlist_calendar_formatted_dates = set()
+        self.sidebar_watchlist_date_edit.dateChanged.connect(
+            self._on_sidebar_watchlist_date_changed
+        )
 
         self.sidebar_stock_list = QListWidget()
         self.sidebar_stock_list.setMinimumWidth(145)
@@ -101,6 +186,131 @@ class SidebarMixin:
         self.stock_sidebar.setWidget(sidebar_widget)
         self.addDockWidget(Qt.LeftDockWidgetArea, self.stock_sidebar)
         self.refresh_sidebar_sources()
+
+    @staticmethod
+    def _qdate_from_date(value: dt.date) -> QDate:
+        return QDate(value.year, value.month, value.day)
+
+    @staticmethod
+    def _date_from_qdate(value: QDate) -> dt.date:
+        return dt.date(value.year(), value.month(), value.day())
+
+    def _current_watchlist_session_date(self) -> dt.date:
+        watchlist = self.__dict__.get("watchlist")
+        resolved = getattr(watchlist, "active_session_date", None)
+        if isinstance(resolved, dt.date):
+            return resolved
+        return dt.datetime.now(US_MARKET_ZONE).date()
+
+    def _selected_watchlist_session_date(self) -> dt.date:
+        date_edit = self.__dict__.get("sidebar_watchlist_date_edit")
+        if date_edit is None:
+            return self._current_watchlist_session_date()
+        return self._date_from_qdate(date_edit.date())
+
+    def _watchlist_view_is_current(self) -> bool:
+        return (
+            self._selected_watchlist_session_date()
+            == self._current_watchlist_session_date()
+        )
+
+    def _watchlist_items_for_sidebar(self):
+        watchlist = self.__dict__.get("watchlist")
+        if watchlist is None:
+            return ()
+        session_date = self._selected_watchlist_session_date()
+        loader = getattr(watchlist, "items_for_session", None)
+        if callable(loader):
+            return loader(session_date)
+        return tuple(getattr(watchlist, "items", ()))
+
+    def _refresh_watchlist_calendar(self) -> None:
+        calendar = self.__dict__.get("sidebar_watchlist_calendar")
+        date_edit = self.__dict__.get("sidebar_watchlist_date_edit")
+        label = self.__dict__.get("sidebar_watchlist_date_label")
+        if calendar is None or date_edit is None or label is None:
+            return
+
+        current_date = self._current_watchlist_session_date()
+        current_qdate = self._qdate_from_date(current_date)
+        previous_selected = date_edit.date()
+        follow_current = bool(
+            self.__dict__.get("_watchlist_calendar_follow_current", True)
+        )
+        date_edit.blockSignals(True)
+        date_edit.setMaximumDate(current_qdate)
+        if follow_current or previous_selected > current_qdate:
+            date_edit.setDate(current_qdate)
+        date_edit.blockSignals(False)
+
+        empty_format = QTextCharFormat()
+        for formatted_date in self.__dict__.get(
+            "_watchlist_calendar_formatted_dates", set()
+        ):
+            calendar.setDateTextFormat(formatted_date, empty_format)
+
+        saved_format = QTextCharFormat()
+        saved_format.setFontWeight(600)
+        saved_format.setForeground(QColor("#37474f"))
+        formatted_dates = set()
+        watchlist = self.__dict__.get("watchlist")
+        for session_date in getattr(watchlist, "session_dates", ()):
+            qdate = self._qdate_from_date(session_date)
+            calendar.setDateTextFormat(qdate, saved_format)
+            formatted_dates.add(qdate)
+        self._watchlist_calendar_formatted_dates = formatted_dates
+
+        selected_date = self._selected_watchlist_session_date()
+        is_current = selected_date == current_date
+        has_session = bool(
+            watchlist is not None
+            and getattr(watchlist, "has_session", lambda _date: False)(
+                selected_date
+            )
+        )
+        if is_current:
+            status = "Current session  •  Editable"
+        elif has_session:
+            status = "Historical snapshot  •  Read-only"
+        else:
+            status = "No saved watchlist  •  Read-only"
+        label.setText(status)
+        current_button = self.__dict__.get(
+            "sidebar_watchlist_current_button"
+        )
+        if current_button is not None:
+            current_button.setEnabled(not is_current)
+
+    def _sync_watchlist_calendar_visibility(self, source: dict) -> None:
+        visible = source.get("type") == "watchlist"
+        label = self.__dict__.get("sidebar_watchlist_date_label")
+        controls = self.__dict__.get("sidebar_watchlist_date_controls")
+        if label is not None:
+            label.setVisible(visible)
+        if controls is not None:
+            controls.setVisible(visible)
+        if visible:
+            self._refresh_watchlist_calendar()
+
+    def _select_current_watchlist_session(self) -> None:
+        date_edit = self.__dict__.get("sidebar_watchlist_date_edit")
+        if date_edit is None:
+            return
+        self._watchlist_calendar_follow_current = True
+        current_qdate = self._qdate_from_date(
+            self._current_watchlist_session_date()
+        )
+        if date_edit.date() == current_qdate:
+            self._on_sidebar_watchlist_date_changed()
+            return
+        date_edit.setDate(current_qdate)
+
+    def _on_sidebar_watchlist_date_changed(self) -> None:
+        self._watchlist_calendar_follow_current = self._watchlist_view_is_current()
+        self._sidebar_render_signature = None
+        self._refresh_watchlist_calendar()
+        self.refresh_stock_sidebar()
+
     def refresh_sidebar_sources(self, selected_source: Optional[dict] = None) -> None:
         """Refresh sidebar source options, keeping Universe as the default."""
         if not hasattr(self, "sidebar_source_combo"):
@@ -306,6 +516,7 @@ class SidebarMixin:
         if source_type == "watchlist":
             return (
                 source_type,
+                self._selected_watchlist_session_date().isoformat(),
                 tuple(
                     (
                         item.symbol,
@@ -314,9 +525,7 @@ class SidebarMixin:
                         item.entry_price,
                         item.breakout_price,
                     )
-                    for item in getattr(
-                        self.__dict__.get("watchlist"), "items", ()
-                    )
+                    for item in self._watchlist_items_for_sidebar()
                 ),
             )
         return (source_type,)
@@ -327,6 +536,7 @@ class SidebarMixin:
             return
 
         source = self.sidebar_source_combo.currentData() or {}
+        self._sync_watchlist_calendar_visibility(source)
         signature = self._sidebar_source_signature(source)
         if signature == self.__dict__.get("_sidebar_render_signature"):
             # Watchlist membership can change while Universe rows remain the
@@ -440,11 +650,10 @@ class SidebarMixin:
                 })
                 self.sidebar_stock_list.addItem(item)
         elif source.get("type") == "watchlist":
-            for watch_item in self.watchlist.items:
-                label = (
-                    f"{watch_item.symbol} "
-                    f"({self._format_sidebar_added_date(watch_item.added_date)})"
-                )
+            session_date = self._selected_watchlist_session_date()
+            is_current = self._watchlist_view_is_current()
+            for watch_item in self._watchlist_items_for_sidebar():
+                label = watch_item.symbol
                 item = QListWidgetItem(label)
                 item.setData(Qt.UserRole, {
                     "symbol": watch_item.symbol,
@@ -452,6 +661,8 @@ class SidebarMixin:
                     "price": watch_item.entry_price,
                     "source": "watchlist",
                     "breakout_price": watch_item.breakout_price,
+                    "watchlist_session_date": session_date.isoformat(),
+                    "watchlist_is_current": is_current,
                 })
                 self.sidebar_stock_list.addItem(item)
         if current_symbol:
@@ -519,10 +730,26 @@ class SidebarMixin:
             and getattr(watchlist, "get", lambda _symbol: None)(symbol) is not None
         )
         pending = bool(self.__dict__.get("_planning_membership_pending", False))
+        visual_operation = getattr(
+            self, "_planning_membership_visual_operation", lambda _symbol: ""
+        )(symbol)
 
         add_button = self.__dict__.get("sidebar_add_watchlist_button")
         if add_button is not None:
-            add_button.setText("In Watchlist" if in_watchlist else "Add to Watchlist")
+            historical_watchlist = source == "watchlist" and not bool(
+                (data or {}).get("watchlist_is_current", False)
+            )
+            if visual_operation == "add":
+                add_text = "Added to Watchlist (Saving…)"
+            elif visual_operation == "remove":
+                add_text = "Removed from Watchlist (Saving…)"
+            elif in_watchlist:
+                add_text = "In Today's Watchlist"
+            elif historical_watchlist:
+                add_text = "Add to Today's Watchlist"
+            else:
+                add_text = "Add to Watchlist"
+            add_button.setText(add_text)
             # Demotion is a versioned Buy Board command; never create dual
             # membership by locally adding an existing Buylist row.
             add_button.setEnabled(
@@ -533,11 +760,24 @@ class SidebarMixin:
             )
         move_button = self.__dict__.get("sidebar_move_buylist_button")
         if move_button is not None:
-            move_button.setEnabled(bool(symbol) and source == "watchlist" and not pending)
+            move_button.setText(
+                "Added to Buylist (Saving…)"
+                if visual_operation == "promote"
+                else "Add to Buylist"
+            )
+            move_button.setEnabled(
+                bool(symbol)
+                and source == "watchlist"
+                and bool((data or {}).get("watchlist_is_current", False))
+                and not pending
+            )
         remove_button = self.__dict__.get("sidebar_remove_watchlist_button")
         if remove_button is not None:
             remove_button.setEnabled(
-                bool(symbol) and source == "watchlist" and not pending
+                bool(symbol)
+                and source == "watchlist"
+                and bool((data or {}).get("watchlist_is_current", False))
+                and not pending
             )
     def apply_sidebar_selection_to_current_tab(self) -> None:
         """Apply selected sidebar stock to the active workflow tab."""
@@ -618,6 +858,14 @@ class SidebarMixin:
                 self, "Watchlist selection required", "Select a Watchlist stock first."
             )
             return
+        if not data.get("watchlist_is_current", False):
+            QMessageBox.information(
+                self,
+                "Historical Watchlist",
+                "Past watchlists are fixed. Add the symbol to today's "
+                "watchlist before moving it to Buylist.",
+            )
+            return
         promote = getattr(self, "_promote_watchlist_candidate", None)
         if callable(promote):
             promote(str(data.get("symbol") or ""))
@@ -629,6 +877,13 @@ class SidebarMixin:
         if not data or data.get("source") != "watchlist":
             QMessageBox.warning(
                 self, "Watchlist selection required", "Select a Watchlist stock first."
+            )
+            return
+        if not data.get("watchlist_is_current", False):
+            QMessageBox.information(
+                self,
+                "Historical Watchlist",
+                "Past watchlists are fixed and cannot be removed or edited.",
             )
             return
         remove_candidate = getattr(self, "_remove_watchlist_candidate", None)

@@ -142,19 +142,25 @@ class ChartsNavigationMixin:
         self.tradingview_symbol_combo.blockSignals(False)
 
     def filter_tradingview_symbol_combo(self, text: str) -> None:
+        """Normalize typed symbols without rebuilding or opening the combo.
+
+        The combo's QCompleter owns prefix suggestions.  Calling ``clear()``,
+        repopulating the model and ``showPopup()`` here used to move keyboard
+        focus into the item view after the first keystroke, so later letters
+        never reached the editor.
+        """
+
         if not hasattr(self, "tradingview_symbol_combo"):
             return
-        prefix = text.strip().upper()
-        filtered = self._filter_symbols_by_prefix(
-            self._get_chart_symbol_universe(), prefix
-        )
-
-        self.tradingview_symbol_combo.blockSignals(True)
-        self.tradingview_symbol_combo.clear()
-        self.tradingview_symbol_combo.addItems(filtered)
-        self.tradingview_symbol_combo.setEditText(prefix)
-        self.tradingview_symbol_combo.blockSignals(False)
-        self.tradingview_symbol_combo.showPopup()
+        editor = self.tradingview_symbol_combo.lineEdit()
+        if editor is None:
+            return
+        normalized = str(text or "").upper()
+        if editor.text() == normalized:
+            return
+        cursor_position = editor.cursorPosition()
+        editor.setText(normalized)
+        editor.setCursorPosition(min(cursor_position, len(normalized)))
 
     def _set_intraday_symbol(self, symbol: str) -> None:
         if not hasattr(self, "intraday_symbol_combo"):
