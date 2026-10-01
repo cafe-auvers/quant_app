@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import math
+from dataclasses import replace
 from typing import Any
 
 from PyQt5.QtCore import Qt
@@ -28,6 +29,125 @@ class WatchlistActionsMixin:
     @staticmethod
     def _normalized_watchlist_symbol(symbol: Any) -> str:
         return str(symbol or "").strip().upper()
+
+    def _planning_membership_visual_operation(self, symbol: str) -> str:
+        state = self.__dict__.get("_planning_membership_optimistic_state") or {}
+        if str(state.get("symbol") or "") != self._normalized_watchlist_symbol(
+            symbol
+        ):
+            return ""
+        return str(state.get("operation") or "")
+
+    @staticmethod
+    def _item_index(items, target) -> int:
+        try:
+            return list(items).index(target)
+        except ValueError:
+            return -1
+
+    def _apply_optimistic_planning_membership(
+        self, request: PlanningMembershipRequest
+    ) -> None:
+        """Paint a local result now; the worker confirms or rolls it back."""
+
+        symbol = request.symbol
+        watch_item = self.watchlist.get(symbol)
+        buylist_item = self.buylist_manager.get(symbol, "PROD")
+        state = {
+            "operation": request.operation,
+            "symbol": symbol,
+            "watchlist_before": copy.deepcopy(watch_item),
+            "watchlist_index": self._item_index(self.watchlist.items, watch_item),
+            "buylist_before": copy.deepcopy(buylist_item),
+            "buylist_index": self._item_index(
+                self.buylist_manager.items, buylist_item
+            ),
+        }
+        self._planning_membership_optimistic_state = state
+
+        if request.operation == "add":
+            self.watchlist.add(symbol, request.name or symbol, request.entry_price)
+        elif request.operation == "remove":
+            self.watchlist.remove(symbol)
+        elif request.operation == "promote" and watch_item is not None:
+            from src.services.planning_membership_service import (
+                build_passive_buylist_preview,
+            )
+
+            preview = (
+                copy.deepcopy(buylist_item)
+                if buylist_item is not None
+                else build_passive_buylist_preview(
+                    watch_item,
+                    account_no=request.default_account_no,
+                    buffer_pct=request.buffer_pct,
+                )
+            )
+            self.buylist_manager.add(preview)
+
+        # Refresh only local render surfaces. Persistence remains exclusively
+        # in the background worker and no navigation source/tab is changed.
+        self._update_watchlist_action_surfaces()
+        update_queue = getattr(self, "_update_tradingview_queue_btn", None)
+        if callable(update_queue):
+            update_queue()
+
+    def _rollback_optimistic_planning_membership(self) -> None:
+        state = self.__dict__.pop(
+            "_planning_membership_optimistic_state", None
+        )
+        if not isinstance(state, dict):
+            return
+        symbol = self._normalized_watchlist_symbol(state.get("symbol"))
+        self.watchlist.remove(symbol)
+        watch_item = state.get("watchlist_before")
+        if watch_item is not None:
+            index = int(state.get("watchlist_index", -1) or -1)
+            self.watchlist.items.insert(
+                min(max(index, 0), len(self.watchlist.items)),
+                copy.deepcopy(watch_item),
+            )
+
+        self.buylist_manager.remove(symbol, "PROD")
+        buylist_item = state.get("buylist_before")
+        if buylist_item is not None:
+            index = int(state.get("buylist_index", -1) or -1)
+            self.buylist_manager.items.insert(
+                min(max(index, 0), len(self.buylist_manager.items)),
+                copy.deepcopy(buylist_item),
+            )
+
+    def _apply_confirmed_planning_card(self, card) -> None:
+        """Paint the worker's committed card without waiting for another read."""
+
+        if card is None:
+            return
+        from src.core.board_workflow import BoardCardProjection
+        from src.ui.buyboard.board import populate_buyboard_columns
+
+        projections = list(
+            self.__dict__.get("_buyboard_current_projections", ()) or ()
+        )
+        replacement = copy.deepcopy(card)
+        for index, value in enumerate(projections):
+            current = getattr(value, "card", value)
+            if (
+                getattr(current, "environment", None) == card.environment
+                and getattr(current, "account_no", None) == card.account_no
+                and getattr(current, "symbol", None) == card.symbol
+            ):
+                projections[index] = (
+                    replace(value, card=replacement)
+                    if isinstance(value, BoardCardProjection)
+                    else replacement
+                )
+                break
+        else:
+            projections.append(BoardCardProjection(card=replacement))
+        if self.__dict__.get("buyboard_columns"):
+            populate_buyboard_columns(self, projections)
+        else:
+            self._buyboard_current_projections = tuple(projections)
 
     def _add_watchlist_candidate(
         self,
@@ -114,10 +234,19 @@ class WatchlistActionsMixin:
         symbol = self._normalized_watchlist_symbol(symbol)
         if not symbol:
             return False
+        pending_operation = self._planning_membership_visual_operation(symbol)
+        if pending_operation == "add":
+            return True
+        if pending_operation == "remove":
+            return False
         projection = self._chart_buyboard_projection(symbol)
         card = projection.card if projection is not None else None
-        if card is not None:
-            return bool(card.watchlist_member)
+        if (
+            card is not None
+            and card.board_status in {BoardStatus.WATCHLIST, BoardStatus.BUYLIST}
+            and not card.watchlist_member
+        ):
+            return False
         watchlist = self.__dict__.get("watchlist")
         return bool(watchlist is not None and watchlist.get(symbol) is not None)
 
@@ -132,6 +261,7 @@ class WatchlistActionsMixin:
         projection = self._chart_buyboard_projection(symbol) if symbol else None
         card = projection.card if projection is not None else None
         in_watchlist = self._tradingview_symbol_in_watchlist(symbol)
+        pending_operation = self._planning_membership_visual_operation(symbol)
         if card is None:
             supports_watchlist_toggle = True
         elif in_watchlist:
@@ -147,13 +277,21 @@ class WatchlistActionsMixin:
                 card.board_status in {BoardStatus.WATCHLIST, BoardStatus.BUYLIST}
                 and is_passive_planning_card(card)
             )
-        if in_watchlist:
+        if pending_operation == "add":
+            button.setText("Added to Watchlist (Saving…)")
+        elif pending_operation == "remove":
+            button.setText("Removed from Watchlist (Saving…)")
+        elif in_watchlist:
             button.setText("Remove from Watchlist (W)")
         elif not supports_watchlist_toggle:
             button.setText(f"In {card.board_status.value.replace('_', ' ').title()}")
         else:
             button.setText("Add to Watchlist (W)")
-        button.setEnabled(bool(symbol) and supports_watchlist_toggle)
+        button.setEnabled(
+            bool(symbol)
+            and supports_watchlist_toggle
+            and not pending_operation
+        )
         button.setStyleSheet(
             "background-color: #c0392b; color: white; font-weight: 600;"
             if in_watchlist
@@ -202,7 +340,8 @@ class WatchlistActionsMixin:
             widget.layout().addWidget(button)
         self.tradingview_add_watchlist_button = button
 
-        shortcut = QShortcut(QKeySequence("W"), widget)
+        shortcut_parent = self.__dict__.get("tradingview_chart_view") or widget
+        shortcut = QShortcut(QKeySequence("W"), shortcut_parent)
         shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         shortcut.activated.connect(self.add_current_tradingview_symbol_to_watchlist)
         self.tradingview_watchlist_shortcut = shortcut
@@ -283,6 +422,7 @@ class WatchlistActionsMixin:
         worker.completed.connect(self._on_planning_membership_completed)
         self._planning_membership_worker = worker
         self._planning_membership_pending = True
+        self._apply_optimistic_planning_membership(request)
         self._update_sidebar_watchlist_actions()
         update_queue = getattr(self, "_update_tradingview_queue_btn", None)
         if callable(update_queue):
@@ -290,7 +430,13 @@ class WatchlistActionsMixin:
         track = getattr(self, "_track_worker", None)
         if callable(track):
             track("_planning_membership_worker", worker)
-        worker.start()
+        try:
+            worker.start()
+        except Exception:
+            self._planning_membership_pending = False
+            self._rollback_optimistic_planning_membership()
+            self._update_watchlist_action_surfaces()
+            raise
         return True
 
     def _promote_watchlist_candidate(self, symbol: str) -> bool:
@@ -337,6 +483,7 @@ class WatchlistActionsMixin:
             result
         )
         if succeeded:
+            self.__dict__.pop("_planning_membership_optimistic_state", None)
             symbol = outcome.request.symbol
             if outcome.request.operation == "add":
                 completed_item = outcome.request.watchlist.get(symbol)
@@ -351,16 +498,14 @@ class WatchlistActionsMixin:
                     self.buylist_manager.add(copy.deepcopy(completed_item))
             elif outcome.request.operation == "remove":
                 self.watchlist.remove(symbol)
+            self._apply_confirmed_planning_card(getattr(result, "card", None))
             save = getattr(self, "_save_state", None)
             if callable(save):
                 save()
-            selected_source = {
-                "type": "buylist" if outcome.request.operation == "promote" else "watchlist"
-            }
-            refresh_sidebar = getattr(self, "refresh_sidebar_sources", None)
-            if callable(refresh_sidebar):
-                refresh_sidebar(selected_source=selected_source)
-            self._refresh_watchlist_symbol_navigation()
+            # Preserve the source and active tab the operator is already
+            # using. The local optimistic refresh has already painted the
+            # membership result without redirecting navigation.
+            self._update_watchlist_action_surfaces()
             refresh_board = getattr(self, "refresh_buyboard", None)
             if callable(refresh_board):
                 refresh_board()
@@ -379,6 +524,8 @@ class WatchlistActionsMixin:
                 prefix = f"[{source}] " if source else "[Watchlist] "
                 append_log(f"{prefix}{verb}: {outcome.request.symbol}.")
         else:
+            self._rollback_optimistic_planning_membership()
+            self._update_watchlist_action_surfaces()
             message = outcome.error or str(
                 getattr(result, "message", "Watchlist membership was not changed.")
             )
@@ -424,13 +571,14 @@ class WatchlistActionsMixin:
             card is not None
             and card.board_status == BoardStatus.WATCHLIST
             and card.watchlist_member
+            and watch_item is not None
         )
         if card is not None and card.board_status == BoardStatus.BUYLIST:
             if not is_passive_planning_card(card):
                 QMessageBox.warning(
                     self,
                     "Active position or order",
-                    f"{symbol} has active broker/order state and cannot move to Watchlist.",
+                    f"{symbol} has active broker/order state and cannot be removed from Buylist.",
                 )
                 return
             payload = card_drag_payload(projection)
@@ -440,7 +588,7 @@ class WatchlistActionsMixin:
             ):
                 append_log = getattr(self, "append_log", None)
                 if callable(append_log):
-                    append_log(f"[Chart] Requested move to Watchlist for {symbol}.")
+                    append_log(f"[Chart] Requested removal from Buylist for {symbol}.")
             return
         if card is not None and card.board_status != BoardStatus.WATCHLIST:
             # Canonical active state outranks the retained Watchlist mirror.
@@ -452,7 +600,7 @@ class WatchlistActionsMixin:
         if (
             card is not None
             and card.board_status == BoardStatus.WATCHLIST
-            and not card.watchlist_member
+            and (not card.watchlist_member or watch_item is None)
         ):
             QMessageBox.information(
                 self,
@@ -490,15 +638,22 @@ class WatchlistActionsMixin:
             card is not None
             and card.board_status == BoardStatus.WATCHLIST
             and card.watchlist_member
+            and watch_item is not None
         )
         pending = bool(self.__dict__.get("_planning_membership_pending", False))
+        pending_operation = self._planning_membership_visual_operation(symbol)
+        if pending_operation == "promote":
+            button.setText("Added to Buylist (Saving…)")
+            button.setEnabled(False)
+            button.setStyleSheet("background-color: #27ae60; color: white;")
+            return
         if card is not None and card.board_status == BoardStatus.BUYLIST:
             if not is_passive_planning_card(card):
                 button.setText("Position / Order Active")
                 button.setEnabled(False)
                 button.setStyleSheet("")
                 return
-            button.setText("Move to Watchlist (Q)")
+            button.setText("Remove from Buylist (Q)")
             button.setEnabled(not pending)
             button.setStyleSheet(
                 "background-color: #c0392b; color: white; font-weight: 600;"
@@ -512,7 +667,7 @@ class WatchlistActionsMixin:
         if (
             card is not None
             and card.board_status == BoardStatus.WATCHLIST
-            and not card.watchlist_member
+            and (not card.watchlist_member or watch_item is None)
         ):
             button.setText("Add to Watchlist First")
             button.setEnabled(False)

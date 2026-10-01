@@ -62,9 +62,18 @@ from src.utils.market_calendar import (
 KST_ZONE = ZoneInfo("Asia/Seoul")
 # KIS WS0 timestamps are whole-second values.  These reviewed limits are for
 # the regular-session-only measurement window and do not relax the separate
-# 2-second execution-freshness fence.
-GATE2_RECEIVE_LAG_P95_LIMIT_MS = 1_500.0
+# execution-freshness fence applied to every live entry decision.  The p95
+# permits the owner's reviewed two-second feed tolerance; the p99 still
+# catches a materially degraded tail.
+GATE2_RECEIVE_LAG_P95_LIMIT_MS = 2_000.0
 GATE2_RECEIVE_LAG_P99_LIMIT_MS = 3_500.0
+# Broker timestamps are whole-second wall-clock values, so the qualification
+# host must remain closely disciplined to an independent NTP source.  A
+# service-level "synchronized" flag alone is insufficient: Windows can retain
+# that state while its special-poll interval allows material clock drift.
+GATE2_CLOCK_OFFSET_LIMIT_MS = 50.0
+GATE2_CLOCK_OFFSET_SAMPLE_COUNT = 5
+GATE2_CLOCK_REFERENCE = "time.cloudflare.com"
 # Structural continuity targets 100%.  The reviewed Gate-2 floor tolerates at
 # most five unavailable samples per 10,000 observed samples (99.95%) while
 # execution readiness remains independently fail-closed on every bad sample.
@@ -144,17 +153,62 @@ def clock_synchronization_status() -> dict[str, object]:
         f"0x{reference_match.group(1).upper()}" if reference_match else None
     )
     leap_indicator = int(leap_match.group(1)) if leap_match else None
-    synchronized = bool(
+    service_synchronized = bool(
         completed.returncode == 0
         and reference_id not in {None, "0x00000000"}
         and leap_indicator == 0
     )
+    offsets_ms: list[float] = []
+    if service_synchronized:
+        try:
+            offset_probe = subprocess.run(
+                [
+                    "w32tm",
+                    "/stripchart",
+                    f"/computer:{GATE2_CLOCK_REFERENCE}",
+                    "/dataonly",
+                    f"/samples:{GATE2_CLOCK_OFFSET_SAMPLE_COUNT}",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError):
+            offset_probe = None
+        if offset_probe is not None and offset_probe.returncode == 0:
+            for line in (offset_probe.stdout or "").splitlines():
+                match = re.search(r"([+-]\d+(?:[.,]\d+)?)s\s*$", line.strip())
+                if match:
+                    offsets_ms.append(
+                        abs(float(match.group(1).replace(",", "."))) * 1_000.0
+                    )
+
+    offset_abs_max_ms = max(offsets_ms) if offsets_ms else None
+    offset_verified = bool(
+        len(offsets_ms) == GATE2_CLOCK_OFFSET_SAMPLE_COUNT
+        and offset_abs_max_ms is not None
+        and offset_abs_max_ms <= GATE2_CLOCK_OFFSET_LIMIT_MS
+    )
+    synchronized = bool(service_synchronized and offset_verified)
+    if not service_synchronized:
+        reason = "windows_time_unsynchronized"
+    elif len(offsets_ms) != GATE2_CLOCK_OFFSET_SAMPLE_COUNT:
+        reason = "windows_time_offset_unavailable"
+    elif not offset_verified:
+        reason = "windows_time_offset_exceeds_limit"
+    else:
+        reason = "synchronized"
     return {
         "checked": True,
         "synchronized": synchronized,
         "reference_id": reference_id,
         "leap_indicator": leap_indicator,
-        "reason": "synchronized" if synchronized else "windows_time_unsynchronized",
+        "offset_reference": GATE2_CLOCK_REFERENCE,
+        "offset_sample_count": len(offsets_ms),
+        "offset_abs_max_ms": offset_abs_max_ms,
+        "offset_limit_ms": GATE2_CLOCK_OFFSET_LIMIT_MS,
+        "reason": reason,
     }
 
 
@@ -240,6 +294,7 @@ class Gate2Evidence:
     deadlock_count: int = 0
     watchdog_max_gap_seconds: float = 0.0
     watchdog_timeout_seconds: float = 0.0
+    watchdog_stalls: list[dict[str, object]] = field(default_factory=list)
     continuity_sample_count: int = 0
     continuity_unexpected_unready_count: int = 0
     continuity_started_at: str = ""
@@ -598,7 +653,7 @@ def build_report(evidence: Gate2Evidence) -> dict:
         "receive_lag_p95_ms": _metric(
             value=receive.get("p95", 0.0),
             threshold=(
-                "regular-session broker-event receive lag < "
+                "regular-session broker-event receive lag <= "
                 f"{GATE2_RECEIVE_LAG_P95_LIMIT_MS:g}ms"
             ),
             passed=(
@@ -606,7 +661,7 @@ def build_report(evidence: Gate2Evidence) -> dict:
                 and evidence.latency_window_start_delay_seconds
                 <= 3.0 + permitted_late_seconds
                 and receive.get("count", 0) > 0
-                and receive.get("p95", 0.0) < GATE2_RECEIVE_LAG_P95_LIMIT_MS
+                and receive.get("p95", 0.0) <= GATE2_RECEIVE_LAG_P95_LIMIT_MS
             ),
         ),
         "receive_lag_p99_ms": _metric(
@@ -782,6 +837,7 @@ def build_report(evidence: Gate2Evidence) -> dict:
         "watchdog_cycles": evidence.watchdog_cycles,
         "watchdog_max_gap_seconds": evidence.watchdog_max_gap_seconds,
         "watchdog_timeout_seconds": evidence.watchdog_timeout_seconds,
+        "watchdog_stalls": list(evidence.watchdog_stalls),
         "continuity_sample_count": evidence.continuity_sample_count,
         "continuity_started_at": evidence.continuity_started_at,
         "continuity_start_delay_seconds": evidence.continuity_start_delay_seconds,
@@ -1290,6 +1346,7 @@ class _ProgressWatchdog:
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._alarm = False
+        self._last_progress_stage = "initialized"
         self._thread = threading.Thread(
             target=self._run, name="Gate2ProgressWatchdog", daemon=True
         )
@@ -1298,9 +1355,10 @@ class _ProgressWatchdog:
     def start(self) -> None:
         self._thread.start()
 
-    def progress(self) -> None:
+    def progress(self, stage: str = "sampling_loop") -> None:
         with self._lock:
             self._last_progress = wall_time.monotonic()
+            self._last_progress_stage = str(stage or "sampling_loop")
             self._alarm = False
 
     def stop(self) -> None:
@@ -1317,6 +1375,13 @@ class _ProgressWatchdog:
                 )
                 if gap > self._timeout and not self._alarm:
                     self._evidence.deadlock_count += 1
+                    self._evidence.watchdog_stalls.append(
+                        {
+                            "detected_at": _iso(datetime.now(timezone.utc)),
+                            "gap_seconds": round(gap, 6),
+                            "last_progress_stage": self._last_progress_stage,
+                        }
+                    )
                     self._alarm = True
 
 
@@ -1453,6 +1518,7 @@ def build_live_status(
             "deadlocks": evidence.deadlock_count,
             "max_gap_seconds": evidence.watchdog_max_gap_seconds,
             "timeout_seconds": evidence.watchdog_timeout_seconds,
+            "stalls": list(evidence.watchdog_stalls),
         },
         "operator_abort_reasons": list(evidence.operator_abort_reasons),
         "log": {"path": str(log_path), "bytes_written": log_bytes},
@@ -1600,7 +1666,8 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
     clock_status = clock_synchronization_status()
     if not clock_status["synchronized"]:
         raise RuntimeError(
-            "Gate 2 requires a Windows clock synchronized to an NTP source"
+            "Gate 2 requires a Windows clock synchronized and within the "
+            "measured NTP-offset limit"
         )
     capability_manifest = load_verified_capability_manifest(
         args.capability_manifest,
@@ -1837,9 +1904,10 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
                     0.0, (latency_window_started_at - session_open).total_seconds()
                 )
                 latency_window_started = True
+            watchdog.progress("poll_and_sample_started")
             sampled_at = runner.poll_and_sample()
             elapsed = (sampled_at - evidence.started_at).total_seconds()
-            watchdog.progress()
+            watchdog.progress("poll_and_sample_complete")
             frame_ready = all(
                 evidence.frame_counts_by_tr_id.get(tr_id, 0) > 0
                 for tr_id in ("HDFSCNT0", "HDFSASP0")
@@ -1891,7 +1959,9 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
                     log_path=log_path,
                 )
                 last_status_write = monotonic_now
+                watchdog.progress("live_status_write_complete")
             wall_time.sleep(args.poll_seconds)
+            watchdog.progress("loop_sleep_complete")
     except KeyboardInterrupt:
         evidence.operator_abort_reasons.append("operator interrupted soak")
     except Exception as exc:
@@ -1900,7 +1970,7 @@ def run_live_soak(args: argparse.Namespace, root: Path) -> int:
         evidence.ended_at = datetime.now(timezone.utc)
         try:
             runner.poll_and_sample(evidence.ended_at)
-            watchdog.progress()
+            watchdog.progress("final_sample_complete")
             runner.finalize()
         except Exception as exc:
             record_runtime_failure("final_sample", exc)

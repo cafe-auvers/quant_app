@@ -632,6 +632,43 @@ def test_checkpointed_mirror_skips_unchanged_restart_without_row_scan(monkeypatc
     assert second == {"price_history": 0}
 
 
+def test_checkpointed_daily_signatures_use_bounded_symbol_queries(monkeypatch):
+    pc, local, pc_daily, local_daily, _pc_hourly, _local_hourly = _raw_engines()
+    rows = [_daily_bar("A", 1, 100), _daily_bar("B", 2, 200)]
+    for engine, table in ((pc, pc_daily), (local, local_daily)):
+        with engine.begin() as conn:
+            conn.execute(insert(table), rows)
+
+    monkeypatch.setattr(mirror_copy, "CACHE_QUERY_SYMBOL_CHUNK_SIZE", 1)
+    statements = []
+
+    def capture_statement(
+        _conn, _cursor, statement, _parameters, _context, _executemany
+    ):
+        statements.append(" ".join(statement.lower().split()))
+
+    event.listen(pc, "before_cursor_execute", capture_statement)
+    try:
+        written = db_loader.sync_local_mirror_from_pc_checkpointed(
+            pc,
+            local,
+            tables=(("price_history", "date"),),
+        )
+    finally:
+        event.remove(pc, "before_cursor_execute", capture_statement)
+
+    signature_queries = [
+        statement
+        for statement in statements
+        if "count(" in statement
+        and "max(" in statement
+        and "from price_history" in statement
+    ]
+    assert written == {"price_history": 0}
+    assert len(signature_queries) >= 2
+    assert all("where price_history.symbol in" in query for query in signature_queries)
+
+
 def test_checkpointed_mirror_copies_only_new_revision_rows(monkeypatch):
     pc, local, pc_daily, local_daily, _pc_hourly, _local_hourly = _raw_engines()
     shared = _daily_bar("A", 1, 100)

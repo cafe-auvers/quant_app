@@ -29,6 +29,7 @@ from __future__ import annotations
 import inspect
 import math
 from contextlib import nullcontext
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
@@ -68,6 +69,7 @@ from src.services.execution_lease_protocol import ExecutionLease
 from src.services.order_ledger import ORDERS_FILE
 from src.services.order_execution_service import submit_guarded_overseas_order
 from src.services.order_reconciliation import cancel_and_reconcile_order
+from src.utils import market_calendar
 
 
 class BoardCommandRejectedError(RuntimeError):
@@ -835,17 +837,70 @@ def _require_board_action_not_conflicted(engine, command, card) -> List[Executio
     def has_durable_entry_or_position_evidence() -> bool:
         return bool(active_orders or has_durable_execution_evidence(card))
 
+    def order_belongs_to_current_card_cycle(order: ExecutionOrderRecord) -> bool:
+        """Fail closed unless a terminal order clearly predates this cycle.
+
+        Execution orders are an immutable audit ledger, so completed fills
+        from an older position remain queryable after a CLOSED card is
+        restarted.  ``board_status_updated_at`` is advanced by that guarded
+        restart and, together with ``created_at``, forms the durable lower
+        bound for orders that can belong to the current planning cycle.
+        """
+
+        boundaries = []
+        for raw_boundary in (card.created_at, card.board_status_updated_at):
+            try:
+                boundary = (
+                    raw_boundary
+                    if isinstance(raw_boundary, datetime)
+                    else datetime.fromisoformat(
+                        str(raw_boundary or "").replace("Z", "+00:00")
+                    )
+                )
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if boundary.tzinfo is None:
+                boundary = boundary.replace(tzinfo=timezone.utc)
+            boundaries.append(boundary.astimezone(timezone.utc))
+        if not boundaries:
+            return True
+
+        try:
+            prepared_at = datetime.fromisoformat(
+                str(order.prepared_at or "").replace("Z", "+00:00")
+            )
+        except (TypeError, ValueError, OverflowError):
+            return True
+        if prepared_at.tzinfo is None:
+            prepared_at = prepared_at.replace(tzinfo=timezone.utc)
+        # ExecutionOrderRecord.prepared_at is intentionally persisted at
+        # whole-second precision, while card timestamps retain microseconds.
+        # Treat the boundary's entire second as current-cycle time so a fill
+        # created immediately after the card cannot be mistaken for history.
+        cycle_boundary = max(boundaries).replace(microsecond=0)
+        return prepared_at.astimezone(timezone.utc) >= cycle_boundary
+
+    def order_has_current_cycle_fill(order: ExecutionOrderRecord) -> bool:
+        has_fill = bool(
+            max(0, int(order.filled_quantity or 0)) > 0
+            or order.status == ExecutionOrderStatus.FILLED
+        )
+        if not has_fill:
+            return False
+        # Any still-active partial fill is current risk regardless of its
+        # timestamp. Only terminal ledger history can belong to a retired
+        # cycle and be ignored for planning edits.
+        if order.status not in TERMINAL_EXECUTION_ORDER_STATUSES:
+            return True
+        return order_belongs_to_current_card_cycle(order)
+
     def has_confirmed_fill_or_position_evidence() -> bool:
         return bool(
             max(0, int(card.broker_quantity or 0)) > 0
             or max(0, int(card.orderable_quantity or 0)) > 0
             or float(card.average_entry_price or 0.0) > 0
             or card.position_runtime_status != PositionRuntimeStatus.NONE
-            or any(
-                max(0, int(order.filled_quantity or 0)) > 0
-                or order.status == ExecutionOrderStatus.FILLED
-                for order in owned_orders
-            )
+            or any(order_has_current_cycle_fill(order) for order in owned_orders)
         )
 
     if isinstance(command, types.SetBreakoutPrice):
@@ -1120,6 +1175,9 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
         card.breakout_price = float(command.price)
         if card.board_status == BoardStatus.WATCHLIST:
             card.watchlist_member = True
+            card.watchlist_session_date = (
+                market_calendar.current_or_next_nyse_session_date()
+            )
             card.buylist_member = False
         else:
             card.buylist_member = True
@@ -1139,6 +1197,9 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
         card.breakout_price = None
         if card.board_status == BoardStatus.WATCHLIST:
             card.watchlist_member = True
+            card.watchlist_session_date = (
+                market_calendar.current_or_next_nyse_session_date()
+            )
             card.buylist_member = False
         else:
             card.buylist_member = True
@@ -1318,6 +1379,9 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
     if isinstance(command, types.MoveToWatchlist):
         clear_executable_entry_plan()
         card.watchlist_member = True
+        card.watchlist_session_date = (
+            market_calendar.current_or_next_nyse_session_date()
+        )
         card.buylist_member = False
         card.session_date = None
         card.entry_runtime_status = None
@@ -1325,6 +1389,9 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
     elif isinstance(command, types.MoveToBuylist):
         clear_executable_entry_plan()
         card.watchlist_member = True
+        card.watchlist_session_date = (
+            market_calendar.current_or_next_nyse_session_date()
+        )
         card.buylist_member = True
         card.buy_today_note = ""
         card.session_date = None
@@ -1341,9 +1408,7 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
         if context is not None and context.session_date is not None:
             card.session_date = context.session_date
         else:
-            from src.utils.market_calendar import current_or_next_nyse_session_date
-
-            card.session_date = current_or_next_nyse_session_date()
+            card.session_date = market_calendar.current_or_next_nyse_session_date()
         monitoring_command = build_entry_monitoring_command(
             environment=card.environment,
             account_no=card.account_no,
@@ -1490,6 +1555,9 @@ def request_board_action(
                     symbol=command.symbol,
                     board_status=BoardStatus.WATCHLIST,
                     watchlist_member=True,
+                    watchlist_session_date=(
+                        market_calendar.current_or_next_nyse_session_date()
+                    ),
                     buylist_member=False,
                 )
                 _apply_board_mutation(

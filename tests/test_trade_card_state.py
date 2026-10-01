@@ -1,7 +1,7 @@
 """Tests for src.core.trade_card_state.TradeCardState."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import pytest
 
@@ -51,6 +51,8 @@ def test_to_dict_from_dict_round_trip():
         name="Apple Inc.",
         board_status=BoardStatus.OPEN_POSITION,
         previous_board_status=BoardStatus.ENTRY_PENDING,
+        watchlist_member=True,
+        watchlist_session_date=date(2026, 8, 17),
         entry_runtime_status=EntryRuntimeStatus.EXECUTE_READY,
         position_runtime_status=PositionRuntimeStatus.OPEN,
         broker_quantity=100,
@@ -77,6 +79,7 @@ def test_to_dict_from_dict_round_trip():
     assert restored.to_dict() == card.to_dict()
     assert restored.board_status == BoardStatus.OPEN_POSITION
     assert restored.previous_board_status == BoardStatus.ENTRY_PENDING
+    assert restored.watchlist_session_date == date(2026, 8, 17)
     assert restored.entry_runtime_status == EntryRuntimeStatus.EXECUTE_READY
     assert restored.stop_type == StopType.ORB_LOW
     assert restored.pending_stop_type == StopType.MANUAL_PRICE

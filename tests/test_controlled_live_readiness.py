@@ -60,7 +60,7 @@ def configured_preflight(monkeypatch):
         configure_desired_channels=lambda **channels: None,
         subscription_capacity_snapshot=lambda: SimpleNamespace(reconnect_replay_count=0, total_capacity=41),
     ))
-    monkeypatch.setattr(preflight, "init_mysql_engine", lambda **kwargs: SimpleNamespace(
+    monkeypatch.setattr(preflight, "init_coordination_engine", lambda **kwargs: SimpleNamespace(
         connect=lambda: nullcontext(SimpleNamespace(execute=lambda query: None)),
         dispose=lambda: None,
     ))
@@ -106,7 +106,7 @@ def test_read_only_startup_retains_release_and_database_failures(configured_pref
     monkeypatch.setattr(preflight, "current_release_identity", lambda: SimpleNamespace(
         issues=("KIS_RUNTIME_COMMIT_SHA does not match repository HEAD",),
     ))
-    monkeypatch.setattr(preflight, "init_mysql_engine", lambda **kwargs: None)
+    monkeypatch.setattr(preflight, "init_coordination_engine", lambda **kwargs: None)
     report_path = tmp_path / "preflight.json"
 
     assert preflight.main(["--startup", "--json-output", str(report_path)]) == 1

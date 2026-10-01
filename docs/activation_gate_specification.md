@@ -275,10 +275,16 @@ AND independent review = APPROVED
 | Duplicate-subscription corruption | 0 |
 | Missed synthetic stop breaches | 0 |
 | Queue/accumulator deadlocks | 0 |
-| Regular-session receive-lag p95 | Less than 1.5 seconds |
+| Regular-session receive-lag p95 | At most 2 seconds |
 | Regular-session receive-lag p99 | Less than 3.5 seconds |
 | Secret or approval-key leaks | 0 |
 | Broker mutation attempts | 0 from an initialized final-boundary audit |
+
+The two-second p95 allowance reflects KIS WS0's whole-second event timestamps
+and the owner's reviewed strategy tolerance. It does not weaken the live
+per-decision stale-data fence: an entry still fails closed whenever its current
+broker event or local receive timestamp is outside the configured freshness
+budget.
 
 Structural continuity measures the connected, ACKed, capacity-valid channel,
 not the validity of every individual broker timestamp. Rejected timestamp or

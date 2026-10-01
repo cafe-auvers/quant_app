@@ -207,6 +207,9 @@ class TradeCardState:
 
     # Membership metadata
     watchlist_member: bool = False
+    # The dated Watchlist session this membership belongs to. Historical
+    # membership must never repopulate a later session's fresh watchlist.
+    watchlist_session_date: Optional[date] = None
     buylist_member: bool = False
     return_to_buylist_after_close: bool = False
     # Durable, trader-facing explanation for the most recent automatic
@@ -380,6 +383,9 @@ class TradeCardState:
             )
         self.board_status_updated_at = _parse_timestamp(self.board_status_updated_at)
         self.session_date = _parse_optional_date(self.session_date)
+        self.watchlist_session_date = _parse_optional_date(
+            self.watchlist_session_date
+        )
         self.last_buy_today_session_date = _parse_optional_date(
             self.last_buy_today_session_date
         )
@@ -582,6 +588,11 @@ class TradeCardState:
                 self.session_date.isoformat() if self.session_date else None
             ),
             "watchlist_member": self.watchlist_member,
+            "watchlist_session_date": (
+                self.watchlist_session_date.isoformat()
+                if self.watchlist_session_date
+                else None
+            ),
             "buylist_member": self.buylist_member,
             "return_to_buylist_after_close": self.return_to_buylist_after_close,
             "buy_today_note": self.buy_today_note,
@@ -717,6 +728,7 @@ class TradeCardState:
             board_status_updated_at=data.get("board_status_updated_at"),
             session_date=data.get("session_date"),
             watchlist_member=bool(data.get("watchlist_member", False)),
+            watchlist_session_date=data.get("watchlist_session_date"),
             buylist_member=bool(data.get("buylist_member", False)),
             return_to_buylist_after_close=bool(
                 data.get("return_to_buylist_after_close", False)

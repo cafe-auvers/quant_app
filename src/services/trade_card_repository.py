@@ -644,6 +644,7 @@ def build_trade_card_migration(
         str(getattr(watch_item, "symbol", "")).upper()
         for watch_item in getattr(watchlist, "items", [])
     }
+    watchlist_session_date = getattr(watchlist, "active_session_date", None)
 
     report = MigrationReport()
     for item in buylist_manager.items:
@@ -663,6 +664,11 @@ def build_trade_card_migration(
             name=item.name,
             board_status=board_status,
             watchlist_member=item.symbol.upper() in watchlist_symbols,
+            watchlist_session_date=(
+                watchlist_session_date
+                if item.symbol.upper() in watchlist_symbols
+                else None
+            ),
             buylist_member=True,
             return_to_buylist_after_close=False,
             breakout_price=item.breakout_price,

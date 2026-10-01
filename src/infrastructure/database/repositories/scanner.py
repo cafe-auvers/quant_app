@@ -12,11 +12,15 @@ from sqlalchemy import (Boolean, Float, Integer, MetaData, Numeric, String,
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
-from src.utils.market_calendar import expected_latest_market_data_date
+from src.utils.market_calendar import (
+    expected_latest_market_data_date,
+    is_nyse_trading_day,
+)
 
 from ..formatting import _format_elapsed, _format_eta
 from ..schema import (_ensure_scanner_metric_snapshots_table,
                       _ensure_scanner_metrics_table,
+                      _get_scanner_metric_snapshots_table,
                       _get_scanner_metrics_table,
                       _get_stock_profiles_table)
 from ..settings import (REFERENCE_SYMBOL, SCANNER_METRIC_WRITE_CHUNK_SIZE,
@@ -431,6 +435,72 @@ def _scanner_rows_to_dicts(table: Table, rows: list) -> List[dict]:
     return results
 
 
+def _latest_completed_scanner_snapshot_date(
+    engine: Engine,
+    requested_date: dt.datetime,
+) -> Optional[dt.datetime]:
+    """Return the newest completed snapshot no later than ``requested_date``.
+
+    The completion table is deliberately tiny and keyed by date, so this
+    lookup stays fast even when the metrics table contains many snapshots.
+    Older databases/tests without the completion table retain exact-date
+    behavior and are handled by the caller.
+    """
+
+    metadata = MetaData()
+    snapshots_table = _get_scanner_metric_snapshots_table(metadata)
+    statement = (
+        select(snapshots_table.c.snapshot_date)
+        .where(
+            snapshots_table.c.snapshot_date <= requested_date,
+            snapshots_table.c.metric_count > 0,
+        )
+        .order_by(snapshots_table.c.snapshot_date.desc())
+        .limit(1)
+    )
+    try:
+        with engine.connect() as conn:
+            value = conn.execute(statement).scalar_one_or_none()
+    except SQLAlchemyError:
+        return None
+    if value is None:
+        return None
+    if isinstance(value, dt.date) and not isinstance(value, dt.datetime):
+        return dt.datetime.combine(value, dt.time.min)
+    return value
+
+
+def _scanner_snapshot_metadata(
+    actual_date: Optional[dt.datetime],
+    expected_date: dt.datetime,
+) -> dict:
+    """Build explicit freshness metadata for scanner results."""
+
+    expected_day = expected_date.date()
+    if actual_date is None:
+        return {
+            "snapshot_date": None,
+            "expected_snapshot_date": expected_day.isoformat(),
+            "stale_market_sessions": None,
+            "stale_calendar_days": None,
+        }
+
+    actual_day = actual_date.date()
+    calendar_days = max(0, (expected_day - actual_day).days)
+    market_sessions = 0
+    candidate = actual_day + dt.timedelta(days=1)
+    while candidate <= expected_day:
+        if is_nyse_trading_day(candidate):
+            market_sessions += 1
+        candidate += dt.timedelta(days=1)
+    return {
+        "snapshot_date": actual_day.isoformat(),
+        "expected_snapshot_date": expected_day.isoformat(),
+        "stale_market_sessions": market_sessions,
+        "stale_calendar_days": calendar_days,
+    }
+
+
 def query_scanner_metrics_with_funnel(
     tickers: List[str],
     engine: Engine,
@@ -442,7 +512,16 @@ def query_scanner_metrics_with_funnel(
     if not symbols:
         return [], {"universe_count": 0, "rule_counts": []}
 
-    snapshot_date = date or scanner_metrics_snapshot_date()
+    requested_snapshot_date = date or scanner_metrics_snapshot_date()
+    completed_snapshot_date = _latest_completed_scanner_snapshot_date(
+        engine,
+        requested_snapshot_date,
+    )
+    # A completed older snapshot is preferable to an empty current-date scan.
+    # Falling back only to a completion marker ensures partially-written metric
+    # generations are never shown. Exact-date rows remain supported for legacy
+    # databases and unit fixtures that predate completion markers.
+    snapshot_date = completed_snapshot_date or requested_snapshot_date
     metadata = MetaData()
     table = _get_scanner_metrics_table(metadata)
     uses_name = any(
@@ -478,14 +557,15 @@ def query_scanner_metrics_with_funnel(
     universe_count = 0
     rule_counts = [0] * len(rule_expressions)
     rows = []
-    query_chunk_size = (
-        len(symbols)
-        if getattr(engine.dialect, "name", "") == "mysql"
-        else SCANNER_QUERY_SYMBOL_CHUNK_SIZE
-    )
     try:
         with engine.connect() as conn:
-            for chunk in _record_chunks(symbols, query_chunk_size):
+            # Keep each aggregate and result query bounded on every backend.
+            # A single full-universe MySQL ``IN`` query can exceed the remote
+            # connection's read timeout even though the same indexed query is
+            # fast in smaller chunks.
+            for chunk in _record_chunks(
+                symbols, SCANNER_QUERY_SYMBOL_CHUNK_SIZE
+            ):
                 base_conditions = (
                     table.c.symbol.in_(chunk),
                     table.c.date == snapshot_date,
@@ -533,9 +613,14 @@ def query_scanner_metrics_with_funnel(
         for result, row in zip(results, rows):
             result["name"] = row[name_index]
 
+    actual_snapshot_date = snapshot_date if universe_count > 0 else None
     return results, {
         "universe_count": universe_count,
         "rule_counts": rule_counts,
+        **_scanner_snapshot_metadata(
+            actual_snapshot_date,
+            requested_snapshot_date,
+        ),
     }
 
 

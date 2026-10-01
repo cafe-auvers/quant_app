@@ -16,7 +16,7 @@ from activation_gates.requalification import normalized_changed_paths
 from gate4.capabilities import load_verified_execution_capabilities
 from gate4.collector import Gate4EvidenceCollector
 from gate4.reporting import build_report
-from src.infrastructure.database.engine import init_mysql_engine
+from src.infrastructure.database.coordination_engine import init_coordination_engine
 from src.services.state_sync import get_live_trading_control
 from src.utils.market_calendar import US_MARKET_ZONE, is_nyse_trading_day
 
@@ -152,7 +152,7 @@ def start_session(args: argparse.Namespace) -> int:
     if any(event.payload.get("session_date") == session_day.isoformat() for event in events):
         raise RuntimeError("Gate-4 session already has evidence for this date")
 
-    engine = init_mysql_engine(ensure_schema=False)
+    engine = init_coordination_engine(ensure_schema=False)
     if engine is None:
         raise RuntimeError("Gate-4 session start requires canonical MySQL")
     try:

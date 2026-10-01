@@ -22,6 +22,7 @@ from src.core.trade_card_state import (
     is_passive_planning_card,
 )
 from src.core.watchlist import BuylistItem, WatchlistItem
+from src.utils.market_calendar import current_or_next_nyse_session_date
 from src.services import trade_card_repository
 from src.services.buylist_membership_service import (
     BuylistMembershipSyncResult,
@@ -178,6 +179,21 @@ def _buylist_from_watchlist(
     )
 
 
+def build_passive_buylist_preview(
+    item: WatchlistItem,
+    *,
+    account_no: str,
+    buffer_pct: float = 0.001,
+) -> BuylistItem:
+    """Build the local-only Buylist row shown while canonical save is pending."""
+
+    return _buylist_from_watchlist(
+        copy.deepcopy(item),
+        account_no=account_no,
+        buffer_pct=buffer_pct,
+    )
+
+
 def _watchlist_from_buylist(item, *, card: Optional[TradeCardState] = None) -> WatchlistItem:
     breakout = (
         getattr(card, "breakout_price", None)
@@ -231,6 +247,9 @@ def add_watchlist_candidate(
     """Add one passive Watchlist candidate, canonical first and local second."""
 
     normalized_symbol = _symbol(symbol)
+    watchlist_session_date = getattr(watchlist, "active_session_date", None)
+    if watchlist_session_date is None:
+        watchlist_session_date = current_or_next_nyse_session_date()
     account_no = _account(default_account_no)
     if not normalized_symbol:
         raise PlanningMembershipError("A symbol is required")
@@ -251,6 +270,7 @@ def add_watchlist_candidate(
                 name=str(name or normalized_symbol),
                 board_status=BoardStatus.WATCHLIST,
                 watchlist_member=True,
+                watchlist_session_date=watchlist_session_date,
                 buylist_member=False,
                 breakout_price=_optional_positive(breakout_price),
                 buffer_pct=min(1.0, _finite_nonnegative(buffer_pct, 0.001)),
@@ -270,6 +290,7 @@ def add_watchlist_candidate(
                 )
             updated = copy.deepcopy(current)
             updated.watchlist_member = True
+            updated.watchlist_session_date = watchlist_session_date
             updated.name = str(name or updated.name or normalized_symbol)
             if breakout_price is not None:
                 updated.breakout_price = _optional_positive(breakout_price)
@@ -423,6 +444,7 @@ def remove_watchlist_candidate(
                 )
             archived = copy.deepcopy(current)
             archived.watchlist_member = False
+            archived.watchlist_session_date = None
             if current.board_status == BoardStatus.WATCHLIST:
                 archived.buylist_member = False
                 archived.breakout_price = None
@@ -468,9 +490,23 @@ def sync_legacy_planning_membership_from_card(
         return PlanningMembershipResult("ignored_non_passive", symbol, card=card)
     watch_item = watchlist.get(symbol)
     buy_item = buylist_manager.get(symbol, "PROD")
+    active_watchlist_session = getattr(watchlist, "active_session_date", None)
+    card_watchlist_session = getattr(card, "watchlist_session_date", None)
+    if card_watchlist_session is None:
+        card_watchlist_session = current_or_next_nyse_session_date(
+            getattr(card, "created_at", None)
+        )
+    card_watchlist_is_current = bool(
+        card.watchlist_member
+        and active_watchlist_session is not None
+        and (
+            watch_item is not None
+            or card_watchlist_session == active_watchlist_session
+        )
+    )
 
     if card.board_status == BoardStatus.WATCHLIST:
-        if not card.watchlist_member:
+        if not card_watchlist_is_current:
             changed = bool(watchlist.remove(symbol))
             if buy_item is not None and _passive_buylist_item(buy_item):
                 changed = bool(buylist_manager.remove(symbol, "PROD")) or changed
@@ -484,6 +520,7 @@ def sync_legacy_planning_membership_from_card(
         converted = _watchlist_from_buylist(source, card=card)
         item_changed = False
         if watch_item is None:
+            converted.added_date = datetime.now(timezone.utc)
             watchlist.items.append(converted)
             item_changed = True
         else:
@@ -539,9 +576,10 @@ def sync_legacy_planning_membership_from_card(
             )
             item_changed = before != after
         watch_changed = False
-        if card.watchlist_member:
+        if card_watchlist_is_current:
             converted = _watchlist_from_buylist(buy_item, card=card)
             if watch_item is None:
+                converted.added_date = datetime.now(timezone.utc)
                 watchlist.items.append(converted)
                 watch_changed = True
             else:

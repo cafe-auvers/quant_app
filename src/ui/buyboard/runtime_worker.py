@@ -359,6 +359,12 @@ class BuyboardRuntimeWorker(QThread):
         )
         self._orb_evaluator = TradeCardOrbEvaluator()
         self._stop_requested = False
+        # An internal worker recomposition (for example, standby -> owner or
+        # an execution-queue reload) is not an application/session shutdown.
+        # The MainWindow explicitly suppresses Gate-4 finalization for those
+        # restarts so the replacement worker can continue the same supervised
+        # journal window.
+        self._finalize_gate4_session_on_shutdown = True
         # Directly-driven workers in unit/diagnostic contexts retain the
         # historical default. ``run`` closes this gate before startup and
         # only reopens it at ACTIVE.
@@ -498,14 +504,19 @@ class BuyboardRuntimeWorker(QThread):
 
     # -- lifecycle ----------------------------------------------------------
 
-    def request_stop(self) -> None:
+    def request_stop(self, *, finalize_gate4_session: bool = True) -> None:
         """Thread-safe: ask the loop to exit on its next wait boundary.
         Does not join -- callers that need to block until the thread has
         actually exited should follow this with ``QThread.wait()``.
+
+        ``finalize_gate4_session`` must be false only for an in-process worker
+        replacement. A real application shutdown retains the default and
+        closes the supervised Gate-4 session after final reconciliation.
         """
         # First close the mutation gate.  The loop may still be between
         # cycles, but no later cycle can derive/submit another command.
         self._accepting_commands = False
+        self._finalize_gate4_session_on_shutdown = bool(finalize_gate4_session)
         self._stop_requested = True
 
     def _set_device_state(
@@ -1368,25 +1379,26 @@ class BuyboardRuntimeWorker(QThread):
             except Exception as exc:
                 self.shutdown_errors.append(f"market-data close: {exc}")
         self.shutdown_prepared = not self.shutdown_errors
-        try:
-            from gate4.runtime_observer import observe_gate4_event
+        if self._finalize_gate4_session_on_shutdown:
+            try:
+                from gate4.runtime_observer import observe_gate4_event
 
-            observe_gate4_event(
-                "FINAL_RECONCILIATION",
-                matches_broker=bool(
-                    self.startup_reconciliation_complete
-                    and not self.startup_reconciliation_errors
-                    and not self.shutdown_errors
-                ),
-            )
-            observe_gate4_event(
-                "SESSION_ENDED",
-                supervised=True,
-                clean_shutdown=not self.shutdown_errors,
-            )
-        except Exception as exc:
-            self.shutdown_errors.append(f"Gate-4 evidence: {exc}")
-            self.shutdown_prepared = False
+                observe_gate4_event(
+                    "FINAL_RECONCILIATION",
+                    matches_broker=bool(
+                        self.startup_reconciliation_complete
+                        and not self.startup_reconciliation_errors
+                        and not self.shutdown_errors
+                    ),
+                )
+                observe_gate4_event(
+                    "SESSION_ENDED",
+                    supervised=True,
+                    clean_shutdown=not self.shutdown_errors,
+                )
+            except Exception as exc:
+                self.shutdown_errors.append(f"Gate-4 evidence: {exc}")
+                self.shutdown_prepared = False
         try:
             self._set_device_state(
                 RuntimeDeviceState.STOPPED if self.shutdown_prepared else RuntimeDeviceState.FAILED

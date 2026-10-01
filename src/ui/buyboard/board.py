@@ -1176,7 +1176,7 @@ def _handle_card_context_menu(main_window, payload: dict, global_pos) -> None:
             actions["rejected_orb_combinations"] = menu.addAction(
                 "Rejected ORB Combinations..."
             )
-        actions["move_watchlist"] = menu.addAction("Move to Watchlist")
+        actions["remove_buylist"] = menu.addAction("Remove from Buylist")
         menu.addSeparator()
     elif card.board_status == BoardStatus.BUY_TODAY:
         actions["orb_combinations"] = menu.addAction("ORB Combinations...")
@@ -1227,7 +1227,7 @@ def _handle_card_context_menu(main_window, payload: dict, global_pos) -> None:
         )
     elif chosen is actions.get("rejected_orb_combinations"):
         _show_rejected_orb_combinations(main_window, card)
-    elif chosen is actions.get("move_watchlist"):
+    elif chosen is actions.get("remove_buylist"):
         command = MoveToWatchlist(**common)
         main_window._buyboard_dispatch_command(
             command, interaction_fingerprint=interaction_fingerprint

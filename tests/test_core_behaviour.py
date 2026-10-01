@@ -543,6 +543,66 @@ def test_watchlist_and_trade_plan_round_trip():
     assert restored_manager.get_active_plans()[0].symbol == "MSFT"
 
 
+def test_legacy_watchlist_is_partitioned_by_close_to_close_session():
+    watchlist = Watchlist.from_dict(
+        {
+            "items": [
+                {
+                    "symbol": "AAPL",
+                    "name": "Apple",
+                    "added_date": "2026-09-29T19:00:00+00:00",
+                },
+                {
+                    "symbol": "MSFT",
+                    "name": "Microsoft",
+                    "added_date": "2026-09-29T20:01:00+00:00",
+                },
+            ]
+        },
+        current_session_date=dt.date(2026, 9, 30),
+    )
+
+    assert [item.symbol for item in watchlist.items] == ["MSFT"]
+    historical = watchlist.items_for_session(dt.date(2026, 9, 29))
+    assert [item.symbol for item in historical] == ["AAPL"]
+
+    historical[0].name = "Changed outside the archive"
+    assert watchlist.items_for_session(dt.date(2026, 9, 29))[0].name == "Apple"
+
+
+def test_dated_watchlist_round_trip_retains_history_and_legacy_current_items():
+    watchlist = Watchlist.from_dict(
+        {
+            "items": [
+                {
+                    "symbol": "AAPL",
+                    "name": "Apple",
+                    "added_date": "2026-09-29T19:00:00+00:00",
+                }
+            ]
+        },
+        current_session_date=dt.date(2026, 9, 29),
+    )
+    watchlist._current_session_date_override = dt.date(2026, 9, 30)
+    watchlist.add("MSFT", "Microsoft")
+
+    payload = watchlist.to_dict()
+    restored = Watchlist.from_dict(
+        payload,
+        current_session_date=dt.date(2026, 9, 30),
+    )
+
+    assert payload["schema_version"] == 2
+    assert payload["session_date_convention"] == "nyse_close_to_close"
+    assert [item["symbol"] for item in payload["items"]] == ["MSFT"]
+    assert set(payload["sessions"]) == {"2026-09-29", "2026-09-30"}
+    assert [item.symbol for item in restored.items] == ["MSFT"]
+    assert [
+        item.symbol
+        for item in restored.items_for_session(dt.date(2026, 9, 29))
+    ] == ["AAPL"]
+
+
 def test_storage_handles_missing_and_malformed_json(tmp_path: Path):
     missing_path = tmp_path / "missing.json"
     assert load_json(missing_path, {"items": []}) == {"items": []}

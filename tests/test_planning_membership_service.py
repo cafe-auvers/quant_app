@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import create_engine
@@ -1139,6 +1139,49 @@ def test_buylist_sync_retains_overlapping_watchlist_mirror():
     assert watchlist.get("AAPL") is not None
     assert watchlist.get("AAPL").breakout_price == 101.0
     assert second.changed is False
+
+
+def test_expired_canonical_watchlist_membership_does_not_seed_new_session():
+    watchlist = Watchlist(current_session_date=date(2026, 9, 30))
+    buylist = BuylistManager()
+    card = TradeCardState(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        name="Apple",
+        board_status=BoardStatus.WATCHLIST,
+        watchlist_member=True,
+        watchlist_session_date=date(2026, 9, 29),
+        created_at=datetime(2026, 9, 29, 18, 0, tzinfo=timezone.utc),
+    )
+
+    result = sync_legacy_planning_membership_from_card(
+        watchlist, buylist, card
+    )
+
+    assert result.changed is False
+    assert watchlist.get("AAPL") is None
+
+
+def test_current_canonical_watchlist_membership_can_recover_current_mirror():
+    watchlist = Watchlist(current_session_date=date(2026, 9, 30))
+    buylist = BuylistManager()
+    card = TradeCardState(
+        environment="PROD",
+        account_no="1",
+        symbol="AAPL",
+        name="Apple",
+        board_status=BoardStatus.WATCHLIST,
+        watchlist_member=True,
+        watchlist_session_date=date(2026, 9, 30),
+    )
+
+    result = sync_legacy_planning_membership_from_card(
+        watchlist, buylist, card
+    )
+
+    assert result.action == "synced_watchlist"
+    assert watchlist.get("AAPL") is not None
 
 
 def test_sync_ignores_nonplanning_card_and_keeps_local_state():

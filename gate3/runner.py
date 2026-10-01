@@ -8,7 +8,9 @@ import ctypes
 from decimal import Decimal, ROUND_HALF_UP
 import hashlib
 import json
+import queue
 import subprocess
+import threading
 import time
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -394,6 +396,20 @@ class CombinedGate3Observer:
         self.runtime_errors: list[str] = []
         self.observation_failed = False
         self.finished = False
+        self._observer_lock = threading.Lock()
+        self._quote_queue: queue.Queue[tuple[QuoteSnapshot, ...]] = queue.Queue(
+            maxsize=4_096
+        )
+        self._observer_stop = threading.Event()
+        self._enqueued_quote_count = 0
+        self._processed_quote_count = 0
+        self._max_queue_depth = 0
+        self._observer_thread = threading.Thread(
+            target=self._run_observer,
+            name="Gate3CombinedObserver",
+            daemon=True,
+        )
+        self._observer_thread.start()
 
     @staticmethod
     def _error_fingerprint(stage: str, exc: BaseException) -> str:
@@ -404,14 +420,88 @@ class CombinedGate3Observer:
         ).hexdigest()
         return f"{stage}:{type(exc).__name__}:{digest}"
 
-    def observe(self, quotes: Sequence[QuoteSnapshot]) -> None:
-        if self.finished or self.observation_failed:
+    def _record_observer_failure(self, stage: str, exc: BaseException) -> None:
+        fingerprint = self._error_fingerprint(stage, exc)
+        lock = getattr(self, "_observer_lock", None)
+        if lock is None:
+            self.runtime_errors.append(fingerprint)
+            self.observation_failed = True
             return
+        with lock:
+            if fingerprint not in self.runtime_errors:
+                self.runtime_errors.append(fingerprint)
+            self.observation_failed = True
+
+    def _evaluate_quotes(self, quotes: Sequence[QuoteSnapshot]) -> None:
         try:
             self.runtime.evaluate(quotes)
         except Exception as exc:
-            self.runtime_errors.append(self._error_fingerprint("observe", exc))
-            self.observation_failed = True
+            self._record_observer_failure("observe", exc)
+
+    def _run_observer(self) -> None:
+        """Persist/evaluate Gate-3 quotes away from Gate 2's sampling loop."""
+
+        while not self._observer_stop.is_set() or not self._quote_queue.empty():
+            try:
+                quotes = self._quote_queue.get(timeout=0.1)
+            except queue.Empty:
+                if not self._observer_stop.is_set() and not self.observation_failed:
+                    self._evaluate_quotes(())
+                continue
+            try:
+                if not self.observation_failed:
+                    self._evaluate_quotes(quotes)
+                    if not self.observation_failed:
+                        with self._observer_lock:
+                            self._processed_quote_count += len(quotes)
+            finally:
+                self._quote_queue.task_done()
+
+    def observe(self, quotes: Sequence[QuoteSnapshot]) -> None:
+        if self.finished or self.observation_failed:
+            return
+        work_queue = getattr(self, "_quote_queue", None)
+        if work_queue is None:
+            # Compatibility for focused unit harnesses that construct the
+            # observer without its production initialization path.
+            self._evaluate_quotes(quotes)
+            return
+        batch = tuple(quotes or ())
+        if not batch:
+            return
+        try:
+            work_queue.put_nowait(batch)
+        except queue.Full as exc:
+            self._record_observer_failure("observer_queue_full", exc)
+            return
+        with self._observer_lock:
+            self._enqueued_quote_count += len(batch)
+            self._max_queue_depth = max(
+                self._max_queue_depth,
+                work_queue.qsize(),
+            )
+
+    def _finish_observer_worker(self) -> None:
+        worker = getattr(self, "_observer_thread", None)
+        if worker is None:
+            return
+        self._observer_stop.set()
+        worker.join(timeout=60.0)
+        if worker.is_alive():
+            self._record_observer_failure(
+                "observer_drain",
+                TimeoutError("Gate 3 observer did not drain within 60 seconds"),
+            )
+            raise RuntimeError("Gate 3 observer did not drain within 60 seconds")
+        with self._observer_lock:
+            enqueued = self._enqueued_quote_count
+            processed = self._processed_quote_count
+        if enqueued != processed:
+            exc = RuntimeError(
+                "Gate 3 observer quote handoff was incomplete "
+                f"({processed}/{enqueued})"
+            )
+            self._record_observer_failure("observer_completeness", exc)
 
     def finish(
         self,
@@ -423,6 +513,16 @@ class CombinedGate3Observer:
         if self.finished:
             return
         after: dict[str, str] | None = None
+        try:
+            self._finish_observer_worker()
+        except Exception:
+            # The sanitized observer error is already retained. Continue only
+            # after the worker has stopped; a still-live worker raises above
+            # and therefore leaves Gate 3 without a terminal passing report.
+            if getattr(self, "_observer_thread", None) is not None and getattr(
+                self._observer_thread, "is_alive", lambda: False
+            )():
+                raise
         try:
             if not self.observation_failed:
                 run_captured_live_replay(self.collector)
@@ -458,6 +558,15 @@ class CombinedGate3Observer:
                     after is None or self.before != after
                 ),
                 "runtime_error_count": len(self.runtime_errors),
+                "observer_enqueued_quote_count": int(
+                    getattr(self, "_enqueued_quote_count", 0)
+                ),
+                "observer_processed_quote_count": int(
+                    getattr(self, "_processed_quote_count", 0)
+                ),
+                "observer_max_queue_depth": int(
+                    getattr(self, "_max_queue_depth", 0)
+                ),
             },
             runtime_errors=list(self.runtime_errors),
             collection_mode="COMBINED_GATE2_GATE3_SINGLE_WEBSOCKET",

@@ -1,6 +1,6 @@
 import pytest
 import pandas as pd
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from src.core.watchlist import BuylistItem, BuylistManager, TradePlan, TradePlanManager, Watchlist
 from src.core.scoring import calculate_deterministic_scores, run_ai_review
 
@@ -17,7 +17,8 @@ def test_persisted_watchlist_timestamps_are_timezone_aware():
                     "added_date": "2026-07-01T09:30:00",
                 }
             ],
-        }
+        },
+        current_session_date=date(2026, 7, 1),
     )
 
     assert watchlist.created_date.tzinfo == timezone.utc

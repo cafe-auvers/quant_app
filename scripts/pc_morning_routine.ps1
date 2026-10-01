@@ -350,16 +350,30 @@ if ($ResumeMode) {
     Write-Log "Resume mode: existing main.py retained; no duplicate process was launched."
 } else {
     try {
-        $proc = Start-Process -FilePath $PythonExe -ArgumentList $MainScriptPath -WorkingDirectory $RepoRoot `
-            -RedirectStandardOutput $MainPyOutLog -RedirectStandardError $MainPyErrLog -PassThru
-        Start-Sleep -Seconds 5
-        if ($proc.HasExited) {
-            Write-Log "ERROR: main.py exited almost immediately (code $($proc.ExitCode)) -- see $MainPyErrLog"
+        # Refresh can take long enough for another supervised launcher to
+        # start the dashboard after the initial process check. Re-check at
+        # the actual launch boundary so this routine never creates a second
+        # execution runtime for the same device identity.
+        $mainProcessesBeforeLaunch = @(
+            Get-QuantMainProcesses -MainScriptPath $MainScriptPath
+        )
+        if ($mainProcessesBeforeLaunch.Count -gt 0) {
+            $existingMainPids = (
+                $mainProcessesBeforeLaunch | ForEach-Object { $_.ProcessId }
+            ) -join ", "
+            Write-Log "main.py appeared during maintenance (PID(s): $existingMainPids); skipping duplicate launch."
         } else {
-            Write-Log "main.py launched (PID $($proc.Id)) and is still running after 5s."
+            $proc = Start-Process -FilePath $PythonExe -ArgumentList $MainScriptPath -WorkingDirectory $RepoRoot `
+                -RedirectStandardOutput $MainPyOutLog -RedirectStandardError $MainPyErrLog -PassThru
+            Start-Sleep -Seconds 5
+            if ($proc.HasExited) {
+                Write-Log "ERROR: main.py exited almost immediately (code $($proc.ExitCode)) -- see $MainPyErrLog"
+            } else {
+                Write-Log "main.py launched (PID $($proc.Id)) and is still running after 5s."
+            }
         }
     } catch {
-        Write-Log "ERROR: could not launch main.py: $($_.Exception.Message)"
+        Write-Log "ERROR: could not verify or launch main.py: $($_.Exception.Message)"
     }
 }
 

@@ -131,6 +131,13 @@ class ScannerMixin:
         rules_header_layout.addWidget(active_rules_label)
         rules_header_layout.addStretch()
         form_layout.addRow(rules_header_layout)
+        self.scanner_data_status_label = QLabel("Scanner data: not loaded.")
+        self.scanner_data_status_label.setObjectName("scannerDataStatus")
+        self.scanner_data_status_label.setWordWrap(True)
+        self.scanner_data_status_label.setStyleSheet(
+            "color: #555555; font-size: 11px; padding: 4px 6px;"
+        )
+        form_layout.addRow(self.scanner_data_status_label)
         form_layout.addRow(self.rules_container)
 
         self.add_rule_button = QPushButton("＋ Add Filter Rule")
@@ -464,6 +471,7 @@ class ScannerMixin:
             self.scanner_universe_count_label.setText(
                 f"Universe: {int(universe_count):,}"
             )
+        self._display_scanner_snapshot_status(funnel)
 
         previous_count = universe_count
         for index, label in enumerate(self.active_rule_count_labels):
@@ -481,6 +489,62 @@ class ScannerMixin:
                     f"{count:,} remain; {removed:,} filtered out by this rule"
                 )
             previous_count = count
+
+    def _display_scanner_snapshot_status(self, funnel: dict) -> None:
+        """Show the exact snapshot date and how far it trails the market."""
+
+        label = getattr(self, "scanner_data_status_label", None)
+        if label is None:
+            return
+        snapshot_date = str(funnel.get("snapshot_date") or "").strip()
+        expected_date = str(funnel.get("expected_snapshot_date") or "").strip()
+        stale_sessions = funnel.get("stale_market_sessions")
+        stale_days = funnel.get("stale_calendar_days")
+        if not snapshot_date:
+            label.setText("Scanner data: not loaded.")
+            label.setStyleSheet(
+                "color: #555555; font-size: 11px; padding: 4px 6px;"
+            )
+            return
+
+        session_count = int(stale_sessions or 0)
+        calendar_count = int(stale_days or 0)
+        if session_count > 0 or calendar_count > 0:
+            session_word = "session" if session_count == 1 else "sessions"
+            day_word = "day" if calendar_count == 1 else "days"
+            label.setText(
+                f"Showing scanner snapshot {snapshot_date}: "
+                f"{session_count} market {session_word} / "
+                f"{calendar_count} calendar {day_word} behind "
+                f"(expected {expected_date})."
+            )
+            label.setStyleSheet(
+                "color: #9a3412; background-color: #fff7ed; "
+                "border: 1px solid #fdba74; border-radius: 4px; "
+                "font-size: 11px; font-weight: bold; padding: 4px 6px;"
+            )
+            return
+
+        label.setText(f"Scanner snapshot {snapshot_date}: current.")
+        label.setStyleSheet(
+            "color: #555555; font-size: 11px; padding: 4px 6px;"
+        )
+
+    @staticmethod
+    def _scanner_snapshot_log_suffix(funnel: dict) -> str:
+        snapshot_date = str(funnel.get("snapshot_date") or "").strip()
+        if not snapshot_date:
+            return ""
+        expected_date = str(funnel.get("expected_snapshot_date") or "").strip()
+        stale_sessions = int(funnel.get("stale_market_sessions") or 0)
+        if stale_sessions <= 0:
+            return f" using current snapshot {snapshot_date}"
+        session_word = "session" if stale_sessions == 1 else "sessions"
+        return (
+            f" using snapshot {snapshot_date} "
+            f"({stale_sessions} market {session_word} behind; "
+            f"expected {expected_date})"
+        )
 
     def update_scanner_metrics_details(self, symbol: str) -> None:
         """Populate the metrics details browser with formatted values for a symbol."""
@@ -777,6 +841,11 @@ class ScannerMixin:
             min_trend_intensity=0,
             universe_limit=self.universe_limit,
             scanner_rules_by_setup=scanner_rules_by_setup,
+            fallback_engine=(
+                self.__dict__.get("_local_mirror_engine")
+                if self.__dict__.get("db_engine_source") == "pc"
+                else None
+            ),
         )
         self.scanner_worker.universe_loaded.connect(self._on_scanner_universe_loaded)
         self.scanner_worker.log_message.connect(self.append_log)
@@ -931,7 +1000,8 @@ class ScannerMixin:
             self.scanner_funnel_counts_by_setup[name] = funnel
             if not is_live:
                 self.append_log(
-                    f"Scanner completed for {name}: {len(scored_rows)} symbols found."
+                    f"Scanner completed for {name}: {len(scored_rows)} symbols found"
+                    f"{self._scanner_snapshot_log_suffix(funnel)}."
                 )
 
         active_setup = self.scanner_setup_combo.currentText()
