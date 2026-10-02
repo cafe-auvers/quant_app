@@ -155,6 +155,72 @@ def test_cache_reloads_when_the_pc_mirror_revision_changes(tmp_path):
     ) is None
 
 
+def test_coordinator_rebuilds_cache_when_generation_policy_changes(tmp_path):
+    async def run():
+        cache = ChartBundleCache(tmp_path, max_symbols=25)
+        source = DemoMarketDataSource()
+        first = ChartLoadCoordinator(
+            source, cache, daily_bars=50, hourly_months=1
+        )
+        second = ChartLoadCoordinator(
+            source, cache, daily_bars=60, hourly_months=1
+        )
+
+        first_bundle = await first.get("AAPL", "1D")
+        second_bundle = await second.get("AAPL", "1D")
+
+        assert len(first_bundle.payload["bars"]) == 50
+        assert len(second_bundle.payload["bars"]) == 60
+        assert second_bundle.cache_hit is False
+
+    asyncio.run(run())
+
+
+def test_coordinator_enforces_retention_and_preserves_pins(tmp_path):
+    async def run():
+        pinned = {"Q001"}
+        coordinator = ChartLoadCoordinator(
+            DemoMarketDataSource(),
+            ChartBundleCache(tmp_path, max_symbols=25),
+            daily_bars=50,
+            hourly_months=1,
+            pinned_symbols=lambda: pinned,
+        )
+        for index in range(1, 28):
+            await coordinator.get(f"Q{index:03d}", "1D")
+
+        symbols = {
+            path.name.split(".", 1)[0]
+            for path in tmp_path.glob("*.json.gz")
+        }
+        assert len(symbols) == 25
+        assert "Q001" in symbols
+
+    asyncio.run(run())
+
+
+def test_coordinator_runtime_pins_preserve_connected_projection_symbols(tmp_path):
+    async def run():
+        coordinator = ChartLoadCoordinator(
+            DemoMarketDataSource(),
+            ChartBundleCache(tmp_path, max_symbols=25),
+            daily_bars=50,
+            hourly_months=1,
+        )
+        coordinator.pin_symbols(["Q001"])
+        for index in range(1, 28):
+            await coordinator.get(f"Q{index:03d}", "1D")
+
+        symbols = {
+            path.name.split(".", 1)[0]
+            for path in tmp_path.glob("*.json.gz")
+        }
+        assert len(symbols) == 25
+        assert "Q001" in symbols
+
+    asyncio.run(run())
+
+
 def test_cache_eviction_never_removes_pinned_symbol(tmp_path):
     cache = ChartBundleCache(tmp_path, max_symbols=25)
     source = DemoMarketDataSource()

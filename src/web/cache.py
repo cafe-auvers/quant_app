@@ -10,12 +10,12 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Callable
 
 import anyio
 
 from .market_data import MarketDataSource
-from .store import normalize_symbol
+from .store import ValidationError, normalize_symbol
 
 
 EXPECTED_PAYLOAD_SCHEMA_VERSION = 6
@@ -64,7 +64,9 @@ class ChartBundleCache:
             f"{expected_text}:"
         )
 
-    def write(self, payload: dict[str, Any]) -> CachedBundle:
+    def write(
+        self, payload: dict[str, Any], *, generation_key: str = ""
+    ) -> CachedBundle:
         symbol = str(payload["symbol"])
         timeframe = str(payload["timeframe"])
         data = json.dumps(
@@ -96,6 +98,7 @@ class ChartBundleCache:
             "session_policy": payload.get("coverage", {}).get(
                 "session_policy", "UNKNOWN"
             ),
+            "generation_key": str(generation_key or ""),
             "published_at_epoch": time.time(),
             "state": "READY",
         }
@@ -130,6 +133,9 @@ class ChartBundleCache:
         *,
         expected_source: str = "",
         expected_source_revision: str = "",
+        expected_adjustment_mode: str = "",
+        expected_session_policy: str = "",
+        expected_generation_key: str = "",
     ) -> CachedBundle | None:
         bundle_path, manifest_path = self._paths(symbol, timeframe)
         with self._lock:
@@ -142,6 +148,21 @@ class ChartBundleCache:
                 if (
                     expected_source_revision
                     and manifest.get("source_revision") != expected_source_revision
+                ):
+                    return None
+                if (
+                    expected_adjustment_mode
+                    and manifest.get("adjustment_mode") != expected_adjustment_mode
+                ):
+                    return None
+                if (
+                    expected_session_policy
+                    and manifest.get("session_policy") != expected_session_policy
+                ):
+                    return None
+                if (
+                    expected_generation_key
+                    and manifest.get("generation_key") != expected_generation_key
                 ):
                     return None
                 compressed = bundle_path.read_bytes()
@@ -166,6 +187,9 @@ class ChartBundleCache:
         *,
         expected_source: str = "",
         expected_source_revision: str = "",
+        expected_adjustment_mode: str = "",
+        expected_session_policy: str = "",
+        expected_generation_key: str = "",
     ) -> PublicationArtifact | None:
         """Return validated compressed bytes without creating another generation."""
 
@@ -180,6 +204,21 @@ class ChartBundleCache:
                 if (
                     expected_source_revision
                     and manifest.get("source_revision") != expected_source_revision
+                ):
+                    return None
+                if (
+                    expected_adjustment_mode
+                    and manifest.get("adjustment_mode") != expected_adjustment_mode
+                ):
+                    return None
+                if (
+                    expected_session_policy
+                    and manifest.get("session_policy") != expected_session_policy
+                ):
+                    return None
+                if (
+                    expected_generation_key
+                    and manifest.get("generation_key") != expected_generation_key
                 ):
                     return None
                 if int(manifest.get("payload_schema_version", 1)) != EXPECTED_PAYLOAD_SCHEMA_VERSION:
@@ -251,16 +290,51 @@ class ChartLoadCoordinator:
         daily_bars: int,
         hourly_months: int,
         worker_limit: int = 4,
+        pinned_symbols: Callable[[], set[str]] | None = None,
     ) -> None:
         self.source = source
         self.cache = cache
         self.daily_bars = daily_bars
         self.hourly_months = hourly_months
+        self._pinned_symbols = pinned_symbols or (lambda: set())
+        self._runtime_pins: set[str] = set()
+        self._pin_lock = threading.Lock()
         self._semaphore = asyncio.Semaphore(worker_limit)
         self._inflight: dict[str, asyncio.Task[CachedBundle]] = {}
         self._states: dict[str, dict[str, Any]] = {}
         self._lock = asyncio.Lock()
         self.request_count = 0
+
+    def pin_symbols(self, symbols: list[str] | tuple[str, ...] | set[str]) -> None:
+        normalized: set[str] = set()
+        for symbol in symbols:
+            try:
+                normalized.add(normalize_symbol(symbol))
+            except ValidationError:
+                continue
+        with self._pin_lock:
+            self._runtime_pins.update(normalized)
+
+    def _all_pins(self) -> set[str]:
+        with self._pin_lock:
+            runtime = set(self._runtime_pins)
+        return runtime | set(self._pinned_symbols())
+
+    def _cache_expectations(self) -> dict[str, str]:
+        return {
+            "expected_source": self.source.source_name,
+            "expected_source_revision": self.source.cache_revision(),
+            "expected_adjustment_mode": str(
+                getattr(self.source, "adjustment_mode", "") or ""
+            ),
+            "expected_session_policy": str(
+                getattr(self.source, "session_policy", "") or ""
+            ),
+            "expected_generation_key": (
+                f"schema={EXPECTED_PAYLOAD_SCHEMA_VERSION};"
+                f"daily_bars={self.daily_bars};hourly_months={self.hourly_months}"
+            ),
+        }
 
     @staticmethod
     def _key(symbol: str, timeframe: str) -> str:
@@ -291,8 +365,7 @@ class ChartLoadCoordinator:
                 lambda: self.cache.publication_artifact(
                     symbol,
                     timeframe,
-                    expected_source=self.source.source_name,
-                    expected_source_revision=self.source.cache_revision(),
+                    **self._cache_expectations(),
                 )
             )
             if artifact is not None:
@@ -306,8 +379,7 @@ class ChartLoadCoordinator:
             lambda: self.cache.publication_artifact(
                 symbol,
                 timeframe,
-                expected_source=self.source.source_name,
-                expected_source_revision=self.source.cache_revision(),
+                **self._cache_expectations(),
             )
         )
         if artifact is None:
@@ -322,8 +394,7 @@ class ChartLoadCoordinator:
                 lambda: self.cache.read(
                     symbol,
                     timeframe,
-                    expected_source=self.source.source_name,
-                    expected_source_revision=self.source.cache_revision(),
+                    **self._cache_expectations(),
                 )
             )
             if cached is not None:
@@ -358,7 +429,22 @@ class ChartLoadCoordinator:
                         hourly_months=self.hourly_months,
                     )
                 )
-                result = await anyio.to_thread.run_sync(self.cache.write, payload)
+                result = await anyio.to_thread.run_sync(
+                    lambda: self.cache.write(
+                        payload,
+                        generation_key=self._cache_expectations()[
+                            "expected_generation_key"
+                        ],
+                    )
+                )
+                await anyio.to_thread.run_sync(
+                    lambda: self.cache.evict(
+                        pinned_symbols={
+                            *self._all_pins(),
+                            symbol,
+                        }
+                    )
+                )
             except Exception as exc:
                 self._states[key] = {
                     "state": "FAILED",

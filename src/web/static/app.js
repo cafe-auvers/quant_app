@@ -7,6 +7,7 @@
   const compactLayout = window.matchMedia('(max-width: 900px)');
   const standaloneLayout = window.matchMedia('(display-mode: standalone)');
   const DEFAULT_VISIBLE_BARS = 63;
+  const BUY_BOARD_FALLBACK_MS = 15_000;
   const KANBAN_COLUMNS = Object.freeze([
     {key: 'BUYLIST', title: 'Buylist', short: 'Buylist', kicker: 'Planning'},
     {key: 'BUY_TODAY', title: 'Buy Today', short: 'Today', kicker: 'Monitoring'},
@@ -99,6 +100,7 @@
     stockRows: new Map(),
     prefetchTimer: null,
     statusTimer: null,
+    clientTimings: [],
     liveUpdateSocket: null,
     liveUpdateReconnectTimer: null,
     liveUpdateRefreshTimer: null,
@@ -110,6 +112,27 @@
   };
 
   function setGlobal(message) { byId('global-message').textContent = message; }
+
+  function recordClientTiming(name, startedAt, details = {}) {
+    const sample = {
+      name,
+      duration_ms: Math.round((performance.now() - startedAt) * 100) / 100,
+      recorded_at: new Date().toISOString(),
+      ...details,
+    };
+    state.clientTimings.push(sample);
+    if (state.clientTimings.length > 100) state.clientTimings.shift();
+    return sample;
+  }
+
+  window.__quantWebMetrics = Object.freeze({
+    snapshot: () => state.clientTimings.map(sample => ({...sample})),
+    clear: () => { state.clientTimings.length = 0; },
+  });
+
+  function nextPaint() {
+    return new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  }
 
   function planningPending(symbol = state.symbol) {
     return Boolean(symbol && state.planningPendingSymbols.has(symbol));
@@ -191,15 +214,19 @@
     });
   }
 
-  async function retireLegacyOfflineShell() {
-    if ('serviceWorker' in navigator) {
-      const registrations = await navigator.serviceWorker.getRegistrations();
-      await Promise.all(registrations.map(registration => registration.unregister()));
-    }
-    if ('caches' in window) {
-      const keys = await caches.keys();
-      await Promise.all(keys.filter(key => key.startsWith('quant-web-static-')).map(key => caches.delete(key)));
-    }
+  async function prepareServiceWorker() {
+    if (!('serviceWorker' in navigator)) return;
+    const registrations = await navigator.serviceWorker.getRegistrations();
+    await Promise.all(registrations.map(registration => {
+      const worker = registration.active || registration.waiting || registration.installing;
+      if (!worker) return registration.unregister();
+      const path = new URL(worker.scriptURL).pathname;
+      return path === '/service-worker.js' ? registration.update() : registration.unregister();
+    }));
+    await navigator.serviceWorker.register('/service-worker.js', {
+      scope: '/',
+      updateViaCache: 'none',
+    });
   }
   function setPanel(message, kind = '') {
     const target = byId('plan-message');
@@ -619,7 +646,10 @@
   function startBuyBoardPolling() {
     stopBuyBoardPolling();
     void loadBuyBoard(false);
-    state.buyBoardTimer = window.setInterval(() => loadBuyBoard(true), 3_000);
+    state.buyBoardTimer = window.setInterval(
+      () => loadBuyBoard(true),
+      BUY_BOARD_FALLBACK_MS,
+    );
   }
 
   function closeBuyBoardActionSheet() {
@@ -2118,7 +2148,13 @@
       updateHeaderMetricChips(bundle.symbol, bundle.context);
       updateEarningsChip(bundle);
       renderMarketAlignment(bundle.market_alignment);
-      byId('company-context').textContent = `${profile.exchange || 'UNAVAILABLE'} · ${profile.sector || 'UNAVAILABLE'} · ${profile.industry || 'UNAVAILABLE'} · RS ${bundle.context?.relative_strength ?? 'UNAVAILABLE'}`;
+      const coverage = bundle.coverage || {};
+      const start = String(coverage.actual_start || 'UNAVAILABLE').slice(0, 10);
+      const end = String(coverage.actual_end || 'UNAVAILABLE').slice(0, 10);
+      const chartMetadata = `${coverage.source || 'UNAVAILABLE'} · ${coverage.bar_count ?? 0} bars · ${start} → ${end} · ${coverage.completeness || 'UNAVAILABLE'}`;
+      const companyContext = byId('company-context');
+      companyContext.textContent = `${profile.exchange || 'UNAVAILABLE'} · ${profile.sector || 'UNAVAILABLE'} · ${profile.industry || 'UNAVAILABLE'} · RS ${bundle.context?.relative_strength ?? 'UNAVAILABLE'} · ${chartMetadata}`;
+      companyContext.title = `${chartMetadata} · ${coverage.adjustment_mode || 'UNAVAILABLE'} · ${coverage.session_policy || 'UNAVAILABLE'}`;
     }
     renderDrawings();
     renderBreakout();
@@ -2186,7 +2222,7 @@
         return false;
       }
     }));
-    if (token !== state.selectionToken) return;
+    if (token !== state.selectionToken) return false;
     if (outcomes.some(Boolean)) {
       setGlobal(`${symbol} · chart ready`);
       byId('data-status').textContent = state.session.data_mode === 'PC_MIRROR'
@@ -2196,6 +2232,7 @@
     } else {
       setGlobal(`${symbol} · chart unavailable`);
     }
+    return outcomes.some(Boolean);
   }
 
   async function fetchPlanAndDrawings(symbol, token) {
@@ -2218,10 +2255,12 @@
     }
   }
 
-  async function selectSymbol(symbol) {
+  async function selectSymbol(symbol, navigationKind = 'symbol-select') {
     if (!symbol) return;
+    const startedAt = performance.now();
     closeBreakoutPricePopup();
     state.symbol = symbol.toUpperCase();
+    const chartCacheHit = state.bundleCache.has(`${state.symbol}:${state.timeframe}`);
     state.planningBusy = planningPending(state.symbol);
     state.selectionToken += 1;
     const token = state.selectionToken;
@@ -2251,7 +2290,20 @@
     Object.values(state.panes).forEach(pane => pane?.breakoutHandle.classList.remove('dragging'));
     updateBreakoutModeUi();
     updateActiveStockRow();
-    await Promise.allSettled([loadCharts(state.symbol, token), fetchPlanAndDrawings(state.symbol, token)]);
+    const chartRequest = loadCharts(state.symbol, token);
+    const contextRequest = fetchPlanAndDrawings(state.symbol, token);
+    const [chartOutcome] = await Promise.allSettled([chartRequest]);
+    await nextPaint();
+    if (token === state.selectionToken) {
+      recordClientTiming('symbol-navigation-chart-paint', startedAt, {
+        symbol: state.symbol,
+        timeframe: state.timeframe,
+        navigation: navigationKind,
+        cache_hit: chartCacheHit,
+        chart_ready: chartOutcome.status === 'fulfilled' && chartOutcome.value === true,
+      });
+    }
+    await Promise.allSettled([contextRequest]);
     schedulePrefetch(token);
   }
 
@@ -3220,7 +3272,9 @@
     const next = current < 0
       ? (direction < 0 ? state.visibleRows.length - 1 : 0)
       : (current + direction + state.visibleRows.length) % state.visibleRows.length;
-    if (state.visibleRows[next]) selectSymbol(state.visibleRows[next].symbol);
+    if (state.visibleRows[next]) {
+      selectSymbol(state.visibleRows[next].symbol, direction < 0 ? 'previous-stock' : 'next-stock');
+    }
   }
 
   function updateTimeframeButtons() {
@@ -3239,6 +3293,7 @@
   async function switchTimeframe(timeframe) {
     timeframe = String(timeframe || '').toUpperCase();
     if (!['1D', '1H'].includes(timeframe)) return;
+    const startedAt = performance.now();
     state.drawAnchor = null;
     state.selectedDrawingId = null;
     updateDrawingSelectionUi();
@@ -3250,9 +3305,19 @@
     updateTimeframeButtons();
     updatePaneTimeframeToggle('primary-label', timeframe);
     if (!state.symbol) return;
+    const chartCacheHit = state.bundleCache.has(`${state.symbol}:${timeframe}`);
     state.selectionToken += 1;
     const token = state.selectionToken;
-    await loadCharts(state.symbol, token);
+    const chartReady = await loadCharts(state.symbol, token);
+    await nextPaint();
+    if (token === state.selectionToken) {
+      recordClientTiming('timeframe-switch-chart-paint', startedAt, {
+        symbol: state.symbol,
+        timeframe,
+        cache_hit: chartCacheHit,
+        chart_ready: chartReady === true,
+      });
+    }
     schedulePrefetch(token);
   }
 
@@ -3620,7 +3685,7 @@
   }
 
   async function initialize() {
-    retireLegacyOfflineShell().catch(() => {});
+    prepareServiceWorker().catch(() => {});
     lockPageDragging();
     initializeHistoryRange();
     state.panes.primary = createPane('chart-primary', 'rs-primary', 'primary-overlay', state.timeframe);

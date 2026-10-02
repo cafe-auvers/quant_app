@@ -13,6 +13,7 @@ from .api import WebServices, build_services, register_api_routes
 from .auth import SESSION_COOKIE
 from .config import WebConfig, load_web_config
 from .pages import register_pages
+from .windows_asyncio import install_web_event_loop_policy
 
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -134,6 +135,7 @@ def create_web_app(config: WebConfig) -> tuple[FastAPI, WebServices]:
 
 def run(config: WebConfig | None = None) -> None:
     config = config or load_web_config()
+    install_web_event_loop_policy()
     app, _services = create_web_app(config)
     uvicorn.run(
         app,

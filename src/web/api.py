@@ -159,6 +159,7 @@ def build_services(config: WebConfig) -> WebServices:
             cache,
             daily_bars=config.daily_bars,
             hourly_months=config.hourly_months,
+            pinned_symbols=store.pinned_symbols,
         ),
         watchlist_history=WatchlistHistorySource.from_config(config),
         canonical_planning=canonical_planning,
@@ -245,6 +246,11 @@ class DrawingDeleteRequest(BaseModel):
 
 def register_api_routes(app: FastAPI, services: WebServices) -> None:
     config = services.config
+
+    def pin_rows(rows: list[dict[str, Any]]) -> None:
+        services.charts.pin_symbols(
+            [str(row.get("symbol") or "") for row in rows]
+        )
 
     app.add_middleware(SecurityHeadersMiddleware)
     app.add_middleware(
@@ -603,6 +609,7 @@ def register_api_routes(app: FastAPI, services: WebServices) -> None:
                     "revision": None,
                     "sync_state": f"CANONICAL PLANNING UNAVAILABLE: {exc}",
                 }
+            pin_rows(list(result.get("rows") or []))
             return {
                 **result,
                 "mode": "CONNECTED",
@@ -669,6 +676,8 @@ def register_api_routes(app: FastAPI, services: WebServices) -> None:
             planning_by_symbol = {
                 row["symbol"]: row for row in planning.get("rows", [])
             }
+            pin_rows(list(planning.get("rows") or []))
+            pin_rows(list(canonical_today.get("rows") or []))
             canonical_symbols = {
                 row["symbol"] for row in canonical_today.get("rows", [])
             }
@@ -731,6 +740,8 @@ def register_api_routes(app: FastAPI, services: WebServices) -> None:
                     "revision": None,
                     "sync_state": f"CANONICAL PLANNING UNAVAILABLE: {exc}",
                 }
+            if result.get("card"):
+                pin_rows([result["card"]])
             return {**result, "sync_state": "PC CANONICAL READ-ONLY"}
         await apply_watchlist_rollover()
         card = await anyio.to_thread.run_sync(services.store.get_plan, symbol)
@@ -932,6 +943,7 @@ def register_api_routes(app: FastAPI, services: WebServices) -> None:
         result = await anyio.to_thread.run_sync(
             services.connected_operator.board_snapshot
         )
+        pin_rows(list(result.get("rows") or []))
         return {
             **result,
             "columns": [

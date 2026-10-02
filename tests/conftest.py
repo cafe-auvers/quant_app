@@ -1,3 +1,4 @@
+import asyncio
 import os
 import sys
 from pathlib import Path
@@ -38,6 +39,22 @@ from src.services import (
     trading_state,
 )  # noqa: E402  (needs sys.path set up above)
 from src.core import execution_config  # noqa: E402
+from src.web.windows_asyncio import install_web_event_loop_policy  # noqa: E402
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _resilient_windows_test_event_loop_policy():
+    """Do not let transient Windows socket-pair creation fail the suite."""
+
+    if sys.platform != "win32":
+        yield
+        return
+    previous = install_web_event_loop_policy()
+    try:
+        yield
+    finally:
+        if previous is not None:
+            asyncio.set_event_loop_policy(previous)
 
 
 @pytest.fixture(autouse=True)

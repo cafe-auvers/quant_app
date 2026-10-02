@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -13,18 +14,34 @@ def test_web_launcher_does_not_import_desktop_or_execution_modules():
 import sys
 from src.web.config import WebConfig
 from src.web.api import build_services
-build_services(WebConfig(data_dir=__import__('pathlib').Path(sys.argv[1])))
-blocked = [name for name in sys.modules if name == 'main' or name.startswith(('PyQt5', 'src.api.kis', 'src.services.broker', 'src.services.buyboard_runtime'))]
+services = build_services(WebConfig(data_dir=__import__('pathlib').Path(sys.argv[1])))
+blocked_prefixes = (
+    'PyQt5',
+    'src.ui',
+    'src.api.kis',
+    'src.services.broker',
+    'src.services.buyboard_runtime',
+    'src.services.execution_command_gateway',
+    'src.services.execution_workflow_service',
+)
+blocked = [name for name in sys.modules if name == 'main' or name.startswith(blocked_prefixes)]
+constructed = [
+    f'{type(value).__module__}.{type(value).__name__}'
+    for value in vars(services).values()
+    if any(token in type(value).__name__.lower() for token in ('broker', 'runtimeworker', 'executiongateway'))
+]
 print('\\n'.join(blocked))
-raise SystemExit(1 if blocked else 0)
+print('\\n'.join(constructed))
+raise SystemExit(1 if blocked or constructed else 0)
 """
-    result = subprocess.run(
-        [sys.executable, "-c", script, str(ROOT / "data" / "web-boundary-test")],
-        cwd=ROOT,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+    with tempfile.TemporaryDirectory(prefix="quant-web-boundary-") as data_dir:
+        result = subprocess.run(
+            [sys.executable, "-c", script, data_dir],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
     assert result.returncode == 0, result.stdout + result.stderr
 
 
@@ -49,7 +66,7 @@ def test_login_form_never_falls_back_to_password_query_string():
     assert 'id="login-form" method="post" action="/login"' in page_source
     assert "event.preventDefault()" in script_source
     assert "access_log=False" in app_source
-    assert '/live-static/login.js?v=38' in page_source
+    assert '/live-static/login.js?v=39' in page_source
     assert "from nicegui" not in app_source.lower()
     assert "import nicegui" not in app_source.lower()
 
@@ -66,7 +83,7 @@ def test_dashboard_is_a_static_shell_without_hydration_runtime():
     assert "new MutationObserver" not in script_source
     assert "bootApp();" in script_source
     assert 'id="quant-app"' in page_source
-    assert '/live-static/app.js?v=87' in page_source
+    assert '/live-static/app.js?v=88' in page_source
     assert page_source.index('id="market-summary"') < page_source.index('id="browser-status"')
     assert page_source.index('id="browser-status"') < page_source.index('id="web-status"')
     assert page_source.index('id="web-status"') < page_source.index('id="data-summary"')
@@ -89,6 +106,30 @@ def test_dashboard_is_a_static_shell_without_hydration_runtime():
     assert "byId('mode-badge')" not in script_source
     assert "byId('data-badge')" not in script_source
     assert "_nicegui" not in page_source.lower()
+
+
+def test_pwa_registers_current_worker_and_caches_presentation_assets_only():
+    app_source = (ROOT / "src" / "web" / "static" / "app.js").read_text(
+        encoding="utf-8"
+    )
+    login_source = (
+        ROOT / "src" / "web" / "static" / "login.js"
+    ).read_text(encoding="utf-8")
+    worker_source = (
+        ROOT / "src" / "web" / "static" / "service_worker.js"
+    ).read_text(encoding="utf-8")
+    for source in (app_source, login_source):
+        assert "navigator.serviceWorker.register('/service-worker.js'" in source
+        assert "updateViaCache: 'none'" in source
+        assert "path === '/service-worker.js'" in source
+    assert "'/live-static/app.css'" in worker_source
+    assert "'/live-static/app.js'" in worker_source
+    assert "'/live-vendor/lightweight-charts.standalone.production.js'" in worker_source
+    assert "'/api/" not in worker_source
+    assert "request.method !== 'GET'" in worker_source
+    assert "fetch" in worker_source
+    assert "indexedDB" not in worker_source
+    assert "sync" not in worker_source.lower()
 
 
 def test_symbol_selection_does_not_rebuild_the_scanner_list():
@@ -255,7 +296,8 @@ def test_mobile_workspace_has_five_primary_bottom_controls():
     assert "const KANBAN_COLUMNS = Object.freeze([" in script_source
     assert "async function applyBuyBoardAction(action, payload = {})" in script_source
     assert "state.buyBoardOptimistic.set(symbol, {row: optimistic})" in script_source
-    assert "window.setInterval(() => loadBuyBoard(true), 3_000)" in script_source
+    assert "const BUY_BOARD_FALLBACK_MS = 15_000" in script_source
+    assert "BUY_BOARD_FALLBACK_MS," in script_source
     assert 'id="buy-board-tabs"' in page_source
     assert 'id="buy-board-action-sheet"' in page_source
     assert ".mobile-kanban-tabs { width: 100%; min-width: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));" in style_source
@@ -278,6 +320,18 @@ def test_mobile_workspace_has_five_primary_bottom_controls():
     assert "bottom: calc(140px + env(safe-area-inset-bottom, 0px))" in style_source
     assert "background: rgba(7, 18, 15, .58)" in style_source
     assert ".mobile-page { position: absolute;" in style_source
+
+
+def test_browser_performance_samples_are_bounded_and_measure_chart_paint():
+    script_source = (ROOT / "src" / "web" / "static" / "app.js").read_text(
+        encoding="utf-8"
+    )
+    assert "window.__quantWebMetrics" in script_source
+    assert "if (state.clientTimings.length > 100)" in script_source
+    assert "symbol-navigation-chart-paint" in script_source
+    assert "timeframe-switch-chart-paint" in script_source
+    assert "await nextPaint()" in script_source
+    assert "cache_hit: chartCacheHit" in script_source
 
 
 def test_review_actions_are_inline_and_daily_view_opens_at_six_months():

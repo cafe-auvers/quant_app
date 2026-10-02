@@ -3,6 +3,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+from pathlib import Path
 
 import httpx
 import pytest
@@ -29,6 +30,20 @@ def settings():
         publishable_key="publishable-test-key",
         allowed_user_id="11111111-1111-1111-1111-111111111111",
     )
+
+
+def test_drawing_update_policy_rechecks_owner_and_allowlist():
+    migration = (
+        Path(__file__).resolve().parents[2]
+        / "supabase"
+        / "migrations"
+        / "20261002_004_drawing_update_allowlist.sql"
+    ).read_text(encoding="utf-8").lower()
+    assert 'drop policy if exists "owner drawing update"' in migration
+    assert "for update to authenticated" in migration
+    assert migration.count("author_id = auth.uid()") == 2
+    assert migration.count("public.web_access_allowlist") == 2
+    assert " to anon" not in migration
 
 
 def test_identity_adapter_verifies_with_auth_endpoint_and_allowlist():

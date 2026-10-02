@@ -1,15 +1,19 @@
 (() => {
   let csrf = '';
 
-  async function retireLegacyOfflineShell() {
-    if ('serviceWorker' in navigator) {
-      const registrations = await navigator.serviceWorker.getRegistrations();
-      await Promise.all(registrations.map(registration => registration.unregister()));
-    }
-    if ('caches' in window) {
-      const keys = await caches.keys();
-      await Promise.all(keys.filter(key => key.startsWith('quant-web-static-')).map(key => caches.delete(key)));
-    }
+  async function prepareServiceWorker() {
+    if (!('serviceWorker' in navigator)) return;
+    const registrations = await navigator.serviceWorker.getRegistrations();
+    await Promise.all(registrations.map(registration => {
+      const worker = registration.active || registration.waiting || registration.installing;
+      if (!worker) return registration.unregister();
+      const path = new URL(worker.scriptURL).pathname;
+      return path === '/service-worker.js' ? registration.update() : registration.unregister();
+    }));
+    await navigator.serviceWorker.register('/service-worker.js', {
+      scope: '/',
+      updateViaCache: 'none',
+    });
   }
 
   async function prepare() {
@@ -57,6 +61,6 @@
     return true;
   }
 
-  retireLegacyOfflineShell().catch(() => {});
+  prepareServiceWorker().catch(() => {});
   bindLoginForm();
 })();

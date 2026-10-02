@@ -639,6 +639,8 @@ def _bundle_from_frame(
 
 class DemoMarketDataSource:
     source_name = "DEMO"
+    adjustment_mode = "unadjusted"
+    session_policy = "regular-hours"
 
     def __init__(self) -> None:
         self.symbols = _demo_symbols()
@@ -748,6 +750,8 @@ class DemoMarketDataSource:
 
 class ReadOnlyMirrorMarketDataSource:
     source_name = "LOCAL_SQLITE_MIRROR"
+    adjustment_mode = "stored adj_close; candles unadjusted"
+    session_policy = "regular-hours"
 
     def __init__(
         self,

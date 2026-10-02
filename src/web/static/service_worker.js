@@ -1,11 +1,11 @@
-const CACHE = 'quant-web-static-v80';
+const CACHE = 'quant-web-static-v81';
 const STATIC_ASSETS = [
-  '/web-static/app.css',
-  '/web-static/app.js',
-  '/web-static/login.js',
+  '/live-static/app.css',
+  '/live-static/app.js',
+  '/live-static/login.js',
   '/web-static/icon.svg',
   '/web-static/manifest.webmanifest',
-  '/vendor/lightweight-charts.standalone.production.js',
+  '/live-vendor/lightweight-charts.standalone.production.js',
 ];
 
 self.addEventListener('install', event => {

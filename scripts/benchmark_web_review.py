@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ctypes
 import json
 import os
 import platform
+import sqlite3
 import statistics
 import tempfile
 import time
@@ -12,13 +14,59 @@ import tracemalloc
 from pathlib import Path
 import sys
 
+import httpx
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.web.cache import ChartBundleCache, ChartLoadCoordinator
+from src.web.api import build_services, create_api_app
+from src.web.auth import SESSION_COOKIE
 from src.web.config import load_web_config
 from src.web.market_data import build_market_data_source
+
+
+def benchmark_symbols(source, limit: int) -> list[str]:
+    scanner = source.scanner_snapshot(limit=limit)
+    symbols = [str(row["symbol"]) for row in scanner["rows"]][:limit]
+    if len(symbols) >= limit or not getattr(source, "path", None):
+        return symbols
+    path = Path(source.path)
+    connection = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+    connection.execute("PRAGMA query_only=ON")
+    try:
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        if not {"price_history", "hourly_price_history"}.issubset(tables):
+            return symbols
+        candidates = connection.execute(
+            """
+            SELECT DISTINCT daily.symbol
+            FROM price_history daily
+            WHERE EXISTS (
+                SELECT 1 FROM hourly_price_history hourly
+                WHERE hourly.symbol=daily.symbol
+            )
+            ORDER BY daily.symbol
+            """
+        )
+        seen = set(symbols)
+        for row in candidates:
+            symbol = str(row[0])
+            if symbol in seen:
+                continue
+            seen.add(symbol)
+            symbols.append(symbol)
+            if len(symbols) >= limit:
+                break
+    finally:
+        connection.close()
+    return symbols
 
 
 def percentile(values: list[float], value: float) -> float:
@@ -40,17 +88,63 @@ async def measured_get(coordinator, symbol, timeframe, *, refresh=False):
     return (time.perf_counter() - started) * 1000, artifact
 
 
+def process_rss_bytes() -> int | None:
+    """Return the current working set without adding a benchmark dependency."""
+
+    if sys.platform != "win32":
+        return None
+
+    class ProcessMemoryCounters(ctypes.Structure):
+        _fields_ = [
+            ("cb", ctypes.c_ulong),
+            ("PageFaultCount", ctypes.c_ulong),
+            ("PeakWorkingSetSize", ctypes.c_size_t),
+            ("WorkingSetSize", ctypes.c_size_t),
+            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+            ("PagefileUsage", ctypes.c_size_t),
+            ("PeakPagefileUsage", ctypes.c_size_t),
+        ]
+
+    get_current_process = ctypes.windll.kernel32.GetCurrentProcess
+    get_current_process.restype = ctypes.c_void_p
+    get_memory_info = ctypes.windll.psapi.GetProcessMemoryInfo
+    get_memory_info.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ProcessMemoryCounters),
+        ctypes.c_ulong,
+    ]
+    get_memory_info.restype = ctypes.c_int
+    counters = ProcessMemoryCounters()
+    counters.cb = ctypes.sizeof(counters)
+    process = get_current_process()
+    if not get_memory_info(process, ctypes.byref(counters), counters.cb):
+        return None
+    return int(counters.WorkingSetSize)
+
+
 async def run(args: argparse.Namespace) -> dict:
-    config = load_web_config(args.config)
-    source = build_market_data_source(config.local_mirror_path)
-    scanner = source.scanner_snapshot(limit=args.symbols)
-    symbols = [str(row["symbol"]) for row in scanner["rows"]][: args.symbols]
+    base_config = load_web_config(args.config)
+    rss_before = process_rss_bytes()
+    source = build_market_data_source(base_config.resolved_local_mirror_path)
+    symbols = benchmark_symbols(source, args.symbols)
     if len(symbols) < args.symbols:
         raise RuntimeError(
             f"Source returned {len(symbols)} symbols; {args.symbols} required"
         )
     with tempfile.TemporaryDirectory(prefix="quant-web-benchmark-") as directory:
-        cache = ChartBundleCache(directory, max_symbols=max(args.symbols, 25))
+        from dataclasses import replace
+
+        config = replace(
+            base_config,
+            data_dir=Path(directory),
+            chart_cache_max_symbols=max(args.symbols, 25),
+        )
+        cache = ChartBundleCache(
+            config.cache_dir, max_symbols=max(args.symbols, 25)
+        )
         coordinator = ChartLoadCoordinator(
             source,
             cache,
@@ -87,12 +181,42 @@ async def run(args: argparse.Namespace) -> dict:
             warm_navigation.append((time.perf_counter() - symbol_started) * 1000)
             warm_bundle.append(daily_ms)
         warm_wall = time.perf_counter() - warm_started
+
+        http_timings: list[float] = []
+        http_bytes = 0
+        etags = 0
+        services = build_services(config)
+        services.auth.bootstrap_user(
+            "benchmark", "benchmark-only-password", replace=True
+        )
+        session = services.auth.authenticate(
+            "benchmark", "benchmark-only-password", remote_key="benchmark"
+        )
+        app = create_api_app(config, services=services)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://localhost:8080",
+            cookies={SESSION_COOKIE: session.token},
+        ) as client:
+            for symbol in symbols:
+                started = time.perf_counter()
+                response = await client.get(f"/api/v1/charts/{symbol}/1D")
+                elapsed = (time.perf_counter() - started) * 1000
+                response.raise_for_status()
+                http_timings.append(elapsed)
+                http_bytes += len(response.content)
+                etags += int(bool(response.headers.get("etag")))
+        services.connected_planning.close()
+        services.canonical_planning.close()
+
         tracemalloc.start()
         cache.publication_artifact(symbols[0], "1D")
         _current, peak = tracemalloc.get_traced_memory()
         tracemalloc.stop()
-        files = list(Path(directory).glob("*"))
+        files = list(config.cache_dir.glob("*"))
         disk_bytes = sum(path.stat().st_size for path in files if path.is_file())
+        rss_after = process_rss_bytes()
 
     def stats(values):
         return {
@@ -124,9 +248,17 @@ async def run(args: argparse.Namespace) -> dict:
             "bundle_read": stats(warm_bundle),
             "wall_seconds": round(warm_wall, 2),
         },
+        "http": {
+            "cache_state": "validated local gzip cache through authenticated ASGI",
+            "response": stats(http_timings),
+            "response_content_bytes": http_bytes,
+            "etag_responses": etags,
+        },
         "compressed_bundle_bytes": compressed_bytes,
         "cache_disk_bytes_including_manifests": disk_bytes,
         "python_peak_traced_bytes": peak,
+        "process_rss_before_bytes": rss_before,
+        "process_rss_after_bytes": rss_after,
         "hardware": {
             "platform": platform.platform(),
             "processor": platform.processor() or "unreported by Python",
@@ -145,6 +277,7 @@ def markdown(report: dict) -> str:
     cold = report["cold"]
     background = report["background"]
     warm = report["warm"]
+    http = report["http"]
     hardware = report["hardware"]
     settings = report["settings"]
     mib = 1024 * 1024
@@ -164,17 +297,20 @@ navigation against the validated gzip cache.
 | Delayed background 1H preparation | {background['bundle_job']['p50_ms']:.2f} ms | {background['bundle_job']['p95_ms']:.2f} ms | {background['bundle_job']['mean_ms']:.2f} ms | {background['wall_seconds']:.2f} s |
 | Warm visible navigation (direct gzip hit) | {warm['navigation']['p50_ms']:.2f} ms | {warm['navigation']['p95_ms']:.2f} ms | {warm['navigation']['mean_ms']:.2f} ms | {warm['wall_seconds']:.2f} s |
 | Warm publish-ready bundle read | {warm['bundle_read']['p50_ms']:.2f} ms | {warm['bundle_read']['p95_ms']:.2f} ms | {warm['bundle_read']['mean_ms']:.2f} ms | included above |
+| Authenticated warm HTTP chart response | {http['response']['p50_ms']:.2f} ms | {http['response']['p95_ms']:.2f} ms | {http['response']['mean_ms']:.2f} ms | {report['symbols']} sequential requests |
 
 ## Conditions
 
 - Source: `{report['source']}`.
 - Cache: cold empty temporary directory, then warm validated local gzip files.
-- Requests: {report['requests']} ({report['symbols']} visible cold + {report['symbols']} background + {report['symbols']} visible warm).
+- Coordinator requests: {report['requests']} direct plus {report['symbols']} authenticated HTTP requests ({report['symbols']} visible cold + {report['symbols']} background + {report['symbols']} visible warm + {report['symbols']} HTTP).
+- HTTP responses carrying an ETag: {http['etag_responses']} / {report['symbols']}; decoded response content: {http['response_content_bytes']:,} bytes.
 - Coverage settings: {settings['daily_bars']} daily bars and {settings['hourly_months']} calendar months hourly.
 - Worker limit: {settings['workers']}; navigation itself is sequential to make per-symbol values comparable.
 - Compressed chart bytes: {report['compressed_bundle_bytes']:,} ({report['compressed_bundle_bytes'] / mib:.2f} MiB).
 - Cache disk including manifests: {report['cache_disk_bytes_including_manifests']:,} ({report['cache_disk_bytes_including_manifests'] / mib:.2f} MiB).
 - Peak Python allocations for one isolated warm publication read, observed by `tracemalloc`: {report['python_peak_traced_bytes']:,} ({report['python_peak_traced_bytes'] / mib:.2f} MiB). This excludes native-library allocations and is kept outside latency timing.
+- Process working set before/after the benchmark: {report['process_rss_before_bytes'] if report['process_rss_before_bytes'] is not None else 'UNAVAILABLE'} / {report['process_rss_after_bytes'] if report['process_rss_after_bytes'] is not None else 'UNAVAILABLE'} bytes. This includes the Python runtime and loaded libraries and is not a browser-memory measurement.
 - Hardware/runtime: {hardware['platform']}; processor `{hardware['processor']}`; {hardware['logical_cpus']} logical CPUs; Python {hardware['python']}.
 
 ## Limitations
@@ -182,9 +318,8 @@ navigation against the validated gzip cache.
 - DEMO results measure deterministic local generation, normalization,
   compression, checksum, and disk cache behavior; they do not predict provider,
   LAN, TiDB, Supabase, or phone-network latency.
-- Values are server/data preparation timings. Browser layout/paint and a real
-  iPhone are outside this script and are checked separately with viewport
-  inspection.
+- Browser layout/paint is measured separately through the bounded
+  `window.__quantWebMetrics` samples; a physical iPhone remains a manual check.
 - The benchmark intentionally uses a temporary cache and performs no planning,
   execution, broker, KIS, or cloud writes.
 """
