@@ -39,6 +39,13 @@ No drag calls KIS directly.
 The engine remains read-only when disabled, when this device lacks the lease,
 or when any action-specific readiness gate fails.
 
+Connected web/PWA actions may update their initiating screen immediately while
+the canonical request is pending. That visual state is not confirmation. A
+failure rolls back; a success publishes browser invalidation and typed desktop
+pulses so every running surface refetches canonical state automatically.
+Runtime device-state and database-writability transitions also refresh desktop
+restrictions without waiting for a card revision or manual refresh.
+
 ## Buy Today and Entry Pending
 
 Buy Today is monitoring intent, not an order. After a current-session ORB
@@ -54,3 +61,4 @@ the old order before submitting the linked replacement. Any fill blocks the
 upgrade and moves broker-confirmed quantity to Open Position.
 
 See [Current Order Logic](https://github.com/cafe-auvers/quant_app/blob/master/docs/current_order_logic.md).
+See also [Web/PWA Operator Synchronization](https://github.com/cafe-auvers/quant_app/blob/master/docs/web_operator_sync.md).

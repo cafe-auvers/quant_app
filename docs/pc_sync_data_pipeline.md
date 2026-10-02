@@ -65,6 +65,29 @@ source: the laptop mirror continues display while TiDB remains the writable exec
 authority. If TiDB is not configured, the legacy PC-hosted coordination path
 still closes new entries and operator commands until PC MySQL returns.
 
+### Connected web/PWA state propagation
+
+An authenticated connected web/PWA action updates its initiating client
+optimistically, then commits through the canonical planning/command services.
+After a successful write, the web process publishes:
+
+- an in-process authenticated WebSocket invalidation for other open browser or
+  PWA clients, which then refetch canonical state; and
+- a typed external coordination pulse for the affected desktop scope, such as
+  `trade_cards`, `operator_commands`, or `app_state_sync`.
+
+The PC desktop checks the local inbound pulse every second. The PC listener
+also exposes the outbound event to the laptop, where it is acknowledged after
+the corresponding canonical refresh. Startup canonical reads and bounded
+revision polling recover a notification missed while a process was offline.
+No manual refresh is required for routine Watchlist, Buylist, breakout, Buy
+Today, Operator Control, runtime-state, or database-writability propagation.
+
+This path moves state visibility and human intent only. It does not transfer
+the execution lease, enable Live Trading, turn `STANDBY_READY` into `ACTIVE`,
+or bypass database, ownership, reconciliation, market-data, risk, capital, or
+broker gates. See [Web/PWA Operator Synchronization](web_operator_sync.md).
+
 ## Architecture
 
 ```mermaid

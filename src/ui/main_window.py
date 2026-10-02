@@ -107,9 +107,11 @@ from src.services.state_sync import (
     SETTINGS_KEY,
     LocalDeviceRole,
     get_live_trading_control,
+    is_mobile_web_operator_identity,
     live_trading_control_block_reason,
     live_trading_control_is_effective,
     load_local_device_role,
+    mobile_web_operator_role,
 )
 from src.ui.buyboard import BuyboardMixin
 from src.ui.buylist import BuylistMixin
@@ -3973,6 +3975,7 @@ class MainWindow(
         owner_layout.addWidget(QLabel("Operator Control:"))
         self.operator_control_pc_button = QPushButton("PC")
         self.operator_control_laptop_button = QPushButton("Laptop")
+        self.operator_control_mobile_button = QPushButton("Mobile")
         self.operator_control_locked_button = QPushButton("Locked")
         self.operator_control_pc_button.clicked.connect(
             lambda: self._on_control_owner_clicked("operator", "PC")
@@ -3980,11 +3983,19 @@ class MainWindow(
         self.operator_control_laptop_button.clicked.connect(
             lambda: self._on_control_owner_clicked("operator", "Laptop")
         )
+        self.operator_control_mobile_button.clicked.connect(
+            lambda: self._on_control_owner_clicked("operator", "Mobile")
+        )
         self.operator_control_locked_button.clicked.connect(
             lambda: self._on_control_owner_clicked("operator", "Locked")
         )
+        self.operator_control_mobile_button.setToolTip(
+            "Assign manual Operator Control to the authenticated Mobile Web/PWA. "
+            "This does not change the Execution Owner."
+        )
         owner_layout.addWidget(self.operator_control_pc_button)
         owner_layout.addWidget(self.operator_control_laptop_button)
+        owner_layout.addWidget(self.operator_control_mobile_button)
         owner_layout.addWidget(self.operator_control_locked_button)
         owner_layout.addSpacing(8)
         self.publish_trading_plan_button = QPushButton("Publish Today's Plan")
@@ -4067,6 +4078,11 @@ class MainWindow(
         return _control_runtime_identity_available(record)
 
     def _control_identity_kind(self, *, device_id: str = "", hostname: str = "") -> str:
+        if is_mobile_web_operator_identity(
+            device_id=device_id,
+            hostname=hostname,
+        ):
+            return "Mobile"
         records = list(self.__dict__.get("_runtime_device_records", ()) or ())
         exact = [
             record
@@ -4096,6 +4112,35 @@ class MainWindow(
     def _control_target_role(self, target_label: str) -> Optional[LocalDeviceRole]:
         if target_label == "Locked":
             return None
+        if target_label == "Mobile":
+            control = self.__dict__.get("_cached_operator_control")
+            if control is not None:
+                if is_mobile_web_operator_identity(
+                    device_id=str(getattr(control, "device_id", "") or ""),
+                    hostname=str(getattr(control, "hostname", "") or ""),
+                ):
+                    return LocalDeviceRole(
+                        str(getattr(control, "device_id", "") or ""),
+                        str(getattr(control, "hostname", "") or "Mobile Web"),
+                        False,
+                    )
+                if is_mobile_web_operator_identity(
+                    device_id=str(
+                        getattr(control, "previous_device_id", "") or ""
+                    ),
+                    hostname=str(
+                        getattr(control, "previous_hostname", "") or ""
+                    ),
+                ):
+                    return LocalDeviceRole(
+                        str(getattr(control, "previous_device_id", "") or ""),
+                        str(
+                            getattr(control, "previous_hostname", "")
+                            or "Mobile Web"
+                        ),
+                        False,
+                    )
+            return mobile_web_operator_role()
         records = self.__dict__.get("_runtime_device_records", ()) or ()
         target = _control_target_role_from_records(records, target_label)
         if target is not None:
@@ -4113,6 +4158,7 @@ class MainWindow(
             "execution_owner_laptop_button",
             "operator_control_pc_button",
             "operator_control_laptop_button",
+            "operator_control_mobile_button",
             "operator_control_locked_button",
         ):
             button = self.__dict__.get(name)
@@ -4579,6 +4625,9 @@ class MainWindow(
         )
         self.operator_control_laptop_button.setStyleSheet(
             active_style if operator_label == "Laptop" else inactive_style
+        )
+        self.operator_control_mobile_button.setStyleSheet(
+            active_style if operator_label == "Mobile" else inactive_style
         )
         self.operator_control_locked_button.setStyleSheet(
             active_style if operator_label == "Locked" else inactive_style
@@ -5165,28 +5214,40 @@ class MainWindow(
 
         kind = detect_local_device_kind(getattr(role, "hostname", platform.node()))
         change = stage_local_coordination_change(engine, device_id=role.device_id)
+        # The web controller is an external process and publishes a typed
+        # inbound file in this repository. Consume it on either device kind;
+        # previously only a PC read this file, so a web app hosted beside the
+        # laptop desktop process could leave the board stale until refresh.
+        inbound_event = read_inbound_change_event()
+        inbound_event_id = inbound_event.event_id
+        if inbound_event_id and inbound_event_id != self.__dict__.get(
+            "_last_inbound_coordination_event_id", ""
+        ):
+            self._last_inbound_coordination_event_id = inbound_event_id
+            if mark_remote_coordination_change(
+                engine,
+                inbound_event_id,
+                tables=inbound_event.tables,
+            ):
+                self._on_remote_coordination_change(inbound_event.tables)
+            if kind != "PC":
+                # Relay the same typed token to the always-on PC. Delivery is
+                # handled by the existing background status worker and is
+                # retried until its listener acknowledges it.
+                self._pending_external_coordination_event = inbound_event
         if kind == "PC":
             if change.event_id and publish_outbound_change_pulse(
                 change.event_id, tables=change.tables
             ):
                 acknowledge_local_change_event(engine, change.event_id)
-            inbound_event = read_inbound_change_event()
-            inbound_event_id = inbound_event.event_id
-            if inbound_event_id and inbound_event_id != self.__dict__.get(
-                "_last_inbound_coordination_event_id", ""
-            ):
-                self._last_inbound_coordination_event_id = inbound_event_id
-                if mark_remote_coordination_change(
-                    engine,
-                    inbound_event_id,
-                    tables=inbound_event.tables,
-                ):
-                    self._on_remote_coordination_change(inbound_event.tables)
             return
 
         # Laptop delivery is piggy-backed on the existing asynchronous PC
         # status worker, so the one-second Qt pulse never performs socket I/O.
-        if change.event_id and self.__dict__.get("_pc_status_worker") is None:
+        if (
+            change.event_id
+            or self.__dict__.get("_pending_external_coordination_event") is not None
+        ) and self.__dict__.get("_pc_status_worker") is None:
             self._poll_pc_status()
 
     def _poll_pc_status(self) -> None:
@@ -5216,21 +5277,28 @@ class MainWindow(
             if self.__dict__.get("_coordination_database_configured", False)
             else None
         )
-        if (
-            role is not None
-            and execution_engine is not None
-            and detect_local_device_kind(getattr(role, "hostname", platform.node()))
-            == "Laptop"
-        ):
+        if role is not None and detect_local_device_kind(
+            getattr(role, "hostname", platform.node())
+        ) == "Laptop":
             from src.services.coordination_change_pulse import (
                 stage_local_coordination_change,
             )
 
-            pending_change = stage_local_coordination_change(
-                execution_engine, device_id=role.device_id
+            external_change = self.__dict__.get(
+                "_pending_external_coordination_event"
             )
-            pending_event_id = pending_change.event_id
-            pending_event_tables = pending_change.tables
+            pending_change = (
+                external_change
+                if external_change is not None
+                else stage_local_coordination_change(
+                    execution_engine, device_id=role.device_id
+                )
+                if execution_engine is not None
+                else None
+            )
+            if pending_change is not None:
+                pending_event_id = pending_change.event_id
+                pending_event_tables = pending_change.tables
         worker = PcRemoteStatusWorker(
             probe_engine,
             coordination_notification_event_id=pending_event_id,
@@ -5291,6 +5359,14 @@ class MainWindow(
             and delivered_event_id
         ):
             acknowledge_local_change_event(execution_engine, delivered_event_id)
+            external_change = self.__dict__.get(
+                "_pending_external_coordination_event"
+            )
+            if (
+                external_change is not None
+                and external_change.event_id == delivered_event_id
+            ):
+                self.__dict__.pop("_pending_external_coordination_event", None)
         role = self.__dict__.get("state_sync_role")
         remote_event_id = str(getattr(status, "coordination_change_event_id", "") or "")
         remote_event_tables = tuple(

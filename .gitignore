@@ -7,6 +7,7 @@ __pycache__/
 .Python
 env/
 venv/
+.venv-web/
 ENV/
 build/
 develop-eggs/
@@ -53,6 +54,8 @@ wheels/
 .secrets/
 config/kis_config.py
 config/runtime.local.json
+config/web.local.json
+config/web.publisher.local.json
 .kis_token_cache*.json
 
 # Data
@@ -62,6 +65,7 @@ data/*.json.bak
 data/*.jsonl
 data/*.lock
 data/cache/
+data/web/
 data/pre_restore_backup_*/
 
 # Historical refresh process runtime state (historical.py / historical_refresh_control.py)

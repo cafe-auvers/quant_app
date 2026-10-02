@@ -90,7 +90,10 @@ def build_report(
                 evidence_mapping(baseline_evidence.get("review"))
             )
         )
-        carry_historical_coverage = change_impact == "EVIDENCE_ONLY"
+        carry_historical_coverage = change_impact in {
+            "EVIDENCE_ONLY",
+            "PRESENTATION_ONLY",
+        }
     required_true = {
         "collector_derived",
         "execution_capabilities_verified",

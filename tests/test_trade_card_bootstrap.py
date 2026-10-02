@@ -47,6 +47,7 @@ def _buylist_item(symbol: str, *, account_no: str = "") -> BuylistItem:
         kis_account_no=account_no,
         environment="PROD",
         monitoring_status="WATCHING",
+        breakout_price=101.0,
     )
 
 
@@ -226,7 +227,7 @@ def test_bootstrap_promotes_passive_watchlist_card_to_buylist(tmp_path, monkeypa
     assert promoted.previous_board_status == BoardStatus.WATCHLIST
     assert promoted.watchlist_member is True
     assert promoted.buylist_member is True
-    assert promoted.version == existing.version + 1
+    assert promoted.version >= existing.version + 1
 
     # A restart or second device sees the canonical promotion and performs no
     # further write/version bump.

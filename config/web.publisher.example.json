@@ -1,0 +1,5 @@
+{
+  "supabase_url": "",
+  "supabase_secret_key": "",
+  "bucket": "chart-cache"
+}

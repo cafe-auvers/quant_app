@@ -47,6 +47,8 @@ from src.services.state_sync import (
     claim_main_device,
     get_main_device,
     get_operator_control,
+    is_mobile_web_operator_identity,
+    mobile_web_operator_role,
     publish_planning_snapshot,
     set_live_trading_control,
     set_operator_control,
@@ -150,6 +152,128 @@ def test_laptop_owner_target_uses_published_device_kind():
     assert target is not None
     assert target.device_id == laptop.device_id
     assert target.hostname == laptop.hostname
+
+
+def test_mobile_operator_target_uses_shared_non_executor_identity():
+    window = MainWindow.__new__(MainWindow)
+    window._runtime_device_records = ()
+    window.state_sync_role = LocalDeviceRole("pc-id", "TRADING-PC", False)
+
+    target = window._control_target_role("Mobile")
+
+    assert target == mobile_web_operator_role()
+    assert target.hostname == "Mobile Web"
+    assert target.is_main is False
+    assert window._control_identity_kind(
+        device_id=target.device_id,
+        hostname=target.hostname,
+    ) == "Mobile"
+    assert is_mobile_web_operator_identity(
+        device_id=target.device_id,
+        hostname=target.hostname,
+    )
+
+
+def test_mobile_operator_target_reuses_previous_account_scoped_identity():
+    mobile = mobile_web_operator_role("PROD", "account-a")
+    window = MainWindow.__new__(MainWindow)
+    window._cached_operator_control = SimpleNamespace(
+        device_id="pc-id",
+        hostname="TRADING-PC",
+        previous_device_id=mobile.device_id,
+        previous_hostname=mobile.hostname,
+    )
+
+    target = window._control_target_role("Mobile")
+
+    assert target.device_id == mobile.device_id
+    assert target.hostname == "Mobile Web"
+
+
+def test_mobile_operator_assignment_preserves_desktop_execution_owner(engine, roles):
+    pc, _laptop = roles
+    mobile = mobile_web_operator_role()
+    claimed = claim_main_device(engine, pc)
+    assert claimed.success is True
+    completed = []
+    worker = ControlOwnerWorker(
+        engine,
+        pc,
+        control="operator",
+        target=mobile,
+        target_label="Mobile",
+    )
+    worker.completed.connect(completed.append)
+
+    worker.run()
+
+    assert completed[0].success is True
+    control = get_operator_control(engine).control
+    assert control is not None
+    assert control.device_id == mobile.device_id
+    assert control.hostname == "Mobile Web"
+    execution_owner = get_main_device(engine).main_device
+    assert execution_owner is not None
+    assert execution_owner.device_id == pc.device_id
+    assert execution_owner.device_id != mobile.device_id
+
+
+def test_operator_status_labels_and_highlights_mobile(monkeypatch):
+    class WidgetStub:
+        def __init__(self):
+            self.text = ""
+            self.tooltip = ""
+            self.stylesheet = ""
+
+        def setText(self, value):
+            self.text = value
+
+        def setToolTip(self, value):
+            self.tooltip = value
+
+        def setStyleSheet(self, value):
+            self.stylesheet = value
+
+    monkeypatch.setattr(
+        "src.ui.main_window._live_execution_status_text",
+        lambda *_args, **_kwargs: "Disabled",
+    )
+    mobile = mobile_web_operator_role()
+    window = MainWindow.__new__(MainWindow)
+    window.state_sync_role = LocalDeviceRole("pc-id", "TRADING-PC", False)
+    window._execution_state_engine = lambda: None
+    window.control_ownership_status = WidgetStub()
+    window.execution_owner_pc_button = WidgetStub()
+    window.execution_owner_laptop_button = WidgetStub()
+    window.operator_control_pc_button = WidgetStub()
+    window.operator_control_laptop_button = WidgetStub()
+    window.operator_control_mobile_button = WidgetStub()
+    window.operator_control_locked_button = WidgetStub()
+    result = SimpleNamespace(
+        operator_control_error="",
+        operator_control=SimpleNamespace(
+            device_id=mobile.device_id,
+            hostname=mobile.hostname,
+            locked=False,
+        ),
+        last_verified_at=datetime.now(timezone.utc),
+        runtime_devices=[],
+        main_device_id="pc-id",
+        is_main_device=True,
+        main_device_hostname="TRADING-PC",
+        errors=[],
+        state_revisions={},
+        live_trading_enabled=False,
+        operator_commands=[],
+    )
+
+    window._refresh_control_ownership_status(result)
+
+    assert "Current Operator Control: Mobile" in window.control_ownership_status.text
+    assert "background-color" in window.operator_control_mobile_button.stylesheet
+    assert window.operator_control_pc_button.stylesheet == ""
+    assert window.operator_control_laptop_button.stylesheet == ""
+    assert window.operator_control_locked_button.stylesheet == ""
 
 
 def test_owner_target_stays_available_for_the_configured_heartbeat_window():

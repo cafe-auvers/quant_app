@@ -11,7 +11,7 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QKeySequence
 from PyQt5.QtWidgets import QMessageBox, QPushButton, QShortcut
 
-from src.core.board_workflow import MoveToWatchlist
+from src.core.board_workflow import MoveToBuylist, MoveToWatchlist
 from src.core.trade_card_state import BoardStatus
 from src.services.planning_membership_service import is_passive_planning_card
 from src.ui.buyboard.board import _command_kwargs
@@ -538,24 +538,6 @@ class WatchlistActionsMixin:
 
     def set_chart_target_price(self, symbol: str, breakout_price: float) -> None:
         symbol = self._normalized_watchlist_symbol(symbol)
-        projection = self._chart_buyboard_projection(symbol)
-        card = projection.card if projection is not None else None
-        watchlist = self.__dict__.get("watchlist")
-        in_watchlist = bool(
-            watchlist is not None and symbol and watchlist.get(symbol) is not None
-        )
-        archived_watchlist_card = bool(
-            card is not None
-            and card.board_status == BoardStatus.WATCHLIST
-            and not card.watchlist_member
-        )
-        if archived_watchlist_card or (projection is None and not in_watchlist):
-            QMessageBox.information(
-                self,
-                "Add to Watchlist first",
-                f"Add {symbol} to Watchlist before setting its breakout price.",
-            )
-            return
         super().set_chart_target_price(symbol, breakout_price)
 
     def _chart_queue_toggle(self, symbol: str) -> None:
@@ -597,22 +579,34 @@ class WatchlistActionsMixin:
             # back into an "add to Buylist" action after activation.
             super()._chart_queue_toggle(symbol)
             return
-        if (
-            card is not None
-            and card.board_status == BoardStatus.WATCHLIST
-            and (not card.watchlist_member or watch_item is None)
-        ):
-            QMessageBox.information(
-                self,
-                "Add to Watchlist first",
-                f"Add {symbol} to Watchlist before moving it to Buylist.",
-            )
-            return
-        if canonical_watchlist_member or watch_item is not None:
+        if card is not None and card.board_status == BoardStatus.WATCHLIST:
             target = self._chart_positive_price(
                 getattr(card, "breakout_price", None)
-                if card is not None
-                else getattr(watch_item, "breakout_price", None)
+            )
+            if target is None:
+                QMessageBox.information(
+                    self,
+                    "Breakout price required",
+                    f"Set a positive breakout price for {symbol} before moving it to Buylist.",
+                )
+                return
+            if canonical_watchlist_member:
+                self._promote_watchlist_candidate(symbol)
+            else:
+                payload = card_drag_payload(projection)
+                if self._dispatch_chart_command(
+                    MoveToBuylist(**_command_kwargs(payload)),
+                    interaction_fingerprint=payload["state_fingerprint"],
+                ):
+                    append_log = getattr(self, "append_log", None)
+                    if callable(append_log):
+                        append_log(
+                            f"[Chart] Requested standalone breakout promotion for {symbol}."
+                        )
+            return
+        if watch_item is not None:
+            target = self._chart_positive_price(
+                getattr(watch_item, "breakout_price", None)
             )
             if target is None:
                 QMessageBox.information(
@@ -664,20 +658,23 @@ class WatchlistActionsMixin:
             # canonical card as a green "Add to Buylist" action.
             super()._apply_chart_queue_btn_state(symbol, button)
             return
-        if (
-            card is not None
-            and card.board_status == BoardStatus.WATCHLIST
-            and (not card.watchlist_member or watch_item is None)
-        ):
-            button.setText("Add to Watchlist First")
-            button.setEnabled(False)
-            button.setStyleSheet("")
-            return
-        if canonical_watchlist_member or watch_item is not None:
+        if card is not None and card.board_status == BoardStatus.WATCHLIST:
             target = self._chart_positive_price(
                 getattr(card, "breakout_price", None)
-                if card is not None
-                else getattr(watch_item, "breakout_price", None)
+            )
+            button.setText(
+                "Add to Buylist (Q)" if target is not None else "Set Breakout First"
+            )
+            button.setEnabled(target is not None and not pending)
+            button.setStyleSheet(
+                "background-color: #27ae60; color: white; font-weight: 600;"
+                if target is not None
+                else ""
+            )
+            return
+        if watch_item is not None:
+            target = self._chart_positive_price(
+                getattr(watch_item, "breakout_price", None)
             )
             button.setText(
                 "Add to Buylist (Q)" if target is not None else "Set Breakout First"

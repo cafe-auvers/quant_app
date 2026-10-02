@@ -1188,6 +1188,7 @@ owned cards).
 | L2. A drag/gesture on the board issues a *command request*; the card only reflects the new state once the workflow service (and, downstream, the gateway) confirms it — a drag never itself declares success. | `src/ui/buyboard/board.py` (modify) | n/a (UI state only) | n/a (delegates) | A rejected command reverts the card's visual position/state, with the rejection reason shown. | N/A | `test_a_rejected_drag_command_reverts_the_cards_visual_state` | Workstream 13 |
 | L3. Full parity matrix (below) — every legacy Buy Dashboard action has a Kanban equivalent that produces the *same underlying command* (tested by asserting on the command, not merely the resulting screen). | `src/ui/buyboard/` | varies per action | varies per action | n/a | n/a | one test per parity row below, asserting command equality, not just visual equivalence | Workstream 13 |
 | L4. `DiscoveredExternalOrder`s (A4b) render as a visually distinct element, never merged into a card's own state, with an explicit "Adopt" action that is the *only* path from `DiscoveredExternalOrder` to a `USER_ADOPTED` `ExecutionOrderRecord` (INV-22; see `ExternalOrderDisposition`). | `src/ui/buyboard/board.py` | n/a | n/a | n/a | n/a | `test_discovered_external_order_renders_distinctly_from_owned_cards`, `test_adopt_action_is_the_only_path_to_a_user_adopted_execution_order_record` | Workstream 13 |
+| L5. Projection freshness is event-driven across control surfaces: web/PWA actions may render pending optimistic state, but success is confirmed only by the canonical response; authenticated invalidations and typed desktop pulses trigger canonical reloads. Runtime device-state and database-writability transitions also refresh the board without requiring a card revision or manual refresh. | `src/web/`, `src/services/coordination_change_pulse.py`, `src/ui/main_window.py`, `src/ui/buyboard/runtime_worker.py` | canonical rows plus non-authoritative invalidation tokens | none | Failed web commands roll back; missed tokens recover through initial reads/revision fallbacks; restricted runtime state remains visible. | Automatic on reconnect/recovery; no manual refresh dependency. | `test_planning_controls_update_optimistically_before_canonical_save`, authenticated `/live-updates` coverage, `test_readiness_projection_refreshes_on_state_and_write_gate_changes` | Workstream 13 |
 
 ### L3 parity matrix
 
@@ -1295,6 +1296,14 @@ requires its own independently verified envelope.
 
 ## Change log
 
+- 2026-10-02 (projection-sync clarification): Documented the implemented
+  web/PWA optimistic-feedback contract, authenticated browser invalidations,
+  typed PC/laptop change pulses, and fallback canonical reads. Added the
+  requirement that runtime device-state and canonical-store writability
+  transitions refresh Buy Board restrictions even when no TradeCard revision
+  changes. These display/synchronization paths do not relax execution lease,
+  ownership, reconciliation, market-data, live-mode, risk, capital, or broker
+  gates.
 - 2026-08-17 (revision 3.5): After Gate 1 passed, separated the full-session
   read-only Gate-2 certificate from a narrowly approved supervised pilot of
   the final runtime. Production WebSocket composition now consumes an exact

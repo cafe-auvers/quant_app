@@ -655,11 +655,6 @@ def _require_breakout_plan_mutation_policy(command, card, context) -> None:
         raise BoardCommandRejectedError(
             f"Cannot change breakout planning from {card.board_status.value}"
         )
-    if card.board_status == BoardStatus.WATCHLIST and not card.watchlist_member:
-        raise BoardCommandRejectedError(
-            "This Watchlist candidate was removed; add it to Watchlist again "
-            "before changing its breakout target"
-        )
     if (
         isinstance(command, types.ClearBreakoutPrice)
         and card.board_status == BoardStatus.BUY_TODAY
@@ -946,26 +941,20 @@ def _require_board_action_not_conflicted(engine, command, card) -> List[Executio
                 "Breakout planning cannot be removed after entry, order, reservation, or position evidence exists"
             )
 
-    planning_stage_move = isinstance(command, types.MoveToWatchlist) or (
+    planning_stage_move = isinstance(
+        command, (types.MoveToWatchlist, types.RemoveFromBuylist)
+    ) or (
         isinstance(command, types.MoveToBuylist)
         and card.board_status == BoardStatus.WATCHLIST
     )
-    if (
-        isinstance(command, types.MoveToBuylist)
-        and card.board_status == BoardStatus.WATCHLIST
-        and not card.watchlist_member
-    ):
-        raise BoardCommandRejectedError(
-            "This Watchlist candidate was removed; add it again before promotion"
-        )
     if planning_stage_move and has_durable_entry_or_position_evidence():
         raise BoardCommandRejectedError(
             "Planning membership cannot change while order, reservation, or "
             "position evidence exists"
         )
-    if isinstance(command, types.MoveToWatchlist) and _active_external_orders(
-        engine, card
-    ):
+    if isinstance(
+        command, (types.MoveToWatchlist, types.RemoveFromBuylist)
+    ) and _active_external_orders(engine, card):
         # WATCHLIST is intentionally hidden from the execution board.  Moving
         # a card there while an unowned broker order is attached would also
         # hide that order's mandatory alert row from the operator.
@@ -993,9 +982,20 @@ def _require_board_action_not_conflicted(engine, command, card) -> List[Executio
             raise BoardCommandRejectedError(
                 "A BUY identity/order already exists; request entry cancellation and wait for broker-confirmed terminal reconciliation"
             )
+        try:
+            breakout_price = float(card.breakout_price or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            breakout_price = 0.0
+        if not math.isfinite(breakout_price) or breakout_price <= 0:
+            raise BoardCommandRejectedError(
+                "Set a breakout price before adding this symbol to Buylist"
+            )
         return active_orders
 
-    if isinstance(command, (types.MoveToWatchlist, types.ReorderCard)):
+    if isinstance(
+        command,
+        (types.MoveToWatchlist, types.RemoveFromBuylist, types.ReorderCard),
+    ):
         return active_orders
     if card.entry_submission_unresolved or card.exit_submission_unresolved:
         raise BoardCommandRejectedError(
@@ -1173,13 +1173,7 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
         ):
             card.buffer_pct = float(command.buffer_pct)
         card.breakout_price = float(command.price)
-        if card.board_status == BoardStatus.WATCHLIST:
-            card.watchlist_member = True
-            card.watchlist_session_date = (
-                market_calendar.current_or_next_nyse_session_date()
-            )
-            card.buylist_member = False
-        else:
+        if card.board_status != BoardStatus.WATCHLIST:
             card.buylist_member = True
         if not preserve_unfilled_execution:
             card.buy_today_note = ""
@@ -1193,16 +1187,12 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
     if isinstance(command, types.ClearBreakoutPrice):
         if card.board_status == BoardStatus.BUY_TODAY:
             _move_board_card(card, BoardStatus.BUYLIST)
+            _move_board_card(card, BoardStatus.WATCHLIST)
+        elif card.board_status == BoardStatus.BUYLIST:
+            _move_board_card(card, BoardStatus.WATCHLIST)
         clear_executable_entry_plan()
         card.breakout_price = None
-        if card.board_status == BoardStatus.WATCHLIST:
-            card.watchlist_member = True
-            card.watchlist_session_date = (
-                market_calendar.current_or_next_nyse_session_date()
-            )
-            card.buylist_member = False
-        else:
-            card.buylist_member = True
+        card.buylist_member = False
         card.session_date = None
         card.buy_today_note = ""
         card.entry_runtime_status = None
@@ -1366,6 +1356,7 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
 
     targets = {
         types.MoveToWatchlist: BoardStatus.WATCHLIST,
+        types.RemoveFromBuylist: BoardStatus.WATCHLIST,
         types.MoveToBuylist: BoardStatus.BUYLIST,
         types.ActivateForToday: BoardStatus.BUY_TODAY,
         types.RequestSellAll: BoardStatus.SELL_ALL,
@@ -1386,12 +1377,14 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
         card.session_date = None
         card.entry_runtime_status = None
         card.buy_today_note = ""
+    elif isinstance(command, types.RemoveFromBuylist):
+        clear_executable_entry_plan()
+        card.buylist_member = False
+        card.session_date = None
+        card.entry_runtime_status = None
+        card.buy_today_note = ""
     elif isinstance(command, types.MoveToBuylist):
         clear_executable_entry_plan()
-        card.watchlist_member = True
-        card.watchlist_session_date = (
-            market_calendar.current_or_next_nyse_session_date()
-        )
         card.buylist_member = True
         card.buy_today_note = ""
         card.session_date = None
@@ -1438,6 +1431,8 @@ def request_board_action(
     *,
     context=None,
     claim_kanban_ownership: bool = False,
+    local_snapshot_path=None,
+    record_summary: bool = True,
 ):
     """Validate and persist one revision-aware Kanban workflow request.
 
@@ -1554,10 +1549,8 @@ def request_board_action(
                     account_no=command.account_no,
                     symbol=command.symbol,
                     board_status=BoardStatus.WATCHLIST,
-                    watchlist_member=True,
-                    watchlist_session_date=(
-                        market_calendar.current_or_next_nyse_session_date()
-                    ),
+                    watchlist_member=False,
+                    watchlist_session_date=None,
                     buylist_member=False,
                 )
                 _apply_board_mutation(
@@ -1567,7 +1560,9 @@ def request_board_action(
                     active_orders=(),
                 )
                 updated = trade_card_repository.insert_trade_card(conn, created)
-            trade_card_repository.sync_trade_card_local_snapshot(updated)
+            trade_card_repository.sync_trade_card_local_snapshot(
+                updated, path=local_snapshot_path
+            )
             return BoardWorkflowResult(card=updated, command_id=command.command_id)
         raise TradeCardNotFoundError(
             f"No trade card for {command.environment}:{command.account_no}:{command.symbol}"
@@ -1739,22 +1734,25 @@ def request_board_action(
             )
         if stop_change_coordinator is not None:
             stop_change_coordinator.record_durable(updated)
-    trade_card_repository.sync_trade_card_local_snapshot(updated)
-    from src.services.daily_trading_summary import (
-        record_buy_today_added_best_effort,
-        record_trade_card_snapshot_best_effort,
+    trade_card_repository.sync_trade_card_local_snapshot(
+        updated, path=local_snapshot_path
     )
-
-    record_trade_card_snapshot_best_effort(
-        engine, updated, occurred_at=getattr(command, "requested_at", None)
-    )
-    if isinstance(command, ActivateForToday):
-        record_buy_today_added_best_effort(
-            engine,
-            updated,
-            command_id=command.command_id,
-            occurred_at=command.requested_at,
+    if record_summary:
+        from src.services.daily_trading_summary import (
+            record_buy_today_added_best_effort,
+            record_trade_card_snapshot_best_effort,
         )
+
+        record_trade_card_snapshot_best_effort(
+            engine, updated, occurred_at=getattr(command, "requested_at", None)
+        )
+        if isinstance(command, ActivateForToday):
+            record_buy_today_added_best_effort(
+                engine,
+                updated,
+                command_id=command.command_id,
+                occurred_at=command.requested_at,
+            )
     return BoardWorkflowResult(card=updated, command_id=command.command_id)
 
 

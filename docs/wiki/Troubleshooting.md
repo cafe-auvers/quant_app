@@ -23,6 +23,33 @@ lease/ownership, stale account reconciliation, missing WebSocket ACKs, stale
 quotes, database write failure, mutation budget, unresolved order, or Live
 Trading off. Fix the underlying cause; never bypass a gate.
 
+`RESTRICTED: Device state is STARTING`, an unconfirmed-writable-store warning,
+or `execution owner is LEGACY` describes separate gates. The first two now
+refresh automatically when the runtime state or writability result changes;
+the ownership warning clears only after the canonical workflow legitimately
+assigns the symbol to the matching Kanban strategy. Refreshing the page cannot
+make any of those gates pass.
+
+## Phone action succeeded but another screen looks stale
+
+Do not repeat the action blindly. Check the initiating browser's final status:
+pending/optimistic state is not confirmation, while a canonical success or a
+durably queued command is. Other browser/PWA sessions should receive an
+authenticated `/live-updates` invalidation and desktops should consume a typed
+coordination pulse automatically.
+
+- Confirm the web host and desktop are using the same canonical coordination
+  store and account/environment.
+- Confirm the web session is still authenticated and the browser reconnected
+  its WebSocket after a network interruption.
+- Confirm the PC listener and desktop `main.py` process are running.
+- Inspect the canonical card/command revision before retrying.
+- Allow the bounded revision fallback or restart a stopped/outdated process;
+  normal operation does not require a manual page refresh.
+
+An offline desktop performs an initial canonical read when it starts, so it
+does not depend on receiving every historical pulse.
+
 ## PC is on but cannot become Execution Owner
 
 `PC: On`, `DB: On`, `Listener: On`, and `main.py: On` are separate health

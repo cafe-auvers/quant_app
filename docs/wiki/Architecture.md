@@ -5,6 +5,7 @@ The code is layered so UI gestures cannot become broker mutations by accident.
 ```mermaid
 flowchart TB
     UI[src/ui<br/>PyQt widgets, controllers, workers]
+    Web[src/web<br/>authenticated static shell and command API]
     Core[src/core and src/strategy<br/>state, rules, commands, ORB]
     Risk[src/risk<br/>sizing and pre-trade approval]
     Services[src/services<br/>workflows, reconciliation, runtime]
@@ -14,6 +15,7 @@ flowchart TB
 
     UI --> Core
     UI --> Services
+    Web --> Services
     Services --> Core
     Services --> Risk
     Services --> Infra
@@ -31,6 +33,9 @@ OS variables, configures logging/Qt handling, creates `QApplication`, imports
 ## Responsibility boundaries
 
 - `src/ui`: presentation, interaction routing, and background worker lifecycle.
+- `src/web`: authenticated read/command boundary, optimistic browser UX, and
+  non-authoritative live-update invalidations; it never constructs a broker or
+  execution runtime.
 - `src/core`: immutable models, transitions, scanner rules, commands, and
   execution contracts.
 - `src/strategy`: strategy-neutral contracts and the built-in ORB strategy.
@@ -44,6 +49,11 @@ OS variables, configures logging/Qt handling, creates `QApplication`, imports
 Slow external work normally belongs in QThread or background workers. The
 remaining chart UI-thread limitation is documented in
 [Performance Audit](https://github.com/cafe-auvers/quant_app/blob/master/docs/performance-audit.md).
+
+Connected web writes use the same headless domain services, then publish typed
+coordination pulses. Desktop workers refetch canonical projections, and
+runtime-state/writability transitions separately trigger board refreshes. See
+[Web/PWA Operator Synchronization](https://github.com/cafe-auvers/quant_app/blob/master/docs/web_operator_sync.md).
 
 The active broker path uses immutable ORB order generations: a fresh confirmed
 breakout submits a passive limit, and a later higher-score generation can be

@@ -12,7 +12,96 @@ see the normative
 
 Quant App is a desktop trading dashboard for US-market swing trading, scanner review, passive Watchlist planning, Buy Board ORB planning, KIS account visibility, and guarded KIS order submission. The Watchlist remains available through lightweight sidebar, Scanner, and TradingView actions; only its former dedicated tab was removed.
 
-The application is not a headless service. `main.py` creates a `QApplication`, installs a small Qt warning filter, imports `src.ui.main_window.MainWindow`, and starts the PyQt event loop.
+The desktop application is not a headless service. `main.py` creates a
+`QApplication`, installs a small Qt warning filter, imports
+`src.ui.main_window.MainWindow`, and starts the PyQt event loop. The separate
+authenticated localhost review process is described below and deliberately
+does not import `main.py` or own execution.
+
+## Localhost Web Review Process
+
+The current validated web implementation is
+`c882a22dc3417a3c034f74e33a32c062a01d1c14` on the single integration branch
+`codex/mobile-operator-control`; see
+[Quant Web Final Validation](docs/web_final_validation.md). The active frontend
+is FastAPI plus static HTML/CSS/JavaScript. The `_nicegui_ws` route is only a
+transitional redirect for tabs left open from the retired frontend.
+
+`scripts/run_web.py` is the independent composition root for a small FastAPI
+process serving a static HTML/JavaScript shell. It binds only to a loopback
+address and imports the headless `src.web` package. It never constructs Qt,
+KIS, a broker, the trading engine, or an execution worker.
+
+```text
+browser / installed PWA
+  -> Host + Origin + session + CSRF boundaries
+  -> FastAPI read and command API
+  -> static responsive page shell (no server hydration; authenticated
+     invalidation WebSocket only)
+       -> Scanner/universe and current chart-bundle interfaces
+       -> isolated sandbox planning/drawing store (data/web/web_state.db)
+       -> one-current gzip chart cache (data/web/chart_cache)
+       -> optional read-only SQLite market mirror
+       -> optional read-only canonical TiDB TradeCard projection
+       -> optional Supabase identity/chart/drawing projection
+
+PyQt main.py / canonical SQL state / executor / KIS
+  (separate process; never started or owned by localhost web)
+```
+
+`SANDBOX` is the default local acceptance mode. Planning
+commands have durable idempotency keys, optimistic revisions, audit rows, and
+the visible state `NOT SYNCED TO EXECUTOR`. Buy Today is a local preview only.
+All active trading, order, ownership, global-risk, workstation-power, and real
+Buy Today activation routes are denied at the server boundary.
+
+Market/chart reads use `MarketDataSource`; local DEMO and read-only SQLite
+mirror adapters implement it. Daily data is prepared with indicator warm-up
+before the latest 750 bars are trimmed. Hourly data covers six calendar months
+independently with exchange-local timestamps converted to UTC. Responses carry
+actual coverage, source, session policy, adjustment policy, completeness, and
+the latest completed bar.
+
+`ChartBundleCache` keeps one current deterministic gzip file and one small
+manifest per symbol/timeframe. Local replacement is atomic and checksum
+validated. Optional cloud publication uses an `UPDATING -> READY/FAILED`
+manifest revision protocol and validates the compressed bytes returned after
+overwrite; readers never treat a manifest change alone as proof of freshness.
+Local retained symbols and canonical Watchlist, Buylist, Buy Today, and
+position symbols are protected from bounded eviction. Cache validation covers
+source revision, adjustment/session policy, payload schema, and configured
+daily/hourly generation coverage.
+
+Authentication is explicit: one local user is created with Argon2 and no
+default password; opaque expiring sessions are server-side. Cookies never
+contain passwords or canonical state. Login is rate limited, mutations require
+CSRF, and Host/Origin allowlists apply to HTTP and WebSocket connections.
+
+Supabase is optional and off by default. Reviewed migrations contain only an
+access allowlist, scanner projection, chart manifests, private chart-cache
+Storage policies, and ordinary drawing rows with RLS. They intentionally do
+not reproduce canonical TradeCards, orders, reservations, ownership, or
+execution ledgers. Canonical connected planning writes default off. The web
+gateway can explicitly allowlist passive Watchlist/Buylist and breakout
+operations; every request is authenticated and revision-fenced, and breakout
+edits additionally verify that either the stable `Mobile Web` identity or the
+exact hosting-desktop identity owns Operator Control. A separately allowlisted operator surface can activate/remove an
+unsubmitted canonical Buy Today card and publish the closed-session plan. It
+uses the existing typed workflow, never constructs a broker, and never claims
+the execution lease.
+
+Allowed actions render optimistically on the initiating browser, then reconcile
+with the server response or roll back to canonical state. The server publishes
+small authenticated WebSocket invalidations to other open web/PWA sessions and
+typed external change pulses to the PC/laptop desktop path. The desktop runtime
+also refreshes its Buy Board whenever device state or canonical-store
+writability changes, even if no card revision changed. Routine cross-device
+operation therefore requires no manual reload. See
+[Web/PWA Operator Synchronization](docs/web_operator_sync.md).
+
+Operational commands and boundaries are documented in
+[Web User Setup](docs/web_user_setup.md); implementation and external blockers
+are tracked in [the localhost web task list](docs/web_localhost_todo.md).
 
 ## Runtime Entry Flow
 
@@ -36,6 +125,8 @@ main.py
       -> reconcile any open broker orders from the local order ledger
       -> start cross-machine state sync and background PC-to-laptop
          mirror top-up when MySQL is reachable
+      -> consume typed external planning/runtime pulses every second and
+         refresh only the affected canonical desktop projections
 ```
 
 Long-running work runs in `QThread` workers so the PyQt UI remains responsive.
@@ -84,6 +175,10 @@ The boundaries are deliberate:
   SQLite mirror is a disposable market-data fallback, not a peer database.
 - Blocking database, synchronization, and broker work runs in focused QThread
   workers outside `main_window.py`.
+- Runtime device-state and canonical-store writability transitions emit a
+  Buy Board projection refresh even when no TradeCard revision changed. This
+  prevents stale `STARTING` or unwritable-store restrictions from remaining on
+  screen until an unrelated action or manual refresh.
 - Optional two-machine, backup, and refresh operations attach at the application
   boundary and do not own trading rules.
 
@@ -319,6 +414,15 @@ workers live in `src/ui/workers.py`; order workers live in
 | `BuyboardRuntimeWorker` | `buyboard/runtime_worker.py` | Run active or standby Kanban startup reconciliation, readiness/lease checks, account refresh, market-data drain, trading heartbeat, persistence, shutdown reconciliation, and alerts |
 | `PlanningMembershipWorker` | `planning_membership_worker.py` | Apply one passive Watchlist/Buylist membership change without blocking the Qt thread; completion merges only that symbol back into current UI state |
 
+The authenticated web/PWA process is an external command surface, not another
+executor. Successful connected writes publish typed change pulses into the PC
+repository. The PC consumes them on its one-second coordination timer and its
+listener exposes them to the laptop; each desktop then reloads the affected
+canonical projection. Open web sessions receive a small authenticated
+WebSocket invalidation and refetch canonical state. Initial reads and bounded
+revision polling recover missed events. See
+[Web/PWA Operator Synchronization](docs/web_operator_sync.md).
+
 ## Service Layer
 
 | Module | Responsibility |
@@ -424,7 +528,7 @@ Local JSON state is read/written through `src/utils/storage.py` and service help
 
 | File | Purpose |
 |---|---|
-| `data/watchlist.json` | User-managed passive Watchlist membership and planning metadata, synchronized between devices; removing membership does not delete an independent Buylist card, stop, order, or position, and there is no dedicated Watchlist tab |
+| `data/watchlist.json` | User-managed passive Watchlist membership and planning metadata, synchronized between devices; removing membership does not delete an independent breakout target, Buylist card, stop, order, or position, and there is no dedicated Watchlist tab |
 | `data/buylist.json` | Buy dashboard and monitoring items |
 | `data/execution_queue.json` | Dynamic ORB execution queue items, selected candidates, status, and warnings |
 | `data/trade_cards.json` | Atomic local recovery snapshot of canonical Kanban trade cards; not authoritative while the database is reachable |
@@ -432,7 +536,7 @@ Local JSON state is read/written through `src/utils/storage.py` and service help
 | `data/legacy_non_prod_execution_queue.json` | One-time archive of non-production execution queue rows removed from actionable state |
 | `data/trade_plans.json` | Saved trade plans |
 | `data/scanner_setups.json` | Named scanner rule presets; revision-synchronized and included in atomic full-plan publishes |
-| `data/chart_drawings.json` | Saved chart line drawings; authoritative breakout targets live on canonical trade cards, including passive Watchlist cards |
+| `data/chart_drawings.json` | Saved chart line drawings; authoritative breakout targets live on canonical trade cards and may remain after current Watchlist membership ends |
 | `data/tab_options.json` | Tab visibility settings |
 | `data/orders.json` | Local broker-order ledger, created when the first order is recorded |
 | `data/event_journal.jsonl` | Append-only, gitignored trading lifecycle journal; timestamped archives preserve earlier events when the active file rotates |
@@ -527,6 +631,7 @@ An optional second machine -- an always-on PC reachable over LAN or Tailscale --
 - **Roles**: the PC hosts canonical MySQL and runs `historical.py` on a schedule (BIOS wake -> auto-login -> `scripts/pc_morning_routine.ps1` -> freshness-gated refresh -> auto-shutdown). Either desktop may be the guarded Execution Owner when it is fresh and fully ready; exactly one owner can cross the broker boundary. `data/local_mirror.db` is the laptop's offline safety copy, not a peer database.
 - **Device identity**: `data/device_role.json` (device id, hostname, `is_main`) determines which device may push compatibility planning collections; it does not grant execution ownership. `src/services/state_sync.py` syncs watchlist, buylist, trade plans, the execution queue, scanner setups, and settings through a revision-tracked MySQL table so a stale device cannot clobber a newer remote copy.
 - **Runtime visibility**: the guarded runtime publishes canonical readiness to `runtime_device_state` every 240 seconds with a 300-second freshness fence; `src/services/runtime_status.py` remains the process-lifecycle fallback. Together with `src/services/pc_remote_control.py`, the dashboard reports independent `PC` / `DB` / `Listener` / `main.py` signals. These lights do not replace a fresh `STANDBY_READY` identity for owner transfer.
+- **Change notification**: connected web/PWA writes publish typed pulses for the affected canonical tables. The desktops perform scoped refreshes automatically; startup reads and revision polling are recovery fallbacks, not a manual-refresh requirement.
 - **Fallback behavior**: connection to MySQL is checked once at startup/reconnect; a success routes reads/writes to MySQL immediately, a failure routes to the local SQLite mirror with cross-machine sync and heartbeats disabled. The mirror top-up afterward is incremental and checkpointed (row-count/revision signatures first, full comparison only on mismatch).
 - **Automation scripts** live in `scripts/` (`pc_morning_routine.ps1`, `run_daily_refresh.py`, `sync_local_mirror_from_pc.py`, `setup_pc_autologin.ps1`, `setup_pc_morning_task.ps1`, `setup_mysql_lan_access.ps1`, `setup_mysql_tailscale_access.ps1`, `pc_remote_control_listener.py`, `Configure-AutomaticShutdown.ps1`, WinRM setup/log-tailing scripts, and the one-time `backfill_hourly_history_200d_once.py` repair).
 

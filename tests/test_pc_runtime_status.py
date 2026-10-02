@@ -374,6 +374,82 @@ def test_typed_remote_change_routes_only_affected_projection():
     assert refreshes == [{"revision_only": True}]
 
 
+def test_laptop_consumes_local_web_change_without_manual_refresh(monkeypatch):
+    import src.ui.main_window as main_window
+    from src.services.coordination_change_pulse import CoordinationChangeEvent
+
+    engine = object()
+    web_change = CoordinationChangeEvent("web-operator:123", ("trade_cards",))
+    monkeypatch.setattr(main_window, "detect_local_device_kind", lambda *_args: "Laptop")
+    monkeypatch.setattr(
+        "src.services.coordination_change_pulse.stage_local_coordination_change",
+        lambda *_args, **_kwargs: CoordinationChangeEvent(),
+    )
+    monkeypatch.setattr(
+        "src.services.coordination_change_pulse.read_inbound_change_event",
+        lambda: web_change,
+    )
+    marked = []
+    monkeypatch.setattr(
+        "src.services.coordination_change_pulse.mark_remote_coordination_change",
+        lambda target, event_id, tables=(): marked.append(
+            (target, event_id, tables)
+        )
+        or True,
+    )
+    window = MainWindow.__new__(MainWindow)
+    window._database_shutting_down = False
+    window._coordination_database_ready = True
+    window.coordination_db_engine = engine
+    window.state_sync_role = SimpleNamespace(
+        device_id="laptop-id", hostname="TRADING-LAPTOP"
+    )
+    window._pc_status_worker = None
+    refreshed = []
+    polls = []
+    window._on_remote_coordination_change = (
+        lambda tables: refreshed.append(tables)
+    )
+    window._poll_pc_status = lambda: polls.append(True)
+
+    window._process_internal_coordination_pulse()
+
+    assert marked == [(engine, web_change.event_id, web_change.tables)]
+    assert refreshed == [web_change.tables]
+    assert window._pending_external_coordination_event == web_change
+    assert polls == [True]
+
+
+def test_laptop_relays_local_web_change_to_pc_listener(monkeypatch):
+    import src.ui.main_window as main_window
+    from src.services.coordination_change_pulse import CoordinationChangeEvent
+
+    _StatusWorkerStub.instances = []
+    monkeypatch.setattr(main_window, "PcRemoteStatusWorker", _StatusWorkerStub)
+    monkeypatch.setattr(main_window, "detect_local_device_kind", lambda *_args: "Laptop")
+    web_change = CoordinationChangeEvent("web-operator:456", ("trade_cards",))
+    window = MainWindow.__new__(MainWindow)
+    window._database_shutting_down = False
+    window._coordination_database_configured = False
+    window.database_recovery_worker = None
+    window._pc_status_worker = None
+    window._pc_probe_engine = object()
+    window.pc_db_engine = None
+    window.state_sync_role = SimpleNamespace(
+        device_id="laptop-id", hostname="TRADING-LAPTOP"
+    )
+    window._pending_external_coordination_event = web_change
+    window._start_coordination_runtime_heartbeat = lambda: None
+    window._track_worker = lambda *_args, **_kwargs: None
+
+    window._poll_pc_status()
+
+    worker = _StatusWorkerStub.instances[-1]
+    assert worker.coordination_notification_event_id == web_change.event_id
+    assert worker.coordination_notification_tables == web_change.tables
+    assert worker.started is True
+
+
 class _WidgetStub:
     def __init__(self):
         self.text = ""

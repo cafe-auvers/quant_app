@@ -73,6 +73,11 @@ class MoveToWatchlist(BoardCommand):
 
 
 @dataclass(frozen=True)
+class RemoveFromBuylist(BoardCommand):
+    """Clear Buylist membership without changing Watchlist membership."""
+
+
+@dataclass(frozen=True)
 class MoveToBuylist(BoardCommand):
     pass
 
@@ -190,6 +195,7 @@ class AdoptExternalOrder(BoardCommand):
 
 AnyBoardCommand = Union[
     MoveToWatchlist,
+    RemoveFromBuylist,
     MoveToBuylist,
     ActivateForToday,
     CancelEntry,

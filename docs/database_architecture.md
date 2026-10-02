@@ -1,6 +1,6 @@
 # Database Tables and DB-Only Architecture
 
-Last verified: **2026-08-22**
+Last verified: **2026-10-02**
 
 This document describes only the SQL databases used by the project:
 
@@ -22,6 +22,14 @@ The inventory below was checked against both the current table definitions and
 a read-only inspection of the configured PC MySQL database, the configured TiDB
 database, and the two SQLite files in `data/`. No schema or row was changed by
 that inspection.
+
+The 2026-10-02 web validation additionally proved that the 1.397 GB PC SQLite
+market mirror retained identical size and nanosecond mtime across scanner,
+search, metadata, earnings, and representative 1D/1H reads. Isolated canonical
+SQL instrumentation observed 5 statements for Watchlist, 14 for breakout, 7
+for Buylist, and 29 for Buy Today, including authority/revision/ownership and
+read-back checks. These are bounded request-path counts, not polling cadences or
+TiDB latency claims; see [web_final_validation.md](web_final_validation.md).
 
 ## 1. Database roles and authority
 
@@ -63,11 +71,13 @@ flowchart LR
     end
 
     TIDB[("TiDB Cloud\nquant_coordination")]
+    WEB["Authenticated web/PWA service"]
 
     LAPAPP <-->|"MySQL protocol over LAN/Tailscale :3306"| MYSQL
     MYSQL -->|"application-level checkpointed copy\nstartup + every 15 minutes"| MIRROR
     LAPAPP <-->|"TLS MySQL protocol :4000"| TIDB
     PCAPP <-->|"TLS MySQL protocol :4000"| TIDB
+    WEB <-->|"allowlisted canonical reads/writes"| TIDB
 
 ```
 
@@ -79,6 +89,9 @@ Important boundaries:
   upserts, not by MySQL replication.
 - One-second quote, ORB, and stop calculations remain local and do not write to
   TiDB every second. Only durable state changes are persisted.
+- WebSocket invalidations and inbound/outbound desktop change pulses are
+  non-authoritative notification paths. They cause scoped canonical reads and
+  are not database replication or a second state store.
 
 ## 3. Read-only deployed-schema snapshot
 
@@ -282,6 +295,7 @@ There is no PC relay. The principal steady-state database cadences are:
 | Alert queue check | 90 seconds; successful external heartbeat audit compacted to about 1 hour |
 | Active/standby card revision check | Typed `trade_cards` token; 180/300-second legacy or 3600-second pulse fallback |
 | Buy Board and planning/control display synchronization | Matching typed token; 3600-second pulse fallback |
+| Open web/PWA display synchronization | Authenticated WebSocket invalidation; 10-second revision/status fallback |
 | Operator-command pickup | Typed command token; legacy 20 seconds in-session/300 seconds off-hours |
 | Writable probe fallback | 180 seconds; normally satisfied by the readiness write |
 | Account-reconciliation relational comparison refresh | Relevant DML token; 900-second fallback without token delivery |
@@ -296,6 +310,14 @@ write. A TradeCard is persisted only when a durable decision changes.
 Listener protocol v3 attaches affected table names to its non-secret event ID,
 so unrelated consumers remain asleep. A protocol-v2 event remains supported
 as a conservative broad invalidation during rolling deployment.
+
+After a connected web/PWA transaction succeeds, the web service writes the
+existing typed inbound and outbound pulse files in the configured PC
+repository. The PC desktop consumes the inbound event on a one-second local
+timer and its listener exposes the outbound event to the laptop. The same web
+process invalidates its open authenticated clients in memory. These operations
+add no unconditional one-second TiDB query; receiving clients fetch canonical
+state only after an event, with revision checks as recovery.
 
 ### 6.4 Local operational SQLite
 
@@ -316,6 +338,8 @@ the PC and laptop and must not be treated as a third coordination authority.
 | Laptop application | Laptop SQLite files | Local SQLite connection with WAL | Offline market reads/writes; private operational recovery access | On demand |
 | Laptop application | TiDB Cloud | TLS-authenticated MySQL/PyMySQL, normally port `4000` | Shared coordination reads/writes | Immediate events plus bounded polling/heartbeats |
 | PC application | TiDB Cloud | Same TLS SQL connection | Same coordination authority as laptop | Immediate events plus bounded polling/heartbeats |
+| Web/PWA service | TiDB Cloud | Server-side TLS SQL connection; credentials never enter the browser | Allowlisted canonical planning/operator requests and projections | Immediate request/response plus bounded revision recovery |
+| Web/PWA service | PC/laptop applications | Authenticated browser invalidation plus typed local/listener change pulse | Non-authoritative scope/revision hint; receiver refetches TiDB | After successful canonical mutation |
 
 There is no SQL communication path from TiDB to the laptop mirror and no SQL
 communication path from TiDB to the PC market-data tables.

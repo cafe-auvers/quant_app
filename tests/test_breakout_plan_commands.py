@@ -10,6 +10,7 @@ from sqlalchemy.pool import NullPool
 from src.core.board_workflow import (
     BoardActionContext,
     ClearBreakoutPrice,
+    MoveToBuylist,
     SetBreakoutPrice,
 )
 from src.core.execution_order_record import (
@@ -102,7 +103,7 @@ def _clear(card):
     )
 
 
-def test_set_missing_symbol_atomically_creates_passive_watchlist(engine):
+def test_set_missing_symbol_atomically_creates_standalone_breakout(engine):
     result = request_board_action(
         engine, _set(buffer_pct=0.005), context=_context()
     )
@@ -110,7 +111,8 @@ def test_set_missing_symbol_atomically_creates_passive_watchlist(engine):
     assert result.card.version == 1
     assert result.card.board_status == BoardStatus.WATCHLIST
     assert result.card.buylist_member is False
-    assert result.card.watchlist_member is True
+    assert result.card.watchlist_member is False
+    assert result.card.watchlist_session_date is None
     assert result.card.breakout_price == 101.5
     assert result.card.buffer_pct == pytest.approx(0.005)
     assert result.card.entry_runtime_status is None
@@ -158,7 +160,7 @@ def test_clear_watchlist_target_keeps_passive_watchlist_membership(engine):
     assert result.card.entry_trigger is None
 
 
-def test_removed_watchlist_tombstone_fences_stale_target_update(engine):
+def test_removed_watchlist_can_receive_a_standalone_target(engine):
     card = _seed(
         engine,
         board_status=BoardStatus.WATCHLIST,
@@ -166,14 +168,61 @@ def test_removed_watchlist_tombstone_fences_stale_target_update(engine):
         watchlist_member=False,
     )
 
-    with pytest.raises(BoardCommandRejectedError, match="removed"):
-        request_board_action(engine, _set(card), context=_context())
+    result = request_board_action(engine, _set(card), context=_context())
 
     stored = card_repo.get_trade_card(engine, "PROD", "1", "AAPL")
     assert stored.board_status == BoardStatus.WATCHLIST
     assert stored.watchlist_member is False
-    assert stored.breakout_price is None
-    assert stored.version == card.version
+    assert stored.breakout_price == 101.5
+    assert stored.version == card.version + 1
+    assert result.card.watchlist_member is False
+
+
+def test_buylist_requires_a_positive_breakout(engine):
+    card = _seed(
+        engine,
+        board_status=BoardStatus.WATCHLIST,
+        buylist_member=False,
+        watchlist_member=True,
+    )
+
+    with pytest.raises(BoardCommandRejectedError, match="breakout price"):
+        request_board_action(
+            engine,
+            MoveToBuylist(
+                environment=card.environment,
+                account_no=card.account_no,
+                symbol=card.symbol,
+                expected_card_version=card.version,
+            ),
+            context=_context(),
+        )
+
+
+def test_standalone_breakout_can_move_to_buylist_without_watchlist(engine):
+    card = _seed(
+        engine,
+        board_status=BoardStatus.WATCHLIST,
+        buylist_member=False,
+        watchlist_member=False,
+        breakout_price=101.5,
+    )
+
+    result = request_board_action(
+        engine,
+        MoveToBuylist(
+            environment=card.environment,
+            account_no=card.account_no,
+            symbol=card.symbol,
+            expected_card_version=card.version,
+        ),
+        context=_context(),
+    )
+
+    assert result.card.board_status == BoardStatus.BUYLIST
+    assert result.card.buylist_member is True
+    assert result.card.watchlist_member is False
+    assert result.card.breakout_price == 101.5
 
 
 def test_breakout_mutation_fails_closed_without_operator_authority(engine):
@@ -232,6 +281,7 @@ def test_passive_buylist_target_can_be_planned_during_market_hours(engine):
     )
 
     assert result.card.board_status == BoardStatus.BUYLIST
+    assert result.card.buylist_member is True
     assert result.card.breakout_price == 102.0
     assert result.card.entry_runtime_status is None
 
@@ -607,7 +657,8 @@ def test_premarket_clear_remands_buy_today_and_removes_executable_plan(engine):
 
     result = request_board_action(engine, _clear(card), context=_context())
 
-    assert result.card.board_status == BoardStatus.BUYLIST
+    assert result.card.board_status == BoardStatus.WATCHLIST
+    assert result.card.buylist_member is False
     assert result.card.breakout_price is None
     assert result.card.session_date is None
     assert result.card.entry_runtime_status is None

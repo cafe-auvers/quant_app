@@ -12,6 +12,10 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from activation_gates.evidence import canonical_report_sha256
+from activation_gates.carryforward import (
+    validate_carried_gate3_report,
+    validate_manifest_git_binding,
+)
 from activation_gates.requalification import normalized_changed_paths
 from gate4.capabilities import load_verified_execution_capabilities
 from gate4.collector import Gate4EvidenceCollector
@@ -78,6 +82,15 @@ def _exact_release(gate3_report_path: Path) -> tuple[str, Mapping[str, Any]]:
     report = _load(gate3_report_path)
     if report.get("result") != "PASSED" or report.get("commit_sha") != commit:
         raise RuntimeError("Gate-3 report must be PASSED on this exact commit")
+    if str(report.get("qualification_mode") or "").endswith("_CARRY_FORWARD"):
+        violations = validate_carried_gate3_report(
+            report,
+            root=ROOT,
+            expected_commit=commit,
+        )
+        if violations:
+            detail = "; ".join(item["detail"] for item in violations)
+            raise RuntimeError(f"Gate-3 carry-forward validation failed: {detail}")
     return commit, report
 
 
@@ -231,6 +244,21 @@ def finalize(args: argparse.Namespace) -> int:
             raise RuntimeError(
                 "change-impact manifest paths do not exactly match the baseline-to-target Git diff"
             )
+        if str(change_impact.get("impact") or "").strip().upper() == "PRESENTATION_ONLY":
+            git_binding_violations = validate_manifest_git_binding(
+                change_impact,
+                root=ROOT,
+                source_commit=baseline_commit,
+                target_commit=commit,
+            )
+            if git_binding_violations:
+                detail = "; ".join(
+                    item["detail"] for item in git_binding_violations
+                )
+                raise RuntimeError(
+                    "presentation-only manifest is not bound to the exact Git diff: "
+                    + detail
+                )
     evidence = collector.build_evidence(
         gate3_report_sha256=canonical_report_sha256(gate3),
         controlled_live_config_sha256=_sha256(args.controlled_live_config),

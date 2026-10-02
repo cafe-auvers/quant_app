@@ -11,8 +11,10 @@ flowchart TB
 
     PC -->|revisioned control/state| Coord[(TLS coordination/operational SQL)]
     Laptop -->|revisioned control/state| Coord
+    Web[Authenticated phone / PWA] -->|allowlisted canonical commands| Coord
     Coord --> PC
     Coord --> Laptop
+    Coord --> Web
 
     PC -. never .-> Upload[Upload laptop mirror rows]
     Laptop -. never .-> MySQL
@@ -35,6 +37,29 @@ Machine identity and local permission are intentionally not synchronized.
 `TRADING_ENABLED` lock), and chart drawings remain local files. The 1D/1H
 "drawing sync" means the two split panes inside one running app share the same
 drawing; it is not laptop-to-PC drawing replication.
+
+## Web/PWA notifications
+
+The initiating browser renders an allowed action immediately as pending. The
+server then accepts canonical persistence or returns an error; an error rolls
+the browser back to canonical truth. Successful writes produce two small
+notifications:
+
+- an authenticated in-process WebSocket invalidation for other open web/PWA
+  clients; and
+- a typed inbound/outbound coordination pulse for PC/laptop desktops.
+
+Notifications carry scope/revision hints, not authoritative TradeCard data.
+Every receiver refetches canonical state. The PC checks its local inbound pulse
+every second and its listener exposes the outbound pulse to the laptop. Startup
+reads and bounded revision polling recover missed/offline events. Manual reload
+is not required for normal operation.
+
+Runtime device-state and canonical-store writability changes independently
+emit desktop board refreshes, so stale readiness restrictions clear without an
+unrelated card change. None of these refresh paths grants an execution lease or
+bypasses ownership, reconciliation, market-data, live-mode, risk, capital, or
+broker checks.
 
 ## Handoff
 
