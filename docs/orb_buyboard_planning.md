@@ -18,8 +18,11 @@ Entry Pending, higher-score replacement, fills, rejections, and EOD behavior.
 - Choose **Watchlist** in the stock sidebar to review saved candidates. From
   there, **Move to Buylist** performs the explicit passive-stage promotion;
   **Remove from Watchlist** removes an unwanted candidate.
-- On a Watchlist chart, drawing or clearing a breakout target keeps the symbol
-  in Watchlist. **Move to Buylist (Q)** is the separate promotion action.
+- Drawing or editing a breakout target does not add the symbol to today's
+  Watchlist. The target remains available after Watchlist membership expires or
+  is removed.
+- **Move to Buylist (Q)** is a separate action and is rejected until the symbol
+  has a positive breakout price.
 - A Buylist card can be returned with **Move to Watchlist** from its Buy Board
   context menu or the TradingView queue-stage control.
 

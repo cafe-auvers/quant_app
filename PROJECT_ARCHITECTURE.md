@@ -12,7 +12,86 @@ see the normative
 
 Quant App is a desktop trading dashboard for US-market swing trading, scanner review, passive Watchlist planning, Buy Board ORB planning, KIS account visibility, and guarded KIS order submission. The Watchlist remains available through lightweight sidebar, Scanner, and TradingView actions; only its former dedicated tab was removed.
 
-The application is not a headless service. `main.py` creates a `QApplication`, installs a small Qt warning filter, imports `src.ui.main_window.MainWindow`, and starts the PyQt event loop.
+The desktop application is not a headless service. `main.py` creates a
+`QApplication`, installs a small Qt warning filter, imports
+`src.ui.main_window.MainWindow`, and starts the PyQt event loop. The separate
+authenticated localhost review process is described below and deliberately
+does not import `main.py` or own execution.
+
+## Localhost Web Review Process
+
+`scripts/run_web.py` is the independent composition root for a small FastAPI
+process serving a static HTML/JavaScript shell. It binds only to a loopback
+address and imports the headless `src.web` package. It never constructs Qt,
+KIS, a broker, the trading engine, or an execution worker.
+
+```text
+browser / installed PWA
+  -> Host + Origin + session + CSRF boundaries
+  -> FastAPI read and command API
+  -> static responsive page shell (no server hydration; authenticated
+     invalidation WebSocket only)
+       -> Scanner/universe and current chart-bundle interfaces
+       -> isolated sandbox planning/drawing store (data/web/web_state.db)
+       -> one-current gzip chart cache (data/web/chart_cache)
+       -> optional read-only SQLite market mirror
+       -> optional read-only canonical TiDB TradeCard projection
+       -> optional Supabase identity/chart/drawing projection
+
+PyQt main.py / canonical SQL state / executor / KIS
+  (separate process; never started or owned by localhost web)
+```
+
+`SANDBOX` is the default local acceptance mode. Planning
+commands have durable idempotency keys, optimistic revisions, audit rows, and
+the visible state `NOT SYNCED TO EXECUTOR`. Buy Today is a local preview only.
+All active trading, order, ownership, global-risk, workstation-power, and real
+Buy Today activation routes are denied at the server boundary.
+
+Market/chart reads use `MarketDataSource`; local DEMO and read-only SQLite
+mirror adapters implement it. Daily data is prepared with indicator warm-up
+before the latest 750 bars are trimmed. Hourly data covers six calendar months
+independently with exchange-local timestamps converted to UTC. Responses carry
+actual coverage, source, session policy, adjustment policy, completeness, and
+the latest completed bar.
+
+`ChartBundleCache` keeps one current deterministic gzip file and one small
+manifest per symbol/timeframe. Local replacement is atomic and checksum
+validated. Optional cloud publication uses an `UPDATING -> READY/FAILED`
+manifest revision protocol and validates the compressed bytes returned after
+overwrite; readers never treat a manifest change alone as proof of freshness.
+Scanner/planning pins are protected from bounded eviction.
+
+Authentication is explicit: one local user is created with Argon2 and no
+default password; opaque expiring sessions are server-side. Cookies never
+contain passwords or canonical state. Login is rate limited, mutations require
+CSRF, and Host/Origin allowlists apply to HTTP and WebSocket connections.
+
+Supabase is optional and off by default. Reviewed migrations contain only an
+access allowlist, scanner projection, chart manifests, private chart-cache
+Storage policies, and ordinary drawing rows with RLS. They intentionally do
+not reproduce canonical TradeCards, orders, reservations, ownership, or
+execution ledgers. Canonical connected planning writes default off. The web
+gateway can explicitly allowlist passive Watchlist/Buylist and breakout
+operations; every request is authenticated and revision-fenced, and breakout
+edits additionally verify that either the stable `Mobile Web` identity or the
+exact hosting-desktop identity owns Operator Control. A separately allowlisted operator surface can activate/remove an
+unsubmitted canonical Buy Today card and publish the closed-session plan. It
+uses the existing typed workflow, never constructs a broker, and never claims
+the execution lease.
+
+Allowed actions render optimistically on the initiating browser, then reconcile
+with the server response or roll back to canonical state. The server publishes
+small authenticated WebSocket invalidations to other open web/PWA sessions and
+typed external change pulses to the PC/laptop desktop path. The desktop runtime
+also refreshes its Buy Board whenever device state or canonical-store
+writability changes, even if no card revision changed. Routine cross-device
+operation therefore requires no manual reload. See
+[Web/PWA Operator Synchronization](docs/web_operator_sync.md).
+
+Operational commands and boundaries are documented in
+[Web User Setup](docs/web_user_setup.md); implementation and external blockers
+are tracked in [the localhost web task list](docs/web_localhost_todo.md).
 
 ## Runtime Entry Flow
 
@@ -439,7 +518,7 @@ Local JSON state is read/written through `src/utils/storage.py` and service help
 
 | File | Purpose |
 |---|---|
-| `data/watchlist.json` | User-managed passive Watchlist membership and planning metadata, synchronized between devices; removing membership does not delete an independent Buylist card, stop, order, or position, and there is no dedicated Watchlist tab |
+| `data/watchlist.json` | User-managed passive Watchlist membership and planning metadata, synchronized between devices; removing membership does not delete an independent breakout target, Buylist card, stop, order, or position, and there is no dedicated Watchlist tab |
 | `data/buylist.json` | Buy dashboard and monitoring items |
 | `data/execution_queue.json` | Dynamic ORB execution queue items, selected candidates, status, and warnings |
 | `data/trade_cards.json` | Atomic local recovery snapshot of canonical Kanban trade cards; not authoritative while the database is reachable |
@@ -447,7 +526,7 @@ Local JSON state is read/written through `src/utils/storage.py` and service help
 | `data/legacy_non_prod_execution_queue.json` | One-time archive of non-production execution queue rows removed from actionable state |
 | `data/trade_plans.json` | Saved trade plans |
 | `data/scanner_setups.json` | Named scanner rule presets; revision-synchronized and included in atomic full-plan publishes |
-| `data/chart_drawings.json` | Saved chart line drawings; authoritative breakout targets live on canonical trade cards, including passive Watchlist cards |
+| `data/chart_drawings.json` | Saved chart line drawings; authoritative breakout targets live on canonical trade cards and may remain after current Watchlist membership ends |
 | `data/tab_options.json` | Tab visibility settings |
 | `data/orders.json` | Local broker-order ledger, created when the first order is recorded |
 | `data/event_journal.jsonl` | Append-only, gitignored trading lifecycle journal; timestamped archives preserve earlier events when the active file rotates |

@@ -428,6 +428,34 @@ def record_inbound_change_pulse(
     return _write_event(INBOUND_CHANGE_PULSE_FILE, event_id, tables=tables)
 
 
+def record_external_change_pulses(
+    data_dir: Path,
+    event_id: str,
+    *,
+    tables: Optional[Iterable[str]] = None,
+) -> bool:
+    """Notify both the hosting PC and remote peers of an external writer.
+
+    A separately hosted control surface cannot advance another process's
+    in-memory generation. Publishing the existing typed files lets the PC
+    consume the event as inbound while its listener exposes the same event to
+    laptop peers. Canonical revision polling remains the missed-event fallback.
+    """
+
+    directory = Path(data_dir)
+    inbound = _write_event(
+        directory / INBOUND_CHANGE_PULSE_FILE.name,
+        event_id,
+        tables=tables,
+    )
+    outbound = _write_event(
+        directory / OUTBOUND_CHANGE_PULSE_FILE.name,
+        event_id,
+        tables=tables,
+    )
+    return bool(inbound and outbound)
+
+
 def read_inbound_change_event() -> CoordinationChangeEvent:
     return _read_event(INBOUND_CHANGE_PULSE_FILE)
 

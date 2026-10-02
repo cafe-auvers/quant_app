@@ -9,7 +9,7 @@ Quant App helps one person find U.S. stocks, plan a trade, and—only when many
 independent safety checks agree—ask KIS to place an order.
 
 ```text
-market data -> scanner -> chart -> Watchlist -> Buylist -> Buy Today
+market data -> scanner -> chart -> breakout planning -> Buylist -> Buy Today
                                                         |
                                              safety gates all pass
                                                         |

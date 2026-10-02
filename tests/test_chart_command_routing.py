@@ -9,6 +9,8 @@ from src.core.board_workflow import (
     BoardCardProjection,
     CancelEntry,
     ClearBreakoutPrice,
+    MoveToBuylist,
+    MoveToWatchlist,
     SetBreakoutPrice,
 )
 from src.core.trade_card_state import BoardStatus, TradeCardState
@@ -151,15 +153,25 @@ def test_clear_dispatches_canonical_command_and_never_mutates_local_mirrors():
     assert "requested" in window.logs[-1].lower()
 
 
-def test_queue_toggle_clears_passive_plan_or_deactivates_today_canonically():
+def test_queue_toggle_removes_buylist_membership_or_deactivates_today_canonically():
     passive = _Window([_projection(status=BoardStatus.BUYLIST)])
     active = _Window([_projection(status=BoardStatus.BUY_TODAY)])
 
     passive._chart_queue_toggle("WEX")
     active._chart_queue_toggle("WEX")
 
-    assert isinstance(passive.commands[0][0], ClearBreakoutPrice)
+    assert isinstance(passive.commands[0][0], MoveToWatchlist)
     assert isinstance(active.commands[0][0], CancelEntry)
+
+
+def test_queue_toggle_promotes_a_standalone_breakout_to_buylist():
+    card = _projection(status=BoardStatus.WATCHLIST, target=197.71)
+    card.card.watchlist_member = False
+    window = _Window([card])
+
+    window._chart_queue_toggle("WEX")
+
+    assert isinstance(window.commands[0][0], MoveToBuylist)
 
 
 def test_activate_toggle_uses_only_canonical_card_and_exact_fences():

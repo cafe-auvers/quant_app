@@ -13,3 +13,7 @@ cryptography>=50.0.0,<51
 websockets==17.0.1
 pytest>=9.0.3,<10
 tzdata>=2023.3
+fastapi>=0.142.2,<0.143
+uvicorn>=0.35.0,<0.55
+argon2-cffi>=25.1.0,<26
+httpx>=0.28.1,<0.29

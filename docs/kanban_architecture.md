@@ -235,10 +235,10 @@ An ambiguous submission, unknown broker identity, or unconfirmed cancellation ha
 
 | UI action | Typed command | Durable effect |
 |---|---|---|
-| Drop into Buylist | `MoveToBuylist` or `CancelEntry` | Move when safe; otherwise request cancellation |
+| Drop into Buylist | `MoveToBuylist` or `CancelEntry` | Require a positive breakout and move when safe; otherwise request cancellation |
 | Drop into Buy Today | `ActivateForToday` | Authorize today's entry monitoring |
-| Draw/set a chart breakout | `SetBreakoutPrice(price)` | Create or revise the canonical Buylist target for the selected account; a premarket Buy Today revision clears old ORB geometry and must be rebuilt |
-| Clear a chart breakout | `ClearBreakoutPrice` | Clear a passive target, or premarket remand a zero-evidence Buy Today card to Buylist while atomically removing executable entry fields |
+| Draw/set a chart breakout | `SetBreakoutPrice(price)` | Create or revise an independent canonical breakout target without changing current Watchlist membership; a premarket Buy Today revision clears old ORB geometry and must be rebuilt |
+| Clear a chart breakout | `ClearBreakoutPrice` | Clear a passive target and remove Buylist membership when present, or premarket remand a zero-evidence Buy Today card to passive planning while atomically removing executable entry fields |
 | Drop queued Sell All into Open Positions | `CancelQueuedSellAll` | Withdraw a local premarket sell-at-open intent before submission |
 | Drop into Partial Sell | `RequestPartialSell(quantity)` | Persist partial-exit intent; quantity at/above orderable shares becomes Sell All |
 | Drop into Sell All | `RequestSellAll` | Persist liquidation intent; premarket requests may queue for market open |

@@ -1,0 +1,17 @@
+{
+  "mode": "SANDBOX",
+  "host": "127.0.0.1",
+  "port": 8087,
+  "base_url": "http://localhost:8087",
+  "trusted_hosts": ["localhost", "127.0.0.1"],
+  "trusted_origins": ["http://localhost:8087", "http://127.0.0.1:8087"],
+  "session_hours": 1,
+  "daily_bars": 750,
+  "hourly_months": 6,
+  "chart_cache_max_symbols": 50,
+  "local_mirror_path": "",
+  "supabase_enabled": false,
+  "canonical_planning_writes": false,
+  "connected_passive_operations": [],
+  "data_dir": "data/web/browser_test"
+}

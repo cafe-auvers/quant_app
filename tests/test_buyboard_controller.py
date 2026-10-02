@@ -161,6 +161,7 @@ def test_watchlist_to_buylist(tmp_path):
         engine,
         board_status=BoardStatus.WATCHLIST,
         watchlist_member=True,
+        breakout_price=101.0,
     )
     result = apply_board_command(engine, _cmd(MoveToBuylist, card))
     assert result.board_status == BoardStatus.BUYLIST
@@ -188,6 +189,7 @@ def test_illegal_transition_rejected(tmp_path):
         engine,
         board_status=BoardStatus.WATCHLIST,
         watchlist_member=True,
+        breakout_price=101.0,
     )
     with pytest.raises(CommandRejectedError):
         apply_board_command(engine, _cmd(ActivateForToday, card))
@@ -201,6 +203,7 @@ def test_stale_command_version_rejected(tmp_path):
         engine,
         board_status=BoardStatus.WATCHLIST,
         watchlist_member=True,
+        breakout_price=101.0,
     )
     apply_board_command(engine, _cmd(MoveToBuylist, card))  # bumps to version 2
 

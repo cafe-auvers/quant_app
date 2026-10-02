@@ -1440,6 +1440,8 @@ def publish_trading_plan(
     *,
     market_is_open: bool,
     metadata_path: Path | None = None,
+    scanner_setups_dict: Dict[str, Any] | None = None,
+    settings_dict: Dict[str, Any] | None = None,
 ) -> PlanPublishResult:
     """Revision-safe pre-market full publish with immediate read-back proof."""
 
@@ -1450,8 +1452,16 @@ def publish_trading_plan(
         BUYLIST_KEY: buylist_dict,
         TRADE_PLANS_KEY: trade_plans_dict,
         EXECUTION_QUEUE_KEY: execution_queue_dict,
-        SCANNER_SETUPS_KEY: load_json(SCANNER_SETUPS_FILE, {}),
-        SETTINGS_KEY: load_json(SETTINGS_FILE, {}),
+        SCANNER_SETUPS_KEY: (
+            scanner_setups_dict
+            if scanner_setups_dict is not None
+            else load_json(SCANNER_SETUPS_FILE, {})
+        ),
+        SETTINGS_KEY: (
+            settings_dict
+            if settings_dict is not None
+            else load_json(SETTINGS_FILE, {})
+        ),
     }
     # The local metadata records the last remote revision absorbed from the
     # previously active coordination store.  It can legitimately outlive the

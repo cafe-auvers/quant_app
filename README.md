@@ -2,6 +2,13 @@
 
 A desktop trading dashboard for US-market swing trading with scanner workflows, Buy Board ORB planning, chart review, KIS account visibility, and guarded KIS order submission.
 
+> **Immediate project priority:** the authenticated localhost web review and
+> planning dashboard is being delivered before the remaining live activation
+> gates. Start with [the localhost plan](docs/web_localhost_plan.md), track
+> progress in [the web task list](docs/web_localhost_todo.md), and use
+> [the user setup guide](docs/web_user_setup.md). The PyQt executor remains
+> functional and authoritative for execution during this transition.
+
 New to the project? Open the large-picture
 [Project Tour](docs/project_tour.html), or use its
 [plain-language text version](docs/project_tour.md). It explains what the two
@@ -23,7 +30,7 @@ use the [Activation Gate Handoff](docs/activation_gate_handoff.md).
 - A read-only Market Pulse tab with cached broad-market, sector, industry, and thematic ETF performance ranked by completed-session daily returns.
 - A precomputed Leadership and Market Context overlay on the TradingView-style chart, with an expandable calculation audit and no chart-time provider calls.
 - A persisted, cross-device Watchlist planning stage available from the stock sidebar, Scanner, and TradingView; the former full Watchlist tab is not built.
-- Chart-based `breakout_price` planning and Buy Board ORB execution, with an explicit Watchlist -> Buylist -> Buy Today progression.
+- Chart-based `breakout_price` planning independent of today's Watchlist membership; Buylist requires a positive breakout before the explicit Buylist -> Buy Today progression.
 - Authenticated web/PWA operator synchronization with immediate optimistic feedback, canonical rollback on failure, authenticated browser invalidations, and typed desktop change pulses. Routine Watchlist, Buylist, breakout, Buy Today, readiness, and writability changes do not require a manual refresh.
 - A read-only Buy Today `ORB Combinations...` comparison covering all 24 risk/window cases, kept separate from the optimized pre-market `Refresh / Select ORB Plans...` selector; the optimized view is read-only during regular market hours.
 - Confirmed-breakout passive-pullback entries: after a fresh post-range trade clears both the structural breakout and ORB high, submit a resting BUY limit at the candidate's configured execution price (ORB high by default).
@@ -95,6 +102,66 @@ regenerate the lock with `uv pip compile requirements.txt --python-platform
 windows --python-version 3.11 --generate-hashes -o
 requirements.lock`, then test both
 supported Python versions before committing it.
+
+## Authenticated Localhost Web Dashboard
+
+The web workspace is a separate loopback-only process. It does not import the
+PyQt entry point, construct a broker, start the execution runtime, or contact
+KIS. The default `SANDBOX` mode uses deterministic `DEMO` market data and
+isolated state under `data/web/`.
+
+```powershell
+python -m venv .venv-web
+.\.venv-web\Scripts\python.exe -m pip install --require-hashes -r requirements.lock
+Copy-Item config\web.example.json config\web.local.json
+.\.venv-web\Scripts\python.exe scripts\bootstrap_web_user.py
+.\.venv-web\Scripts\python.exe scripts\check_web_readiness.py
+.\.venv-web\Scripts\python.exe scripts\run_web.py
+```
+
+Open `http://localhost:8080`. There is no default password. The dashboard
+supports Scanner/search, independently loaded 1D/1H charts, visual drawings,
+local Watchlist/Buylist planning, breakout overlays, and a non-executable Buy
+Today preview. Sandbox mode explicitly denies execution, order, ownership,
+risk, power, and real Buy Today activation endpoints.
+
+`CONNECTED` mode can point at the PC repository to show its read-only market
+mirror and canonical TiDB Watchlist, breakout, Buylist, and Buy Today state on
+the phone/PWA. Allowed actions update the initiating browser optimistically,
+then reconcile with canonical state. Authenticated WebSocket invalidations
+refresh other open browser/PWA sessions; typed coordination pulses refresh the
+PC/laptop desktop projections. Revision polling remains a missed-event fallback,
+so routine synchronization does not require a manual reload. Canonical writes
+and mobile operator operations default off.
+An installation may explicitly allowlist passive Watchlist/Buylist/breakout
+operations and, separately, guarded Buy Today activation/removal and full-plan
+publication. Every operator request revalidates that the hosting PC owns
+Operator Control. When it is also Execution Owner, the existing typed command
+is applied directly; otherwise it is queued for the Execution Owner. Full-plan
+publication is blocked during the regular session and uses the existing
+revision/read-back publication service. The browser never constructs a broker,
+places an order, transfers the execution lease, changes risk, or controls
+power. See [Web/PWA Operator Synchronization](docs/web_operator_sync.md) for
+confirmation, rollback, cross-device refresh, and safety semantics.
+
+Useful maintenance commands:
+
+```powershell
+# Build/refresh the bounded local current-snapshot cache.
+.\.venv-web\Scripts\python.exe scripts\publish_web_snapshots.py --limit 300
+
+# Inspect a legacy drawing import, then apply it explicitly.
+.\.venv-web\Scripts\python.exe scripts\import_web_drawings.py --dry-run data\chart_drawings.json
+.\.venv-web\Scripts\python.exe scripts\import_web_drawings.py data\chart_drawings.json
+
+# Reproduce the measured 300-symbol report.
+.\.venv-web\Scripts\python.exe scripts\benchmark_web_review.py --symbols 300
+```
+
+See [Web User Setup](docs/web_user_setup.md) for read-only mirror mapping,
+optional Supabase publication, private phone access, backup/import boundaries,
+and known limitations. The measured local data-path results are in
+[Web Review Performance](docs/web_performance_report.md).
 
 If you're running this across two machines (a dev laptop + an always-on
 data-refresh PC, sharing one MySQL database over LAN/Tailscale), see

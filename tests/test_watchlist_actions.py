@@ -3,7 +3,7 @@ import time
 
 from PyQt5.QtCore import QCoreApplication
 
-from src.core.board_workflow import BoardCardProjection, MoveToWatchlist
+from src.core.board_workflow import BoardCardProjection, MoveToBuylist, MoveToWatchlist
 from src.core.trade_card_state import BoardStatus, StopType, TradeCardState
 from src.core.watchlist import BuylistManager, Watchlist
 from src.ui.mixins.watchlist_actions_mixin import WatchlistActionsMixin
@@ -365,16 +365,21 @@ def test_buy_today_canonical_state_outranks_retained_watchlist_mirror():
     assert "#27ae60" not in button.style
 
 
-def test_archived_watchlist_tombstone_requires_explicit_readd(monkeypatch):
+def test_archived_watchlist_can_set_breakout_and_promote_without_readd(monkeypatch):
     window = _Window()
     window.watchlist = Watchlist()
     # A stale local mirror must not override the newer canonical removal.
     window.watchlist.add("WEX", "Stale local membership")
-    archived = _card(BoardStatus.WATCHLIST, target=None)
+    archived = _card(BoardStatus.WATCHLIST, target=25.0)
     archived.watchlist_member = False
     projection = BoardCardProjection(card=archived)
     window._chart_buyboard_projection = lambda _symbol: projection
     window._chart_positive_price = lambda value: float(value) if value else None
+    captured = []
+    window._dispatch_chart_command = (
+        lambda command, **kwargs: captured.append((command, kwargs)) or True
+    )
+    window.append_log = lambda _message: None
     messages = []
     monkeypatch.setattr(
         "src.ui.mixins.watchlist_actions_mixin.QMessageBox.information",
@@ -386,11 +391,12 @@ def test_archived_watchlist_tombstone_requires_explicit_readd(monkeypatch):
     button = _Button()
     window._apply_chart_queue_btn_state("WEX", button)
 
-    assert not hasattr(window, "base_target")
+    assert window.base_target == ("WEX", 25.0)
     assert not hasattr(window, "base_queue_symbol")
-    assert len(messages) == 2
-    assert button.text == "Add to Watchlist First"
-    assert button.enabled is False
+    assert messages == []
+    assert isinstance(captured[0][0], MoveToBuylist)
+    assert button.text == "Add to Buylist (Q)"
+    assert button.enabled is True
 
 
 def test_add_action_reconciles_stale_local_item_with_canonical_tombstone():

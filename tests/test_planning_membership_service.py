@@ -159,6 +159,36 @@ def test_explicit_watchlist_promotion_is_passive_and_keeps_watchlist_membership(
     assert stored.entry_trigger is None
 
 
+def test_promotion_uses_an_existing_canonical_breakout(engine):
+    watchlist = Watchlist()
+    watchlist.add("AAPL", "Apple")
+    trade_card_repository.create_trade_card(
+        engine,
+        TradeCardState(
+            environment="PROD",
+            account_no="1",
+            symbol="AAPL",
+            board_status=BoardStatus.WATCHLIST,
+            watchlist_member=True,
+            breakout_price=101.0,
+        ),
+    )
+    buylist = BuylistManager()
+
+    result = promote_watchlist_to_buylist(
+        watchlist,
+        buylist,
+        "AAPL",
+        engine=engine,
+        default_account_no="1",
+    )
+
+    assert result.card is not None
+    assert result.card.board_status == BoardStatus.BUYLIST
+    assert result.card.breakout_price == 101.0
+    assert buylist.get("AAPL", "PROD").breakout_price == 101.0
+
+
 def test_watchlist_toggle_on_buylist_preserves_buylist_plan(engine):
     watchlist = Watchlist()
     watchlist.add("AAPL", "Apple").breakout_price = 101.0
@@ -721,7 +751,7 @@ def test_remove_watchlist_archives_canonical_before_removing_json(engine):
     assert stored.board_status == BoardStatus.WATCHLIST
     assert stored.watchlist_member is False
     assert stored.buylist_member is False
-    assert stored.breakout_price is None
+    assert stored.breakout_price == 101.0
 
 
 def test_remove_watchlist_leaves_local_membership_on_canonical_rejection(engine):
@@ -921,7 +951,7 @@ def test_older_local_membership_cannot_revive_a_newer_canonical_tombstone(engine
 
 def test_stale_local_watchlist_cannot_promote_a_canonical_tombstone(engine):
     watchlist = Watchlist()
-    watchlist.add("AAPL", "Stale local copy")
+    watchlist.add("AAPL", "Stale local copy").breakout_price = 101.0
     original = trade_card_repository.create_trade_card(
         engine,
         TradeCardState(
