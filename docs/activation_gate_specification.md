@@ -408,10 +408,27 @@ The three-date requirement establishes the first Gate-4 baseline. After that
 baseline passes, a new commit whose exact Git diff is classified and
 independently approved as `EVIDENCE_ONLY` requires one new supervised delta
 date; the approved baseline supplies the already-proven genuine
-entry/protection/cancellation coverage. A current delta entry, if one occurs,
-must still satisfy every card, notional, risk, ownership, and lifecycle rule.
-Production execution, strategy, risk, persistence, configuration, dependency,
-or unclassified changes require the full three new dates.
+entry/protection/cancellation coverage. A narrowly approved
+`PRESENTATION_ONLY` change preserves the baseline without another live
+session. Production execution, strategy, risk, persistence, configuration,
+dependency, or unclassified changes require the full three new dates.
+
+`PRESENTATION_ONLY` is fail-closed. Static CSS and raster assets under the
+approved UI asset roots are candidates by path. HTML, JavaScript, SVG, and
+Python UI files require exact per-file patch digests, explicit review scope,
+and every no-behavior-change assertion. The review must prove there was no
+change to command targets or payloads, permissions, enablement, confirmations,
+quantity/price/risk defaults, persistence, runtime state, operator control,
+leases, execution-state interpretation, dependencies, or configuration.
+Anything outside that scope remains `PRODUCTION_OR_UNKNOWN`.
+
+Before the initial Gate-4 baseline, passed Gate-2/Gate-3 evidence can be
+carried to a descendant commit only when the target has a new passed Gate-1
+report and an independently approved exact-diff carry-forward manifest. The
+derived Gate-3 report embeds the source reports, target Gate-1 report, complete
+manifest, target tree identity, binary-diff digest, and per-file patch digests.
+Gate 4 revalidates that complete package against Git before accepting it. This
+does not reduce the initial three supervised Gate-4 dates.
 
 The existing optional pre-Gate-2 controlled-live pilot is an exception path,
 not a gate pass. It requires separately recorded risk acceptance and cannot be

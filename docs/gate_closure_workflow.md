@@ -137,8 +137,53 @@ python scripts/manage_gate4_session.py finalize `
   --output C:\quant_evidence\gate4\gate4_report.json
 ```
 
-The first Gate-4 pass always requires at least three supervised dates. Once it
-passes, build a draft manifest for a later commit:
+The first Gate-4 pass always requires at least three supervised dates. If a
+presentation-only or evidence-only change is required before that baseline,
+first run Gate 1 on the clean target commit, then build the exact-diff draft:
+
+```powershell
+python scripts/build_qualification_carryforward.py manifest `
+  --source-gate2-report C:\quant_evidence\source\gate2_report.json `
+  --source-gate3-report C:\quant_evidence\source\gate3_report.json `
+  --target-gate1-report C:\quant_evidence\target\gate1_report.json `
+  --output C:\quant_evidence\target\qualification_change_manifest.json
+```
+
+The draft is intentionally `PENDING`. For JavaScript, HTML, SVG, or Python UI
+changes, independently inspect every recorded patch and set every behavior
+invariant to `true` only when command routing, payloads, permissions,
+confirmations, sizing/risk defaults, persistence, runtime state, operator
+control, leases, dependencies, and configuration are unchanged. Recompute the
+review-subject digest after recording the findings:
+
+```powershell
+python scripts/build_qualification_carryforward.py refresh-review-subject `
+  --manifest C:\quant_evidence\target\qualification_change_manifest.json
+```
+
+The distinct reviewer then sets `review.status=APPROVED`, supplies their name
+and timezone-aware review time, and sets `review.reference` to the printed
+`sha256:<review-subject>` value. Build and independently validate the carried
+Gate-3 report:
+
+```powershell
+python scripts/build_qualification_carryforward.py report `
+  --source-gate2-report C:\quant_evidence\source\gate2_report.json `
+  --source-gate3-report C:\quant_evidence\source\gate3_report.json `
+  --target-gate1-report C:\quant_evidence\target\gate1_report.json `
+  --manifest C:\quant_evidence\target\qualification_change_manifest.json `
+  --output C:\quant_evidence\target\gate3_report.carry_forward.json
+
+python scripts/build_qualification_carryforward.py validate `
+  --report C:\quant_evidence\target\gate3_report.carry_forward.json
+```
+
+Gate 4 accepts this derived report only on the exact clean target commit. A
+`PRESENTATION_ONLY` carry-forward preserves Gate 2/3 but the initial Gate-4
+campaign still requires all three supervised dates. Any unknown or production
+path rejects the carry-forward.
+
+Once Gate 4 passes, build a draft manifest for a later commit:
 
 ```powershell
 python scripts/build_gate4_requalification_manifest.py `
@@ -155,9 +200,10 @@ arguments to `manage_gate4_session.py finalize`:
 --change-impact-manifest <approved-exact-diff-manifest>
 ```
 
-Any production-affecting or unknown changed path mechanically keeps the
-three-new-session requirement. Evidence cannot be backfilled or manually
-reclassified downward.
+An approved `PRESENTATION_ONLY` post-baseline manifest requires zero new live
+sessions; `EVIDENCE_ONLY` requires one supervised delta date. Any production-
+affecting or unknown changed path mechanically keeps the three-new-session
+requirement. Evidence cannot be backfilled or manually reclassified downward.
 
 ## Check Gate 2 locally before reserving a session
 

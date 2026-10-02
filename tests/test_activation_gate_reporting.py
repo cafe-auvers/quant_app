@@ -289,6 +289,35 @@ def test_gate4_evidence_only_change_uses_one_delta_session_and_baseline_coverage
     assert report["change_impact"] == "EVIDENCE_ONLY"
 
 
+def test_gate4_presentation_only_change_preserves_baseline_without_new_session():
+    baseline, upstream, evidence, manifest = _gate4_delta_inputs(
+        ["src/web/static/app.css"]
+    )
+    from activation_gates.requalification import PRESENTATION_BEHAVIOR_INVARIANTS
+
+    manifest["behavior_invariants"] = {
+        name: True for name in PRESENTATION_BEHAVIOR_INVARIANTS
+    }
+    from activation_gates.carryforward import manifest_review_subject_sha256
+
+    manifest["review_subject_sha256"] = manifest_review_subject_sha256(manifest)
+    manifest["review"]["reference"] = (
+        f"sha256:{manifest['review_subject_sha256']}"
+    )
+
+    report = build_gate4(
+        evidence,
+        upstream_gate3_report=upstream,
+        baseline_gate4_report=baseline,
+        change_impact_manifest=manifest,
+    )
+
+    assert report["result"] == "PASSED"
+    assert report["qualification_mode"] == "DELTA_REQUALIFICATION"
+    assert report["required_supervised_session_count"] == 0
+    assert report["change_impact"] == "PRESENTATION_ONLY"
+
+
 def test_gate4_production_change_still_requires_three_new_sessions():
     baseline, upstream, evidence, manifest = _gate4_delta_inputs(
         ["src/services/trading_engine.py"]
