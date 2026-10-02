@@ -1,16 +1,23 @@
 # Localhost Web Dashboard Plan
 
-Status: **LOCAL SANDBOX COMPLETE; EXTERNAL CHECKS BLOCKED**  
-Baseline: `8437fded0a112fcdab424e99e12aeeba2ab63ad1` on 2026-10-01  
-Feature worktree: `codex/localhost-web` (`C:\Users\tonyh\Documents\quant_app_web`)
+Status: **READY FOR USER ACCEPTANCE; PHYSICAL/OPTIONAL EXTERNAL CHECKS PENDING**
+
+Validated implementation: `c882a22dc3417a3c034f74e33a32c062a01d1c14` on 2026-10-02
+
+Single integration branch: `codex/mobile-operator-control`
+
+The former `codex/localhost-web` branch is fully contained in the integration
+branch and is retained only as Git history. Current evidence is consolidated in
+[web_final_validation.md](web_final_validation.md).
 
 ## Priority and scope
 
 The authenticated localhost dashboard provides the daily Scanner/search →
 1D/1H charts → drawings → Watchlist → breakout → Buylist workflow while the
-existing PyQt application and execution engine remain intact. Its mobile shell
-has Summary, Market Pulse, Chart, and Buy Board destinations, with a centered
-Home shortcut and Chart as the initial destination.
+existing PyQt application and execution engine remain intact. Its mobile
+bottom bar exposes Home, the scrollable list selector, Chart, Buy Board, and
+previous/next Stocks controls; Market Pulse is summarized inside Home and
+Chart remains the initial destination.
 
 CONNECTED mode can act as a delegated controller after verifying that either
 the stable `Mobile Web` identity or the exact hosting-desktop identity owns
@@ -20,7 +27,7 @@ snapshot through existing typed services. It never arms trading, transfers
 ownership, submits/cancels/replaces a broker order, changes global risk limits,
 or controls workstation power.
 
-## Baseline evidence
+## Historical baseline evidence (2026-10-01; not current)
 
 - Repository SHA: `8437fded0a112fcdab424e99e12aeeba2ab63ad1`.
 - Active checkout branch at inspection: `fix/gate3-journal-append`.
@@ -170,21 +177,22 @@ Any tracked change creates a new SHA and therefore requires normal activation
 gate requalification before a future execution promotion. This web milestone
 does not rewrite or extend historical gate evidence.
 
-## Completion evidence
+## Current completion evidence
 
-- `pytest tests -q`: **3072 passed**, one third-party Starlette/httpx
-  deprecation warning, 234.90 seconds.
-- Targeted web suite: **33 passed**.
+- `python -m pytest tests -q`: **3141 passed**, zero failures/errors/skips,
+  one third-party Starlette/httpx deprecation warning, 265.52 seconds.
+- Web suite: **96 passed**, the same warning, 26.42 seconds.
 - Isolated dependency graph: `pip check` reports no broken requirements;
   Python compilation and JavaScript syntax checks pass.
 - Live loopback HTTP smoke: local login, authenticated page, root-scoped
   service worker, 300-row scanner, 750-bar 1D chart, sandbox Watchlist command,
   and logout all returned successfully.
-- Reproducible DEMO 300-symbol/two-timeframe benchmark: 1,200 requests; cold
-  navigation p50/p95 1519.76/2187.17 ms; warm navigation p50/p95
-  131.92/201.69 ms; 24.82 MiB compressed chart bytes. See
+- Reproducible DEMO and PC-mirror 300-symbol/two-timeframe benchmarks: 1,200
+  requests per source. DEMO cold 1D p50/p95 is 144.00/224.76 ms and warm
+  bundle p50/p95 is 1.11/1.75 ms; mirror cold 1D is 106.08/144.09 ms and warm
+  is 1.42/2.04 ms. See
   `docs/web_performance_report.md` for conditions and limitations.
 - In-app desktop/mobile screenshot inspection remains blocked because this
   session had no attached `iab` browser instance. Supabase and real-iPhone
-  visual inspection remain explicitly blocked; real mirror and canonical
-  passive-write authority checks passed.
+  visual inspection remain explicitly blocked; real mirror, two-session
+  invalidation/conflict, and canonical passive-write checks passed.

@@ -3,6 +3,11 @@
 The local SANDBOX workflow is the first acceptance target. Supabase, public
 hosting, Docker, and a domain are not required.
 
+The current validated implementation and 20-30 minute acceptance checklist are
+in [web_final_validation.md](web_final_validation.md). Use
+`codex/mobile-operator-control`; do not continue feature work independently on
+the already-contained `codex/localhost-web` branch.
+
 ## Local workstation
 
 1. Use the isolated web worktree; do not install web packages into a checkout
@@ -40,9 +45,10 @@ hosting, Docker, and a domain are not required.
    `SANDBOX`, `DEMO` (unless a read-only source was configured), and
    `NOT SYNCED TO EXECUTOR`.
 
-Do not place passwords, session secrets, database credentials, or Supabase
-secret keys in tracked files, screenshots, or chat. The launcher generates a
-local session secret if one is absent and never modifies `.env` or `.env.pc`.
+Do not place passwords, session tokens, database credentials, or Supabase
+secret keys in tracked files, screenshots, or chat. Each login creates a
+cryptographically random session token; only its SHA-256 hash is stored. The
+launcher never modifies `.env` or `.env.pc`.
 
 ## Optional read-only real data
 
@@ -109,7 +115,8 @@ ownership, changes risk, or controls power.
 
 The cache keeps one current gzip bundle and one manifest per
 symbol/timeframe under `data/web/chart_cache/`. Its default retention is 350
-symbols; Watchlist/Buylist and retained searched symbols are pinned. Rebuild a
+symbols; local retained symbols and canonical Watchlist, Buylist, Buy Today,
+and position symbols observed by the web projection are pinned. Rebuild a
 bounded cache without starting the UI:
 
 ```powershell
@@ -211,8 +218,8 @@ PWA installation does not make the authenticated local API available offline.
   New installations keep writes off until the account/environment, hosting-PC
   identity, Operator Control, revision recovery, and rollback behavior are
   verified. The SANDBOX workflow is unaffected.
-- The deterministic DEMO and HTTP/API paths have local evidence. Real mirror
-  parity needs a configured mirror. Real iPhone/PWA testing needs a trusted
+- The deterministic DEMO, HTTP/API, and configured read-only PC mirror paths
+  have current local evidence. Real iPhone/PWA testing needs a trusted
   private HTTPS origin and is not claimed by desktop viewport emulation.
 - The dashboard shell is static and has no server-driven UI hydration. It uses
   one authenticated invalidation WebSocket; canonical data still comes from

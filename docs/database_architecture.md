@@ -23,6 +23,14 @@ a read-only inspection of the configured PC MySQL database, the configured TiDB
 database, and the two SQLite files in `data/`. No schema or row was changed by
 that inspection.
 
+The 2026-10-02 web validation additionally proved that the 1.397 GB PC SQLite
+market mirror retained identical size and nanosecond mtime across scanner,
+search, metadata, earnings, and representative 1D/1H reads. Isolated canonical
+SQL instrumentation observed 5 statements for Watchlist, 14 for breakout, 7
+for Buylist, and 29 for Buy Today, including authority/revision/ownership and
+read-back checks. These are bounded request-path counts, not polling cadences or
+TiDB latency claims; see [web_final_validation.md](web_final_validation.md).
+
 ## 1. Database roles and authority
 
 | Store | Default location/configuration | Primary role | Authority |

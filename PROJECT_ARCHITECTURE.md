@@ -20,6 +20,13 @@ does not import `main.py` or own execution.
 
 ## Localhost Web Review Process
 
+The current validated web implementation is
+`c882a22dc3417a3c034f74e33a32c062a01d1c14` on the single integration branch
+`codex/mobile-operator-control`; see
+[Quant Web Final Validation](docs/web_final_validation.md). The active frontend
+is FastAPI plus static HTML/CSS/JavaScript. The `_nicegui_ws` route is only a
+transitional redirect for tabs left open from the retired frontend.
+
 `scripts/run_web.py` is the independent composition root for a small FastAPI
 process serving a static HTML/JavaScript shell. It binds only to a loopback
 address and imports the headless `src.web` package. It never constructs Qt,
@@ -60,7 +67,10 @@ manifest per symbol/timeframe. Local replacement is atomic and checksum
 validated. Optional cloud publication uses an `UPDATING -> READY/FAILED`
 manifest revision protocol and validates the compressed bytes returned after
 overwrite; readers never treat a manifest change alone as proof of freshness.
-Scanner/planning pins are protected from bounded eviction.
+Local retained symbols and canonical Watchlist, Buylist, Buy Today, and
+position symbols are protected from bounded eviction. Cache validation covers
+source revision, adjustment/session policy, payload schema, and configured
+daily/hourly generation coverage.
 
 Authentication is explicit: one local user is created with Argon2 and no
 default password; opaque expiring sessions are server-side. Cookies never

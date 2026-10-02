@@ -8,6 +8,13 @@ For the application-wide maintenance map, see [PROJECT_ARCHITECTURE.md](../PROJE
 
 The Buy Board is a projection of durable domain and broker state. It is not an independent order-entry client.
 
+The web Buy Board uses the same canonical projection and typed command
+services. Browser actions may be optimistic in presentation, but canonical
+version/read-back determines the result; broker-facing intent is queued for or
+handled by the desktop Execution Owner. The web process itself has no broker,
+runtime worker, or execution lease. See
+[Quant Web Final Validation](web_final_validation.md).
+
 The central rules are:
 
 1. One production `(environment, account_no, symbol)` has at most one `TradeCardState`.

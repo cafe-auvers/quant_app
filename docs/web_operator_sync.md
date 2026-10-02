@@ -111,3 +111,11 @@ Regression coverage must prove:
 - queued commands remain distinct from completed commands and broker facts;
 - no web route can create a broker, claim the execution lease, or bypass an
   execution gate.
+
+The final integration pass proves two authenticated sessions converge through
+the WebSocket invalidation/refetch path and that a stale revision receives 409
+plus current canonical state. Isolated SQL instrumentation measured bounded
+per-action work: Watchlist 5 statements, breakout 14, Buylist 7, Buy Today 29.
+These include authority/revision/ownership/read-back checks and introduce no
+one-second SQL polling or per-card fanout. See
+[web_final_validation.md](web_final_validation.md).

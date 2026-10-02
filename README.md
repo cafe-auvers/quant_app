@@ -91,7 +91,7 @@ The **Buy Board** is the operator surface for planning and execution. Its cards 
 1. Install the tested dependency graph: `python -m pip install --require-hashes -r requirements.lock`
 2. Configure private database/KIS credentials in `.env` and non-secret local overrides in `config/runtime.local.json` when needed.
 3. Run the app: `python main.py`
-4. Run tests: `pytest -q`
+4. Run the supported full suite: `python -m pytest tests -q`
 
 The app can run without MySQL. Database-backed scanning and cache freshness features require valid `MYSQL_*` settings. For PC-independent execution coordination, configure the separate TLS-only `COORD_DB_*` SQL connection described in [TiDB Cloud Coordination Store](docs/tidb_coordination_store.md); historical prices are never uploaded there.
 
@@ -104,6 +104,14 @@ requirements.lock`, then test both
 supported Python versions before committing it.
 
 ## Authenticated Localhost Web Dashboard
+
+Final integration validation is recorded in
+[Quant Web Final Validation](docs/web_final_validation.md). The validated
+implementation is `c882a22dc3417a3c034f74e33a32c062a01d1c14` on
+`codex/mobile-operator-control`: 3,141 supported tests and 96 web tests pass.
+`codex/localhost-web` is already contained and is not a second development
+line. Physical iPhone/PWA acceptance and optional live Supabase verification
+remain external checks.
 
 The web workspace is a separate loopback-only process. It does not import the
 PyQt entry point, construct a broker, start the execution runtime, or contact

@@ -13,6 +13,11 @@ process may act?" Operator Control answers "which device may send the next
 human instruction?" Neither role, by itself, arms live trading or bypasses
 per-symbol market-data, account, risk, order-identity, or broker checks.
 
+The validated web/PWA surface may assign or use Operator Control only through
+typed, authenticated routes. It cannot select itself as Execution Owner,
+construct a broker, or cross the KIS boundary. Route-level evidence is in
+[Quant Web Final Validation](web_final_validation.md).
+
 Roles also do not change strategy semantics. The exact confirmed-breakout
 passive-limit and higher-score cancel-then-replace behavior is documented in
 [Current Order Logic](current_order_logic.md).

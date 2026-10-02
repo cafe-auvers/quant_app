@@ -7,15 +7,15 @@ Status values: `TODO`, `IN_PROGRESS`, `DONE`, `BLOCKED`.
 | Status | Owner | Work item | Dependencies | Affected files / evidence |
 |---|---|---|---|---|
 | DONE | Developer | Inspect architecture, safety docs, scanner/chart/drawing/planning implementations | None | `docs/web_localhost_plan.md`; SHA and baseline recorded |
-| DONE | Developer | Establish isolated feature worktree | Clean target path | Branch `codex/localhost-web`; active checkout unchanged |
-| DONE | Developer | Run baseline tests | Existing environment | `pytest tests -q`: 3033 passed |
+| DONE | Developer | Consolidate the integration branch | Verified Git graph | `codex/mobile-operator-control`; `codex/localhost-web` already contained |
+| DONE | Developer | Run historical baseline tests | Existing environment | Historical 2026-10-01 result: 3033 passed; not the current count |
 | DONE | Developer | Add pinned FastAPI/Uvicorn/auth dependencies and isolated `.venv-web` | Python 3.11/3.12 compatibility | hash-locked install; `pip check` clean |
 | DONE | Developer | Implement web config, bootstrap auth, sessions, Host/Origin/CSRF/rate limits | Local state directory | `src/web/config.py`, `src/web/auth.py`, bootstrap/readiness scripts |
 | DONE | Developer | Implement local planning/drawing SQLite store with CAS, idempotency, audit, tombstones | Authenticated actor | `src/web/store.py`, web tests |
 | DONE | Developer | Separate breakout targets from current Watchlist membership and require breakout before Buylist | Shared planning rules + sandbox UI | canonical and sandbox services; rollover preserves breakouts; focused regressions passed |
 | DONE | Developer | Implement DEMO and read-only local market/scanner adapters | Existing schemas and indicator semantics | `src/web/market_data.py`, coverage tests |
-| DONE | Developer | Connect phone/PWA reads to the PC market mirror and canonical TiDB TradeCards | PC repository path and coordination credentials | Real 300-row scanner, current mirror freshness, 1D/1H payloads, 35 canonical Buylist rows verified; `tests/web/test_canonical_planning.py` |
-| DONE | Developer | Verify and harden mobile 1D/1H switching | Actual PC mirror + mobile browser | 390x844 Playwright run switched `A` from 1D to a rendered 1H bundle; immediate label feedback and 44px tap target added |
+| DONE | Developer | Connect phone/PWA reads to the PC market mirror and canonical TiDB TradeCards | PC repository path and coordination credentials | Current mirror: 132 ranked Setup 1 matches, representative 1D/1H payloads, 54 canonical planning symbols; `scripts/validate_web_mirror.py` |
+| BLOCKED | User + Developer | Final physical mobile 1D/1H and gesture acceptance | Real iPhone/private HTTPS origin | Static/API coverage passes; physical device acceptance is not claimed |
 | DONE | Developer | Add bounded canonical revision polling and PC runtime-heartbeat status | Read-only TiDB adapter | Browser refreshes planning after revision changes; missing heartbeat remains `UNKNOWN` |
 | DONE | Developer | Add immediate optimistic planning/Buy Today feedback and automatic cross-device refresh | Connected writes, authenticated session, coordination pulse path | `/live-updates` invalidations, typed external pulses, rollback paths, and runtime state/writability `board_changed` regression coverage |
 | DONE | Developer | Share non-executable Buy Today drafts across web clients | Authenticated shared web store | Phone/laptop two-client create, observe, cancel test with connected operator operations disabled; canonical activation is a separate guarded allowlist |
@@ -28,14 +28,14 @@ Status values: `TODO`, `IN_PROGRESS`, `DONE`, `BLOCKED`.
 | BLOCKED | User | Create/configure optional Supabase development project | User account and dashboard access | See `docs/web_user_setup.md` |
 | BLOCKED | Developer + User | Verify Supabase auth, RLS, private Storage, overwrite freshness, and two-browser sync | Supabase credentials and project | Integration report must remain BLOCKED until run |
 | DONE | Developer + User | Enable canonical passive CONNECTED writes | TiDB scope, permitted Operator Control identity, explicit allowlist | Watchlist/Buylist/breakout round-trip and idempotency tests; live authority verification passed |
-| DONE | Developer | Add mobile workspace navigation and delegated operator controller | Verified Mobile Web or hosting-desktop Operator Control, explicit operator allowlist | Summary, Market Pulse, Chart, Buy Board, centered Home; direct/queued Buy Today tests and guarded six-document plan publish test |
-| DONE | Developer | Run targeted/full regression and 300-symbol benchmark | Local implementation complete | 73 web tests passed; focused shared-planning regressions passed; prior full `pytest tests -q`: 3072 passed; measured report complete |
+| DONE | Developer | Add mobile workspace navigation and delegated operator controller | Verified Mobile Web or hosting-desktop Operator Control, explicit operator allowlist | Home with Market Pulse, list selector, Chart, Buy Board, Stocks controls; direct/queued Buy Today tests and guarded plan publish test |
+| DONE | Developer | Run targeted/full regression and two 300-symbol benchmarks | Final implementation SHA | 96 web tests and 3141 total tests passed; DEMO and read-only mirror reports current |
 | BLOCKED | User + Developer | Capture/inspect desktop and 390 px in-app browser screenshots | In-app browser must be attached | Browser controller reported no available `iab`; do not claim screenshot acceptance |
 | DONE | Developer | Final documentation and exact launch/readiness/import commands | Local verification | README, architecture, setup, performance report |
 
 ## Current blockers
 
-- Bare repository-root `pytest -q` cannot traverse an existing protected
+- Bare repository-root `pytest -q` may traverse an existing protected
   artifact directory. `pytest tests -q` is the valid baseline command.
 - Canonical CONNECTED reads and the six allowlisted passive writes are enabled.
   Watchlist/Buylist changes use canonical domain services and CAS revisions;

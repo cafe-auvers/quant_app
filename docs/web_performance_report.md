@@ -1,49 +1,70 @@
 # Web Review Performance Report
 
-Recorded: 2026-10-01T08:46:56Z
+Current result for the final integration pass, recorded 2026-10-02 on Windows
+11, Python 3.12.4, Intel64 Family 6 Model 142, 8 logical CPUs.
 
-This is a reproducible local server/data-path benchmark, not a latency
-guarantee. It follows the lightweight UI path: request only the visible 1D
-bundle while navigating, fill 1H in the delayed background, then repeat 1D
-navigation against the validated gzip cache.
+Both runs used 300 symbols, up to 750 daily bars, six calendar months of hourly
+bars, an empty temporary cache for cold work, and the validated gzip cache for
+warm work. Each run made 900 direct coordinator requests plus 300 authenticated
+HTTP chart requests. No planning, broker, KIS, cloud, or mirror write occurred.
 
-| Measurement | p50 | p95 | Mean | Wall time |
+| Source and measurement | p50 | p95 | Mean | Wall time |
 |---|---:|---:|---:|---:|
-| Cold visible navigation (1D only) | 91.05 ms | 122.36 ms | 94.95 ms | 28.49 s |
-| Cold visible provider + normalize + compress | 91.05 ms | 122.35 ms | 94.94 ms | included above |
-| Delayed background 1H preparation | 80.18 ms | 113.40 ms | 84.11 ms | 25.23 s |
-| Warm visible navigation (direct gzip hit) | 0.86 ms | 1.81 ms | 1.01 ms | 0.30 s |
-| Warm publish-ready bundle read | 0.86 ms | 1.80 ms | 1.01 ms | included above |
+| DEMO cold visible 1D generation | 144.00 ms | 224.76 ms | 157.33 ms | 47.20 s |
+| DEMO independent 1H generation | 191.78 ms | 302.26 ms | 204.07 ms | 61.23 s |
+| DEMO warm bundle read | 1.11 ms | 1.75 ms | 1.32 ms | 0.40 s |
+| DEMO authenticated warm HTTP | 26.43 ms | 44.13 ms | 30.10 ms | 300 requests |
+| PC mirror cold visible 1D generation | 106.08 ms | 144.09 ms | 106.54 ms | 31.96 s |
+| PC mirror independent 1H generation | 129.47 ms | 248.87 ms | 140.49 ms | 42.15 s |
+| PC mirror warm bundle read | 1.42 ms | 2.04 ms | 1.52 ms | 0.46 s |
+| PC mirror authenticated warm HTTP | 28.10 ms | 35.05 ms | 29.09 ms | 300 requests |
 
-## Conditions
+Every authenticated HTTP response carried an ETag. The DEMO cache occupied
+36,551,975 bytes (34.86 MiB), including manifests; the PC-mirror cache occupied
+18,868,858 bytes (17.99 MiB). Compressed daily-plus-hourly artifacts totaled
+36,238,330 bytes for DEMO and 18,474,805 bytes for the mirror.
 
-- Source: `DEMO`.
-- Cache: cold empty temporary directory, then warm validated local gzip files.
-- Requests: 900 (300 visible cold + 300 background + 300 visible warm).
-- Coverage settings: 750 daily bars and 6 calendar months hourly.
-- Worker limit: 4; navigation itself is sequential to make per-symbol values comparable.
-- Compressed chart bytes: 26,029,638 (24.82 MiB).
-- Cache disk including manifests: 26,274,887 (25.06 MiB).
-- Peak Python allocations for one isolated warm publication read, observed by `tracemalloc`: 52,004 (0.05 MiB). This excludes native-library allocations and is kept outside latency timing.
-- Hardware/runtime: Windows-11-10.0.26200-SP0; processor `Intel64 Family 6 Model 142 Stepping 12, GenuineIntel`; 8 logical CPUs; Python 3.12.4.
+The process working set changed from 128,221,184 to 140,652,544 bytes during
+the DEMO run and from 128,360,448 to 145,969,152 bytes during the PC-mirror
+run. These figures include the Python runtime and loaded libraries. The
+isolated warm publication read peaked at 68,562 bytes (DEMO) and 30,879 bytes
+(mirror) of Python-traced allocations; neither figure is browser memory.
 
-## Limitations
+Reproduce the two current runs with:
 
-- DEMO results measure deterministic local generation, normalization,
-  compression, checksum, and disk cache behavior; they do not predict provider,
-  LAN, TiDB, Supabase, or phone-network latency.
-- Values are server/data preparation timings. Browser layout/paint and a real
-  iPhone are outside this script and are checked separately with viewport
-  inspection.
-- The benchmark intentionally uses a temporary cache and performs no planning,
-  execution, broker, KIS, or cloud writes.
+```powershell
+python scripts/benchmark_web_review.py --symbols 300
+python scripts/benchmark_web_review.py --config config\web.local.json --symbols 300
+```
 
-## Planning interaction path
+When the real scanner has fewer than 300 matches, the real-data benchmark
+keeps those ranked scanner symbols first and fills the sample from mirror
+symbols that have both daily and hourly data. SQLite is opened with `mode=ro`
+and `PRAGMA query_only=ON`.
 
-Planning and Buy Today responsiveness is handled separately from this chart
-benchmark. The initiating browser renders allowed changes optimistically before
-awaiting persistence, then reconciles with canonical state or rolls back. Other
-open clients are invalidated through an authenticated WebSocket, and desktops
-receive typed change pulses. This removes manual-refresh latency from the
-normal interaction path, but this report does not claim a measured WAN/TiDB
-commit time. See [Web/PWA Operator Synchronization](web_operator_sync.md).
+## Browser-paint status
+
+The static client now records at most 100 in-memory samples for:
+
+- selection to first chart paint;
+- previous/next stock to first chart paint;
+- 1D/1H switch to first chart paint;
+- warm-cache versus uncached navigation.
+
+They are available in a signed-in tab through
+`window.__quantWebMetrics.snapshot()` and can be cleared with
+`window.__quantWebMetrics.clear()`. No sample is transmitted or persisted.
+The in-app browser controller was unavailable during this pass, so no honest
+desktop/iPhone chart-paint p50/p95 is claimed here. Collecting those values on
+the user's real browser and iPhone remains part of UAT.
+
+## Interpretation and limits
+
+- DEMO measures deterministic local generation and is not a prediction of
+  LAN, TiDB, Supabase, Tailscale, or phone-network latency.
+- PC-mirror values measure a local read-only SQLite mirror, not provider or
+  TiDB planning-write latency.
+- HTTP values use an authenticated in-process ASGI transport, so they include
+  routing/auth/serialization but not TCP, TLS, browser parsing, or paint.
+- Nearby prefetch remains bounded to the other current timeframe plus one
+  previous and one next stock. The browser bundle cache remains capped at 36.
