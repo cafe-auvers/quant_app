@@ -13,7 +13,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 import subprocess
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 
 from activation_gates.evidence import (
     canonical_report_sha256,
@@ -21,7 +21,6 @@ from activation_gates.evidence import (
     evidence_sequence,
     validate_independent_review,
     valid_git_commit_sha,
-    valid_sha256,
     violation,
 )
 from activation_gates.requalification import (

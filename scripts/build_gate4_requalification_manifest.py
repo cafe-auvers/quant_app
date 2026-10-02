@@ -7,13 +7,12 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 from typing import Any, Mapping, Sequence
 
 
 ROOT = Path(__file__).resolve().parents[1]
-
-import sys
 
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
