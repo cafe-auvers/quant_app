@@ -36,6 +36,7 @@ GATE4_EVIDENCE_ONLY_FILES = frozenset(
         "gate4/collector.py",
         "gate4/reporting.py",
         "gate4/runner.py",
+        "scripts/build_gate4_requalification_manifest.py",
         "scripts/check_gate2_readiness.py",
         "scripts/manage_gate2_session.py",
         "scripts/manage_gate4_session.py",
