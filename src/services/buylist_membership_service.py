@@ -8,6 +8,7 @@ BUYLIST, but it may never pull a card back from a later lifecycle state.
 from __future__ import annotations
 
 import copy
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -45,6 +46,14 @@ def _normalized_account(value: object) -> str:
 
 def _normalized_symbol(value: object) -> str:
     return str(value or "").strip().upper()
+
+
+def _has_positive_breakout(value: object) -> bool:
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return math.isfinite(number) and number > 0
 
 
 def reconcile_buylist_item(
@@ -95,19 +104,40 @@ def reconcile_buylist_item(
         )
     )
 
+    if (
+        current is not None
+        and current.board_status == BoardStatus.WATCHLIST
+        and not is_passive_planning_card(current)
+    ):
+        return BuylistMembershipSyncResult(action="unsafe", card=current)
+    if not _has_positive_breakout(getattr(normalized_item, "breakout_price", None)):
+        return BuylistMembershipSyncResult(action="missing_breakout", card=current)
+    if (
+        current is not None
+        and current.board_status == BoardStatus.WATCHLIST
+        and not current.watchlist_member
+        and not _has_positive_breakout(current.breakout_price)
+    ):
+        return BuylistMembershipSyncResult(action="missing_breakout", card=current)
+
     for _attempt in range(2):
+        # Neither an explicit click nor a stale compatibility mirror may hide
+        # broker/order/stop/exit evidence by relabelling the card as passive.
         if (
             current is not None
             and current.board_status == BoardStatus.WATCHLIST
-            and (
-                not current.watchlist_member
-                or not is_passive_planning_card(current)
-            )
+            and not is_passive_planning_card(current)
         ):
-            # Neither an explicit click nor a stale compatibility mirror may
-            # hide broker/order/stop/exit evidence by relabelling the card as
-            # a passive Buylist candidate. No CAS is attempted in this case.
             return BuylistMembershipSyncResult(action="unsafe", card=current)
+        if (
+            current is not None
+            and current.board_status == BoardStatus.WATCHLIST
+            and not current.watchlist_member
+            and not _has_positive_breakout(current.breakout_price)
+        ):
+            return BuylistMembershipSyncResult(
+                action="missing_breakout", card=current
+            )
         report = trade_card_repository.build_trade_card_migration(
             buylist_manager=SimpleNamespace(items=[normalized_item]),
             watchlist=watchlist,
@@ -149,6 +179,8 @@ def reconcile_buylist_item(
         promoted.board_status = BoardStatus.BUYLIST
         promoted.board_status_updated_at = datetime.now(timezone.utc)
         promoted.buylist_member = True
+        if not _has_positive_breakout(promoted.breakout_price):
+            promoted.breakout_price = row.card.breakout_price
         promoted.watchlist_member = bool(
             current.watchlist_member or row.card.watchlist_member
         )
@@ -198,11 +230,15 @@ def add_to_buylist(
 ) -> BuylistMembershipSyncResult:
     """Write a Buylist addition through to canonical Kanban state."""
 
-    buylist_manager.add(item)
-    return reconcile_buylist_item(
+    if not _has_positive_breakout(getattr(item, "breakout_price", None)):
+        return BuylistMembershipSyncResult(action="missing_breakout")
+    result = reconcile_buylist_item(
         engine,
         item,
         default_account_no=default_account_no,
         watchlist=watchlist,
         explicit_watchlist_promotion=explicit_watchlist_promotion,
     )
+    if result.action not in {"missing_breakout", "unsafe", "conflicted"}:
+        buylist_manager.add(item)
+    return result

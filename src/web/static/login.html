@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+  <meta name="theme-color" content="#07110f">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <title>Quant Web — Sign in</title>
+  <link rel="manifest" href="/web-static/manifest.webmanifest">
+  <link rel="icon" href="/web-static/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/live-static/app.css?v=85">
+  <script src="/live-static/login.js?v=38" defer></script>
+</head>
+<body>
+  <main class="login-shell">
+    <section class="login-card" aria-labelledby="login-title">
+      <div class="eyebrow">PRIVATE LOCAL WORKSPACE</div>
+      <h1 id="login-title">Quant Web</h1>
+      <p>Review charts and prepare sandbox plans without touching the executor.</p>
+      <form id="login-form" method="post" action="/login" autocomplete="on">
+        <label for="username">Username</label>
+        <input id="username" name="username" autocomplete="username" required maxlength="80">
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required maxlength="256">
+        <button id="login-button" type="submit">Sign in</button>
+        <p id="login-error" class="form-error" role="alert" aria-live="polite"></p>
+      </form>
+      <div class="login-note">No default password · Server-side session · Loopback only</div>
+    </section>
+  </main>
+</body>
+</html>

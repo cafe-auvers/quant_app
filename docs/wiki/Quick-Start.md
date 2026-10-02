@@ -43,3 +43,9 @@ read-only as appropriate.
 See [Configuration](Configuration) before enabling optional services.
 Before operating Buy Today or Entry Pending, read
 [Current Order Logic](https://github.com/cafe-auvers/quant_app/blob/master/docs/current_order_logic.md).
+
+For the optional connected phone/PWA, use the authenticated web launcher and
+explicit operation allowlists. Routine actions synchronize automatically; a
+manual desktop or browser refresh is not an execution requirement. Read
+[Web/PWA Operator Synchronization](https://github.com/cafe-auvers/quant_app/blob/master/docs/web_operator_sync.md)
+before enabling connected writes.

@@ -23,6 +23,16 @@ reference; startup migrates recognized legacy runtime keys out of `.env`.
 | `QUANT_BACKUP_DIR` | Offsite local-state backup target | Optional |
 | `AUTO_CLAIM_MAIN_ON_HANDOFF` | PC ownership auto-claim | `0` |
 
+The web/PWA uses separate gitignored `config/web.local.json` settings. Keep
+canonical writes and both connected operation allowlists off unless the exact
+account/environment and permitted Operator Control identity (`Mobile Web` or
+the hosting desktop) have been verified. Enabling an allowlist permits only
+those typed planning/operator
+requests; it never changes `TRADING_ENABLED`, the shared Live Trading switch,
+the execution lease, or broker configuration. The authenticated live-update
+WebSocket and typed desktop pulses are notification paths, not additional
+authority settings.
+
 `Buffer %` is persisted Trade Card planning/compatibility metadata. It does not
 raise the active passive-order trigger: live confirmation uses
 `max(breakout_price, orb_high)`, and automatic execution uses ORB high. The

@@ -18,8 +18,11 @@ Entry Pending, higher-score replacement, fills, rejections, and EOD behavior.
 - Choose **Watchlist** in the stock sidebar to review saved candidates. From
   there, **Move to Buylist** performs the explicit passive-stage promotion;
   **Remove from Watchlist** removes an unwanted candidate.
-- On a Watchlist chart, drawing or clearing a breakout target keeps the symbol
-  in Watchlist. **Move to Buylist (Q)** is the separate promotion action.
+- Drawing or editing a breakout target does not add the symbol to today's
+  Watchlist. The target remains available after Watchlist membership expires or
+  is removed.
+- **Move to Buylist (Q)** is a separate action and is rejected until the symbol
+  has a positive breakout price.
 - A Buylist card can be returned with **Move to Watchlist** from its Buy Board
   context menu or the TradingView queue-stage control.
 
@@ -150,6 +153,21 @@ The canonical trade card always wins over local compatibility data. If a local
 execution-queue target is missing or differs after a chart edit, execution is
 `DATA_UNAVAILABLE` until a fresh queue snapshot matches; the stale queue can
 never restore the old target or submit against it.
+
+## Connected web/PWA feedback
+
+An allowlisted connected chart/planning action renders immediately as pending
+on the initiating browser. Canonical revision, lifecycle, session, account, and
+Operator Control checks still run on the server. A success replaces the pending
+view with canonical state; a failure rolls it back. Authenticated browser
+invalidations and typed desktop pulses update the other running surfaces, with
+revision polling/startup reads as recovery. A manual refresh is not required
+and cannot turn a rejected plan into executable intent.
+
+Buy Today activation through this surface uses the same canonical workflow and
+may claim eligible `KANBAN` ownership, but it does not place an order. Execution
+still belongs to the separately gated `ACTIVE` Execution Owner. See
+[Web/PWA Operator Synchronization](web_operator_sync.md).
 
 ## Execution boundary
 

@@ -482,7 +482,11 @@ def update_trade_card_in_transaction(
 
 
 def create_trade_card(
-    engine: Engine, card: TradeCardState, *, local_snapshot_path: Optional[Path] = None
+    engine: Engine,
+    card: TradeCardState,
+    *,
+    local_snapshot_path: Optional[Path] = None,
+    record_summary: bool = True,
 ) -> TradeCardState:
     """Insert a brand-new card. Raises ``TradeCardVersionConflictError`` if a
     row for this (environment, account_no, symbol) already exists -- callers
@@ -494,11 +498,12 @@ def create_trade_card(
     with engine.begin() as conn:
         insert_trade_card(conn, card)
     _upsert_local_snapshot_card(card, path=local_snapshot_path)
-    from src.services.daily_trading_summary import (
-        record_trade_card_snapshot_best_effort,
-    )
+    if record_summary:
+        from src.services.daily_trading_summary import (
+            record_trade_card_snapshot_best_effort,
+        )
 
-    record_trade_card_snapshot_best_effort(engine, card)
+        record_trade_card_snapshot_best_effort(engine, card)
     return card
 
 
@@ -508,6 +513,7 @@ def update_trade_card(
     *,
     expected_version: int,
     local_snapshot_path: Optional[Path] = None,
+    record_summary: bool = True,
 ) -> TradeCardState:
     """Conditionally update an existing row: the write only applies if the
     stored ``version`` still equals ``expected_version`` (spec section 317's
@@ -520,11 +526,12 @@ def update_trade_card(
             conn, card, expected_version=expected_version
         )
     _upsert_local_snapshot_card(card, path=local_snapshot_path)
-    from src.services.daily_trading_summary import (
-        record_trade_card_snapshot_best_effort,
-    )
+    if record_summary:
+        from src.services.daily_trading_summary import (
+            record_trade_card_snapshot_best_effort,
+        )
 
-    record_trade_card_snapshot_best_effort(engine, card)
+        record_trade_card_snapshot_best_effort(engine, card)
     return card
 
 

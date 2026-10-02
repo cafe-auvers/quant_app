@@ -23,6 +23,13 @@ During regular market hours, non-execution-owner planning changes are locked;
 authorized intervention commands are routed through the operator command path.
 Published plan immutability and account ownership remain enforced.
 
+On the connected phone/PWA, an allowed action changes the local display
+immediately while saving. Wait for the canonical success or queued result; a
+failure rolls back and shows its reason. Other web and desktop screens update
+automatically through invalidations/change pulses, so do not use reload or
+repeat-clicking as confirmation. Operator Control authorizes the instruction;
+only the `ACTIVE` Execution Owner can cross the broker boundary.
+
 No fixed profit target is used for active ORB management. Confirmation is a
 fresh trade strictly above `max(orb_high, breakout_price)`; the passive order
 rests at ORB high by default and fills only on broker evidence. A later,
@@ -31,3 +38,4 @@ through strict cancel-then-replace. Exits follow the rulebook and
 broker-confirmed state.
 
 See [Current Order Logic](https://github.com/cafe-auvers/quant_app/blob/master/docs/current_order_logic.md).
+For cross-device confirmation semantics, see [Web/PWA Operator Synchronization](https://github.com/cafe-auvers/quant_app/blob/master/docs/web_operator_sync.md).

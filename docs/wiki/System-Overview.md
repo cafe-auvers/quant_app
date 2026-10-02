@@ -1,12 +1,13 @@
 # System Overview
 
-Quant App combines five operational areas:
+Quant App combines six operational areas:
 
 1. research and scanning;
 2. Watchlist and Buylist planning;
 3. chart review and ORB plan selection;
 4. account, position, and broker reconciliation;
 5. a guarded Buy Board execution runtime.
+6. an authenticated web/PWA review and delegated operator surface.
 
 ```mermaid
 flowchart LR
@@ -19,6 +20,7 @@ flowchart LR
     Buylist --> Board[Buy Board]
     KIS[KIS account and order APIs] --> Reconcile[Broker reconciliation]
     Board --> Gateway[Guarded execution gateway]
+    Web[Phone / PWA] -->|allowlisted intent| Board
     Gateway --> KIS
     Reconcile --> Board
     Cache --> Mirror[(Laptop SQLite mirror)]
@@ -30,6 +32,11 @@ flowchart LR
 - TradingView Lightweight Charts with drawings, ORB markers, fundamentals,
   earnings, Leadership, and Market Context overlays.
 - Cross-device planning and execution ownership controls.
+- A four-state PyQt Operator Control selector (`PC`, `Laptop`, `Mobile`, or
+  `Locked`); Mobile is visible as a distinct shared owner but is never an
+  Execution Owner option.
+- Immediate optimistic web/PWA actions with canonical confirmation, automatic
+  peer-browser invalidation, and typed desktop refresh pulses.
 - Buy Board runtime availability by default, with broker mutations still
   blocked by independent live-execution, ownership, readiness, and risk gates.
 - Durable order/card/command state, conservative reconciliation, event journal,

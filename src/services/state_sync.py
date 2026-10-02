@@ -66,6 +66,7 @@ SETTINGS_KEY = "settings"
 MAIN_DEVICE_KEY = "__main_device__"
 OPERATOR_CONTROL_KEY = "__operator_control__"
 LIVE_TRADING_CONTROL_KEY = "__live_trading_control__"
+MOBILE_WEB_OPERATOR_HOSTNAME = "Mobile Web"
 
 SYNCED_STATE_KEYS = (
     WATCHLIST_KEY,
@@ -251,6 +252,41 @@ class OperatorControlResult:
     success: bool
     control: Optional[OperatorControl] = None
     error: str = ""
+
+
+def mobile_web_operator_role(
+    environment: str = "PROD",
+    account_no: str = "",
+) -> LocalDeviceRole:
+    """Return the stable non-executor identity used by the private web app."""
+
+    identity_seed = ":".join(
+        (
+            "quant-app-mobile-web",
+            str(environment or "").strip().upper(),
+            str(account_no or "").strip(),
+        )
+    )
+    return LocalDeviceRole(
+        device_id=str(uuid.uuid5(uuid.NAMESPACE_URL, identity_seed)),
+        hostname=MOBILE_WEB_OPERATOR_HOSTNAME,
+        is_main=False,
+    )
+
+
+def is_mobile_web_operator_identity(
+    *, device_id: str = "", hostname: str = ""
+) -> bool:
+    """Identify Mobile Web without treating it as a PC runtime."""
+
+    normalized_hostname = str(hostname or "").strip().casefold()
+    if normalized_hostname == MOBILE_WEB_OPERATOR_HOSTNAME.casefold():
+        return True
+    default_role = mobile_web_operator_role()
+    return bool(
+        str(device_id or "").strip()
+        and str(device_id or "").strip() == default_role.device_id
+    )
 
 
 @dataclass(frozen=True)

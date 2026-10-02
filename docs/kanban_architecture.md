@@ -235,10 +235,10 @@ An ambiguous submission, unknown broker identity, or unconfirmed cancellation ha
 
 | UI action | Typed command | Durable effect |
 |---|---|---|
-| Drop into Buylist | `MoveToBuylist` or `CancelEntry` | Move when safe; otherwise request cancellation |
+| Drop into Buylist | `MoveToBuylist` or `CancelEntry` | Require a positive breakout and move when safe; otherwise request cancellation |
 | Drop into Buy Today | `ActivateForToday` | Authorize today's entry monitoring |
-| Draw/set a chart breakout | `SetBreakoutPrice(price)` | Create or revise the canonical Buylist target for the selected account; a premarket Buy Today revision clears old ORB geometry and must be rebuilt |
-| Clear a chart breakout | `ClearBreakoutPrice` | Clear a passive target, or premarket remand a zero-evidence Buy Today card to Buylist while atomically removing executable entry fields |
+| Draw/set a chart breakout | `SetBreakoutPrice(price)` | Create or revise an independent canonical breakout target without changing current Watchlist membership; a premarket Buy Today revision clears old ORB geometry and must be rebuilt |
+| Clear a chart breakout | `ClearBreakoutPrice` | Clear a passive target and remove Buylist membership when present, or premarket remand a zero-evidence Buy Today card to passive planning while atomically removing executable entry fields |
 | Drop queued Sell All into Open Positions | `CancelQueuedSellAll` | Withdraw a local premarket sell-at-open intent before submission |
 | Drop into Partial Sell | `RequestPartialSell(quantity)` | Persist partial-exit intent; quantity at/above orderable shares becomes Sell All |
 | Drop into Sell All | `RequestSellAll` | Persist liquidation intent; premarket requests may queue for market open |
@@ -281,6 +281,20 @@ queue cannot restore a cleared target or execute after a target revision.
 ## Read Projection Flow
 
 The UI refreshes asynchronously and periodically, and the runtime emits immediate refresh signals after material changes.
+
+Material runtime changes include device-state transitions and changes in the
+canonical-store writability gate, even when no card version changed. This keeps
+`STARTING`, `STANDBY_READY`, `ACTIVE`, `FAILED`, and writable-store restrictions
+aligned with the live worker rather than leaving an old restriction visible
+until an unrelated card mutation.
+
+Connected web/PWA mutations also publish typed external change pulses. The PC
+desktop consumes its inbound file every second, its listener exposes the
+outbound event to a laptop, and each receiver performs a scoped canonical read.
+Open browser clients receive an authenticated WebSocket invalidation and
+refetch the canonical projection. Initial reads and periodic revision checks
+recover missed events; a manual refresh is not part of the normal flow. See
+[Web/PWA Operator Synchronization](web_operator_sync.md).
 
 Before projection, `trade_card_bootstrap` creates only missing cards from already-loaded Watchlist/Buylist state. It never overwrites an existing Kanban lifecycle. While the runtime is not running, a fresh cached KIS account snapshot may update broker-derived holdings; once the runtime starts, normal account reconciliation becomes the sole broker-truth projector.
 
@@ -374,6 +388,11 @@ can strand in-flight human intent. Pre-market **Publish Today's Plan** remains
 a separate atomic four-document publish and is disabled during the regular
 session. See [execution_operator_control.md](execution_operator_control.md)
 for the operator workflow and troubleshooting checklist.
+
+User-visible immediacy does not weaken this command boundary. The initiating
+web client may render pending optimistic state, but a failure rolls it back and
+only the canonical response/change notification can confirm persistence.
+Queued intent remains distinct from executor completion and broker truth.
 
 ### Startup and readiness
 

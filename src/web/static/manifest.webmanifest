@@ -1,0 +1,18 @@
+{
+  "name": "Quant Web Review",
+  "short_name": "Quant Web",
+  "description": "Private localhost chart review and sandbox planning workspace",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#07110f",
+  "theme_color": "#07110f",
+  "icons": [
+    {
+      "src": "/web-static/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

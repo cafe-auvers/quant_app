@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+  <meta name="theme-color" content="#07110f">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <title>Quant Web — Review Workspace</title>
+  <link rel="manifest" href="/web-static/manifest.webmanifest">
+  <link rel="icon" href="/web-static/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/live-static/app.css?v=86">
+  <script src="/live-vendor/lightweight-charts.standalone.production.js" defer></script>
+  <script src="/live-static/app.js?v=87" defer></script>
+</head>
+<body class="dashboard-body">
+  <div id="quant-app" class="app-shell">
+    <header class="topbar">
+      <div class="brand-block">
+        <div class="brand-mark">Q</div>
+        <div><div class="brand-name">Quant Web</div><div class="brand-sub">Review workspace</div></div>
+      </div>
+      <button id="logout-button" class="ghost-button">Sign out</button>
+    </header>
+    <section class="status-strip" aria-live="polite">
+      <span id="market-summary" title="Checking NYSE market status"><i id="market-dot" class="status-dot"></i><b id="market-status-long">Market Status: Checking</b><b id="market-status-compact">Market Checking</b></span>
+      <span id="browser-status" title="Browser: CONNECTED"><i id="browser-dot" class="status-dot good"></i>Browser</span>
+      <span id="web-status" title="Web: HEALTHY"><i id="service-dot" class="status-dot good"></i>Web</span>
+      <span id="data-summary" title="Data mode: DEMO"><i id="data-dot" class="status-dot good"></i><b id="data-status">Demo</b></span>
+      <span id="executor-status" title="Executor: UNKNOWN"><i id="executor-dot" class="status-dot stale"></i>Executor</span>
+      <span id="global-message">Preparing workspace…</span>
+    </section>
+    <main class="workspace">
+      <aside id="stock-rail" class="stock-rail">
+        <div class="rail-head">
+          <button id="rail-collapse" class="icon-button" aria-label="Collapse stock list">☰</button>
+          <div class="search-wrap">
+            <input id="symbol-search" type="search" placeholder="Search all instruments" autocomplete="off" maxlength="120">
+            <div id="search-results" class="search-results" hidden></div>
+          </div>
+        </div>
+        <div class="list-tabs" role="tablist">
+          <button class="list-tab active" data-list="scanner">Scanner</button>
+          <button class="list-tab" data-list="history">History</button>
+          <button class="list-tab" data-list="watchlist">Watchlist</button>
+          <button class="list-tab" data-list="buylist">Buylist</button>
+          <button class="list-tab" data-list="buy_today">Buy Today</button>
+        </div>
+        <form id="rail-history-filters" class="history-filters rail-history-filters" data-history-form="rail" hidden>
+          <label class="history-date-field"><span>From</span><input id="rail-history-from" type="date" required></label>
+          <label class="history-date-field"><span>To</span><input id="rail-history-to" type="date" required></label>
+          <button type="submit">Apply range</button>
+        </form>
+        <div class="snapshot-meta"><strong id="scanner-setup">Loading scanner…</strong><span id="scanner-freshness">—</span></div>
+        <div id="stock-list" class="stock-list" role="listbox" aria-label="Stocks"></div>
+      </aside>
+      <section id="mobile-workspace" class="chart-workspace" data-mobile-page="chart">
+        <section id="mobile-summary-page" class="mobile-page" data-mobile-page-panel="summary" aria-label="Summary" hidden>
+          <div class="mobile-page-header"><div><span class="eyebrow">HOME</span><h1>Summary</h1></div><span id="summary-market-state" class="mobile-page-badge">Checking</span></div>
+          <div class="mobile-summary-grid">
+            <article class="mobile-dashboard-card mobile-dashboard-card-wide">
+              <span class="mobile-card-label">Today</span>
+              <strong id="summary-session-label">Loading market session</strong>
+              <small id="summary-control-label">Checking operator control</small>
+            </article>
+            <article class="mobile-dashboard-card"><span class="mobile-card-label">Scanner</span><strong id="summary-scanner-count">0</strong><small>ranked stocks</small></article>
+            <article class="mobile-dashboard-card"><span class="mobile-card-label">Watchlist</span><strong id="summary-watchlist-count">0</strong><small>today</small></article>
+            <article class="mobile-dashboard-card"><span class="mobile-card-label">Buylist</span><strong id="summary-buylist-count">0</strong><small>planned</small></article>
+            <article class="mobile-dashboard-card"><span class="mobile-card-label">Buy Today</span><strong id="summary-buy-today-count">0</strong><small>active or drafted</small></article>
+          </div>
+          <article class="mobile-page-section mobile-operator-control">
+            <div class="mobile-section-heading"><div><span class="mobile-card-label">Operator Control</span><strong id="operator-control-current">Checking owner</strong></div><span id="operator-control-executor">Executor: unknown</span></div>
+            <p>Choose where manual actions originate. This does not move execution ownership or place an order.</p>
+            <div id="operator-control-targets" class="operator-control-targets" role="group" aria-label="Choose Operator Control device"></div>
+            <div id="operator-control-status" class="mobile-inline-status" role="status"></div>
+          </article>
+          <article class="mobile-page-section">
+            <div class="mobile-section-heading"><div><span class="mobile-card-label">Scanner settings</span><strong id="summary-scanner-setup">Current scanner</strong></div><span id="summary-scanner-freshness">â€”</span></div>
+            <div id="summary-scanner-setups" class="mobile-scanner-setups" aria-label="Saved scanner setups"></div>
+            <p>Review the ranked scanner, historical Watchlists, Watchlist, Buylist, and Buy Today lists from one scrollable drawer.</p>
+            <button id="summary-open-lists" class="mobile-primary-action" type="button">Open stock lists</button>
+          </article>
+          <article class="mobile-page-section">
+            <div class="mobile-section-heading"><div><span class="mobile-card-label">Chart settings</span><strong>Indicators and data</strong></div></div>
+            <p>Choose EMAs, volume, relative strength, earnings, market context, ADR, and growth fields.</p>
+            <button id="summary-open-settings" class="mobile-secondary-action" type="button">Open chart settings</button>
+          </article>
+          <article class="mobile-page-section mobile-summary-pulse">
+            <div class="mobile-section-heading"><div><span class="mobile-card-label">Market Pulse</span><strong id="pulse-context">Waiting for chart data</strong></div><span id="pulse-market-state">Checking</span></div>
+            <small id="pulse-symbol-context" class="mobile-summary-pulse-symbol">Select a stock to inspect leadership</small>
+            <div id="pulse-components" class="mobile-pulse-components" aria-label="Market pulse components"></div>
+            <div class="mobile-section-heading mobile-pulse-leadership"><div><span class="mobile-card-label">Leadership</span><strong id="pulse-leadership">Unavailable</strong></div></div>
+            <p id="pulse-detail">Market, segment, sector, and industry context will update with the selected stock.</p>
+            <button id="pulse-open-chart" class="mobile-primary-action" type="button">Open selected chart</button>
+          </article>
+        </section>
+        <section id="mobile-buy-board-page" class="mobile-page" data-mobile-page-panel="buy-board" aria-label="Buy Board" hidden>
+          <div class="mobile-page-header"><div><span class="eyebrow">OPERATOR</span><h1>Buy Board</h1></div><span id="buy-board-authority" class="mobile-page-badge">Checking</span></div>
+          <article class="mobile-board-control-card">
+            <div><strong id="buy-board-control-state">Verifying authority</strong><small id="buy-board-control-detail">No browser can transfer ownership or contact the broker.</small></div>
+            <button id="buy-board-refresh" type="button" aria-label="Refresh Buy Board" title="Refresh Buy Board">↻</button>
+          </article>
+          <div id="buy-board-tabs" class="mobile-kanban-tabs" role="tablist" aria-label="Buy Board columns"></div>
+          <section class="mobile-kanban-column" aria-live="polite">
+            <div class="mobile-kanban-heading">
+              <div><span id="buy-board-column-kicker" class="mobile-card-label">Planning</span><strong id="buy-board-column-title">Buylist</strong></div>
+              <span id="buy-board-column-count">0</span>
+            </div>
+            <div id="buy-board-cards" class="mobile-kanban-cards"></div>
+          </section>
+          <div id="buy-board-sync-status" class="mobile-board-sync-status" role="status">Loading canonical Kanban…</div>
+          <div id="buy-board-action-sheet" class="mobile-board-action-sheet" role="dialog" aria-modal="true" aria-labelledby="buy-board-action-symbol" hidden>
+            <div class="mobile-board-action-card">
+              <div class="mobile-board-action-heading"><div><span id="buy-board-action-stage" class="mobile-card-label"></span><strong id="buy-board-action-symbol">—</strong><small id="buy-board-action-name"></small></div><button id="buy-board-action-close" type="button" aria-label="Close">×</button></div>
+              <div id="buy-board-action-facts" class="mobile-board-action-facts"></div>
+              <div id="buy-board-action-input" class="mobile-board-action-input" hidden><label id="buy-board-action-input-label" for="buy-board-action-value">Value</label><input id="buy-board-action-value" type="number" min="0" step="0.01" inputmode="decimal"><button id="buy-board-action-input-submit" type="button">Apply</button></div>
+              <div id="buy-board-action-buttons" class="mobile-board-action-buttons"></div>
+              <button id="buy-board-open-chart" class="mobile-secondary-action" type="button">Open chart</button>
+              <div id="buy-board-action-status" class="mobile-inline-status" role="status"></div>
+            </div>
+          </div>
+          <article class="mobile-page-section mobile-publish-section">
+            <div class="mobile-section-heading"><div><span class="mobile-card-label">Pre-market publication</span><strong>Today's Plan</strong></div></div>
+            <p>Publishes the verified planning snapshot. It does not place an order; the executor still applies every runtime and broker gate.</p>
+            <button id="publish-today-plan" class="mobile-publish-action" type="button">Publish Today's Plan</button>
+            <div id="publish-today-status" class="mobile-inline-status" role="status"></div>
+          </article>
+        </section>
+        <div class="chart-header">
+          <div class="chart-identity">
+            <div class="symbol-line">
+              <button id="mobile-symbol-search-button" class="mobile-symbol-search-button" type="button" aria-label="Search stocks" aria-haspopup="dialog" aria-expanded="false" aria-controls="mobile-symbol-search-dialog" title="Search stocks">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6"></circle><path d="m16 16 4 4"></path></svg>
+              </button>
+              <button id="active-symbol-search-trigger" class="active-symbol-search-trigger" type="button" aria-label="Search stocks" aria-haspopup="dialog" aria-expanded="false" aria-controls="mobile-symbol-search-dialog" title="Search stocks">
+                <strong id="active-symbol">—</strong><span id="company-name">Select a symbol</span>
+              </button>
+            </div>
+            <div id="company-context" class="company-context">Sector and industry unavailable</div>
+            <div class="chart-metrics"><span id="adr-chip" class="metric-chip">ADR</span><span id="growth-1m-chip" class="metric-chip performance-chip">1M</span><span id="growth-3m-chip" class="metric-chip performance-chip">3M</span><span id="earnings-chip" class="metric-chip">Earnings</span></div>
+          </div>
+          <div class="chart-actions">
+            <div class="symbol-stepper chart-symbol-stepper" role="group" aria-label="Change stock">
+              <button id="previous-symbol" class="icon-button" aria-label="Previous stock" title="Previous stock">‹</button>
+              <button id="next-symbol" class="icon-button" aria-label="Next stock" title="Next stock">›</button>
+            </div>
+            <div class="timeframe-switch" role="group" aria-label="Timeframe"><button data-timeframe="1D" class="active">1D</button><button data-timeframe="1H">1H</button></div>
+            <button id="split-toggle" class="ghost-button">Split 1D / 1H</button>
+            <button id="draw-line" class="ghost-button" aria-pressed="false" title="Draw and edit chart lines (D)">Line Tool</button>
+            <button id="fit-chart" class="ghost-button">Fit</button>
+          </div>
+        </div>
+        <div id="mobile-symbol-search-dialog" class="mobile-symbol-search-dialog" role="dialog" aria-modal="true" aria-label="Search stocks" hidden>
+          <div class="mobile-symbol-search-card">
+            <div class="mobile-symbol-search-heading">
+              <input id="mobile-symbol-search" type="search" placeholder="Search ticker or company" autocomplete="off" maxlength="120" aria-label="Search ticker or company">
+              <button id="mobile-symbol-search-close" type="button" aria-label="Close stock search">×</button>
+            </div>
+            <div id="mobile-symbol-search-results" class="mobile-symbol-search-results" role="listbox" aria-label="Stock search results" hidden></div>
+          </div>
+        </div>
+        <div class="review-actions" aria-label="Local list actions">
+          <span id="quick-stage" class="quick-stage">NOT LISTED</span>
+          <button id="quick-watchlist" class="review-action" aria-pressed="false">Watchlist</button>
+          <button id="quick-buylist" class="review-action" aria-pressed="false">Buylist</button>
+          <button id="quick-buy-today" class="review-action" title="Add to Buy Today using the available planning or operator workflow">Buy Today</button>
+          <button id="quick-plan-details" class="review-action mobile-only" aria-pressed="false" title="Click, then choose the breakout price on the chart">Breakout</button>
+          <span id="quick-safety" class="quick-safety">LOCAL ONLY</span>
+        </div>
+        <div id="chart-grid" class="chart-grid">
+          <div class="chart-pane">
+            <button class="pane-label" id="primary-label" type="button" data-chart-timeframe-toggle data-current-timeframe="1D" aria-label="Switch chart to 1H" title="Switch chart to 1H">1D</button>
+            <aside id="market-alignment-overlay" class="market-alignment-overlay" aria-label="Leadership and market context" hidden>
+              <div class="alignment-compact">
+                <div class="alignment-leadership"><strong id="alignment-score">â€”</strong><span id="alignment-label">N/A</span></div>
+                <div id="alignment-context" class="alignment-context">CONTEXT: UNKNOWN</div>
+                <div class="alignment-indicators" aria-label="Market context components">
+                  <span data-alignment-state="MKT" data-state="UNKNOWN"><i aria-hidden="true">â—‹</i>MKT</span>
+                  <span data-alignment-state="SEG" data-state="UNKNOWN"><i aria-hidden="true">â—‹</i>SEG</span>
+                  <span data-alignment-state="SEC" data-state="UNKNOWN"><i aria-hidden="true">â—‹</i>SEC</span>
+                  <span data-alignment-state="IND" data-state="UNKNOWN"><i aria-hidden="true">â—‹</i>IND</span>
+                </div>
+                <div class="alignment-footer">
+                  <button id="market-alignment-toggle" type="button" aria-controls="market-alignment-details" aria-expanded="false">Details â–¾</button>
+                  <span id="alignment-provisional" class="alignment-provisional" hidden>PROVISIONAL</span>
+                  <span id="alignment-stale" class="alignment-stale" hidden>STALE</span>
+                </div>
+              </div>
+              <div id="market-alignment-details" class="market-alignment-details" hidden></div>
+            </aside>
+            <div id="chart-primary" class="chart-surface"></div><div id="rs-primary" class="rs-surface"></div><div id="primary-overlay" class="chart-overlay">Select a symbol</div>
+          </div>
+          <div id="secondary-pane" class="chart-pane secondary-pane"><button class="pane-label" id="secondary-label" type="button" data-chart-timeframe-toggle data-current-timeframe="1H" aria-label="Switch chart to 1D" title="Switch chart to 1D">1H</button><div id="chart-secondary" class="chart-surface"></div><div id="rs-secondary" class="rs-surface"></div><div id="secondary-overlay" class="chart-overlay">1H loads independently</div></div>
+        </div>
+        <div id="mobile-drawing-actions" class="mobile-drawing-actions" role="toolbar" aria-label="Selected drawing actions" hidden>
+          <span>Line selected</span>
+          <button id="mobile-delete-drawing" type="button">Delete</button>
+          <button id="mobile-cancel-drawing-selection" type="button">Cancel</button>
+        </div>
+        <div id="breakout-price-popup" class="breakout-price-popup" role="dialog" aria-modal="true" aria-labelledby="breakout-price-title" hidden>
+          <form id="breakout-price-form" class="breakout-price-card">
+            <div class="breakout-price-heading">
+              <div><span class="eyebrow">BREAKOUT</span><h2 id="breakout-price-title">Set exact price</h2></div>
+              <button id="breakout-price-close" class="breakout-price-close" type="button" aria-label="Close breakout price editor">×</button>
+            </div>
+            <label for="breakout-price-popup-input">Price</label>
+            <input id="breakout-price-popup-input" type="number" min="0.01" step="0.01" inputmode="decimal" required>
+            <div class="breakout-price-actions">
+              <button id="breakout-price-cancel" type="button">Cancel</button>
+              <button type="submit">Save</button>
+            </div>
+          </form>
+        </div>
+        <div id="operator-confirm-dialog" class="operator-confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="operator-confirm-title" hidden>
+          <div class="operator-confirm-card">
+            <span class="eyebrow">OPERATOR ACTION</span>
+            <h2 id="operator-confirm-title">Confirm action</h2>
+            <p id="operator-confirm-copy"></p>
+            <div class="operator-confirm-actions"><button id="operator-confirm-cancel" type="button">Cancel</button><button id="operator-confirm-submit" type="button">Confirm</button></div>
+          </div>
+        </div>
+        <button id="mobile-draw-line" class="mobile-floating-draw" type="button" aria-label="Line Tool" aria-pressed="false" title="Draw and edit chart lines">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 20 4.5-1 10-10-3.5-3.5-10 10L4 20Zm9.5-13 3.5 3.5M3 21h18"/></svg>
+        </button>
+        <div id="mobile-menu-popover" class="mobile-menu-popover" role="dialog" aria-label="Chart display settings" hidden>
+          <div class="display-settings-heading"><strong>Chart Settings</strong><button id="display-settings-reset" type="button">Reset</button></div>
+          <div class="display-settings-scroll">
+            <fieldset class="display-settings-group">
+              <legend>Indicators</legend>
+              <label class="display-setting"><span><b>Volume</b><small>Volume bars</small></span><input type="checkbox" data-display-setting="volume"></label>
+              <label class="display-setting"><span><b>EMA 10</b><small>Fast moving average</small></span><input type="checkbox" data-display-setting="ema10"></label>
+              <label class="display-setting"><span><b>EMA 20</b><small>Short trend average</small></span><input type="checkbox" data-display-setting="ema20"></label>
+              <label class="display-setting"><span><b>EMA 50</b><small>Medium trend average</small></span><input type="checkbox" data-display-setting="ema50"></label>
+              <label class="display-setting"><span><b>Relative vs SPY</b><small>Linked lower panel</small></span><input type="checkbox" data-display-setting="relativeStrength"></label>
+            </fieldset>
+            <fieldset class="display-settings-group">
+              <legend>Chart data</legend>
+              <label class="display-setting"><span><b>Earnings</b><small>Events and chart markers</small></span><input type="checkbox" data-display-setting="earnings"></label>
+              <label class="display-setting"><span><b>Market context</b><small>Leadership and MKT/SEG/SEC/IND</small></span><input type="checkbox" data-display-setting="marketAlignment"></label>
+            </fieldset>
+            <fieldset class="display-settings-group">
+              <legend>Header data</legend>
+              <label class="display-setting"><span><b>ADR</b><small>20-session average range</small></span><input type="checkbox" data-display-setting="adr"></label>
+              <label class="display-setting"><span><b>1M growth</b><small>21-session return</small></span><input type="checkbox" data-display-setting="return1m"></label>
+              <label class="display-setting"><span><b>3M growth</b><small>63-session return</small></span><input type="checkbox" data-display-setting="return3m"></label>
+            </fieldset>
+            <button id="mobile-logout-button" class="mobile-menu-signout" type="button">Sign out</button>
+          </div>
+        </div>
+        <nav class="mobile-bottom-nav" aria-label="Mobile workspace">
+          <button class="mobile-nav-button mobile-workspace-tab" type="button" data-mobile-page="summary" aria-label="Home">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 13h6V4H4v9Zm10 7h6V11h-6v9ZM4 20h6v-3H4v3Zm10-13h6V4h-6v3Z"/></svg><span>Home</span>
+          </button>
+          <div class="mobile-list-control">
+            <button id="mobile-list-menu" class="mobile-nav-button" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="mobile-list-popover">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v16l-7-3-7 3V4Zm3 4h8M8 11h8"/></svg>
+              <span id="mobile-list-label">Watchlist</span>
+            </button>
+            <div id="mobile-list-popover" class="mobile-list-popover" role="dialog" aria-label="Stock lists" hidden>
+              <div class="mobile-list-tabs" role="tablist" aria-label="Choose stock list">
+                <button type="button" role="tab" aria-selected="false" data-mobile-list="scanner">Scanner</button>
+                <button type="button" role="tab" aria-selected="false" data-mobile-list="history">History</button>
+                <button type="button" role="tab" aria-selected="true" class="active" data-mobile-list="watchlist">Watchlist</button>
+                <button type="button" role="tab" aria-selected="false" data-mobile-list="buylist">Buylist</button>
+                <button type="button" role="tab" aria-selected="false" data-mobile-list="buy_today">Buy Today</button>
+              </div>
+              <form id="mobile-history-filters" class="history-filters mobile-history-filters" data-history-form="mobile" hidden>
+                <label class="history-date-field"><span>From</span><input id="mobile-history-from" type="date" required></label>
+                <label class="history-date-field"><span>To</span><input id="mobile-history-to" type="date" required></label>
+                <button type="submit">Apply</button>
+              </form>
+              <div class="mobile-list-heading"><strong id="mobile-list-title">Watchlist</strong><span id="mobile-list-count">0</span></div>
+              <div id="mobile-list-items" class="mobile-list-items" role="listbox" aria-label="Watchlist stocks"></div>
+            </div>
+          </div>
+          <button class="mobile-nav-button mobile-workspace-tab active" type="button" data-mobile-page="chart" aria-label="Chart" aria-current="page">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 18 9 12l4 3 7-9M4 4v16h16"/></svg><span>Chart</span>
+          </button>
+          <button class="mobile-nav-button mobile-workspace-tab" type="button" data-mobile-page="buy-board" aria-label="Buy Board">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14v15H5V5Zm3-2v4m8-4v4M8 11h8m-8 4h5"/></svg><span>Buy Board</span>
+          </button>
+          <div class="symbol-stepper mobile-symbol-stepper mobile-segment-control" role="group" aria-label="Change stock">
+            <div class="mobile-segment-buttons">
+              <button id="mobile-previous-symbol" class="icon-button" aria-label="Previous stock" title="Previous stock">‹</button>
+              <button id="mobile-next-symbol" class="icon-button" aria-label="Next stock" title="Next stock">›</button>
+            </div>
+            <span class="mobile-control-caption" aria-hidden="true">Stocks</span>
+          </div>
+        </nav>
+      </section>
+      <aside id="planning-panel" class="planning-panel">
+        <div class="panel-title-row"><div><span id="planning-eyebrow" class="eyebrow">LOCAL PLANNING</span><h2>Plan</h2></div><button id="close-planning" class="icon-button mobile-only" aria-label="Close planning panel">Close</button></div>
+        <div class="plan-state-card"><span id="plan-stage" class="stage-pill">NOT PLANNED</span><span id="plan-revision">Revision 0</span></div>
+        <button id="place-breakout" class="breakout-place-button" aria-pressed="false">Place on chart</button>
+        <label for="breakout-input">Manual breakout price</label>
+        <div class="field-row"><input id="breakout-input" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00"><button id="save-breakout">Save</button><button id="clear-breakout" class="ghost-button">Clear</button></div>
+        <p class="hint breakout-hint">Choose Place on chart, then click the exact level. Drag the saved line to adjust it, or enter a manual price here.</p>
+        <div class="plan-actions">
+          <button id="add-watchlist">Add to Watchlist</button><button id="promote-buylist">Move to Buylist</button>
+          <button id="move-watchlist" class="ghost-button">Move to Watchlist</button><button id="remove-watchlist" class="danger-ghost">Remove Watchlist</button>
+        </div>
+        <button id="buy-today-preview" class="preview-button">Create non-executable Buy Today preview</button>
+        <p id="buy-today-safety" class="safety-copy">Buy Today availability follows the verified controller mode. The browser never places an order.</p>
+        <div class="section-divider"></div>
+        <div class="panel-title-row"><h3>Visual drawings</h3><span id="drawing-count">0</span></div>
+        <p class="hint">Choose Line Tool, then click two chart points. Select and drag a saved line or endpoint to adjust it; Delete removes the selected line.</p>
+        <div id="drawing-list" class="drawing-list"></div>
+        <div id="plan-message" class="panel-message" role="status"></div>
+      </aside>
+    </main>
+  </div>
+</body>
+</html>

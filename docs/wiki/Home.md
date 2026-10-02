@@ -1,8 +1,8 @@
 # Quant App Wiki
 
-Quant App is a Windows/PyQt5 desktop dashboard for U.S. swing-trading
-research, planning, market-data review, KIS account visibility, and guarded
-order execution.
+Quant App is a Windows/PyQt5 desktop dashboard with a companion authenticated
+web/PWA operator surface for U.S. swing-trading research, planning,
+market-data review, KIS account visibility, and guarded order execution.
 
 The application is live-trading capable, but production mutation paths are
 fail-closed. A visible card, broker acceptance response, or enabled Buy Board
@@ -14,6 +14,7 @@ control remain independent gates.
 
 - Completely new: [plain-language Project Tour](https://github.com/cafe-auvers/quant_app/blob/master/docs/project_tour.md) and its [large-picture HTML view](https://github.com/cafe-auvers/quant_app/blob/master/docs/project_tour.html)
 - New operator: [Quick Start](Quick-Start) and [User Workflow](User-Workflow)
+- Phone/PWA operator: [Web/PWA Operator Synchronization](https://github.com/cafe-auvers/quant_app/blob/master/docs/web_operator_sync.md)
 - Exact entry behavior: [Current Order Logic](https://github.com/cafe-auvers/quant_app/blob/master/docs/current_order_logic.md) and [Order Lifecycle](Order-Lifecycle)
 - Installation: [Installation and Environment Setup](Installation-and-Environment-Setup)
 - Maintainer: [System Overview](System-Overview) and [Architecture](Architecture)

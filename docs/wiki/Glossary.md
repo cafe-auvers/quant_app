@@ -7,6 +7,7 @@
 | Breakout price | Persisted daily structural breakout level |
 | Buy Today | Pre-entry card with a selected/published plan for the session |
 | Canonical state | Authoritative persisted state, not a transient widget |
+| Change pulse | Small typed invalidation token that tells another process which canonical scope to refetch; not state or authority itself |
 | Controlled live | Restricted live envelope for canonical active Trade Cards and entry notional |
 | Entry Pending | System-owned state for a durable unresolved/submitted entry |
 | Execution price | Exact resting BUY-limit price; ORB high by default, never the current market price |
@@ -19,6 +20,7 @@
 | Local mirror | Pull-only laptop SQLite market-data copy |
 | Mutation budget | Submit/cancel/replace capacity and spacing control |
 | Operator Control | Device allowed to issue the next human command |
+| Optimistic UI state | Immediate pending browser display before canonical persistence confirms or rejects the action |
 | ORB | Opening Range Breakout strategy |
 | ORB generation | Immutable timeframe, ORH/ORL, score, execution price, and order identity for one submitted attempt |
 | Passive-pullback entry | Submit below the current market after breakout confirmation, then wait for a pullback and broker fill evidence |

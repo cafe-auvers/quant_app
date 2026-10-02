@@ -525,9 +525,12 @@ class BuyboardRuntimeWorker(QThread):
         *,
         handoff_confirmed: bool = False,
     ):
+        previous_state = self.device_state
         if not self._device_id:
             self.device_state = state
             self._observe_gate4_runtime_state(state)
+            if state != previous_state:
+                self.board_changed.emit()
             return
         details = self._runtime_readiness_details(state)
         if state != RuntimeDeviceState.STANDBY_READY and not handoff_confirmed:
@@ -542,6 +545,8 @@ class BuyboardRuntimeWorker(QThread):
             self._last_device_state_published_at = datetime.now(timezone.utc)
             self._last_device_state_details = details
             self._observe_gate4_runtime_state(state)
+            if state != previous_state:
+                self.board_changed.emit()
             return None
         record = save_runtime_device_state(
             self._db_engine,
@@ -558,7 +563,18 @@ class BuyboardRuntimeWorker(QThread):
         self._last_device_state_published_at = datetime.now(timezone.utc)
         self._last_device_state_details = details
         self._observe_gate4_runtime_state(state)
+        if state != previous_state:
+            self.board_changed.emit()
         return record
+
+    def _set_database_writable(self, writable: bool) -> None:
+        """Update the local write gate and invalidate readiness projections."""
+
+        writable = bool(writable)
+        changed = writable != self._database_writable
+        self._database_writable = writable
+        if changed:
+            self.board_changed.emit()
 
     def _observe_gate4_runtime_state(self, state: RuntimeDeviceState) -> None:
         if state != RuntimeDeviceState.ACTIVE:
@@ -875,7 +891,7 @@ class BuyboardRuntimeWorker(QThread):
                 # catches read-only connections; the false predicate keeps
                 # all rows untouched.
                 conn.execute(text("UPDATE trade_cards SET version = version WHERE 1 = 0"))
-            self._database_writable = True
+            self._set_database_writable(True)
             if self.execution_gateway is not None:
                 self.execution_gateway.reconcile_emergency_journal()
             if had_prior_probe and not was_writable:
@@ -895,7 +911,7 @@ class BuyboardRuntimeWorker(QThread):
                     "Buyboard runtime database remains unavailable: %s",
                     scrub_sensitive_text(exc, account_no=self._account_no),
                 )
-            self._database_writable = False
+            self._set_database_writable(False)
             if self.execution_gateway is not None:
                 self.execution_gateway.note_canonical_database_unavailable()
             if outage_started:
@@ -1207,7 +1223,7 @@ class BuyboardRuntimeWorker(QThread):
                     # outage immediately and preserve the prior card cache;
                     # the next cycle can continue bounded protection without
                     # another canonical read.
-                    self._database_writable = False
+                    self._set_database_writable(False)
                     if self.execution_gateway is not None:
                         self.execution_gateway.note_canonical_database_unavailable()
                     logger.warning(

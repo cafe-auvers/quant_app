@@ -20,6 +20,8 @@ from src.core.board_workflow import (
     BoardCardProjection,
     CancelEntry,
     ClearBreakoutPrice,
+    MoveToBuylist,
+    MoveToWatchlist,
     SetBreakoutPrice,
 )
 from src.core.trade_card_state import BoardStatus
@@ -286,10 +288,10 @@ class ChartCommandRoutingMixin:
         common = _command_kwargs(payload)
         target = self._chart_positive_price(card.breakout_price)
         if card.board_status == BoardStatus.BUYLIST and target is not None:
-            command = ClearBreakoutPrice(**common)
+            command = MoveToWatchlist(**common)
             message = f"[Chart] Requested Buylist plan removal for {symbol}."
         elif card.board_status == BoardStatus.WATCHLIST and target is not None:
-            command = SetBreakoutPrice(price=target, **common)
+            command = MoveToBuylist(**common)
             message = f"[Chart] Requested canonical Buylist plan for {symbol}."
         elif card.board_status in {BoardStatus.BUY_TODAY, BoardStatus.ENTRY_PENDING}:
             command = CancelEntry(**common)

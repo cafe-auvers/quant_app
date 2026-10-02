@@ -19,6 +19,19 @@
 - Validate SQL identifiers and use parameterized SQLAlchemy statements.
 - Keep remote-control commands authenticated and narrowly allowlisted.
 
+## Web/PWA control
+
+- Require an authenticated server-side session for HTTP and `/live-updates`;
+  validate Host/Origin and require CSRF for mutations.
+- Keep passive and operator operation allowlists separate and revalidate that
+  either the stable `Mobile Web` identity or the exact hosting-desktop identity
+  owns Operator Control on each protected request.
+- Treat WebSocket and typed pulse messages as invalidation hints only. They
+  must contain no database credentials, device secrets, account secrets, or
+  authoritative TradeCard payloads; receivers refetch canonical state.
+- Never expose broker construction, execution-lease transfer, global risk, or
+  workstation-power actions through the browser merely to reduce latency.
+
 ## Trading safety is security
 
 Lease fencing, durable command identity, idempotency, mutation budgets,

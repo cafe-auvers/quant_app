@@ -13,6 +13,7 @@
 - [Scanner and Charts](Scanner-and-Charts)
 - [Market Data and Database](Market-Data-and-Database)
 - [Synchronization](Synchronization)
+- [Web/PWA Operator Synchronization](https://github.com/cafe-auvers/quant_app/blob/master/docs/web_operator_sync.md)
 - [KIS API Integration](KIS-API-Integration)
 - [Current Order Logic](https://github.com/cafe-auvers/quant_app/blob/master/docs/current_order_logic.md)
 - [Order Lifecycle](Order-Lifecycle)

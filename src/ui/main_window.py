@@ -107,9 +107,11 @@ from src.services.state_sync import (
     SETTINGS_KEY,
     LocalDeviceRole,
     get_live_trading_control,
+    is_mobile_web_operator_identity,
     live_trading_control_block_reason,
     live_trading_control_is_effective,
     load_local_device_role,
+    mobile_web_operator_role,
 )
 from src.ui.buyboard import BuyboardMixin
 from src.ui.buylist import BuylistMixin
@@ -3973,6 +3975,7 @@ class MainWindow(
         owner_layout.addWidget(QLabel("Operator Control:"))
         self.operator_control_pc_button = QPushButton("PC")
         self.operator_control_laptop_button = QPushButton("Laptop")
+        self.operator_control_mobile_button = QPushButton("Mobile")
         self.operator_control_locked_button = QPushButton("Locked")
         self.operator_control_pc_button.clicked.connect(
             lambda: self._on_control_owner_clicked("operator", "PC")
@@ -3980,11 +3983,19 @@ class MainWindow(
         self.operator_control_laptop_button.clicked.connect(
             lambda: self._on_control_owner_clicked("operator", "Laptop")
         )
+        self.operator_control_mobile_button.clicked.connect(
+            lambda: self._on_control_owner_clicked("operator", "Mobile")
+        )
         self.operator_control_locked_button.clicked.connect(
             lambda: self._on_control_owner_clicked("operator", "Locked")
         )
+        self.operator_control_mobile_button.setToolTip(
+            "Assign manual Operator Control to the authenticated Mobile Web/PWA. "
+            "This does not change the Execution Owner."
+        )
         owner_layout.addWidget(self.operator_control_pc_button)
         owner_layout.addWidget(self.operator_control_laptop_button)
+        owner_layout.addWidget(self.operator_control_mobile_button)
         owner_layout.addWidget(self.operator_control_locked_button)
         owner_layout.addSpacing(8)
         self.publish_trading_plan_button = QPushButton("Publish Today's Plan")
@@ -4067,6 +4078,11 @@ class MainWindow(
         return _control_runtime_identity_available(record)
 
     def _control_identity_kind(self, *, device_id: str = "", hostname: str = "") -> str:
+        if is_mobile_web_operator_identity(
+            device_id=device_id,
+            hostname=hostname,
+        ):
+            return "Mobile"
         records = list(self.__dict__.get("_runtime_device_records", ()) or ())
         exact = [
             record
@@ -4096,6 +4112,35 @@ class MainWindow(
     def _control_target_role(self, target_label: str) -> Optional[LocalDeviceRole]:
         if target_label == "Locked":
             return None
+        if target_label == "Mobile":
+            control = self.__dict__.get("_cached_operator_control")
+            if control is not None:
+                if is_mobile_web_operator_identity(
+                    device_id=str(getattr(control, "device_id", "") or ""),
+                    hostname=str(getattr(control, "hostname", "") or ""),
+                ):
+                    return LocalDeviceRole(
+                        str(getattr(control, "device_id", "") or ""),
+                        str(getattr(control, "hostname", "") or "Mobile Web"),
+                        False,
+                    )
+                if is_mobile_web_operator_identity(
+                    device_id=str(
+                        getattr(control, "previous_device_id", "") or ""
+                    ),
+                    hostname=str(
+                        getattr(control, "previous_hostname", "") or ""
+                    ),
+                ):
+                    return LocalDeviceRole(
+                        str(getattr(control, "previous_device_id", "") or ""),
+                        str(
+                            getattr(control, "previous_hostname", "")
+                            or "Mobile Web"
+                        ),
+                        False,
+                    )
+            return mobile_web_operator_role()
         records = self.__dict__.get("_runtime_device_records", ()) or ()
         target = _control_target_role_from_records(records, target_label)
         if target is not None:
@@ -4113,6 +4158,7 @@ class MainWindow(
             "execution_owner_laptop_button",
             "operator_control_pc_button",
             "operator_control_laptop_button",
+            "operator_control_mobile_button",
             "operator_control_locked_button",
         ):
             button = self.__dict__.get(name)
@@ -4579,6 +4625,9 @@ class MainWindow(
         )
         self.operator_control_laptop_button.setStyleSheet(
             active_style if operator_label == "Laptop" else inactive_style
+        )
+        self.operator_control_mobile_button.setStyleSheet(
+            active_style if operator_label == "Mobile" else inactive_style
         )
         self.operator_control_locked_button.setStyleSheet(
             active_style if operator_label == "Locked" else inactive_style

@@ -9,7 +9,7 @@ Quant App helps one person find U.S. stocks, plan a trade, and—only when many
 independent safety checks agree—ask KIS to place an order.
 
 ```text
-market data -> scanner -> chart -> Watchlist -> Buylist -> Buy Today
+market data -> scanner -> chart -> breakout planning -> Buylist -> Buy Today
                                                         |
                                              safety gates all pass
                                                         |
@@ -50,6 +50,20 @@ capital, risk approval, mutation budget, and no ambiguous prior order.
 
 So yes: if the laptop is Execution Owner, the PC cannot execute an order merely
 because its screen says Live Trading is enabled.
+
+## What the phone/PWA controls
+
+The connected phone/PWA is another authenticated Operator Control surface, not
+another executor. An allowed Watchlist, Buylist, breakout, or Buy Today action
+changes the initiating screen immediately while it is being saved. The server
+then confirms canonical state or rolls the screen back with an error.
+
+Other open browsers and the PC/laptop desktops update automatically through
+small invalidation/change-pulse messages and refetch canonical truth. No manual
+refresh is required in normal operation. These notifications do not carry
+execution authority: only the `ACTIVE` Execution Owner with the current lease,
+matching `KANBAN` ownership, writable database, fresh reconciliation/feed, and
+all live/risk/capital gates may reach KIS.
 
 ## How an entry actually works
 
@@ -149,4 +163,5 @@ If one required check is missing, the correct outcome is no order.
 - [Supervised Controlled-Live Pilot](controlled_live_pilot_runbook.md)
 - [TiDB Cloud Coordination Store](tidb_coordination_store.md)
 - [Database Architecture](database_architecture.md)
+- [Web/PWA Operator Synchronization](web_operator_sync.md)
 - [Main README](../README.md)

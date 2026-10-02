@@ -14,12 +14,24 @@ false.
 
 1. Do not edit the recovery snapshot, execution journal, or runtime database.
 2. Restore access to the Kanban operational store.
-3. Restart the app with the Buy Board engine enabled.
-4. Wait until the board reports ACTIVE and broker reconciliation completes.
+3. Leave the app running while its recovery probe retries. Database writability
+   and runtime-state transitions now refresh the board automatically; a manual
+   board refresh is not required. Restart only if the process or worker is no
+   longer running, is on an older build, or automatic recovery reports a
+   persistent fault.
+4. Wait until the intended Execution Owner reports `ACTIVE` and broker
+   reconciliation completes. A non-owner may correctly remain
+   `STANDBY_READY`.
 5. Review every external or unmatched broker order. Explicitly adopt or dismiss
    it before resuming trading.
 6. Confirm the exact account, open orders, holdings, orderable quantities, and
    live-mode authorization before making another change.
+
+If a web/PWA or peer desktop changed state during the outage, startup reads and
+revision fallbacks reload canonical truth after recovery. Typed pulses provide
+the normal immediate path. Neither automatic screen refresh nor restored
+writability is permission to execute; lease, ownership, reconciliation,
+market-data, risk, capital, and live-mode gates still apply.
 
 ## Entry replacement recovery
 

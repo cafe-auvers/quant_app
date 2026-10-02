@@ -23,6 +23,13 @@ pytest tests/test_trading_engine.py tests/test_execution_command_gateway.py test
 pytest tests/test_buyboard_runtime_worker.py tests/test_eod_trading_service.py -q
 ```
 
+Focused cross-device projection checks include
+`test_readiness_projection_refreshes_on_state_and_write_gate_changes` in the
+runtime-worker suite. In the companion web checkout, run the web tests covering
+optimistic planning order, authenticated `/live-updates`, connected planning,
+and connected operator actions. They must prove rollback and notification
+behavior without constructing a broker or execution runtime.
+
 These suites cover the raw breakout/ORB-high passive zone, current-session
 candidate validity, fresh-KIS breakout latching, immediate passive submission,
 broker-result handling, durable identity/reconciliation, strict

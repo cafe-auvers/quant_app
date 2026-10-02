@@ -11,6 +11,7 @@ import copy
 import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 from sqlalchemy.engine import Engine
@@ -243,6 +244,8 @@ def add_watchlist_candidate(
     engine: Optional[Engine],
     default_account_no: str,
     buffer_pct: float = 0.001,
+    local_snapshot_path: Optional[Path] = None,
+    record_summary: bool = True,
 ) -> PlanningMembershipResult:
     """Add one passive Watchlist candidate, canonical first and local second."""
 
@@ -275,18 +278,20 @@ def add_watchlist_candidate(
                 breakout_price=_optional_positive(breakout_price),
                 buffer_pct=min(1.0, _finite_nonnegative(buffer_pct, 0.001)),
             )
-            stored = trade_card_repository.create_trade_card(engine, card)
+            stored = trade_card_repository.create_trade_card(
+                engine,
+                card,
+                local_snapshot_path=local_snapshot_path,
+                record_summary=record_summary,
+            )
         else:
             if (
-                current.board_status not in {
-                    BoardStatus.WATCHLIST,
-                    BoardStatus.BUYLIST,
-                }
-                or not is_passive_planning_card(current)
+                current.board_status == BoardStatus.WATCHLIST
+                and not is_passive_planning_card(current)
             ):
                 raise PlanningMembershipError(
-                    f"{normalized_symbol} is already in {current.board_status.value}; "
-                    "its Watchlist membership cannot be changed"
+                    f"{normalized_symbol} has active execution evidence; "
+                    "its Watchlist planning card cannot be changed"
                 )
             updated = copy.deepcopy(current)
             updated.watchlist_member = True
@@ -297,13 +302,20 @@ def add_watchlist_candidate(
             if current.board_status == BoardStatus.WATCHLIST:
                 updated.buylist_member = False
                 _clear_executable_geometry(updated)
-            else:
+            elif current.board_status == BoardStatus.BUYLIST:
                 # Watchlist is an independent saved-symbol membership. Adding
                 # it to a passive Buylist card must not demote or rewrite the
                 # card's Buylist plan.
                 updated.buylist_member = True
+            # Active Buy Today/position cards keep every lifecycle field.
+            # Watchlist is an independent saved-symbol membership and may be
+            # toggled without changing executable intent or broker state.
             stored = trade_card_repository.update_trade_card(
-                engine, updated, expected_version=current.version
+                engine,
+                updated,
+                expected_version=current.version,
+                local_snapshot_path=local_snapshot_path,
+                record_summary=record_summary,
             )
     except SQLAlchemyError as exc:
         raise PlanningMembershipError(
@@ -363,7 +375,25 @@ def promote_watchlist_to_buylist(
     candidate.environment = "PROD"
 
     try:
-        _canonical_card_for_selected_account(engine, normalized_symbol, account_no)
+        current = _canonical_card_for_selected_account(
+            engine, normalized_symbol, account_no
+        )
+        if current is not None and (
+            current.board_status not in {BoardStatus.WATCHLIST, BoardStatus.BUYLIST}
+            or not is_passive_planning_card(current)
+        ):
+            raise PlanningMembershipError(
+                f"{normalized_symbol} is already in {current.board_status.value}; "
+                "its canonical lifecycle was left unchanged"
+            )
+        breakout_price = _optional_positive(getattr(source, "breakout_price", None))
+        if breakout_price is None and current is not None:
+            breakout_price = _optional_positive(current.breakout_price)
+        if breakout_price is None:
+            raise PlanningMembershipError(
+                f"Set a breakout price for {normalized_symbol} before adding it to Buylist"
+            )
+        candidate.breakout_price = breakout_price
         sync: BuylistMembershipSyncResult = reconcile_buylist_item(
             engine,
             candidate,
@@ -416,6 +446,8 @@ def remove_watchlist_candidate(
     *,
     engine: Optional[Engine],
     default_account_no: str,
+    local_snapshot_path: Optional[Path] = None,
+    record_summary: bool = True,
 ) -> PlanningMembershipResult:
     """Remove Watchlist membership while preserving an overlapping Buylist."""
 
@@ -432,10 +464,7 @@ def remove_watchlist_candidate(
             engine, normalized_symbol, account_no
         )
         if current is not None:
-            if current.board_status not in {
-                BoardStatus.WATCHLIST,
-                BoardStatus.BUYLIST,
-            } or (
+            if (
                 current.board_status == BoardStatus.WATCHLIST
                 and not is_passive_planning_card(current)
             ):
@@ -447,16 +476,19 @@ def remove_watchlist_candidate(
             archived.watchlist_session_date = None
             if current.board_status == BoardStatus.WATCHLIST:
                 archived.buylist_member = False
-                archived.breakout_price = None
                 _clear_executable_geometry(archived)
                 archived.board_status_updated_at = datetime.now(timezone.utc)
-            else:
+            elif current.board_status == BoardStatus.BUYLIST:
                 # W removes only the independent Watchlist membership. The
                 # Buylist card and all planning/execution metadata survive, so
                 # durable evidence must not block this independent toggle.
                 archived.buylist_member = True
             stored = trade_card_repository.update_trade_card(
-                engine, archived, expected_version=current.version
+                engine,
+                archived,
+                expected_version=current.version,
+                local_snapshot_path=local_snapshot_path,
+                record_summary=record_summary,
             )
         elif source is None:
             return PlanningMembershipResult("unchanged", normalized_symbol)

@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Quant Web">
+  <rect width="512" height="512" rx="112" fill="#07110f"/>
+  <path d="M102 338 184 234l68 54 92-144 66 30" fill="none" stroke="#48d6a5" stroke-width="32" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="184" cy="234" r="18" fill="#f5c96a"/>
+  <circle cx="344" cy="144" r="18" fill="#f5c96a"/>
+  <path d="M145 394h222" stroke="#d7e5df" stroke-width="24" stroke-linecap="round" opacity=".8"/>
+</svg>
