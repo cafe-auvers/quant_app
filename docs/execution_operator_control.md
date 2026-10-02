@@ -5,7 +5,8 @@ The dashboard uses two independent shared roles:
 - **Execution Owner** is the only device that may mutate live canonical state,
   consume operator commands, and cross the KIS broker boundary.
 - **Operator Control** is the only device that may create new manual live
-  commands. It can be assigned to PC, Laptop, or Locked.
+  commands. It can be assigned to PC, Laptop, Mobile, or Locked. Mobile is the
+  authenticated web/PWA identity and can never be selected as Execution Owner.
 
 These roles answer different questions. Execution Owner answers "which one
 process may act?" Operator Control answers "which device may send the next
@@ -38,8 +39,10 @@ laptop to appear as a PC.
 
 1. Start `main.py` on the PC and laptop and wait for both readiness rows.
 2. Set **Execution Owner: PC**.
-3. Set **Operator Control: Laptop** while manual intervention is expected, or
-   **Locked** when no more manual instructions should be accepted.
+3. Set **Operator Control: PC**, **Laptop**, or **Mobile** according to the
+   surface used for manual intervention, or **Locked** when no more manual
+   instructions should be accepted. The active PyQt button and status text show
+   the shared selection on both desktops.
 4. Before market open, click **Publish Today's Plan** on the Operator Control
    device. The app saves local JSON, atomically publishes watchlist, buylist,
    trade plans, and execution queue, reads all four rows back, and reports
@@ -124,6 +127,36 @@ do not poll the queue. Planning/UI sync uses its matching typed pulse. An execut
 latest canonical cards, quote subscriptions, and stops before the target may
 become `ACTIVE`; it never relies on the minute display refresh for handoff.
 
+## Web/PWA control and automatic refresh
+
+The connected web/PWA is a delegated Operator Control surface, not an
+Execution Owner. Its allowed Watchlist, Buylist, breakout, Buy Today, and plan
+publication actions are revalidated by the server against either the stable
+`Mobile Web` identity or the exact hosting-desktop identity, plus the
+account/environment, expected revision, and operation allowlist.
+The browser never receives the device credential or a broker connection.
+
+The initiating browser updates immediately with pending optimistic state. On
+success it replaces that state with the canonical response; on rejection it
+rolls back to canonical truth and shows the reason. A successful connected
+write sends an authenticated invalidation to other open web/PWA sessions and a
+typed coordination pulse to the desktop path. The PC consumes that pulse on
+its one-second timer and relays the event to the laptop through the existing
+listener. Receiving clients reload canonical state rather than trusting the
+notification payload.
+
+A permitted Buy Today activation uses the same canonical workflow as the
+desktop and may claim eligible `LEGACY` ownership as `KANBAN`; it still places
+no order. Broker-facing commands that cannot be applied on the hosting
+execution owner remain durable queued requests for the actual Execution Owner.
+`QUEUED`, `KANBAN UPDATED`, and `BUY TODAY ACTIVATED` are intent/persistence
+results, not broker acceptance or fill evidence.
+
+No manual browser reload, desktop refresh, or restart is required for normal
+state propagation. Initial canonical reads and bounded revision polling recover
+missed/offline notifications. The exact flow and recovery boundary are in
+[Web/PWA Operator Synchronization](web_operator_sync.md).
+
 If the current-session 1m, 5m, and 30m ORB plans all reach terminal
 `REJECTED`/`RISK_INVALID` states before any BUY identity exists, the Execution
 Owner automatically returns the card to Buylist. The Buylist card shows one
@@ -146,8 +179,9 @@ working entries, position protection, reconciliation, or automatic exits.
 During the regular session, full-plan publish and planning mutations from a
 non-executor are blocked. Buy Today, Cancel Entry, partial/sell-all, and stop
 changes are inserted into `operator_commands`. The Execution Owner validates
-and applies each command once; the requesting device displays the shared,
-executor-confirmed board on its next refresh.
+and applies each command once; the requesting device and other connected
+clients automatically reload the shared, executor-confirmed board when the
+typed change pulse arrives. Periodic revision checks are the recovery fallback.
 
 ## Switching execution
 

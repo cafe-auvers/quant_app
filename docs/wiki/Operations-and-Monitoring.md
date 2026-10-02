@@ -10,6 +10,8 @@
 - Inspect unresolved/ambiguous/open orders before any retry or ownership
   transfer.
 - Verify the Buy Board readiness label and action-specific blockers.
+- Confirm connected browser/PWA actions reconcile from pending to canonical
+  state and that peer screens update without a manual reload.
 - For each Buy Today plan, inspect the 1m/5m/30m ORB details, confirmation
   source/time, selected generation, passive limit, broker identity, and memo.
 - Treat `Entry Pending` as accepted or unresolved broker work, not as a fill;
@@ -60,6 +62,20 @@ different paths; seeing them ON does not replace the shared readiness proof.
 The maintained synthetic audit covers sidebar projection and cache watermark
 latency. Production chart/SQL latency needs sanitized local instrumentation;
 never log sensitive broker identifiers while profiling.
+
+## Cross-device update checks
+
+Routine Watchlist, Buylist, breakout, Buy Today, Operator Control, runtime
+state, and database-writability changes are push/change-pulse driven. The
+initiating web/PWA responds optimistically, peer web clients refetch after an
+authenticated WebSocket invalidation, and desktops refetch after a typed
+coordination pulse. Initial reads and bounded revision checks recover missed
+events.
+
+Do not use a manual refresh as an execution control. If a screen remains stale,
+check the web session/socket, PC listener, coordination database, desktop
+process, and pulse files. The underlying runtime must still be `ACTIVE`, own
+the lease and symbol, and pass every independent safety gate.
 
 The complete state and failure semantics are in
 [Current Order Logic](https://github.com/cafe-auvers/quant_app/blob/master/docs/current_order_logic.md)

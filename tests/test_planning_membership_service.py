@@ -277,6 +277,51 @@ def test_promotion_does_not_rewrite_an_advanced_canonical_lifecycle(engine):
     assert buylist.get("AAPL", "PROD") is None
 
 
+def test_watchlist_toggle_preserves_active_buy_today_lifecycle(engine):
+    watchlist = Watchlist()
+    original = trade_card_repository.create_trade_card(
+        engine,
+        TradeCardState(
+            environment="PROD",
+            account_no="1",
+            symbol="AAPL",
+            board_status=BoardStatus.BUY_TODAY,
+            watchlist_member=False,
+            buylist_member=True,
+            breakout_price=201.25,
+        ),
+    )
+
+    added = add_watchlist_candidate(
+        watchlist,
+        symbol="AAPL",
+        name="Apple",
+        engine=engine,
+        default_account_no="1",
+    )
+    stored = trade_card_repository.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert added.changed is True
+    assert stored.board_status == BoardStatus.BUY_TODAY
+    assert stored.watchlist_member is True
+    assert stored.buylist_member is True
+    assert stored.breakout_price == 201.25
+    assert stored.version == original.version + 1
+
+    removed = remove_watchlist_candidate(
+        watchlist,
+        "AAPL",
+        engine=engine,
+        default_account_no="1",
+    )
+    stored = trade_card_repository.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert removed.changed is True
+    assert stored.board_status == BoardStatus.BUY_TODAY
+    assert stored.watchlist_member is False
+    assert stored.buylist_member is True
+    assert stored.breakout_price == 201.25
+
+
+
 @pytest.mark.parametrize("_label,evidence", DURABLE_EVIDENCE_CASES)
 def test_explicit_promotion_preflights_all_durable_evidence_before_cas(
     engine, _label, evidence

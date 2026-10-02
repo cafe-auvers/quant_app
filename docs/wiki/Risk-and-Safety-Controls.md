@@ -25,6 +25,11 @@ requires the applicable combination of:
 - Laptop mirror data is never promoted into canonical market data.
 - Handoff does not auto-arm Live Trading.
 - Unknown submission/persistence outcomes are not automatically retried.
+- Optimistic browser state and change notifications are never execution
+  evidence; canonical response and broker reconciliation remain authoritative.
+- Automatic screen refresh does not convert `STARTING` or `STANDBY_READY` into
+  execution authority and does not bypass an unwritable store or `LEGACY`
+  symbol ownership.
 - External orders remain unowned until deliberately adopted.
 - A passive BUY is submitted only while both fresh last trade and best ask are
   above its exact limit; reaching the limit before submission blocks ordinary

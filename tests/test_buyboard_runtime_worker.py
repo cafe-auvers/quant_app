@@ -1250,6 +1250,20 @@ def test_database_probe_logs_one_concise_warning_for_an_outage(
     assert all(record.exc_info is None for record in warnings)
 
 
+def test_readiness_projection_refreshes_on_state_and_write_gate_changes(tmp_path):
+    worker, _ = _worker(tmp_path)
+    emitted = []
+    worker.board_changed.connect(lambda: emitted.append(True))
+
+    worker._set_device_state(RuntimeDeviceState.STANDBY)
+    worker._set_device_state(RuntimeDeviceState.STANDBY)
+    worker._set_database_writable(True)
+    worker._set_database_writable(True)
+    worker._set_device_state(RuntimeDeviceState.STANDBY_READY)
+
+    assert len(emitted) == 3
+
+
 def test_recent_runtime_state_write_replaces_redundant_writable_probe(tmp_path):
     worker, _ = _worker(tmp_path)
     now = dt.datetime.now(dt.timezone.utc)

@@ -58,6 +58,7 @@ SCENARIO_GROUPS: tuple[ScenarioGroup, ...] = (
             "tests/test_runtime_readiness.py",
             "tests/test_main_window_handoff.py",
             "tests/test_handoff_reconciliation.py",
+            "tests/test_operator_control_architecture.py",
         ),
     ),
     ScenarioGroup(
@@ -115,6 +116,7 @@ REQUIRED_SCENARIO_IDS: frozenset[str] = frozenset(
         "tests.test_runtime_readiness::test_readiness_loss_demotes_and_recovery_mints_a_new_generation",
         "tests.test_main_window_handoff::test_post_claim_clean_broker_result_stays_blocked_if_state_publish_fails",
         "tests.test_handoff_reconciliation::test_reconciliation_blocks_entire_account_for_unmatched_order",
+        "tests.test_operator_control_architecture::test_mobile_operator_assignment_preserves_desktop_execution_owner",
     }
 )
 

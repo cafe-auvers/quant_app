@@ -49,7 +49,10 @@ class OperatorCommandType(str, Enum):
     CLEAR_BREAKOUT_PRICE = "CLEAR_BREAKOUT_PRICE"
     CANCEL_ENTRY = "CANCEL_ENTRY"
     SELL_PARTIAL = "SELL_PARTIAL"
+    CANCEL_PARTIAL_SELL = "CANCEL_PARTIAL_SELL"
     SELL_ALL = "SELL_ALL"
+    CANCEL_SELL_ALL = "CANCEL_SELL_ALL"
+    MOVE_STOP_ORB = "MOVE_STOP_ORB"
     MOVE_STOP_BREAKEVEN = "MOVE_STOP_BREAKEVEN"
     MOVE_STOP_MANUAL_PRICE = "MOVE_STOP_MANUAL_PRICE"
     SET_PARTIAL_SELL_QUANTITY = "SET_PARTIAL_SELL_QUANTITY"
@@ -346,24 +349,51 @@ def submit_operator_command(
             conflict_types = {
                 OperatorCommandType.SELL_PARTIAL: {
                     OperatorCommandType.SELL_PARTIAL,
+                    OperatorCommandType.CANCEL_PARTIAL_SELL,
                     OperatorCommandType.SELL_ALL,
+                    OperatorCommandType.CANCEL_SELL_ALL,
+                    OperatorCommandType.SET_PARTIAL_SELL_QUANTITY,
+                },
+                OperatorCommandType.CANCEL_PARTIAL_SELL: {
+                    OperatorCommandType.SELL_PARTIAL,
+                    OperatorCommandType.CANCEL_PARTIAL_SELL,
+                    OperatorCommandType.SELL_ALL,
+                    OperatorCommandType.CANCEL_SELL_ALL,
                     OperatorCommandType.SET_PARTIAL_SELL_QUANTITY,
                 },
                 OperatorCommandType.SELL_ALL: {
                     OperatorCommandType.SELL_PARTIAL,
+                    OperatorCommandType.CANCEL_PARTIAL_SELL,
                     OperatorCommandType.SELL_ALL,
+                    OperatorCommandType.CANCEL_SELL_ALL,
+                    OperatorCommandType.SET_PARTIAL_SELL_QUANTITY,
+                },
+                OperatorCommandType.CANCEL_SELL_ALL: {
+                    OperatorCommandType.SELL_PARTIAL,
+                    OperatorCommandType.CANCEL_PARTIAL_SELL,
+                    OperatorCommandType.SELL_ALL,
+                    OperatorCommandType.CANCEL_SELL_ALL,
                     OperatorCommandType.SET_PARTIAL_SELL_QUANTITY,
                 },
                 OperatorCommandType.SET_PARTIAL_SELL_QUANTITY: {
                     OperatorCommandType.SELL_PARTIAL,
+                    OperatorCommandType.CANCEL_PARTIAL_SELL,
                     OperatorCommandType.SELL_ALL,
+                    OperatorCommandType.CANCEL_SELL_ALL,
                     OperatorCommandType.SET_PARTIAL_SELL_QUANTITY,
                 },
+                OperatorCommandType.MOVE_STOP_ORB: {
+                    OperatorCommandType.MOVE_STOP_ORB,
+                    OperatorCommandType.MOVE_STOP_BREAKEVEN,
+                    OperatorCommandType.MOVE_STOP_MANUAL_PRICE,
+                },
                 OperatorCommandType.MOVE_STOP_BREAKEVEN: {
+                    OperatorCommandType.MOVE_STOP_ORB,
                     OperatorCommandType.MOVE_STOP_BREAKEVEN,
                     OperatorCommandType.MOVE_STOP_MANUAL_PRICE,
                 },
                 OperatorCommandType.MOVE_STOP_MANUAL_PRICE: {
+                    OperatorCommandType.MOVE_STOP_ORB,
                     OperatorCommandType.MOVE_STOP_BREAKEVEN,
                     OperatorCommandType.MOVE_STOP_MANUAL_PRICE,
                 },

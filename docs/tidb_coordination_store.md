@@ -130,6 +130,16 @@ for the current formula.
 - Planning/control state sync is internal/Tailscale change-driven with a
   one-hour recovery fallback. Publishing, operator commands, control-button
   actions, broker-boundary checks, and owner activation retain immediate paths.
+- A connected web/PWA writer publishes the existing typed inbound and outbound
+  pulse files after its canonical transaction. This adds no steady TiDB poll:
+  the PC's one-second timer reads a local file, the listener relays the token,
+  and receivers issue a scoped canonical read only after a change.
+- Open clients on the same web service use an authenticated in-process
+  WebSocket invalidation. The event contains only kind/symbol/revision hints;
+  clients refetch canonical state rather than treating it as authority.
+- Runtime device-state and database-writability transitions emit a local board
+  refresh only when the value changes. They do not write price-only TradeCard
+  rows and do not add a steady coordination query.
 - Each change-driven live-control, Operator Control, and planning-revision display
   refresh is one conditional SELECT. It returns payload text only for the two
   tiny control rows; the larger planning documents contribute revision numbers
@@ -166,6 +176,7 @@ polls.
 | External watchdog pulse | 5 seconds over HTTPS; no TiDB request |
 | Active/standby card revision checks | On typed card token; 180/300-second legacy or 3600-second pulse fallback |
 | Buy Board and planning/control display sync | On matching typed token; 3600-second pulse fallback |
+| Open web/PWA display sync | Authenticated WebSocket invalidation; 10-second revision/status fallback |
 | Operator-command pickup outside regular session | On typed command token; 300-second legacy or 3600-second pulse fallback |
 | Alert queue check | 90 seconds; successful pulse audit every 60 minutes |
 | Stable pending-order snapshot | 2 seconds; unknown submissions stay at 1 second |

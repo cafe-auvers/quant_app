@@ -368,6 +368,9 @@ symbol/notional envelope, continuous supervision, and external alerts.
   semantics are verified for the pilot account and endpoints.
 - The PC is the sole authoritative WebSocket/execution owner; the laptop is
   pull-only.
+- Mobile may own manual Operator Control, but it is not a runtime device, can
+  never satisfy the execution-owner/lease predicate, and does not alter any
+  Gate-2, Gate-3, or Gate-4 broker-boundary requirement.
 - Startup reconciliation, buying power, lease, database, WebSocket, mutation
   budget, and external-alert delivery are current.
 

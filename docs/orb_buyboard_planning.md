@@ -151,6 +151,21 @@ execution-queue target is missing or differs after a chart edit, execution is
 `DATA_UNAVAILABLE` until a fresh queue snapshot matches; the stale queue can
 never restore the old target or submit against it.
 
+## Connected web/PWA feedback
+
+An allowlisted connected chart/planning action renders immediately as pending
+on the initiating browser. Canonical revision, lifecycle, session, account, and
+Operator Control checks still run on the server. A success replaces the pending
+view with canonical state; a failure rolls it back. Authenticated browser
+invalidations and typed desktop pulses update the other running surfaces, with
+revision polling/startup reads as recovery. A manual refresh is not required
+and cannot turn a rejected plan into executable intent.
+
+Buy Today activation through this surface uses the same canonical workflow and
+may claim eligible `KANBAN` ownership, but it does not place an order. Execution
+still belongs to the separately gated `ACTIVE` Execution Owner. See
+[Web/PWA Operator Synchronization](web_operator_sync.md).
+
 ## Execution boundary
 
 Once a current-session, risk-valid ORB is `WAITING_BREAKOUT`/armed, a fresh

@@ -24,6 +24,7 @@ use the [Activation Gate Handoff](docs/activation_gate_handoff.md).
 - A precomputed Leadership and Market Context overlay on the TradingView-style chart, with an expandable calculation audit and no chart-time provider calls.
 - A persisted, cross-device Watchlist planning stage available from the stock sidebar, Scanner, and TradingView; the former full Watchlist tab is not built.
 - Chart-based `breakout_price` planning and Buy Board ORB execution, with an explicit Watchlist -> Buylist -> Buy Today progression.
+- Authenticated web/PWA operator synchronization with immediate optimistic feedback, canonical rollback on failure, authenticated browser invalidations, and typed desktop change pulses. Routine Watchlist, Buylist, breakout, Buy Today, readiness, and writability changes do not require a manual refresh.
 - A read-only Buy Today `ORB Combinations...` comparison covering all 24 risk/window cases, kept separate from the optimized pre-market `Refresh / Select ORB Plans...` selector; the optimized view is read-only during regular market hours.
 - Confirmed-breakout passive-pullback entries: after a fresh post-range trade clears both the structural breakout and ORB high, submit a resting BUY limit at the candidate's configured execution price (ORB high by default).
 - Strict zero-fill ORB upgrades: a later, strictly higher-scoring 5m/30m candidate can replace an earlier working order only after authoritative cancellation and full post-cancel revalidation.
@@ -103,6 +104,8 @@ architecture and automation.
 For live control, handoff, Buy Today publishing, and the distinction between
 **Execution Owner** and **Operator Control**, see
 [docs/execution_operator_control.md](docs/execution_operator_control.md).
+For the phone/browser-to-desktop update path and its safety boundary, see
+[docs/web_operator_sync.md](docs/web_operator_sync.md).
 
 ## Configuration
 
@@ -154,6 +157,7 @@ Only enable KIS intraday after the endpoint, TR ID, request parameters, output f
 - `docs/current_order_logic.md` is the canonical implemented entry, Entry Pending, cancel-replace, fill, rejection, and EOD behavior.
 - `docs/activation_gate_specification.md` is the single normative definition of Gates 1-5, evidence identity, invalidation, and promotion.
 - `docs/kanban_architecture.md` explains the Kanban state machine, command/runtime flow, persistence, safety boundaries, and component architecture.
+- `docs/web_operator_sync.md` defines optimistic web/PWA feedback, browser invalidation, typed desktop pulses, automatic runtime projection refresh, and the execution gates that synchronization never bypasses.
 - `docs/orb_buyboard_planning.md` explains Buffer %, the 24-case read-only comparison, Operator-Control-only pre-market ORB selection, market-hours read-only behavior, and published-plan immutability.
 - `docs/kanban_production_readiness.md` records the detailed production invariants and rollout evidence requirements.
 - `docs/market_pulse.md` documents the Market Pulse universe, EOD calculations, batched refresh, and idempotent cache schema.

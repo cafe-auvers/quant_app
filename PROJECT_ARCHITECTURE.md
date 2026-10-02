@@ -36,6 +36,8 @@ main.py
       -> reconcile any open broker orders from the local order ledger
       -> start cross-machine state sync and background PC-to-laptop
          mirror top-up when MySQL is reachable
+      -> consume typed external planning/runtime pulses every second and
+         refresh only the affected canonical desktop projections
 ```
 
 Long-running work runs in `QThread` workers so the PyQt UI remains responsive.
@@ -84,6 +86,10 @@ The boundaries are deliberate:
   SQLite mirror is a disposable market-data fallback, not a peer database.
 - Blocking database, synchronization, and broker work runs in focused QThread
   workers outside `main_window.py`.
+- Runtime device-state and canonical-store writability transitions emit a
+  Buy Board projection refresh even when no TradeCard revision changed. This
+  prevents stale `STARTING` or unwritable-store restrictions from remaining on
+  screen until an unrelated action or manual refresh.
 - Optional two-machine, backup, and refresh operations attach at the application
   boundary and do not own trading rules.
 
@@ -319,6 +325,15 @@ workers live in `src/ui/workers.py`; order workers live in
 | `BuyboardRuntimeWorker` | `buyboard/runtime_worker.py` | Run active or standby Kanban startup reconciliation, readiness/lease checks, account refresh, market-data drain, trading heartbeat, persistence, shutdown reconciliation, and alerts |
 | `PlanningMembershipWorker` | `planning_membership_worker.py` | Apply one passive Watchlist/Buylist membership change without blocking the Qt thread; completion merges only that symbol back into current UI state |
 
+The authenticated web/PWA process is an external command surface, not another
+executor. Successful connected writes publish typed change pulses into the PC
+repository. The PC consumes them on its one-second coordination timer and its
+listener exposes them to the laptop; each desktop then reloads the affected
+canonical projection. Open web sessions receive a small authenticated
+WebSocket invalidation and refetch canonical state. Initial reads and bounded
+revision polling recover missed events. See
+[Web/PWA Operator Synchronization](docs/web_operator_sync.md).
+
 ## Service Layer
 
 | Module | Responsibility |
@@ -527,6 +542,7 @@ An optional second machine -- an always-on PC reachable over LAN or Tailscale --
 - **Roles**: the PC hosts canonical MySQL and runs `historical.py` on a schedule (BIOS wake -> auto-login -> `scripts/pc_morning_routine.ps1` -> freshness-gated refresh -> auto-shutdown). Either desktop may be the guarded Execution Owner when it is fresh and fully ready; exactly one owner can cross the broker boundary. `data/local_mirror.db` is the laptop's offline safety copy, not a peer database.
 - **Device identity**: `data/device_role.json` (device id, hostname, `is_main`) determines which device may push compatibility planning collections; it does not grant execution ownership. `src/services/state_sync.py` syncs watchlist, buylist, trade plans, the execution queue, scanner setups, and settings through a revision-tracked MySQL table so a stale device cannot clobber a newer remote copy.
 - **Runtime visibility**: the guarded runtime publishes canonical readiness to `runtime_device_state` every 240 seconds with a 300-second freshness fence; `src/services/runtime_status.py` remains the process-lifecycle fallback. Together with `src/services/pc_remote_control.py`, the dashboard reports independent `PC` / `DB` / `Listener` / `main.py` signals. These lights do not replace a fresh `STANDBY_READY` identity for owner transfer.
+- **Change notification**: connected web/PWA writes publish typed pulses for the affected canonical tables. The desktops perform scoped refreshes automatically; startup reads and revision polling are recovery fallbacks, not a manual-refresh requirement.
 - **Fallback behavior**: connection to MySQL is checked once at startup/reconnect; a success routes reads/writes to MySQL immediately, a failure routes to the local SQLite mirror with cross-machine sync and heartbeats disabled. The mirror top-up afterward is incremental and checkpointed (row-count/revision signatures first, full comparison only on mismatch).
 - **Automation scripts** live in `scripts/` (`pc_morning_routine.ps1`, `run_daily_refresh.py`, `sync_local_mirror_from_pc.py`, `setup_pc_autologin.ps1`, `setup_pc_morning_task.ps1`, `setup_mysql_lan_access.ps1`, `setup_mysql_tailscale_access.ps1`, `pc_remote_control_listener.py`, `Configure-AutomaticShutdown.ps1`, WinRM setup/log-tailing scripts, and the one-time `backfill_hourly_history_200d_once.py` repair).
 

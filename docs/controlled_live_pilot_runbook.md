@@ -8,6 +8,13 @@ The pilot and later full-live mode use the same WebSocket, runtime, gateway,
 broker, database, reconciliation, stop, and handoff code. Promotion changes
 only the risk-envelope configuration.
 
+Automatic web/PWA-to-desktop refresh is visibility and operator-intent
+delivery only. Optimistic browser state, a delivered change pulse, or a cleared
+`STARTING`/writability warning is not pilot evidence and does not arm trading.
+The canonical card, `KANBAN` ownership, `ACTIVE` Execution Owner, lease,
+reconciliation, execution-grade feed, live-mode envelope, and all risk/capital
+gates below remain mandatory.
+
 Before supervising an entry, read [Current Order Logic](current_order_logic.md).
 The pilot does not alter the strategy: breakout confirmation submits a passive
 BUY limit below the market, Entry Pending is not a fill, and a later ORB may

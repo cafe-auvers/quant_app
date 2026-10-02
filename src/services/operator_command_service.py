@@ -12,12 +12,15 @@ from src.core.board_workflow import (
     AnyBoardCommand,
     BoardActionContext,
     CancelEntry,
+    CancelPartialSell,
+    CancelQueuedSellAll,
     ClearBreakoutPrice,
     RequestPartialSell,
     RequestSellAll,
     SetBreakevenStop,
     SetBreakoutPrice,
     SetManualStop,
+    SetOrbStop,
 )
 from src.core.trade_card_state import BoardStatus
 from src.services import execution_workflow_service, trade_card_repository
@@ -40,7 +43,10 @@ _BOARD_TO_OPERATOR_TYPE = {
     ClearBreakoutPrice: OperatorCommandType.CLEAR_BREAKOUT_PRICE,
     CancelEntry: OperatorCommandType.CANCEL_ENTRY,
     RequestPartialSell: OperatorCommandType.SELL_PARTIAL,
+    CancelPartialSell: OperatorCommandType.CANCEL_PARTIAL_SELL,
     RequestSellAll: OperatorCommandType.SELL_ALL,
+    CancelQueuedSellAll: OperatorCommandType.CANCEL_SELL_ALL,
+    SetOrbStop: OperatorCommandType.MOVE_STOP_ORB,
     SetBreakevenStop: OperatorCommandType.MOVE_STOP_BREAKEVEN,
     SetManualStop: OperatorCommandType.MOVE_STOP_MANUAL_PRICE,
 }

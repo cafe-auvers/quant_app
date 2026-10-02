@@ -32,5 +32,8 @@ not interchangeable with local planning labels.
 - A filled position cannot be created by editing JSON or dragging a card.
 - Cross-device synchronization is revision-aware; do not hand-edit state while
   another device owns writes.
+- Connected web/PWA actions render immediately as pending, then confirm or
+  roll back from the canonical response. Browser invalidations and typed
+  desktop pulses update the other running surfaces without a manual refresh.
 
 See [Buy Board and Kanban States](Buy-Board-and-Kanban-States).
