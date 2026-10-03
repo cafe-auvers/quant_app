@@ -133,16 +133,55 @@ def test_apply_first_fill_stop_persists_entry_orb_values():
     assert card.entry_orb_low == 97.5
 
 
-def test_on_partial_exit_filled_moves_stop_to_breakeven_not_raw_avg_cost():
-    """Section 644: replaces the legacy max(existing_stop, avg_cost) logic."""
+def test_on_partial_exit_filled_raises_orb_stop_to_breakeven():
     card = _open_card(broker_quantity=300, stop_type=StopType.ORB_LOW, active_stop_price=95.0)
     manager = PositionManager()
     manager.on_partial_exit_filled(card, refreshed_broker_quantity=200)
     assert card.broker_quantity == 200
+    assert card.orderable_quantity == 200
     assert card.stop_type == StopType.BREAKEVEN
     assert card.active_stop_price == pytest.approx(compute_breakeven_stop_price(100.0))
     assert card.active_stop_price > card.average_entry_price  # not raw avg cost
+    assert card.stop_quantity == 200
     assert card.board_status == BoardStatus.OPEN_POSITION
+
+
+def test_on_partial_exit_filled_retains_higher_manual_stop_and_type():
+    card = _open_card(
+        broker_quantity=300,
+        stop_type=StopType.MANUAL_PRICE,
+        active_stop_price=110.0,
+        stop_quantity=300,
+    )
+
+    PositionManager().on_partial_exit_filled(
+        card, refreshed_broker_quantity=200
+    )
+
+    assert card.broker_quantity == 200
+    assert card.orderable_quantity == 200
+    assert card.stop_type == StopType.MANUAL_PRICE
+    assert card.active_stop_price == pytest.approx(110.0)
+    assert card.stop_quantity == 200
+
+
+def test_repeated_partial_exit_reconciliation_never_lowers_higher_stop():
+    card = _open_card(
+        broker_quantity=300,
+        stop_type=StopType.MANUAL_PRICE,
+        active_stop_price=110.0,
+        stop_quantity=300,
+    )
+    manager = PositionManager()
+
+    manager.on_partial_exit_filled(card, refreshed_broker_quantity=200)
+    manager.on_partial_exit_filled(card, refreshed_broker_quantity=150)
+
+    assert card.broker_quantity == 150
+    assert card.orderable_quantity == 150
+    assert card.stop_type == StopType.MANUAL_PRICE
+    assert card.active_stop_price == pytest.approx(110.0)
+    assert card.stop_quantity == 150
 
 
 # --- Stop triggered during partial sell (spec section 671-697) -------------
