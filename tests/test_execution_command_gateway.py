@@ -994,6 +994,51 @@ def test_gate4_dispatch_observation_occurs_only_when_scheduler_runs_operation(
     assert events == []
 
 
+def test_gate4_entry_observation_includes_effective_nav_cap(tmp_path):
+    engine = _make_engine(tmp_path)
+    events = []
+    gateway = ExecutionCommandGateway(
+        real_broker=FakeExecutionBroker(),
+        engine=engine,
+        mode_override=True,
+        lease_protocol=_lease()[0],
+        mutation_budget=AllowAllMutationBudget(),
+        buying_power_provider=lambda environment, account_no: 100_000.0,
+        qualification_observer=lambda event_type, payload: events.append(
+            (event_type, payload)
+        ),
+    )
+
+    result = gateway._execute_scheduled_mutation(
+        lambda: "accepted",
+        command_type=gw_module.CommandType.SUBMIT,
+        account_no="12345678-01",
+        endpoint="submit_order",
+        priority=gw_module.RequestPriority.NEW_ENTRY,
+        is_new_entry=True,
+        qualification_context={
+            "symbol": "AAPL",
+            "quantity": 5,
+            "limit_price": 100.0,
+            "active_trade_card": True,
+            "risk_rechecked_atomically": True,
+            "effective_entry_notional_cap": 1_000.0,
+        },
+    )
+
+    assert result == "accepted"
+    assert events[0] == (
+        "ENTRY_CANDIDATE",
+        {
+            "symbol": "AAPL",
+            "notional": 500.0,
+            "active_trade_card": True,
+            "risk_rechecked_atomically": True,
+            "effective_entry_notional_cap": 1_000.0,
+        },
+    )
+
+
 # --- finding 5: H1 persisted execution ownership ----------------------------
 
 

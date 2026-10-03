@@ -403,7 +403,7 @@ def test_controlled_live_percentage_cap_uses_current_total_equity(
     engine = _engine(tmp_path)
     _persist_card(engine)
 
-    require_live_entry_allowed(
+    effective_cap = require_live_entry_allowed(
         environment="PROD",
         account_no="1",
         symbol="AAPL",
@@ -413,6 +413,7 @@ def test_controlled_live_percentage_cap_uses_current_total_equity(
         engine=engine,
         account_equity_provider=lambda _environment, _account: 10_000.0,
     )
+    assert effective_cap == pytest.approx(3_000.0)
 
     with pytest.raises(LiveExecutionEnvelopeError, match="maximum notional"):
         require_live_entry_allowed(
