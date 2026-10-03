@@ -1430,7 +1430,14 @@ def test_partial_sell_request_is_actually_submitted(tmp_path):
         refresh_orderable_quantity=lambda *a: 300,
         find_open_sell_order=lambda card: None,
     )
-    card = _open_card(board_status=BoardStatus.PARTIAL_SELL, broker_quantity=300, orderable_quantity=300)
+    card = _open_card(
+        board_status=BoardStatus.PARTIAL_SELL,
+        broker_quantity=300,
+        orderable_quantity=300,
+        stop_type=StopType.MANUAL_PRICE,
+        active_stop_price=110.0,
+        stop_quantity=300,
+    )
     card.pending_partial_sell_quantity = 100
 
     changed = engine.run_heartbeat([card])
@@ -1439,6 +1446,10 @@ def test_partial_sell_request_is_actually_submitted(tmp_path):
     assert len(submitted) == 1
     assert submitted[0]["quantity"] == 100
     assert submitted[0]["reason"] == "partial_sell"
+    assert card.broker_quantity == 300
+    assert card.stop_type == StopType.MANUAL_PRICE
+    assert card.active_stop_price == pytest.approx(110.0)
+    assert card.stop_quantity == 300
 
 
 def test_partial_sell_does_not_resubmit_while_order_is_working(tmp_path):

@@ -1091,6 +1091,73 @@ def test_stop_hit_auto_sell_is_suppressed_when_buyboard_engine_enabled(
     )
 
 
+def test_partial_exit_advisory_uses_display_only_fallback_with_healthy_buyboard(
+    monkeypatch, tmp_path
+):
+    window = _build_queue_window(monkeypatch, tmp_path)
+    monkeypatch.setenv("BUYBOARD_ENGINE_ENABLED", "true")
+    window._buyboard_runtime_worker = _healthy_buyboard_worker()
+    item = SimpleNamespace(
+        symbol="AAPL",
+        environment="PROD",
+        kis_account_no="1",
+        monitoring_status="BOUGHT",
+        breakout_method="",
+        stop_loss=90.0,
+        shares_held=10,
+        sell_half_done=False,
+        auto_order_block_reason="",
+        _exit_order_pending=False,
+    )
+    window.buylist_manager = SimpleNamespace(items=[item])
+    window.latest_intraday_prices = {"AAPL": 110.0}
+    window._buylist_refresh_item_data = lambda _item: None
+    window._buylist_days_held = lambda _item: 3
+    window._populate_buylist_env_table = lambda _env: None
+    window.append_log = lambda _message: None
+
+    MainWindow._run_buylist_monitor_cycle(window, "PROD")
+
+    assert not getattr(item, "partial_exit_review_alert", False)
+    assert "PARTIAL EXIT REVIEW" in MainWindow._buylist_compute_alerts(
+        window, item, 110.0, 3
+    )
+
+
+def test_ema_advisory_requires_manual_review_with_healthy_buyboard(
+    monkeypatch, tmp_path
+):
+    window = _build_queue_window(monkeypatch, tmp_path)
+    monkeypatch.setenv("BUYBOARD_ENGINE_ENABLED", "true")
+    window._buyboard_runtime_worker = _healthy_buyboard_worker()
+    item = SimpleNamespace(
+        symbol="AAPL",
+        environment="PROD",
+        kis_account_no="1",
+        monitoring_status="BOUGHT",
+        breakout_method="",
+        stop_loss=90.0,
+        shares_held=6,
+        sell_half_done=True,
+        auto_order_block_reason="",
+        _exit_order_pending=False,
+        _ema10=100.0,
+        _ema20=95.0,
+        _latest_daily_close=94.0,
+    )
+    window.buylist_manager = SimpleNamespace(items=[item])
+    window.latest_intraday_prices = {"AAPL": 110.0}
+    window._buylist_refresh_item_data = lambda _item: None
+    window._buylist_days_held = lambda _item: 8
+    window._populate_buylist_env_table = lambda _env: None
+    window.append_log = lambda _message: None
+
+    MainWindow._run_buylist_monitor_cycle(window, "PROD")
+
+    assert not getattr(item, "ema_trailing_stop_alert", False)
+    assert MainWindow._momentum_exit_signal(item) == "10 EMA"
+
+
 def test_auto_submit_execute_ready_is_suppressed_when_buyboard_engine_enabled(
     monkeypatch, tmp_path
 ):

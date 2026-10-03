@@ -273,8 +273,11 @@ class PositionManager:
         return card
 
     def apply_breakeven_stop(self, card: TradeCardState) -> TradeCardState:
-        card.stop_type = StopType.BREAKEVEN
-        card.active_stop_price = compute_breakeven_stop_price(card.average_entry_price)
+        breakeven = compute_breakeven_stop_price(card.average_entry_price)
+        current_stop = float(card.active_stop_price or 0.0)
+        if current_stop <= breakeven:
+            card.stop_type = StopType.BREAKEVEN
+            card.active_stop_price = breakeven
         card.stop_quantity = card.broker_quantity
         return card
 
@@ -293,9 +296,9 @@ class PositionManager:
         self, card: TradeCardState, *, refreshed_broker_quantity: int
     ) -> TradeCardState:
         """Section 596-603: after a confirmed partial exit, refresh the
-        broker-reported quantity and move the stop to cost-adjusted
-        breakeven -- replacing the legacy ``max(existing_stop, avg_cost)``
-        behavior entirely (section 644).
+        broker-reported quantity and tighten the stop to cost-adjusted
+        breakeven when necessary. An already-higher active stop and its type
+        remain unchanged so partial-exit reconciliation can never widen risk.
         """
         card.broker_quantity = refreshed_broker_quantity
         card.orderable_quantity = refreshed_broker_quantity
