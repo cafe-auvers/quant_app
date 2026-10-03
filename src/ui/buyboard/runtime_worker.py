@@ -28,7 +28,9 @@ new engine activity on the next tick without requiring an app restart.
 from __future__ import annotations
 
 import logging
+import math
 import platform
+import threading
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, List, Optional, Tuple
@@ -265,6 +267,42 @@ class BuyboardRuntimeWorker(QThread):
     _QUEUE_DRAIN_FAILURE_CONFIRMATIONS = 3
     _ACCOUNT_RECONCILIATION_FAILURE_CONFIRMATIONS = 3
     _ACCOUNT_REFRESH_FAILURE_COOLDOWN_SECONDS = 30.0
+    _fx_rate_cache_lock = threading.Lock()
+    _fx_rate_cache_value = 0.0
+    _fx_rate_cache_recorded_at: Optional[datetime] = None
+
+    @staticmethod
+    def _account_snapshot_requires_fx(snapshot: dict) -> bool:
+        """Whether the snapshot contains a positive KRW-denominated leg."""
+
+        def positive(value) -> bool:
+            try:
+                number = float(value or 0.0)
+            except (TypeError, ValueError, OverflowError):
+                return False
+            return math.isfinite(number) and number > 0.0
+
+        domestic = snapshot.get("domestic")
+        summary = domestic.get("summary", {}) if isinstance(domestic, dict) else {}
+        if isinstance(summary, dict) and any(
+            positive(summary.get(key))
+            for key in (
+                "cash_total_krw",
+                "d2_deposit_krw",
+                "total_evaluation_krw",
+                "tot_evlu_amt",
+                "stock_evaluation_krw",
+            )
+        ):
+            return True
+        overseas = snapshot.get("overseas")
+        return bool(
+            isinstance(overseas, dict)
+            and any(
+                positive(overseas.get(key))
+                for key in ("frcr_evlu_tota_krw", "tot_asst_krw")
+            )
+        )
 
     board_changed = pyqtSignal()
     alert = pyqtSignal(str)
@@ -3288,36 +3326,85 @@ class BuyboardRuntimeWorker(QThread):
             if key[:2] != account_prefix
         } | current_incidents
 
-    @staticmethod
-    def _extract_account_balance(snapshot: dict) -> Tuple[float, float]:
+    @classmethod
+    def _resolve_account_usd_krw_rate(cls, snapshot: dict) -> float:
+        """Return a recent USD/KRW rate without ever treating KRW as USD."""
+        from src.ui.workers import FxRateWorker
+
+        embedded = FxRateWorker._extract_usd_krw_from_snapshot(snapshot) or 0.0
+        try:
+            embedded = float(embedded)
+        except (TypeError, ValueError, OverflowError):
+            embedded = 0.0
+        if math.isfinite(embedded) and 900.0 <= embedded <= 2000.0:
+            with cls._fx_rate_cache_lock:
+                cls._fx_rate_cache_value = embedded
+                cls._fx_rate_cache_recorded_at = datetime.now(timezone.utc)
+            return embedded
+
+        now = datetime.now(timezone.utc)
+        max_age = max(1.0, float(execution_config.PORTFOLIO_MAX_FX_AGE_SECONDS))
+        with cls._fx_rate_cache_lock:
+            cached = float(cls._fx_rate_cache_value or 0.0)
+            recorded_at = cls._fx_rate_cache_recorded_at
+            if (
+                math.isfinite(cached)
+                and 900.0 <= cached <= 2000.0
+                and recorded_at is not None
+                and (now - recorded_at).total_seconds() <= max_age
+            ):
+                return cached
+
+            # This method runs only on the background runtime thread. Reuse the
+            # dashboard's existing provider and cache the result so routine
+            # account refreshes do not perform another market-data request.
+            try:
+                frame = FxRateWorker._download_yfinance_usd_krw()
+            except Exception as exc:  # network/provider failure must fail closed
+                logger.warning("USD/KRW fallback refresh failed: %s", exc)
+                return 0.0
+            if frame is None or frame.empty:
+                return 0.0
+            try:
+                rate = float(frame["Close"].dropna().iloc[-1])
+            except (KeyError, IndexError, TypeError, ValueError, OverflowError):
+                return 0.0
+            if not math.isfinite(rate) or not 900.0 <= rate <= 2000.0:
+                return 0.0
+            cls._fx_rate_cache_value = rate
+            cls._fx_rate_cache_recorded_at = now
+            return rate
+
+    @classmethod
+    def _extract_account_balance(cls, snapshot: dict) -> Tuple[float, float]:
         """(usable_buying_power_usd, total_equity_usd) from a raw KIS
         account snapshot -- reuses
         ``DashboardMixin._extract_kis_account_value_krw`` directly rather
         than re-implementing this parsing (it has already been hardened
         against several KIS response quirks; see its own docstring) and
-        ``FxRateWorker._extract_usd_krw_from_snapshot`` to find a KIS-
-        embedded USD/KRW rate, so this periodic background refresh never
-        needs a UI widget or an extra yfinance network call from this
-        thread. Without an embedded rate, ``total_equity_usd`` falls back
-        to the overseas-only (pure USD, no conversion needed) cash+stock
-        total, which understates -- never overstates -- equity when the
-        account also holds KRW-denominated assets, the safe direction to
-        err for a risk-sizing base.
+        ``FxRateWorker`` to resolve USD/KRW without depending on a UI
+        widget. A recent class-level cache avoids routine provider calls.
+        When a snapshot contains a KRW-denominated leg and no valid rate
+        can be resolved, both values remain unavailable (zero) so entry
+        sizing fails closed instead of interpreting KRW totals as USD.
         """
         from src.ui.mixins.dashboard_mixin import DashboardMixin
-        from src.ui.workers import FxRateWorker
 
-        fx_rate = FxRateWorker._extract_usd_krw_from_snapshot(snapshot) or 0.0
+        requires_fx = cls._account_snapshot_requires_fx(snapshot)
+        fx_rate = cls._resolve_account_usd_krw_rate(snapshot) if requires_fx else 1.0
+        if fx_rate <= 0:
+            logger.warning(
+                "Account equity remains unavailable because USD/KRW could not "
+                "be resolved; refusing to interpret KRW totals as USD"
+            )
+            return 0.0, 0.0
         breakdown = DashboardMixin._extract_kis_account_value_krw(
-            snapshot, fx_rate=fx_rate if fx_rate > 0 else 1.0, return_breakdown=True
+            snapshot, fx_rate=fx_rate, return_breakdown=True
         )
         if not breakdown:
             return 0.0, 0.0
         usable_usd = float(breakdown.get("ovrs_cash_usd", 0.0) or 0.0)
-        if fx_rate > 0:
-            equity_usd = float(breakdown.get("total_krw", 0.0) or 0.0) / fx_rate
-        else:
-            equity_usd = usable_usd + float(breakdown.get("ovrs_stock_usd", 0.0) or 0.0)
+        equity_usd = float(breakdown.get("total_krw", 0.0) or 0.0) / fx_rate
         return usable_usd, equity_usd
 
     def _sync_orb_plans(
