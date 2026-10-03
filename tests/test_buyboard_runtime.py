@@ -23,6 +23,11 @@ from src.services.broker import BrokerSubmissionResult
 from src.services.intraday_provider import IntradayProviderName, IntradayResult
 from src.services.realtime_market_data import QuoteSnapshot
 from src.services.trading_engine import TradingEngine
+from src.risk.orb_position import (
+    OrbSettings,
+    configure_orb_settings,
+    get_orb_settings,
+)
 from src.risk.pre_trade import PreTradeRiskRejectedError
 
 
@@ -50,6 +55,24 @@ def _card(**overrides):
     )
     fields.update(overrides)
     return TradeCardState(**fields)
+
+
+def test_default_portfolio_manager_uses_current_orb_capital_limit():
+    original = get_orb_settings()
+    try:
+        configure_orb_settings(
+            OrbSettings(
+                capital_min_percent=10.0,
+                capital_ideal_percent=20.0,
+                capital_max_percent=40.0,
+            )
+        )
+
+        manager = runtime_module._default_portfolio_risk_manager()
+
+        assert manager.limits.max_single_position_notional_fraction == 0.40
+    finally:
+        configure_orb_settings(original)
 
 
 class _FakeBroker:

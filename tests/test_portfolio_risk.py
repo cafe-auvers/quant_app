@@ -171,7 +171,7 @@ def test_single_symbol_filled_and_projected_exposure_cannot_exceed_25_percent():
     existing = PortfolioPositionRisk("AAPL", 10, 100.0, 95.0, "ORB")
 
     at_limit = manager.evaluate_entry(
-        _proposal(symbol="AAPL"),
+        _proposal(symbol="AAPL", environment="PROD", account_no="1"),
         _snapshot(
             positions=(existing,),
             projected_exposures=(_projected("AAPL", gross=500.0),),
@@ -188,6 +188,23 @@ def test_single_symbol_filled_and_projected_exposure_cannot_exceed_25_percent():
     assert at_limit.approved is True
     assert above.approved is False
     assert any("single-position notional" in reason for reason in above.reasons)
+
+
+def test_single_position_ceiling_is_configurable_up_to_full_nav():
+    manager = PortfolioRiskManager(
+        PortfolioRiskLimits(max_single_position_notional_fraction=0.40)
+    )
+
+    decision = manager.evaluate_entry(
+        _proposal(symbol="AAPL", environment="PROD", account_no="1"),
+        _snapshot(
+            positions=(PortfolioPositionRisk("AAPL", 20, 100.0, 95.0, "ORB"),),
+        ),
+    )
+
+    assert decision.approved is True
+    assert decision.reservation_spec is not None
+    assert decision.reservation_spec.max_single_position_notional_fraction == 0.40
 
 
 def test_approves_entry_within_all_aggregate_limits():

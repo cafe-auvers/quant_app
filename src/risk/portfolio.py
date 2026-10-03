@@ -14,7 +14,6 @@ from typing import Iterable, Optional, Tuple
 
 
 MAX_PORTFOLIO_POSITIONS = 30
-MAX_SINGLE_POSITION_NOTIONAL_FRACTION = 0.25
 
 
 def _finite_nonnegative(value: float, name: str) -> float:
@@ -35,6 +34,7 @@ class PortfolioRiskLimits:
     max_simultaneous_positions: int = MAX_PORTFOLIO_POSITIONS
     max_total_open_risk_fraction: float = 0.10
     max_gross_notional_fraction: float = 1.0
+    max_single_position_notional_fraction: float = 0.25
     max_incremental_buying_power_fraction: float = 0.0
     max_daily_loss_fraction: float = 0.0
     max_drawdown_fraction: float = 0.0
@@ -54,6 +54,7 @@ class PortfolioRiskLimits:
         for name in (
             "max_total_open_risk_fraction",
             "max_gross_notional_fraction",
+            "max_single_position_notional_fraction",
             "max_incremental_buying_power_fraction",
             "max_daily_loss_fraction",
             "max_drawdown_fraction",
@@ -66,6 +67,10 @@ class PortfolioRiskLimits:
         if self.max_gross_notional_fraction > 1.0:
             raise ValueError(
                 "max_gross_notional_fraction cannot exceed 1.0 (100% of NAV)"
+            )
+        if not 0 < self.max_single_position_notional_fraction <= 1.0:
+            raise ValueError(
+                "max_single_position_notional_fraction must be in (0, 1]"
             )
         if self.max_fx_age <= timedelta(0):
             raise ValueError("max_fx_age must be positive")
@@ -281,10 +286,10 @@ class PortfolioRiskReservationSpec:
             self.max_single_position_notional_fraction,
             "max_single_position_notional_fraction",
         )
-        if not 0 < single_position_fraction <= MAX_SINGLE_POSITION_NOTIONAL_FRACTION:
+        if not 0 < single_position_fraction <= 1.0:
             raise ValueError(
                 "portfolio reservation single-position fraction must be in "
-                f"(0, {MAX_SINGLE_POSITION_NOTIONAL_FRACTION}]"
+                "(0, 1]"
             )
         if self.evaluated_at.tzinfo is None:
             raise ValueError("portfolio reservation evaluated_at must be timezone-aware")
@@ -407,11 +412,11 @@ class PortfolioRiskManager:
                 )
         if equity > 0:
             symbol_fraction = symbol_notional_after / equity
-            if symbol_fraction > MAX_SINGLE_POSITION_NOTIONAL_FRACTION:
+            if symbol_fraction > self.limits.max_single_position_notional_fraction:
                 reasons.append(
                     "Maximum single-position notional would be exceeded "
                     f"({symbol_fraction:.2%}>"
-                    f"{MAX_SINGLE_POSITION_NOTIONAL_FRACTION:.2%})"
+                    f"{self.limits.max_single_position_notional_fraction:.2%})"
                 )
         if buying_power > 0 and self.limits.max_incremental_buying_power_fraction > 0:
             fraction = proposed.notional / buying_power
@@ -528,7 +533,7 @@ class PortfolioRiskManager:
                 max_total_open_risk_fraction=self.limits.max_total_open_risk_fraction,
                 max_gross_notional_fraction=self.limits.max_gross_notional_fraction,
                 max_single_position_notional_fraction=(
-                    MAX_SINGLE_POSITION_NOTIONAL_FRACTION
+                    self.limits.max_single_position_notional_fraction
                 ),
                 evaluated_at=snapshot.evaluated_at,
             )

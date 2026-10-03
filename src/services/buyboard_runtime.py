@@ -143,6 +143,7 @@ from src.core.order_state import (
 from src.core.trade_card_state import BoardStatus, TradeCardState
 from src.risk.orb_position import (
     calculate_orb_position_values,
+    get_orb_settings,
     is_orb_position_plan_valid,
 )
 from src.risk.portfolio import (
@@ -530,6 +531,9 @@ def _default_portfolio_risk_manager() -> PortfolioRiskManager:
             max_gross_notional_fraction=(
                 execution_config.PORTFOLIO_MAX_GROSS_NOTIONAL_FRACTION
             ),
+            max_single_position_notional_fraction=(
+                get_orb_settings().capital_max_percent / 100.0
+            ),
             max_incremental_buying_power_fraction=(
                 execution_config.PORTFOLIO_MAX_INCREMENTAL_BUYING_POWER_FRACTION
             ),
@@ -889,9 +893,20 @@ def build_buyboard_runtime(
     guarded_lease = execution_lease if isinstance(execution_lease, ExecutionLease) else None
     legacy_lease = execution_lease if isinstance(execution_lease, LeaseHandle) else None
     resolved_equity_provider = account_equity_provider or buying_power_provider
+    uses_default_portfolio_risk_manager = portfolio_risk_manager is None
     resolved_portfolio_risk_manager = (
         portfolio_risk_manager or _default_portfolio_risk_manager()
     )
+
+    def current_portfolio_risk_manager() -> PortfolioRiskManager:
+        # ORB capital bounds are live operator settings. Rebuild only the
+        # default pure manager so a newly synchronized setting is enforced by
+        # the very next decision; explicitly injected managers remain stable.
+        return (
+            _default_portfolio_risk_manager()
+            if uses_default_portfolio_risk_manager
+            else resolved_portfolio_risk_manager
+        )
     guarded_record_cache: dict[str, ExecutionOrderRecord] = {}
     guarded_record_cached_at: dict[str, float] = {}
     guarded_card_record_cache: dict[
@@ -1188,7 +1203,7 @@ def build_buyboard_runtime(
                     or usable_buying_power <= 0
                 ):
                     usable_buying_power = 0.0
-                portfolio_decision = resolved_portfolio_risk_manager.evaluate_entry(
+                portfolio_decision = current_portfolio_risk_manager().evaluate_entry(
                     ProposedPortfolioEntry(
                         symbol=symbol,
                         quantity=quantity,
@@ -1519,7 +1534,7 @@ def build_buyboard_runtime(
                 buying_power = 0.0
             if not math.isfinite(buying_power) or buying_power <= 0:
                 buying_power = 0.0
-            portfolio_decision = resolved_portfolio_risk_manager.evaluate_entry(
+            portfolio_decision = current_portfolio_risk_manager().evaluate_entry(
                 ProposedPortfolioEntry(
                     symbol=candidate_card.symbol,
                     quantity=quantity,

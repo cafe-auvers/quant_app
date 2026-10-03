@@ -16,7 +16,6 @@ from PyQt5.QtWidgets import (
 
 from src.risk.orb_position import (
     DEFAULT_ORB_SETTINGS,
-    MAX_SINGLE_POSITION_PERCENT,
     OrbSettings,
 )
 
@@ -30,7 +29,7 @@ class OrbSettingsDialog(QDialog):
             "capital_min_percent",
             "capital_ideal_percent",
             "capital_max_percent",
-            MAX_SINGLE_POSITION_PERCENT,
+            100.0,
         ),
         (
             "Stop / ADR (%)",
@@ -80,8 +79,7 @@ class OrbSettingsDialog(QDialog):
         layout.addLayout(grid)
 
         note = QLabel(
-            "Capital allocation may equal either bound and can never exceed "
-            f"the hard {MAX_SINGLE_POSITION_PERCENT:g}% single-position ceiling. "
+            "Capital allocation may equal either user-selected bound. "
             "Stop / ADR may equal either bound."
         )
         note.setWordWrap(True)
