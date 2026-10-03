@@ -776,7 +776,7 @@ def _portfolio_risk_configuration_check() -> HealthCheck:
         f"{gross:.0%} gross notional",
         "Read-only effective values after runtime configuration overrides. "
         "These limits apply only to exposure-increasing BUY entries; values "
-        "are decimal fractions (for example, 2.0 is displayed as 200%).",
+        "are decimal fractions (for example, 1.0 is displayed as 100%).",
     )
 
 

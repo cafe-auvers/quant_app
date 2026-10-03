@@ -11,13 +11,16 @@ from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Mapping, Optional
 
 
+MAX_SINGLE_POSITION_PERCENT = 25.0
+
+
 @dataclass(frozen=True)
 class OrbSettings:
     """User-adjustable ORB validity bounds and scoring ideals."""
 
     capital_min_percent: float = 10.0
     capital_ideal_percent: float = 17.5
-    capital_max_percent: float = 30.0
+    capital_max_percent: float = MAX_SINGLE_POSITION_PERCENT
     stop_adr_min_percent: float = 15.0
     stop_adr_ideal_percent: float = 65.0
     stop_adr_max_percent: float = 66.0
@@ -26,8 +29,14 @@ class OrbSettings:
         values = tuple(asdict(self).values())
         if not all(math.isfinite(value) for value in values):
             raise ValueError("ORB settings must be finite numbers")
-        if self.capital_min_percent < 0 or self.capital_max_percent > 100:
-            raise ValueError("Capital allocation bounds must be between 0% and 100%")
+        if (
+            self.capital_min_percent < 0
+            or self.capital_max_percent > MAX_SINGLE_POSITION_PERCENT
+        ):
+            raise ValueError(
+                "Capital allocation bounds must be between 0% and the hard "
+                f"{MAX_SINGLE_POSITION_PERCENT:g}% single-position ceiling"
+            )
         if self.stop_adr_min_percent < 0:
             raise ValueError("Stop/ADR bounds cannot be negative")
         if not (
@@ -56,6 +65,17 @@ class OrbSettings:
         if not isinstance(values, Mapping):
             return defaults
         try:
+            # Older settings allowed a 30% ORB upper bound. Preserve the
+            # remaining operator choices while migrating that value to the
+            # rulebook's hard 25%-of-NAV single-position ceiling.
+            capital_max_percent = min(
+                float(
+                    values.get(
+                        "capital_max_percent", defaults.capital_max_percent
+                    )
+                ),
+                MAX_SINGLE_POSITION_PERCENT,
+            )
             return cls(
                 capital_min_percent=float(
                     values.get("capital_min_percent", defaults.capital_min_percent)
@@ -63,9 +83,7 @@ class OrbSettings:
                 capital_ideal_percent=float(
                     values.get("capital_ideal_percent", defaults.capital_ideal_percent)
                 ),
-                capital_max_percent=float(
-                    values.get("capital_max_percent", defaults.capital_max_percent)
-                ),
+                capital_max_percent=capital_max_percent,
                 stop_adr_min_percent=float(
                     values.get("stop_adr_min_percent", defaults.stop_adr_min_percent)
                 ),
@@ -200,7 +218,7 @@ def is_orb_position_plan_valid(
     capital_percent = sizing.get("capital_percent", 0.0)
     if (
         capital_percent < orb_settings.capital_min_percent
-        or capital_percent >= orb_settings.capital_max_percent
+        or capital_percent > orb_settings.capital_max_percent
     ):
         return False
     stop_loss_percent = sizing.get("stop_loss_percent", 0.0)
@@ -239,7 +257,7 @@ def validate_orb_position_values(
             f"Capital allocation ({capital_percent:.2f}%) is below "
             f"{orb_settings.capital_min_percent:g}%"
         )
-    if capital_percent >= orb_settings.capital_max_percent:
+    if capital_percent > orb_settings.capital_max_percent:
         warnings.append(
             f"Capital allocation ({capital_percent:.2f}%) exceeds "
             f"{orb_settings.capital_max_percent:g}%"

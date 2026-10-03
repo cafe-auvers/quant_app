@@ -257,9 +257,11 @@ def test_account_transaction_serializes_concurrent_projected_position_slots(tmp_
             baseline_position_symbols=(),
             baseline_open_risk_usd=0.0,
             baseline_gross_notional_usd=0.0,
+            baseline_symbol_notional_usd=0.0,
             max_simultaneous_positions=1,
             max_total_open_risk_fraction=1.0,
             max_gross_notional_fraction=1.0,
+            max_single_position_notional_fraction=0.25,
             evaluated_at=datetime.now(timezone.utc),
         )
         barrier.wait(timeout=2)
@@ -295,6 +297,53 @@ def test_account_transaction_serializes_concurrent_projected_position_slots(tmp_
             engine, environment="PROD", account_no="1"
         )
     ) == 1
+
+
+def test_account_transaction_enforces_25_percent_same_symbol_ceiling(tmp_path):
+    engine = _sqlite_engine(tmp_path)
+    capital_reservation_repository.ensure_capital_reservations_table(engine)
+
+    def reserve(notional: float, group: str) -> None:
+        reservation = CapitalReservation.create(
+            environment="PROD",
+            account_no="1",
+            symbol="AAPL",
+            attempt_group_id=group,
+            requested_notional=notional,
+            projected_open_risk=notional * 0.05,
+        )
+        spec = PortfolioRiskReservationSpec(
+            environment="PROD",
+            account_no="1",
+            symbol="AAPL",
+            proposed_notional_usd=notional,
+            proposed_open_risk_usd=notional * 0.05,
+            account_equity_usd=10_000.0,
+            baseline_position_symbols=(),
+            baseline_open_risk_usd=0.0,
+            baseline_gross_notional_usd=0.0,
+            baseline_symbol_notional_usd=0.0,
+            max_simultaneous_positions=30,
+            max_total_open_risk_fraction=1.0,
+            max_gross_notional_fraction=1.0,
+            max_single_position_notional_fraction=0.25,
+            evaluated_at=datetime.now(timezone.utc),
+        )
+        with engine.begin() as conn:
+            capital_reservation_repository.insert_reservation_if_available(
+                conn,
+                reservation,
+                buying_power=10_000.0,
+                portfolio_risk_spec=spec,
+            )
+
+    reserve(1_500.0, "first")
+    reserve(1_000.0, "at-limit")
+    with pytest.raises(
+        capital_reservation_repository.ProjectedPortfolioRiskLimitError,
+        match="single-position notional",
+    ):
+        reserve(0.01, "above-limit")
 
 
 # --- P1-12: database-backed capital reservations (cross-device) ------------

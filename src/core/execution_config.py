@@ -551,9 +551,9 @@ PORTFOLIO_MAX_TOTAL_OPEN_RISK_FRACTION = _env_float(
 )
 PORTFOLIO_MAX_GROSS_NOTIONAL_FRACTION = _env_float(
     "PORTFOLIO_MAX_GROSS_NOTIONAL_FRACTION",
-    2.0,
+    1.0,
     minimum=0.0,
-    maximum=10.0,
+    maximum=1.0,
     entry_boundary=True,
 )
 PORTFOLIO_MAX_INCREMENTAL_BUYING_POWER_FRACTION = _env_float(

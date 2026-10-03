@@ -26,18 +26,44 @@ def test_orb_sizing_call_sites_share_authoritative_calculation():
     }
 
 
-def test_orb_risk_thresholds_remain_inclusive_at_10_and_exclusive_at_30():
+def test_orb_risk_thresholds_allow_25_percent_and_reject_anything_above_it():
     base = {
         "shares": 1.0,
         "stop_loss_percent": 1.0,
         "sl_adr": 50.0,
     }
     at_ten = {**base, "capital_percent": 10.0}
-    at_thirty = {**base, "capital_percent": 30.0}
+    at_twenty_five = {**base, "capital_percent": 25.0}
+    above_twenty_five = {**base, "capital_percent": 25.01}
 
     assert is_orb_position_plan_valid(at_ten, adr_percent=10.0) is True
-    assert is_orb_position_plan_valid(at_thirty, adr_percent=10.0) is False
+    assert is_orb_position_plan_valid(at_twenty_five, adr_percent=10.0) is True
+    assert is_orb_position_plan_valid(above_twenty_five, adr_percent=10.0) is False
+    assert any(
+        "exceeds 25%" in warning
+        for warning in validate_orb_position_values(
+            above_twenty_five, adr_percent=10.0
+        )
+    )
     assert MainWindow._orb_position_plan_is_valid(at_ten, 10.0) is True
+
+
+def test_legacy_30_percent_setting_is_clamped_without_losing_other_choices():
+    settings = OrbSettings.from_mapping(
+        {
+            "capital_min_percent": 12.0,
+            "capital_ideal_percent": 20.0,
+            "capital_max_percent": 30.0,
+            "stop_adr_min_percent": 20.0,
+            "stop_adr_ideal_percent": 50.0,
+            "stop_adr_max_percent": 75.0,
+        }
+    )
+
+    assert settings.capital_min_percent == 12.0
+    assert settings.capital_ideal_percent == 20.0
+    assert settings.capital_max_percent == 25.0
+    assert settings.stop_adr_ideal_percent == 50.0
 
 
 def test_orb_recommendation_score_is_shared_across_call_sites():
@@ -76,8 +102,8 @@ def test_custom_orb_settings_control_bounds_warnings_and_scoring():
     original = get_orb_settings()
     custom = OrbSettings(
         capital_min_percent=20.0,
-        capital_ideal_percent=25.0,
-        capital_max_percent=40.0,
+        capital_ideal_percent=22.5,
+        capital_max_percent=25.0,
         stop_adr_min_percent=30.0,
         stop_adr_ideal_percent=45.0,
         stop_adr_max_percent=60.0,
@@ -92,7 +118,7 @@ def test_custom_orb_settings_control_bounds_warnings_and_scoring():
         }
         ideal = {
             "shares": 1.0,
-            "capital_percent": 25.0,
+            "capital_percent": 22.5,
             "stop_loss_percent": 1.0,
             "sl_adr": 45.0,
         }

@@ -14,6 +14,7 @@ from typing import Iterable, Optional, Tuple
 
 
 MAX_PORTFOLIO_POSITIONS = 30
+MAX_SINGLE_POSITION_NOTIONAL_FRACTION = 0.25
 
 
 def _finite_nonnegative(value: float, name: str) -> float:
@@ -33,7 +34,7 @@ class PortfolioRiskLimits:
 
     max_simultaneous_positions: int = MAX_PORTFOLIO_POSITIONS
     max_total_open_risk_fraction: float = 0.10
-    max_gross_notional_fraction: float = 2.0
+    max_gross_notional_fraction: float = 1.0
     max_incremental_buying_power_fraction: float = 0.0
     max_daily_loss_fraction: float = 0.0
     max_drawdown_fraction: float = 0.0
@@ -62,6 +63,10 @@ class PortfolioRiskLimits:
             "max_strategy_notional_fraction",
         ):
             _finite_nonnegative(getattr(self, name), name)
+        if self.max_gross_notional_fraction > 1.0:
+            raise ValueError(
+                "max_gross_notional_fraction cannot exceed 1.0 (100% of NAV)"
+            )
         if self.max_fx_age <= timedelta(0):
             raise ValueError("max_fx_age must be positive")
 
@@ -220,9 +225,11 @@ class PortfolioRiskReservationSpec:
     baseline_position_symbols: Tuple[str, ...]
     baseline_open_risk_usd: float
     baseline_gross_notional_usd: float
+    baseline_symbol_notional_usd: float
     max_simultaneous_positions: int
     max_total_open_risk_fraction: float
     max_gross_notional_fraction: float
+    max_single_position_notional_fraction: float
     evaluated_at: datetime
 
     def __post_init__(self) -> None:
@@ -249,6 +256,9 @@ class PortfolioRiskReservationSpec:
         _finite_nonnegative(
             self.baseline_gross_notional_usd, "baseline_gross_notional_usd"
         )
+        _finite_nonnegative(
+            self.baseline_symbol_notional_usd, "baseline_symbol_notional_usd"
+        )
         if not self.environment or not self.account_no or not self.symbol:
             raise ValueError("portfolio reservation scope is incomplete")
         if self.proposed_notional_usd <= 0:
@@ -267,6 +277,15 @@ class PortfolioRiskReservationSpec:
             self.max_gross_notional_fraction,
             "max_gross_notional_fraction",
         )
+        single_position_fraction = _finite_nonnegative(
+            self.max_single_position_notional_fraction,
+            "max_single_position_notional_fraction",
+        )
+        if not 0 < single_position_fraction <= MAX_SINGLE_POSITION_NOTIONAL_FRACTION:
+            raise ValueError(
+                "portfolio reservation single-position fraction must be in "
+                f"(0, {MAX_SINGLE_POSITION_NOTIONAL_FRACTION}]"
+            )
         if self.evaluated_at.tzinfo is None:
             raise ValueError("portfolio reservation evaluated_at must be timezone-aware")
 
@@ -357,6 +376,11 @@ class PortfolioRiskManager:
         total_open_risk_after = total_open_risk + proposed.open_risk
         gross_notional = sum(position.notional for position in existing)
         gross_notional_after = gross_notional + proposed.notional
+        symbol_notional_after = sum(
+            position.notional
+            for position in existing
+            if position.symbol == proposed.symbol
+        ) + proposed.notional
 
         if equity <= 0:
             reasons.append("Fresh positive account equity is required")
@@ -380,6 +404,14 @@ class PortfolioRiskManager:
                 reasons.append(
                     "Maximum gross notional would be exceeded "
                     f"({fraction:.2%}>{self.limits.max_gross_notional_fraction:.2%})"
+                )
+        if equity > 0:
+            symbol_fraction = symbol_notional_after / equity
+            if symbol_fraction > MAX_SINGLE_POSITION_NOTIONAL_FRACTION:
+                reasons.append(
+                    "Maximum single-position notional would be exceeded "
+                    f"({symbol_fraction:.2%}>"
+                    f"{MAX_SINGLE_POSITION_NOTIONAL_FRACTION:.2%})"
                 )
         if buying_power > 0 and self.limits.max_incremental_buying_power_fraction > 0:
             fraction = proposed.notional / buying_power
@@ -487,9 +519,17 @@ class PortfolioRiskManager:
                 baseline_gross_notional_usd=sum(
                     position.notional for position in atomic_baseline
                 ),
+                baseline_symbol_notional_usd=sum(
+                    position.notional
+                    for position in atomic_baseline
+                    if position.symbol == proposed.symbol
+                ),
                 max_simultaneous_positions=self.limits.max_simultaneous_positions,
                 max_total_open_risk_fraction=self.limits.max_total_open_risk_fraction,
                 max_gross_notional_fraction=self.limits.max_gross_notional_fraction,
+                max_single_position_notional_fraction=(
+                    MAX_SINGLE_POSITION_NOTIONAL_FRACTION
+                ),
                 evaluated_at=snapshot.evaluated_at,
             )
         return PortfolioRiskDecision(

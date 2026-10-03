@@ -157,7 +157,7 @@ def test_pr4_market_data_configuration_is_present_and_fail_closed():
     assert runtime_config["BUYBOARD_ENGINE_ENABLED"] == "true"
     assert runtime_config["PORTFOLIO_MAX_SIMULTANEOUS_POSITIONS"] == "30"
     assert runtime_config["PORTFOLIO_MAX_TOTAL_OPEN_RISK_FRACTION"] == "0.10"
-    assert runtime_config["PORTFOLIO_MAX_GROSS_NOTIONAL_FRACTION"] == "2.0"
+    assert runtime_config["PORTFOLIO_MAX_GROSS_NOTIONAL_FRACTION"] == "1.0"
     assert "KIS_WS_SYMBOL_KEYS_JSON=" not in env_example
     assert "websockets==17.0.1" in requirements
 
