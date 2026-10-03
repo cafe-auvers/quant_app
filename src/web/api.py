@@ -218,6 +218,18 @@ class OperatorControlRequest(BaseModel):
     target: str = Field(pattern="^(?i:pc|laptop|mobile)$")
 
 
+class OrbSettingsUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    command_id: str = Field(min_length=32, max_length=40)
+    expected_revision: int = Field(ge=0)
+    capital_min_percent: float = Field(ge=0, le=100)
+    capital_ideal_percent: float = Field(ge=0, le=100)
+    capital_max_percent: float = Field(ge=0, le=100)
+    stop_adr_min_percent: float = Field(ge=0, le=1000)
+    stop_adr_ideal_percent: float = Field(ge=0, le=1000)
+    stop_adr_max_percent: float = Field(ge=0, le=1000)
+
+
 class DrawingCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     id: str | None = Field(default=None, max_length=120)
@@ -981,6 +993,62 @@ def register_api_routes(app: FastAPI, services: WebServices) -> None:
         )
         announce_planning_change("operator_control")
         return result
+
+    @app.get("/api/v1/operator/orb-settings")
+    async def orb_settings(
+        _session: SessionRecord = Depends(current_session),
+    ) -> dict[str, Any]:
+        if config.mode == "SANDBOX" or services.connected_operator.engine is None:
+            raise HTTPException(status_code=404, detail="Shared ORB settings unavailable")
+        return await anyio.to_thread.run_sync(
+            services.connected_operator.orb_settings_snapshot
+        )
+
+    @app.put("/api/v1/operator/orb-settings")
+    async def update_orb_settings(
+        payload: OrbSettingsUpdateRequest,
+        session: SessionRecord = Depends(csrf_session),
+    ) -> dict[str, Any]:
+        if config.mode == "SANDBOX" or not services.connected_operator.available:
+            raise HTTPException(status_code=403, detail="Shared ORB settings are disabled")
+        from src.risk.orb_position import OrbSettings
+
+        settings_values = payload.model_dump(
+            exclude={"command_id", "expected_revision"}
+        )
+        try:
+            settings = OrbSettings(**settings_values)
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
+        command_payload = {
+            "operation": "update_orb_settings",
+            "expected_revision": int(payload.expected_revision),
+            **settings.to_dict(),
+        }
+        replay = await anyio.to_thread.run_sync(
+            lambda: services.store.connected_command_replay(
+                command_id=payload.command_id,
+                payload=command_payload,
+            )
+        )
+        if replay is not None:
+            return replay
+        result = await anyio.to_thread.run_sync(
+            lambda: services.connected_operator.update_orb_settings(
+                expected_revision=payload.expected_revision,
+                settings=settings,
+            )
+        )
+        recorded = await anyio.to_thread.run_sync(
+            lambda: services.store.record_connected_command(
+                command_id=payload.command_id,
+                payload=command_payload,
+                response=result,
+                actor=session.username,
+            )
+        )
+        announce_planning_change("orb_settings", result=recorded)
+        return recorded
 
     @app.post("/api/v1/operator/board-actions")
     async def apply_board_action(

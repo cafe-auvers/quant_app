@@ -447,10 +447,13 @@ either machine.
   `_state_sync_allows_order_submission` also gained a bounded-age
   requirement (fails closed if the last successful reconcile is >90s old)
   as defense in depth against network partition.
-- **`execution_queue` is now a 4th synced state key** (alongside watchlist/
-  buylist/trade_plans) -- a valid automated entry is queue-backed since
+- **The synchronized state has six keys**: watchlist, buylist, trade plans,
+  execution queue, scanner setups, and settings. A valid automated entry is
+  queue-backed since
   legacy `ACTIVE` entry automation was retired, so the queue has to cross
-  machines too. A synced `EXECUTE_READY` is never trusted directly.
+  machines too. ORB bounds therefore follow the same revision to PC and laptop;
+  authenticated mobile edits use a settings-only CAS write after Operator
+  Control is re-verified. A synced `EXECUTE_READY` is never trusted directly.
 - **Broker-truth reconciliation before resuming** (`src/services/
   handoff_reconciliation.py`): the moment a device becomes main, every
   in-flight PROD item's runtime pending flags are forced to "assume

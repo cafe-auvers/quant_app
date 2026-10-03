@@ -15,11 +15,20 @@ from src.services.operator_commands import OperatorCommandError
 from src.services.runtime_device_state_repository import list_runtime_device_states
 from src.services.state_sync import (
     LocalDeviceRole,
+    PULL_ERROR,
+    PULL_OK,
+    PUSH_CONFLICT,
+    PUSH_NOT_OPERATOR,
+    PUSH_WRITTEN,
+    SETTINGS_KEY,
     get_main_device,
     get_operator_control,
     load_local_device_role,
+    pull_state,
+    push_operator_controlled_settings,
     set_operator_control,
 )
+from src.risk.orb_position import DEFAULT_ORB_SETTINGS, OrbSettings
 from src.utils.device_identity import runtime_device_kind
 from src.utils.market_calendar import (
     current_or_next_nyse_session_date,
@@ -50,6 +59,7 @@ ALLOWED_OPERATOR_OPERATIONS = frozenset(
         "set_manual_stop",
         "reorder_card",
         "publish_today_plan",
+        "update_orb_settings",
     }
 )
 
@@ -319,6 +329,105 @@ class ConnectedOperatorService:
             f"web-operator:{token}",
             tables=tables,
         )
+
+    @staticmethod
+    def _validated_orb_settings(values: Any) -> OrbSettings:
+        if values is None:
+            return DEFAULT_ORB_SETTINGS
+        if not isinstance(values, dict):
+            raise ConnectedOperatorUnavailable(
+                "Shared ORB settings are not a valid object"
+            )
+        defaults = DEFAULT_ORB_SETTINGS.to_dict()
+        try:
+            normalized = {
+                key: float(values.get(key, default))
+                for key, default in defaults.items()
+            }
+            return OrbSettings(**normalized)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ConnectedOperatorUnavailable(
+                f"Shared ORB settings are invalid: {exc}"
+            ) from exc
+
+    def _orb_settings_document(
+        self,
+    ) -> tuple[dict[str, Any], OrbSettings, int, str, str]:
+        if self.engine is None:
+            raise ConnectedOperatorUnavailable("Operator database is unavailable")
+        pulled = pull_state(self.engine, SETTINGS_KEY)
+        if pulled.status == PULL_ERROR:
+            raise ConnectedOperatorUnavailable(
+                pulled.error or "Shared settings are unavailable"
+            )
+        if pulled.status == PULL_OK and pulled.state is not None:
+            document = dict(pulled.state.payload)
+            settings = self._validated_orb_settings(document.get("orb_settings"))
+            return (
+                document,
+                settings,
+                int(pulled.state.revision),
+                pulled.state.updated_at.isoformat(),
+                pulled.state.updated_by_host,
+            )
+
+        path = self._repository() / "data" / "settings.json"
+        document = self._load_document(path) if path.is_file() else {}
+        settings = self._validated_orb_settings(document.get("orb_settings"))
+        return document, settings, 0, "", ""
+
+    def orb_settings_snapshot(self) -> dict[str, Any]:
+        """Return the shared ORB bounds shown by desktop and mobile."""
+
+        _document, settings, revision, updated_at, updated_by = (
+            self._orb_settings_document()
+        )
+        return {
+            "settings": settings.to_dict(),
+            "revision": revision,
+            "updated_at": updated_at or None,
+            "updated_by": updated_by,
+            "source": "SHARED" if revision > 0 else "LOCAL_DEFAULT",
+        }
+
+    def update_orb_settings(
+        self,
+        *,
+        expected_revision: int,
+        settings: OrbSettings,
+    ) -> dict[str, Any]:
+        """Persist one validated ORB-settings revision for every device."""
+
+        role, _authority = self._require_operator_authority(
+            "update_orb_settings"
+        )
+        document, _current, _revision, _updated_at, _updated_by = (
+            self._orb_settings_document()
+        )
+        document["orb_settings"] = settings.to_dict()
+        result = push_operator_controlled_settings(
+            self.engine,
+            document,
+            role=role,
+            expected_revision=expected_revision,
+        )
+        if result.status == PUSH_CONFLICT:
+            raise ConflictError(
+                result.error or "Shared ORB settings changed before save",
+                self.orb_settings_snapshot(),
+            )
+        if result.status == PUSH_NOT_OPERATOR:
+            raise ConnectedOperatorUnavailable(
+                result.error or "Operator Control changed before save"
+            )
+        if result.status != PUSH_WRITTEN:
+            raise ConnectedOperatorUnavailable(
+                result.error or "Shared ORB settings could not be saved"
+            )
+        self._publish_change_pulse(
+            f"orb-settings-{uuid.uuid4()}", "app_state_sync"
+        )
+        return self.orb_settings_snapshot()
 
     def board_snapshot(self, *, force: bool = False) -> dict[str, Any]:
         """Return the canonical six-column Kanban projection."""

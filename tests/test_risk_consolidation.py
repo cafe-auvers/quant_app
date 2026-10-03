@@ -26,23 +26,23 @@ def test_orb_sizing_call_sites_share_authoritative_calculation():
     }
 
 
-def test_orb_risk_thresholds_allow_25_percent_and_reject_anything_above_it():
+def test_orb_risk_thresholds_allow_30_percent_and_reject_anything_above_it():
     base = {
         "shares": 1.0,
         "stop_loss_percent": 1.0,
         "sl_adr": 50.0,
     }
     at_ten = {**base, "capital_percent": 10.0}
-    at_twenty_five = {**base, "capital_percent": 25.0}
-    above_twenty_five = {**base, "capital_percent": 25.01}
+    at_thirty = {**base, "capital_percent": 30.0}
+    above_thirty = {**base, "capital_percent": 30.01}
 
     assert is_orb_position_plan_valid(at_ten, adr_percent=10.0) is True
-    assert is_orb_position_plan_valid(at_twenty_five, adr_percent=10.0) is True
-    assert is_orb_position_plan_valid(above_twenty_five, adr_percent=10.0) is False
+    assert is_orb_position_plan_valid(at_thirty, adr_percent=10.0) is True
+    assert is_orb_position_plan_valid(above_thirty, adr_percent=10.0) is False
     assert any(
-        "exceeds 25%" in warning
+        "exceeds 30%" in warning
         for warning in validate_orb_position_values(
-            above_twenty_five, adr_percent=10.0
+            above_thirty, adr_percent=10.0
         )
     )
     assert MainWindow._orb_position_plan_is_valid(at_ten, 10.0) is True

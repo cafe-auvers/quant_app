@@ -81,14 +81,15 @@ only in gitignored `config/web.local.json`:
     "move_watchlist", "set_breakout", "clear_breakout"
   ],
   "connected_operator_operations": [
-    "activate_buy_today", "deactivate_buy_today", "publish_today_plan"
+    "activate_buy_today", "deactivate_buy_today", "publish_today_plan",
+    "update_orb_settings"
   ]
 }
 ```
 
 Keep both write allowlists empty for read-only installations. Enable the
-operator list only on the web host whose exact local device identity is meant
-to hold Operator Control; the server rejects it elsewhere at request time.
+operator list only on the private web host used for Operator Control; the
+server re-verifies the current shared Operator Control owner at request time.
 
 An empty `canonical_account_no` is accepted only when exactly one production
 account exists. The server reads the PC mirror with SQLite read-only mode and
@@ -104,12 +105,14 @@ The 10-second revision/status check remains a missed-event fallback. Manual
 refresh is not required for routine changes. Passive planning and mobile
 operator operations are separate explicit allowlists. When the latter is
 enabled, an authenticated phone can activate/remove an unsubmitted canonical
-Buy Today card and publish Today's Plan only while the hosting PC's exact
-identity owns Operator Control. A separate Execution Owner receives an
-append-only queued command; the browser never assumes its identity. Plan
+Buy Today card, publish Today's Plan, and edit the six shared ORB bounds only
+while its selected device owns Operator Control. ORB settings use revision/CAS
+writes; typed change pulses make the PC and laptop reload the same `settings`
+document automatically. A separate Execution Owner receives queued
+broker-facing commands; the browser never assumes its identity. Plan
 publication is rejected during regular market hours and reuses the six-document
 revision/CAS/read-back workflow. No browser endpoint places an order, transfers
-ownership, changes risk, or controls power.
+execution ownership, or controls power.
 
 ## Local cache, backup, and drawing import
 

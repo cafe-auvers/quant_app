@@ -5,11 +5,10 @@
 Most of `data/*.json` is gitignored (see `.gitignore`) -- it's runtime
 state, not code, and churns on every UI action. That also means, unlike
 everything under `src/`, it exists **only** on the machine that wrote it.
-`watchlist`/`buylist`/`trade_plans` additionally get pushed to the PC's
-shared MySQL (`app_state_sync` table, see
-[pc_sync_data_pipeline.md](pc_sync_data_pipeline.md)) whenever the PC is
-reachable, but the rest never do. A dead disk or an accidental delete on
-the laptop has no recovery path without this.
+`watchlist`/`buylist`/`trade_plans`/`execution_queue` plus scanner setups and
+settings additionally use the shared coordination store (`app_state_sync`, see
+[pc_sync_data_pipeline.md](pc_sync_data_pipeline.md)). The backup remains an
+independent recovery layer for those documents and the local-only files.
 
 **11 files are backed up** -- `STATE_BACKUP_FILENAMES` in
 `src/services/cloud_backup.py` is the source of truth for the exact list:
@@ -22,7 +21,7 @@ the laptop has no recovery path without this.
 | `scanner_setups.json` | Saved scanner threshold presets |
 | `chart_drawings.json` | User-drawn chart lines |
 | `tab_options.json` | Which tabs are shown |
-| `settings.json` | Keyboard shortcuts, chart pan step |
+| `settings.json` | Keyboard shortcuts, chart behavior, and shared ORB bounds |
 | `orders.json` | **Order ledger -- real trade/order history** |
 | `execution_queue.json` | **Live execution queue -- active trading state** |
 | `legacy_non_prod_buylist.json` | Archived non-PROD buylist rows |

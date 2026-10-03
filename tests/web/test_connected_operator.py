@@ -12,6 +12,7 @@ from src.core.trade_card_state import BoardStatus, TradeCardState
 from src.core.runtime_readiness import RuntimeDeviceState
 from src.core.execution_ownership import ExecutionOwner
 from src.services import trade_card_repository
+from src.services import state_sync as ss
 from src.services.operator_command_service import process_next_board_operator_command
 from src.services.operator_commands import OperatorCommandStatus
 from src.services.runtime_device_state_repository import save_runtime_device_state
@@ -63,6 +64,7 @@ def _service(web_config, tmp_path, *, same_executor: bool = True):
             "set_manual_stop",
             "reorder_card",
             "publish_today_plan",
+            "update_orb_settings",
         ),
         canonical_account_no="account-a",
         pc_repository_path=str(tmp_path),
@@ -197,6 +199,35 @@ def test_mobile_can_select_mobile_pc_and_laptop_operator_control(
     assert pc_status["delegated"] is True
     assert pc_status["operator_control"] == "PC"
     assert get_operator_control(engine).control.device_id == role.device_id
+
+
+def test_mobile_operator_updates_one_shared_orb_settings_revision(
+    web_config, tmp_path
+):
+    engine, _role, service = _service(web_config, tmp_path, same_executor=True)
+    service.set_operator_control_target("mobile")
+
+    initial = service.orb_settings_snapshot()
+    assert initial["settings"]["capital_max_percent"] == 30.0
+    assert initial["revision"] == 0
+
+    from src.risk.orb_position import OrbSettings
+
+    updated = service.update_orb_settings(
+        expected_revision=initial["revision"],
+        settings=OrbSettings(
+            capital_min_percent=8.0,
+            capital_ideal_percent=16.0,
+            capital_max_percent=32.0,
+            stop_adr_min_percent=12.0,
+            stop_adr_ideal_percent=60.0,
+            stop_adr_max_percent=70.0,
+        ),
+    )
+
+    assert updated["revision"] == 1
+    assert updated["settings"]["capital_max_percent"] == 32.0
+    assert updated["updated_by"] == "Mobile Web"
 
 
 def test_mobile_plan_publish_uses_guarded_full_snapshot(
@@ -364,3 +395,57 @@ def test_mobile_buyboard_api_returns_columns_and_applies_typed_action(
         assert action.status_code == 200, action.text
         assert action.json()["queued"] is False
         assert action.json()["card"]["board_status"] == "BUY_TODAY"
+
+
+def test_mobile_orb_settings_api_round_trip_is_revision_safe(
+    web_config, services, tmp_path
+):
+    engine, _role, operator = _service(web_config, tmp_path, same_executor=True)
+    services.config = operator.config
+    services.canonical_planning = operator.source
+    services.connected_planning = operator.planning
+    services.connected_operator = operator
+
+    with TestClient(
+        create_api_app(operator.config, services=services),
+        base_url="http://localhost:8080",
+    ) as phone:
+        session = login(phone)
+        phone.headers.update(
+            {
+                "Origin": "http://localhost:8080",
+                "X-CSRF-Token": session["csrf_token"],
+            }
+        )
+        control = phone.post(
+            "/api/v1/operator/control", json={"target": "mobile"}
+        )
+        assert control.status_code == 200
+        initial = phone.get("/api/v1/operator/orb-settings")
+        assert initial.status_code == 200
+        assert initial.json()["settings"]["capital_max_percent"] == 30.0
+
+        payload = {
+            "command_id": str(uuid.uuid4()),
+            "expected_revision": initial.json()["revision"],
+            "capital_min_percent": 10.0,
+            "capital_ideal_percent": 18.0,
+            "capital_max_percent": 35.0,
+            "stop_adr_min_percent": 15.0,
+            "stop_adr_ideal_percent": 65.0,
+            "stop_adr_max_percent": 66.0,
+        }
+        saved = phone.put("/api/v1/operator/orb-settings", json=payload)
+        assert saved.status_code == 200, saved.text
+        assert saved.json()["revision"] == 1
+        assert saved.json()["settings"]["capital_max_percent"] == 35.0
+
+        stale = phone.put(
+            "/api/v1/operator/orb-settings",
+            json={**payload, "command_id": str(uuid.uuid4())},
+        )
+        assert stale.status_code == 409
+        assert stale.json()["current"]["revision"] == 1
+        assert ss.pull_state(engine, ss.SETTINGS_KEY).state.payload[
+            "orb_settings"
+        ]["capital_max_percent"] == 35.0

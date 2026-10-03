@@ -226,6 +226,7 @@ def _validate(config: WebConfig) -> None:
         "set_manual_stop",
         "reorder_card",
         "publish_today_plan",
+        "update_orb_settings",
     }
     unknown_operator_operations = (
         set(config.connected_operator_operations) - allowed_operator_operations

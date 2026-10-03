@@ -8,9 +8,9 @@
   <title>Quant Web — Review Workspace</title>
   <link rel="manifest" href="/web-static/manifest.webmanifest">
   <link rel="icon" href="/web-static/icon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/live-static/app.css?v=86">
+  <link rel="stylesheet" href="/live-static/app.css?v=87">
   <script src="/live-vendor/lightweight-charts.standalone.production.js" defer></script>
-  <script src="/live-static/app.js?v=88" defer></script>
+  <script src="/live-static/app.js?v=89" defer></script>
 </head>
 <body class="dashboard-body">
   <div id="quant-app" class="app-shell">
@@ -83,6 +83,30 @@
             <div class="mobile-section-heading"><div><span class="mobile-card-label">Chart settings</span><strong>Indicators and data</strong></div></div>
             <p>Choose EMAs, volume, relative strength, earnings, market context, ADR, and growth fields.</p>
             <button id="summary-open-settings" class="mobile-secondary-action" type="button">Open chart settings</button>
+          </article>
+          <article class="mobile-page-section mobile-orb-settings">
+            <div class="mobile-section-heading"><div><span class="mobile-card-label">Shared risk settings</span><strong>ORB position bounds</strong></div><span id="orb-settings-revision">Loading</span></div>
+            <p>These are the same ORB bounds used by the PC and laptop. Saving creates one shared revision for every device.</p>
+            <form id="mobile-orb-settings-form">
+              <fieldset>
+                <legend>Capital allocation (%)</legend>
+                <div class="mobile-orb-inputs">
+                  <label><span>Lower</span><input id="orb-capital-min" type="number" min="0" max="100" step="0.5" inputmode="decimal" required></label>
+                  <label><span>Ideal</span><input id="orb-capital-ideal" type="number" min="0" max="100" step="0.5" inputmode="decimal" required></label>
+                  <label><span>Upper</span><input id="orb-capital-max" type="number" min="0" max="100" step="0.5" inputmode="decimal" required></label>
+                </div>
+              </fieldset>
+              <fieldset>
+                <legend>Stop / ADR (%)</legend>
+                <div class="mobile-orb-inputs">
+                  <label><span>Lower</span><input id="orb-stop-adr-min" type="number" min="0" max="1000" step="0.5" inputmode="decimal" required></label>
+                  <label><span>Ideal</span><input id="orb-stop-adr-ideal" type="number" min="0" max="1000" step="0.5" inputmode="decimal" required></label>
+                  <label><span>Upper</span><input id="orb-stop-adr-max" type="number" min="0" max="1000" step="0.5" inputmode="decimal" required></label>
+                </div>
+              </fieldset>
+              <div class="mobile-orb-actions"><button id="orb-settings-defaults" type="button">Restore defaults</button><button id="orb-settings-save" type="submit">Save shared settings</button></div>
+            </form>
+            <div id="orb-settings-status" class="mobile-inline-status" role="status"></div>
           </article>
           <article class="mobile-page-section mobile-summary-pulse">
             <div class="mobile-section-heading"><div><span class="mobile-card-label">Market Pulse</span><strong id="pulse-context">Waiting for chart data</strong></div><span id="pulse-market-state">Checking</span></div>

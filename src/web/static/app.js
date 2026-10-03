@@ -28,6 +28,14 @@
     return1m: true,
     return3m: true,
   });
+  const ORB_SETTINGS_DEFAULTS = Object.freeze({
+    capital_min_percent: 10,
+    capital_ideal_percent: 17.5,
+    capital_max_percent: 30,
+    stop_adr_min_percent: 15,
+    stop_adr_ideal_percent: 65,
+    stop_adr_max_percent: 66,
+  });
 
   function loadDisplayPreferences() {
     try {
@@ -97,6 +105,10 @@
     marketAlignment: null,
     mobilePage: 'chart',
     displayPreferences: loadDisplayPreferences(),
+    orbSettings: null,
+    orbSettingsRevision: 0,
+    orbSettingsLoading: false,
+    orbSettingsSaving: false,
     stockRows: new Map(),
     prefetchTimer: null,
     statusTimer: null,
@@ -378,6 +390,141 @@
       setupFragment.appendChild(button);
     });
     setupPicker.replaceChildren(setupFragment);
+    renderOrbSettingsAccess();
+  }
+
+  const ORB_INPUTS = Object.freeze({
+    capital_min_percent: 'orb-capital-min',
+    capital_ideal_percent: 'orb-capital-ideal',
+    capital_max_percent: 'orb-capital-max',
+    stop_adr_min_percent: 'orb-stop-adr-min',
+    stop_adr_ideal_percent: 'orb-stop-adr-ideal',
+    stop_adr_max_percent: 'orb-stop-adr-max',
+  });
+
+  function canEditOrbSettings() {
+    const operator = state.session?.operator || {};
+    return Boolean(
+      state.session?.mode === 'CONNECTED'
+      && operator.delegated
+      && (operator.operations || []).includes('update_orb_settings')
+    );
+  }
+
+  function renderOrbSettingsAccess() {
+    const editable = canEditOrbSettings();
+    const busy = state.orbSettingsLoading || state.orbSettingsSaving;
+    Object.values(ORB_INPUTS).forEach(id => { byId(id).disabled = busy || !editable; });
+    byId('orb-settings-defaults').disabled = busy || !editable;
+    byId('orb-settings-save').disabled = busy || !editable;
+    byId('orb-settings-revision').textContent = state.orbSettingsRevision > 0
+      ? `Shared r${state.orbSettingsRevision}`
+      : state.orbSettingsLoading ? 'Loading' : 'Not synced';
+  }
+
+  function setOrbSettingsInputs(settings) {
+    Object.entries(ORB_INPUTS).forEach(([name, id]) => {
+      byId(id).value = Number(settings[name]).toFixed(2);
+      byId(id).setCustomValidity('');
+    });
+  }
+
+  function readOrbSettingsInputs() {
+    const values = Object.fromEntries(
+      Object.entries(ORB_INPUTS).map(([name, id]) => [name, Number(byId(id).value)])
+    );
+    if (!Object.values(values).every(Number.isFinite)) {
+      throw new Error('Enter a number in every ORB setting.');
+    }
+    if (values.capital_min_percent < 0 || values.capital_max_percent > 100) {
+      throw new Error('Capital allocation bounds must be between 0% and 100%.');
+    }
+    if (!(values.capital_min_percent <= values.capital_ideal_percent
+      && values.capital_ideal_percent <= values.capital_max_percent)
+      || values.capital_min_percent === values.capital_max_percent) {
+      throw new Error('Capital ideal must be between distinct lower and upper bounds.');
+    }
+    if (values.stop_adr_min_percent < 0
+      || !(values.stop_adr_min_percent <= values.stop_adr_ideal_percent
+        && values.stop_adr_ideal_percent <= values.stop_adr_max_percent)
+      || values.stop_adr_min_percent === values.stop_adr_max_percent) {
+      throw new Error('Stop / ADR ideal must be between distinct non-negative bounds.');
+    }
+    return values;
+  }
+
+  async function loadOrbSettings() {
+    const status = byId('orb-settings-status');
+    if (state.session?.mode !== 'CONNECTED') {
+      state.orbSettings = {...ORB_SETTINGS_DEFAULTS};
+      setOrbSettingsInputs(state.orbSettings);
+      status.textContent = 'Shared settings are available in connected mode.';
+      renderOrbSettingsAccess();
+      return;
+    }
+    if (state.orbSettingsLoading) return;
+    state.orbSettingsLoading = true;
+    renderOrbSettingsAccess();
+    try {
+      const result = await api('/api/v1/operator/orb-settings');
+      state.orbSettings = {...result.settings};
+      state.orbSettingsRevision = Number(result.revision || 0);
+      setOrbSettingsInputs(state.orbSettings);
+      status.textContent = canEditOrbSettings()
+        ? 'Synced. Changes apply to mobile, PC, and laptop.'
+        : 'Read only until this device has Operator Control.';
+      status.className = `mobile-inline-status ${canEditOrbSettings() ? 'success' : ''}`.trim();
+    } catch (error) {
+      status.textContent = `Shared settings unavailable: ${error.message}`;
+      status.className = 'mobile-inline-status error';
+    } finally {
+      state.orbSettingsLoading = false;
+      renderOrbSettingsAccess();
+    }
+  }
+
+  async function saveOrbSettings(event) {
+    event.preventDefault();
+    if (state.orbSettingsSaving || !canEditOrbSettings()) return;
+    const status = byId('orb-settings-status');
+    let settings;
+    try {
+      settings = readOrbSettingsInputs();
+    } catch (error) {
+      status.textContent = error.message;
+      status.className = 'mobile-inline-status error';
+      return;
+    }
+    state.orbSettingsSaving = true;
+    renderOrbSettingsAccess();
+    status.textContent = 'Saving one shared revision...';
+    status.className = 'mobile-inline-status';
+    try {
+      const result = await api('/api/v1/operator/orb-settings', {
+        method: 'PUT',
+        body: JSON.stringify({
+          command_id: commandId(),
+          expected_revision: state.orbSettingsRevision,
+          ...settings,
+        }),
+      });
+      state.orbSettings = {...result.settings};
+      state.orbSettingsRevision = Number(result.revision || 0);
+      setOrbSettingsInputs(state.orbSettings);
+      status.textContent = `Saved as shared revision ${state.orbSettingsRevision}. PC and laptop refresh automatically.`;
+      status.className = 'mobile-inline-status success';
+    } catch (error) {
+      if (error.status === 409 && error.current?.settings) {
+        state.orbSettings = {...error.current.settings};
+        state.orbSettingsRevision = Number(error.current.revision || 0);
+        setOrbSettingsInputs(state.orbSettings);
+      }
+      status.textContent = `${error.status === 409 ? 'Settings changed on another device' : 'Save blocked'}: ${error.message}`;
+      status.className = 'mobile-inline-status error';
+    } finally {
+      state.orbSettingsSaving = false;
+      renderOrbSettingsAccess();
+    }
   }
 
   async function changeOperatorControl(target) {
@@ -401,6 +548,7 @@
       status.textContent = `Operator Control is now ${target.label}.`;
       status.className = 'mobile-inline-status success';
       renderMobileWorkspace();
+      void loadOrbSettings();
     } catch (error) {
       status.textContent = `Control was not changed: ${error.message}`;
       status.className = 'mobile-inline-status error';
@@ -1025,6 +1173,10 @@
       state.liveUpdateRefreshTimer = null;
       if (event?.kind === 'operator_control') {
         void refreshStatusStrip();
+        return;
+      }
+      if (event?.kind === 'orb_settings') {
+        void loadOrbSettings();
         return;
       }
       void refreshCanonicalPlanning();
@@ -3347,6 +3499,16 @@
       mobileMenuPopover.hidden = false;
       syncDisplaySettingInputs();
     });
+    byId('mobile-orb-settings-form').addEventListener('submit', saveOrbSettings);
+    byId('orb-settings-defaults').addEventListener('click', () => {
+      setOrbSettingsInputs(ORB_SETTINGS_DEFAULTS);
+      const status = byId('orb-settings-status');
+      status.textContent = 'Defaults loaded. Tap Save shared settings to apply them.';
+      status.className = 'mobile-inline-status';
+    });
+    Object.values(ORB_INPUTS).forEach(id => byId(id).addEventListener('input', event => {
+      event.target.setCustomValidity('');
+    }));
     byId('publish-today-plan').addEventListener('click', publishTodayPlan);
     byId('buy-board-refresh').addEventListener('click', () => loadBuyBoard(false));
     byId('buy-board-action-close').addEventListener('click', closeBuyBoardActionSheet);
@@ -3700,7 +3862,7 @@
       byId('planning-eyebrow').textContent = state.session.mode === 'CONNECTED' ? 'PC PLANNING' : 'LOCAL PLANNING';
       connectLiveUpdates();
       startStatusStripRefresh();
-      await Promise.all([loadScanner(), refreshPlanningLists()]);
+      await Promise.all([loadScanner(), refreshPlanningLists(), loadOrbSettings()]);
       const remembered = localStorage.getItem('quant-web-symbol');
       const initial = state.scanner.find(row => row.symbol === remembered)?.symbol || state.scanner[0]?.symbol;
       if (initial) await selectSymbol(initial);

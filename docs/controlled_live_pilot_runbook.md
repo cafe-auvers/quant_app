@@ -87,7 +87,7 @@ Gate-4 evidence records the effective numeric ceiling from this same final
 broker-boundary check for every candidate, so a percentage-only profile does
 not require an artificial fixed dollar cap.
 Every entry also passes the current user-selected ORB capital-allocation upper
-bound (25% of fresh account NAV by default). The portfolio governor applies
+bound (30% of fresh account NAV by default). The portfolio governor applies
 that setting to the symbol's filled and projected exposure. Separately, it
 rejects a BUY that would raise aggregate gross notional above 100% of NAV.
 Protective SELLs are not blocked by the entry cap. The shared scheduler

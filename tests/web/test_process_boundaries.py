@@ -203,6 +203,12 @@ def test_mobile_layout_uses_a_scrollable_stock_drawer_and_chart_edges():
     assert 'aria-selected="true" class="active" data-mobile-list="watchlist"' in page_source
     assert "listMode: 'watchlist'" in script_source
     assert 'id="display-settings-reset"' in page_source
+    assert 'id="mobile-orb-settings-form"' in page_source
+    assert 'id="orb-capital-max"' in page_source
+    assert 'id="orb-stop-adr-max"' in page_source
+    assert "capital_max_percent: 30" in script_source
+    assert "api('/api/v1/operator/orb-settings'" in script_source
+    assert "PC and laptop refresh automatically" in script_source
     assert 'data-display-setting="relativeStrength"' in page_source
     assert 'data-display-setting="marketAlignment"' in page_source
     assert 'id="mobile-logout-button"' in page_source

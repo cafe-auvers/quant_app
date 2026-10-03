@@ -85,6 +85,7 @@ PULL_ERROR = "error"
 PUSH_WRITTEN = "written"
 PUSH_CONFLICT = "conflict"
 PUSH_NOT_MAIN = "not_main"
+PUSH_NOT_OPERATOR = "not_operator"
 PUSH_ERROR = "error"
 
 _ensured_engines: weakref.WeakSet[Engine] = weakref.WeakSet()
@@ -1697,4 +1698,111 @@ def push_state(
         )
     except (SQLAlchemyError, ValueError, TypeError) as exc:
         logger.info("State sync push failed for %s: %s", state_key, exc)
+        return PushResult(PUSH_ERROR, error=str(exc))
+
+
+def push_operator_controlled_settings(
+    engine: Optional[Engine],
+    payload: Dict[str, Any],
+    *,
+    role: LocalDeviceRole,
+    expected_revision: int,
+) -> PushResult:
+    """CAS-update shared settings from the current Operator Control owner.
+
+    Ordinary synchronized documents remain exclusive to the Main device.
+    Settings are the narrow exception because they are an explicit operator
+    input that must be editable from the authenticated mobile controller. The
+    transaction re-verifies Operator Control under a row lock and can update
+    only the ``settings`` state row; it cannot transfer execution ownership or
+    mutate any planning/execution document.
+    """
+
+    if engine is None:
+        return PushResult(PUSH_ERROR, error="State sync database is unavailable.")
+    if not str(role.device_id or "").strip():
+        return PushResult(
+            PUSH_NOT_OPERATOR,
+            error="This operator has no shared device identity.",
+        )
+    try:
+        expected_revision = int(expected_revision)
+        if expected_revision < 0:
+            raise ValueError("expected_revision must be non-negative")
+        payload_json = json.dumps(payload, default=str, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:
+        return PushResult(PUSH_ERROR, error=str(exc))
+
+    try:
+        table = _ensure_state_sync_table(engine)
+        with engine.begin() as conn:
+            operator_row = _select_row(
+                conn,
+                table,
+                OPERATOR_CONTROL_KEY,
+                for_update=True,
+            )
+            if operator_row is None:
+                return PushResult(
+                    PUSH_NOT_OPERATOR,
+                    error="Operator Control has not been assigned.",
+                )
+            operator = _operator_control_from_state(
+                _remote_state_from_row(operator_row, OPERATOR_CONTROL_KEY)
+            )
+            if operator.locked or operator.device_id != role.device_id:
+                return PushResult(
+                    PUSH_NOT_OPERATOR,
+                    error="Another device owns Operator Control.",
+                )
+
+            current_row = _select_row(conn, table, SETTINGS_KEY, for_update=True)
+            current_revision = int(current_row.revision or 1) if current_row else 0
+            if current_revision != expected_revision:
+                return PushResult(
+                    PUSH_CONFLICT,
+                    revision=current_revision,
+                    error=(
+                        "Remote settings revision changed from "
+                        f"{expected_revision} to {current_revision}."
+                    ),
+                )
+
+            new_revision = current_revision + 1
+            values = {
+                "payload": payload_json,
+                "revision": new_revision,
+                "updated_at": _server_now(engine),
+                "updated_by_host": role.hostname,
+                "updated_by_device": role.device_id,
+            }
+            if current_row is None:
+                conn.execute(
+                    table.insert().values(state_key=SETTINGS_KEY, **values)
+                )
+            else:
+                result = conn.execute(
+                    table.update()
+                    .where(table.c.state_key == SETTINGS_KEY)
+                    .where(table.c.revision == current_revision)
+                    .values(**values)
+                )
+                if result.rowcount != 1:
+                    return PushResult(
+                        PUSH_CONFLICT,
+                        revision=current_revision,
+                        error="Remote settings changed during the save.",
+                    )
+            written_row = _select_row(conn, table, SETTINGS_KEY)
+
+        if written_row is None:
+            return PushResult(PUSH_ERROR, error="Remote settings write disappeared.")
+        written = _remote_state_from_row(written_row, SETTINGS_KEY)
+        return PushResult(
+            PUSH_WRITTEN,
+            revision=written.revision,
+            updated_at=written.updated_at,
+        )
+    except (SQLAlchemyError, ValueError, TypeError) as exc:
+        logger.info("Operator-controlled settings push failed: %s", exc)
         return PushResult(PUSH_ERROR, error=str(exc))

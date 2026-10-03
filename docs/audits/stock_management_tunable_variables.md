@@ -8,10 +8,11 @@
 > but are marked resolved where applicable.
 >
 > Post-audit resolution (2026-10-03): executable entry controls now enforce a
-> user-adjustable maximum for one position (25% of NAV by default) and a hard
+> user-adjustable maximum for one position (30% of NAV by default) and a hard
 > 100%-of-NAV maximum for aggregate filled plus projected gross notional.
-> Historical 30%/200% findings below are retained as audit evidence and no
-> longer describe the active defaults.
+> Historical 25%/200% findings below are retained as audit evidence and no
+> longer describe the active defaults. The six ORB bounds are revisioned shared
+> settings editable from the desktop or authenticated mobile Operator Control.
 
 Audit date: 2026-08-24
 Scope: repository and local effective non-secret configuration present on the audited workstation
@@ -32,7 +33,7 @@ The executable correctness findings from this audit have now been addressed:
 - the Buy Board position header reads the enforced portfolio position limit;
 - the gross-notional fallback and deployment value are now a hard 1.0 (100%),
   while the synchronized ORB single-position ceiling remains user-adjustable
-  with a 25%-of-fresh-NAV default;
+  with a 30%-of-fresh-NAV default;
 - `settings.json` and `scanner_setups.json` join revisioned cross-device sync
   and the atomic full-plan snapshot under coordination profile
   `operator-executor-sync-v8`;
@@ -96,7 +97,7 @@ The five percentage hazards counted above are: (1) `risk_percent` fraction versu
 2. **The visible position limit disagrees with enforcement.** Current local enforcement is 20 positions (`.env:148`), while the Buy Board always renders and colors against 30 (`src/ui/buyboard/board.py:74,140,420-424`). The code and example fallback are also 30.
 3. **The account-equity sizing base has incompatible fallbacks.** The visible planner initializes to $100,000, while scoring and the dashboard's manual fallback use $10,000. Configured production execution correctly replaces both with fresh KIS total equity and fails closed when that snapshot is unavailable (`src/ui/charts/controller_layout.py:148`; `src/core/scoring.py:68`; `src/ui/mixins/dashboard_mixin.py:1161-1199,1219-1238`). Any future setting must stay planning-only and never override broker equity in production.
 4. **Gross exposure is intentionally capable of leverage and currently equals 2.0 (200%).** The fallback/dataclass value is 10.0 (1,000%), and validation has no finite maximum (`.env:150`; `src/core/execution_config.py:368-370`; `src/risk/portfolio.py:36,46-66`). A missing local override silently expands the governor fivefold.
-5. **ORB settings are already mutable but device-local.** Effective values are capital 10/17.5/28% and stop/ADR 20/65/90%, while code fallbacks are 10/17.5/30 and 15/65/66. `settings` and `scanner_setups` are absent from `SYNCED_STATE_KEYS`, so laptop and PC can rank or reject different plans (`data/settings.json:2-9`; `src/services/state_sync.py:64`).
+5. **Resolved after the audit: ORB settings were mutable but device-local.** The active defaults are capital 10/17.5/30% and stop/ADR 15/65/66%. `settings` and `scanner_setups` now belong to `SYNCED_STATE_KEYS`; desktop edits use the normal Main-device save path, while authenticated mobile edits use a narrow Operator-Control-authorized CAS update of only the shared settings row. Typed change pulses make PC and laptop reload the new revision automatically.
 6. **`stop_adr` has incompatible meanings.** ORB sizing stores stop distance as a percentage of ADR, but outage classification divides a dollar price distance by `card.stop_adr` as if it were a dollar ATR value (`src/risk/orb_position.py:173-177`; `src/services/trading_engine.py:202-205`). The outage tier can be dimensionally wrong.
 7. **Protective-exit price floors differ by path.** The shared command path floors a marketable sell at $0.01; the legacy stop path permits $0.0001 (`src/core/exit_execution_command.py:67-80`; `src/ui/buylist/actions.py:665-674`).
 8. **Documented and implemented exit choices diverge.** UI/rulebooks say sell 1/3–1/2 and use a selected 10/20 EMA; runtime always calculates one third and prioritizes EMA10 before EMA20 (`src/core/exit_policy.py:52-74`; `src/ui/buylist/view.py:175`; `README.md:33`). Legacy `take_profit`/`target_price` fields also remain even though the active ORB contract explicitly has no fixed profit target.
@@ -728,21 +729,26 @@ These are relationships proved by the current code, not proposed policy.
 | WF-001/WF-002 | user transition graph cannot bypass unresolved order; one card key only | `src/core/kanban_transitions.py:26-136` | invalid command/duplicate card error |
 | BROKER-001/BROKER-002/BROKER-004/BROKER-006 | engine true is insufficient; live mode, switch, lease, reconciliation, verified WS, budget, capital and risk gates all required | `src/core/execution_config.py:409-421`; `src/services/controlled_live_policy.py:49-111` | fail closed before broker mutation |
 | INT-001 | engine sleep is `max(1ms, delay*1000)` while the queue-drain budget is `max(queue_delay, delay+queue_delay)`; device-heartbeat max age is `>= heartbeat cadence+60`; several coordination polls have non-overridable floors | `src/core/execution_config.py:89-180`; `src/ui/buyboard/runtime_worker.py:263-265,931,998,2573-2576` | a non-positive engine delay spins near1ms and adds no drain allowance; the remaining floors protect failover/RU budget |
-| INT-003 | synchronized config must be versioned/atomic with active plan state; current key set excludes settings/scanner | `src/services/state_sync.py:59-64,902-905` | today, changing one device does not update the other |
+| INT-003 | synchronized config must be versioned/atomic with active plan state | `src/services/state_sync.py`; `src/services/app_state.py`; `src/web/connected_operator.py` | RESOLVED for settings/scanner: both are revisioned; mobile ORB changes require Operator Control and CAS |
 
 ## 6. Recommended first-wave settings
 
-These ten are the strongest initial dashboard candidates. They already have clear units, runtime consumers, validation, and behavior-preserving defaults. The required synchronization strategy for all ten is a **single versioned, canonical settings payload in the coordination/state store**, atomically published with a revision and pulled by both PC and laptop. Apply a new revision only while the market is closed and no affected entry is pending; persist the revision used to build each queue candidate so an old plan cannot be silently reinterpreted. Local JSON may remain a cache, not the authority. This is a recommendation only—no sync/config change was made.
+These ten were the strongest initial dashboard candidates. The recommended
+versioned canonical payload is now implemented for ORB settings and scanner
+setups. PC and laptop keep local JSON caches but reconcile against the shared
+revision; mobile ORB edits use optimistic concurrency and cannot write another
+synchronized document or bypass Operator Control. The remaining
+candidate-specific guards in the table still apply.
 
 | Rank | Candidate/field | Current effective default | Why first wave | Required guard before implementation |
 |---:|---|---:|---|---|
 | 1 | ENTRY-002 — Legacy/planning breakout buffer | 0.1% dashboard /0.001 fraction | Already visible and persisted for planning compatibility, but not the active broker trigger | Rename to avoid execution ambiguity; replace points/fraction ambiguity with unit-tagged schema; sync revision |
 | 2 | SIZE-001 — ORB minimum capital | 10% | Existing validated dialog and authoritative runtime consumer | Apply only to new/refreshed plans; sync revision |
 | 3 | SIZE-002 — ORB ideal capital | 17.5% | Ranking-only, bounded by min/max | Enforce `min<=ideal<=max` atomically |
-| 4 | SIZE-003 — ORB maximum capital | 28% | Clear rejection boundary and maximum100% code bound | Expert warning; respect portfolio/buying power; preserve upper-exclusive semantics |
-| 5 | SIZE-004 — ORB minimum stop/ADR | 20% of ADR | Existing validation and clear unit | Store explicitly as percent-of-ADR, not ATR dollars |
+| 4 | SIZE-003 — ORB maximum capital | 30% | Clear rejection boundary and maximum100% code bound | Expert warning; respect portfolio/buying power; upper bound is inclusive |
+| 5 | SIZE-004 — ORB minimum stop/ADR | 15% of ADR | Existing validation and clear unit | Store explicitly as percent-of-ADR, not ATR dollars |
 | 6 | SIZE-005 — ORB ideal stop/ADR | 65% of ADR | Ranking-only and cross-field bounded | Atomic three-field validation |
-| 7 | SIZE-006 — ORB maximum stop/ADR | 90% of ADR | Existing validator and clear current behavior | Expert warning; keep independent `stop_loss%<ADR%` check |
+| 7 | SIZE-006 — ORB maximum stop/ADR | 66% of ADR | Existing validator and clear current behavior | Expert warning; keep independent `stop_loss%<ADR%` check |
 | 8 | FILTER-003 — Setup1 minimum daily volume | 40,000 shares | Existing editable scanner rule, direct eligibility effect | Version metric/rule schema and sync scanner setups |
 | 9 | FILTER-003 — Setup1 minimum daily dollar volume | $35,000/day | Existing editable rule and clear unit | Resolve help-text $500k conflict before label/help release |
 | 10 | FILTER-003 — Setup1 minimum ADR20 | 2.4 percentage points | Existing editable rule, metric window identified | Bind to metric definition/version; retain percentage-points representation |
@@ -800,6 +806,6 @@ SEC-001 through SEC-008—KIS application key/secret, account/product identifier
 - Confirmed every master candidate has at least one exact file/line evidence reference and occurrence entry.
 - Confirmed every SAFE/CONDITIONAL row states units, internal/dashboard representation, validation, bounds (or `null` with basis), cross-field constraints, timing, restart/open-order/open-position implications, and an unchanged proposed default.
 - Compared production composition with test-friendly fallbacks: notably TradingEngine’s always-open/never-EOD constructor default, injected clocks/sleepers, permissive risk fixtures, and controlled-live mutation policy.
-- Confirmed local `settings.json` and `scanner_setups.json` are not in live `SYNCED_STATE_KEYS`; `.env` and `.env.pc` currently agree for the non-secret audited overrides.
+- The original audit confirmed `settings.json` and `scanner_setups.json` were absent from `SYNCED_STATE_KEYS`; remediation added both to the live revisioned key set and full-plan publication.
 - Confirmed database schema contains scanner/cache fields but no separate relational defaults/constraints for these trade-risk settings.
 - Confirmed only this Markdown audit was added. No Python source, runtime JSON, environment file, database schema, test, or production behavior was changed.

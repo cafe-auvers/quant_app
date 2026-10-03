@@ -338,6 +338,16 @@ input::placeholder { color: #65776f; }
   .mobile-inline-status { min-height: 18px; margin-top: 8px; color: var(--muted); font-size: 9px; line-height: 1.4; }
   .mobile-inline-status.success { color: var(--green); }
   .mobile-inline-status.error { color: #ff9ba4; }
+  .mobile-orb-settings form { display: grid; gap: 9px; }
+  .mobile-orb-settings fieldset { min-width: 0; margin: 0; padding: 8px; border: 1px solid var(--line-soft); border-radius: 9px; background: #091713; }
+  .mobile-orb-settings legend { padding: 0 5px; color: var(--muted); font-size: 9px; font-weight: 850; }
+  .mobile-orb-inputs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+  .mobile-orb-inputs label { min-width: 0; display: grid; gap: 4px; color: var(--faint); font-size: 8px; font-weight: 800; }
+  .mobile-orb-inputs input { min-width: 0; min-height: 38px; padding: 0 7px; text-align: right; font-size: 12px; font-weight: 800; font-variant-numeric: tabular-nums; }
+  .mobile-orb-actions { display: grid; grid-template-columns: minmax(0, .8fr) minmax(0, 1.2fr); gap: 7px; }
+  .mobile-orb-actions button { min-width: 0; min-height: 40px; padding: 0 7px; border: 1px solid #315548; border-radius: 8px; color: var(--ink); background: #132a23; font-size: 9px; font-weight: 900; }
+  #orb-settings-save { color: #07110f; border-color: var(--green); background: var(--green); }
+  .mobile-orb-actions button:disabled { color: var(--faint); border-color: var(--line); background: #101c18; }
   .mobile-pulse-hero strong { font-size: 22px; }
   .mobile-pulse-components { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; margin: 9px 0; }
   .mobile-pulse-component { min-width: 0; min-height: 64px; display: grid; place-items: center; align-content: center; gap: 5px; border: 1px solid var(--line); border-radius: 10px; color: var(--muted); background: #0d201a; font-size: 9px; font-weight: 900; }
