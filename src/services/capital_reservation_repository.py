@@ -714,9 +714,17 @@ def _require_projected_portfolio_capacity(
     baseline_gross = float(
         getattr(spec, "baseline_gross_notional_usd", 0.0) or 0.0
     )
+    baseline_symbol_notional = float(
+        getattr(spec, "baseline_symbol_notional_usd", 0.0) or 0.0
+    )
     if not all(
         math.isfinite(value) and value >= 0
-        for value in (equity, baseline_open_risk, baseline_gross)
+        for value in (
+            equity,
+            baseline_open_risk,
+            baseline_gross,
+            baseline_symbol_notional,
+        )
     ) or equity <= 0:
         raise ProjectedPortfolioRiskLimitError(
             "Entry blocked: fresh positive account equity and finite projected exposure "
@@ -761,6 +769,25 @@ def _require_projected_portfolio_capacity(
     if max_gross_fraction > 0 and gross_after / equity > max_gross_fraction:
         reasons.append(
             f"gross notional {gross_after / equity:.2%} exceeds {max_gross_fraction:.2%}"
+        )
+    max_single_position_fraction = float(
+        getattr(spec, "max_single_position_notional_fraction", 0.0) or 0.0
+    )
+    active_symbol_gross = sum(
+        float(row.remaining_reserved_notional or 0.0)
+        for row in active_rows
+        if str(row.symbol or "").upper() == reservation.symbol
+    )
+    symbol_notional_after = (
+        baseline_symbol_notional + active_symbol_gross + proposed_notional
+    )
+    if (
+        max_single_position_fraction > 0
+        and symbol_notional_after / equity > max_single_position_fraction
+    ):
+        reasons.append(
+            f"single-position notional {symbol_notional_after / equity:.2%} "
+            f"exceeds {max_single_position_fraction:.2%}"
         )
     if reasons:
         raise ProjectedPortfolioRiskLimitError(

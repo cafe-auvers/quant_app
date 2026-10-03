@@ -169,7 +169,7 @@ def test_pending_buy_without_open_reservation_stays_in_atomic_risk_baseline(
         PortfolioRiskLimits(
             max_simultaneous_positions=30,
             max_total_open_risk_fraction=0.20,
-            max_gross_notional_fraction=10.0,
+            max_gross_notional_fraction=1.0,
         )
     ).evaluate_entry(
         ProposedPortfolioEntry(

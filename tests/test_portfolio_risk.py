@@ -58,10 +58,12 @@ def test_controlled_live_defaults_and_hard_position_ceiling():
 
     assert limits.max_simultaneous_positions == 30
     assert limits.max_total_open_risk_fraction == 0.10
-    assert limits.max_gross_notional_fraction == 2.0
+    assert limits.max_gross_notional_fraction == 1.0
     assert MAX_PORTFOLIO_POSITIONS == 30
     with pytest.raises(ValueError, match="between 1 and 30"):
         PortfolioRiskLimits(max_simultaneous_positions=31)
+    with pytest.raises(ValueError, match="cannot exceed 1.0"):
+        PortfolioRiskLimits(max_gross_notional_fraction=1.01)
 
 
 def test_thirtieth_unique_projected_position_is_permitted():
@@ -140,28 +142,52 @@ def test_controlled_and_full_live_open_risk_boundaries(open_risk_limit):
     assert any("total open risk" in reason for reason in rejected.reasons)
 
 
-def test_two_hundred_percent_gross_notional_is_an_extreme_ceiling_only():
+def test_one_hundred_percent_gross_notional_is_a_hard_ceiling():
     manager = PortfolioRiskManager(PortfolioRiskLimits())
 
     below = manager.evaluate_entry(
         _proposal(),
-        _snapshot(projected_exposures=(_projected("AAPL", gross=18_999.99),)),
+        _snapshot(projected_exposures=(_projected("AAPL", gross=8_999.99),)),
     )
     at_limit = manager.evaluate_entry(
         _proposal(),
-        _snapshot(projected_exposures=(_projected("AAPL", gross=19_000.0),)),
+        _snapshot(projected_exposures=(_projected("AAPL", gross=9_000.0),)),
     )
     above = manager.evaluate_entry(
         _proposal(),
-        _snapshot(projected_exposures=(_projected("AAPL", gross=19_000.01),)),
+        _snapshot(projected_exposures=(_projected("AAPL", gross=9_000.01),)),
     )
 
     assert below.approved is True
     assert below.reasons == ()
     assert at_limit.approved is True
-    assert at_limit.gross_notional_after_usd == 20_000.0
+    assert at_limit.gross_notional_after_usd == 10_000.0
     assert above.approved is False
     assert any("gross notional" in reason for reason in above.reasons)
+
+
+def test_single_symbol_filled_and_projected_exposure_cannot_exceed_25_percent():
+    manager = PortfolioRiskManager(PortfolioRiskLimits())
+    existing = PortfolioPositionRisk("AAPL", 10, 100.0, 95.0, "ORB")
+
+    at_limit = manager.evaluate_entry(
+        _proposal(symbol="AAPL"),
+        _snapshot(
+            positions=(existing,),
+            projected_exposures=(_projected("AAPL", gross=500.0),),
+        ),
+    )
+    above = manager.evaluate_entry(
+        _proposal(symbol="AAPL"),
+        _snapshot(
+            positions=(existing,),
+            projected_exposures=(_projected("AAPL", gross=500.01),),
+        ),
+    )
+
+    assert at_limit.approved is True
+    assert above.approved is False
+    assert any("single-position notional" in reason for reason in above.reasons)
 
 
 def test_approves_entry_within_all_aggregate_limits():

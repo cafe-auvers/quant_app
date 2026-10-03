@@ -11,15 +11,14 @@ The tracked defaults are the Controlled Live profile:
 |---|---:|
 | Simultaneous filled/projected symbols | 30 |
 | Total filled/projected open risk | 10% of account equity |
-| Total filled/projected gross notional | 200% of account equity |
+| Maximum single position | 25% of account equity |
+| Total filled/projected gross notional | 100% of account equity |
 
-The gross-notional limit is an extreme final safety ceiling for corrupted
-quantities, erroneous prices, excessive leverage, or unit-conversion defects.
-It does not warn, restrict, or create UI noise below the ceiling. A 200%
-gross ceiling permits leverage; regulators warn that margin can amplify
-losses and can lead to forced liquidation. See the
-[SEC margin bulletin](https://www.sec.gov/investor/alerts/ib_marginaccounts.pdf)
-and [FINRA brokerage-account guidance](https://www.finra.org/investors/investing/investment-accounts/brokerage-accounts).
+The gross-notional limit is a final safety ceiling for corrupted quantities,
+erroneous prices, leverage, or unit-conversion defects. It does not warn,
+restrict, or create UI noise below the ceiling. The 100% boundary prevents the
+strategy from deliberately using margin. Independently, the ORB pre-trade
+boundary rejects any one position above 25% of fresh NAV.
 
 ## Operating profiles
 
@@ -31,10 +30,10 @@ promotion is an explicit configuration decision, never a silent migration.
 |---|---:|---:|
 | `PORTFOLIO_MAX_SIMULTANEOUS_POSITIONS` | `30` | `30` |
 | `PORTFOLIO_MAX_TOTAL_OPEN_RISK_FRACTION` | `0.10` | `0.20` |
-| `PORTFOLIO_MAX_GROSS_NOTIONAL_FRACTION` | `2.0` | `2.0` |
+| `PORTFOLIO_MAX_GROSS_NOTIONAL_FRACTION` | `1.0` | `1.0` |
 
 All percentage settings are decimal fractions. `0.10` is 10%, `0.20` is 20%,
-and `2.0` is 200% of fresh account equity. The only setting changed when
+and `1.0` is 100% of fresh account equity. The only setting changed when
 moving from Controlled Live to this Full Live starting profile is
 `PORTFOLIO_MAX_TOTAL_OPEN_RISK_FRACTION=0.20`.
 

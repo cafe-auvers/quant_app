@@ -50,7 +50,7 @@ def _configure_controlled_live(monkeypatch) -> None:
     monkeypatch.setattr(
         execution_config, "PORTFOLIO_MAX_TOTAL_OPEN_RISK_FRACTION", 0.10
     )
-    monkeypatch.setattr(execution_config, "PORTFOLIO_MAX_GROSS_NOTIONAL_FRACTION", 2.0)
+    monkeypatch.setattr(execution_config, "PORTFOLIO_MAX_GROSS_NOTIONAL_FRACTION", 1.0)
     monkeypatch.setattr(execution_config, "is_buyboard_engine_enabled", lambda: True)
 
 
@@ -206,7 +206,7 @@ def test_controlled_live_configuration_requires_no_retry_spacing_and_budgets(
     (
         ("PORTFOLIO_MAX_SIMULTANEOUS_POSITIONS", 31),
         ("PORTFOLIO_MAX_TOTAL_OPEN_RISK_FRACTION", 0.11),
-        ("PORTFOLIO_MAX_GROSS_NOTIONAL_FRACTION", 2.01),
+        ("PORTFOLIO_MAX_GROSS_NOTIONAL_FRACTION", 1.01),
     ),
 )
 def test_controlled_live_rejects_risk_limits_above_reviewed_profile(

@@ -273,7 +273,7 @@ def calculate_deterministic_scores(
         warnings.append(f"Daily dollar volume (${dollar_volume:,.2f}) is below $35,000")
     if stop_loss_percent >= adr_percent:
         warnings.append(f"Stop loss % ({stop_loss_percent:.2f}%) is wider than ADR 20-day ({adr_percent:.2f}%)")
-    if capital_percent >= orb_settings.capital_max_percent:
+    if capital_percent > orb_settings.capital_max_percent:
         warnings.append(
             f"Capital allocation ({capital_percent:.2f}%) exceeds hard limit of "
             f"{orb_settings.capital_max_percent:g}%"
