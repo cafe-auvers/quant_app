@@ -11,14 +11,15 @@ The tracked defaults are the Controlled Live profile:
 |---|---:|
 | Simultaneous filled/projected symbols | 30 |
 | Total filled/projected open risk | 10% of account equity |
-| Maximum single position | 25% of account equity |
+| Maximum single position | User-selected ORB upper bound; 25% default |
 | Total filled/projected gross notional | 100% of account equity |
 
 The gross-notional limit is a final safety ceiling for corrupted quantities,
 erroneous prices, leverage, or unit-conversion defects. It does not warn,
 restrict, or create UI noise below the ceiling. The 100% boundary prevents the
 strategy from deliberately using margin. Independently, the ORB pre-trade
-boundary rejects any one position above 25% of fresh NAV.
+boundary rejects any one position above the current user-selected capital
+allocation upper bound (25% by default).
 
 ## Operating profiles
 

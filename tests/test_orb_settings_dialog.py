@@ -28,7 +28,7 @@ def test_orb_settings_dialog_shows_defaults_and_restores_them():
     custom = OrbSettings(
         capital_min_percent=12.0,
         capital_ideal_percent=20.0,
-        capital_max_percent=25.0,
+        capital_max_percent=35.0,
         stop_adr_min_percent=25.0,
         stop_adr_ideal_percent=55.0,
         stop_adr_max_percent=80.0,
@@ -61,7 +61,7 @@ def test_main_window_saves_and_applies_accepted_orb_settings(monkeypatch):
     custom = OrbSettings(
         capital_min_percent=12.0,
         capital_ideal_percent=22.0,
-        capital_max_percent=25.0,
+        capital_max_percent=36.0,
         stop_adr_min_percent=20.0,
         stop_adr_ideal_percent=50.0,
         stop_adr_max_percent=75.0,

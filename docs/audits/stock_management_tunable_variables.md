@@ -8,9 +8,10 @@
 > but are marked resolved where applicable.
 >
 > Post-audit resolution (2026-10-03): executable entry controls now enforce a
-> 25%-of-NAV maximum for one position and a 100%-of-NAV maximum for aggregate
-> filled plus projected gross notional. Historical 30%/200% findings below are
-> retained as audit evidence and no longer describe the active defaults.
+> user-adjustable maximum for one position (25% of NAV by default) and a hard
+> 100%-of-NAV maximum for aggregate filled plus projected gross notional.
+> Historical 30%/200% findings below are retained as audit evidence and no
+> longer describe the active defaults.
 
 Audit date: 2026-08-24
 Scope: repository and local effective non-secret configuration present on the audited workstation
@@ -29,8 +30,9 @@ The executable correctness findings from this audit have now been addressed:
   boundary, and unmarked already-persisted cards receive a one-time compatible
   conversion.
 - the Buy Board position header reads the enforced portfolio position limit;
-- the gross-notional fallback and deployment value are now 1.0 (100%), and
-  the ORB single-position ceiling is 25% of fresh NAV;
+- the gross-notional fallback and deployment value are now a hard 1.0 (100%),
+  while the synchronized ORB single-position ceiling remains user-adjustable
+  with a 25%-of-fresh-NAV default;
 - `settings.json` and `scanner_setups.json` join revisioned cross-device sync
   and the atomic full-plan snapshot under coordination profile
   `operator-executor-sync-v8`;

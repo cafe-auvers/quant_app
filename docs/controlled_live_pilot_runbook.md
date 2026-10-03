@@ -83,10 +83,10 @@ again for every BUY from the fresh, exact-account KIS total-equity snapshot
 (cash plus the current value of positions). A missing or stale equity snapshot
 blocks the BUY. When both a percentage cap and fixed USD ceiling are
 configured, the lower ceiling wins.
-Every entry also passes the ORB single-position boundary: one symbol may use
-at most 25% of fresh account NAV. The portfolio governor includes filled and
-projected exposure and rejects a BUY that would raise aggregate gross notional
-above 100% of NAV.
+Every entry also passes the current user-selected ORB capital-allocation upper
+bound (25% of fresh account NAV by default). The portfolio governor applies
+that setting to the symbol's filled and projected exposure. Separately, it
+rejects a BUY that would raise aggregate gross notional above 100% of NAV.
 Protective SELLs are not blocked by the entry cap. The shared scheduler
 enforces process-wide spacing across endpoints and performs one mutation
 attempt only. The low-level KIS token-expiry branches also do not repeat a
