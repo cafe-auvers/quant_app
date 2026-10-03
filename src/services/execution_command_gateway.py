@@ -1631,6 +1631,9 @@ class ExecutionCommandGateway:
                     "active_trade_card": context.get("active_trade_card") is True,
                     "risk_rechecked_atomically": context.get("risk_rechecked_atomically")
                     is True,
+                    "effective_entry_notional_cap": float(
+                        context.get("effective_entry_notional_cap", 0.0) or 0.0
+                    ),
                 },
             )
         scheduler = self._require_mutation_budget()
@@ -2529,7 +2532,7 @@ class ExecutionCommandGateway:
             # Recheck at the last possible moment because lease/database work
             # above may consume most of the approval's short TTL.
             final_portfolio_risk_spec = require_current_entry_risk_approval()
-            require_live_entry_allowed(
+            effective_entry_notional_cap = require_live_entry_allowed(
                 environment=environment,
                 account_no=account_no,
                 symbol=symbol,
@@ -2604,6 +2607,7 @@ class ExecutionCommandGateway:
                     "risk_rechecked_atomically": bool(
                         is_new_entry and final_portfolio_risk_spec is not None
                     ),
+                    "effective_entry_notional_cap": effective_entry_notional_cap,
                 },
             )
         except Exception as exc:

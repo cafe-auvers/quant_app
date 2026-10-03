@@ -227,6 +227,52 @@ def test_gate4_accepts_more_than_the_three_session_minimum():
     assert report["result"] == "PASSED"
 
 
+def test_gate4_accepts_entry_specific_nav_caps_when_nav_changes():
+    passing = _passing_gate4()
+    upstream = _passing_gate3()
+    evidence = dict(passing["evidence"])
+    evidence.update(
+        {
+            "gate3_report_sha256": canonical_report_sha256(upstream),
+            "entry_candidate_count": 2,
+            "reviewed_entry_notional_cap": 500.0,
+            "max_observed_entry_notional": 900.0,
+            "observed_entry_notional_envelopes": [
+                {"notional": 900.0, "effective_cap": 1_000.0},
+                {"notional": 400.0, "effective_cap": 500.0},
+            ],
+        }
+    )
+
+    report = build_gate4(evidence, upstream_gate3_report=upstream)
+
+    assert report["result"] == "PASSED"
+
+
+def test_gate4_rejects_an_entry_that_exceeds_its_nav_derived_cap():
+    passing = _passing_gate4()
+    upstream = _passing_gate3()
+    evidence = dict(passing["evidence"])
+    evidence.update(
+        {
+            "gate3_report_sha256": canonical_report_sha256(upstream),
+            "reviewed_entry_notional_cap": 500.0,
+            "max_observed_entry_notional": 900.0,
+            "observed_entry_notional_envelopes": [
+                {"notional": 900.0, "effective_cap": 500.0}
+            ],
+        }
+    )
+
+    report = build_gate4(evidence, upstream_gate3_report=upstream)
+
+    assert report["result"] == "FAILED"
+    assert any(
+        item["property"] == "reviewed_entry_notional_envelope"
+        for item in report["invariant_violations"]
+    )
+
+
 def _gate4_delta_inputs(changed_paths):
     baseline = _passing_gate4()
     current_commit = "b" * 40

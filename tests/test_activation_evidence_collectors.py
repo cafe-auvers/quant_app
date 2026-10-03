@@ -346,7 +346,8 @@ def test_gate4_collector_derives_three_session_lifecycle(tmp_path):
             owner_count=1,
             lease_count=1,
             live_execution_mode="CONTROLLED_LIVE",
-            reviewed_entry_notional_cap=1_000.0,
+            reviewed_entry_notional_cap=0.0,
+            reviewed_entry_equity_fraction=1.0,
             approved_symbols=["AAPL"],
         )
         collector.record("MANUAL_ARM", session_date=session_date, source="MANUAL_UI")
@@ -357,6 +358,7 @@ def test_gate4_collector_derives_three_session_lifecycle(tmp_path):
                 session_date=session_date,
                 symbol="AAPL",
                 notional=500.0,
+                effective_entry_notional_cap=1_000.0,
                 active_trade_card=True,
                 risk_rechecked_atomically=True,
             )
@@ -459,6 +461,10 @@ def test_gate4_collector_derives_three_session_lifecycle(tmp_path):
         "2026-08-26",
     ]
     assert evidence["max_observed_entry_notional"] == 500.0
+    assert evidence["reviewed_entry_notional_cap"] == 1_000.0
+    assert evidence["observed_entry_notional_envelopes"] == [
+        {"notional": 500.0, "effective_cap": 1_000.0}
+    ]
 
 
 def test_gate4_runtime_observer_requires_explicit_open_session(tmp_path, monkeypatch):

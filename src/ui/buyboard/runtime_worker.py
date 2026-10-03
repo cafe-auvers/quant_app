@@ -627,6 +627,9 @@ class BuyboardRuntimeWorker(QThread):
             reviewed_entry_notional_cap=float(
                 execution_config.KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL
             ),
+            reviewed_entry_equity_fraction=float(
+                execution_config.KIS_CONTROLLED_LIVE_MAX_ENTRY_EQUITY_FRACTION
+            ),
             approved_symbols=list(controlled_live_symbols()),
             runtime_state=state.value,
         )

@@ -119,10 +119,12 @@ disarmed; arm only from the UI. The collector derives broker dispatches,
 terminal reconciliation, protected positions, disarm proof and delivered
 external alerts from runtime boundaries. It rejects events without an explicit
 open supervised session and ignores events outside that session's start/end
-window. Gate-4 qualification also requires a positive fixed
-`KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL`; an equity-fraction-only envelope is
-safe for ordinary controlled live but does not provide the single reviewed
-numeric cap required by the Gate-4 report.
+window. Gate-4 qualification accepts either a reviewed fixed
+`KIS_CONTROLLED_LIVE_MAX_ENTRY_NOTIONAL` or a reviewed positive
+`KIS_CONTROLLED_LIVE_MAX_ENTRY_EQUITY_FRACTION`. For the percentage-only
+profile, every entry records the fresh NAV-derived notional ceiling actually
+enforced at the final broker boundary, and the report checks the observed
+entry against that exact numeric ceiling.
 
 After at least three valid NYSE dates, independently review and finalize:
 

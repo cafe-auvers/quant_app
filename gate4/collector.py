@@ -171,8 +171,25 @@ class Gate4EvidenceCollector:
             for item in entries
             if str(item.get("symbol") or "").strip()
         }
-        caps = [float(item.get("reviewed_entry_notional_cap") or 0.0) for item in active_observations]
         notionals = [float(item.get("notional") or 0.0) for item in entries]
+        entry_caps = [
+            float(item.get("effective_entry_notional_cap") or 0.0)
+            for item in entries
+        ]
+        active_caps = [
+            float(item.get("reviewed_entry_notional_cap") or 0.0)
+            for item in active_observations
+        ]
+        # Record the exact final broker-boundary cap for dynamic NAV profiles.
+        # Retain the active-session fixed-cap fallback for older journals.
+        entry_envelopes = list(zip(notionals, entry_caps))
+        entry_caps_complete = bool(entries) and all(cap > 0 for cap in entry_caps)
+        fallback_cap = min((cap for cap in active_caps if cap > 0), default=0.0)
+        reviewed_caps = (
+            entry_caps
+            if entry_caps_complete
+            else ([fallback_cap] if fallback_cap > 0 else [])
+        )
         dispatched_entry_ids = {
             str(item.get("client_order_id") or "")
             for item in mutations
@@ -314,7 +331,7 @@ class Gate4EvidenceCollector:
         )
 
         return {
-            "evidence_schema_version": 2,
+            "evidence_schema_version": 3,
             "collector_derived": True,
             "commit_sha": self.commit_sha,
             "gate3_report_sha256": str(gate3_report_sha256 or "").lower(),
@@ -337,9 +354,12 @@ class Gate4EvidenceCollector:
             ),
             "every_buy_below_notional_cap": bool(
                 entries
-                and caps
-                and min(caps) > 0
-                and all(0 < value <= min(caps) for value in notionals)
+                and (
+                    all(0 < notional <= cap for notional, cap in entry_envelopes)
+                    if entry_caps_complete
+                    else fallback_cap > 0
+                    and all(0 < value <= fallback_cap for value in notionals)
+                )
             ),
             "portfolio_risk_rechecked_atomically": bool(
                 entries and all(item.get("risk_rechecked_atomically") is True for item in entries)
@@ -361,8 +381,14 @@ class Gate4EvidenceCollector:
             "supervised_regular_session_dates": supervised_dates,
             "controlled_live_config_sha256": controlled_live_config_sha256,
             "risk_limits_sha256": risk_limits_sha256,
-            "reviewed_entry_notional_cap": min(caps) if caps else 0.0,
+            "reviewed_entry_notional_cap": (
+                min(reviewed_caps) if reviewed_caps else 0.0
+            ),
             "max_observed_entry_notional": max(notionals) if notionals else 0.0,
+            "observed_entry_notional_envelopes": [
+                {"notional": notional, "effective_cap": cap}
+                for notional, cap in entry_envelopes
+            ],
             "approved_symbols": sorted(approved_symbols),
             "observed_entry_symbols": sorted(observed_symbols),
             "entry_candidate_count": len(entries),

@@ -165,16 +165,53 @@ def build_report(
     require_current_entry_coverage = not (
         carry_historical_coverage and entry_count == 0
     )
-    if require_current_entry_coverage and not (
+    envelope_rows = evidence_sequence(
+        evidence.get("observed_entry_notional_envelopes")
+    )
+    valid_dynamic_envelopes = False
+    if envelope_rows:
+        parsed_envelopes: list[tuple[float, float]] = []
+        try:
+            parsed_envelopes = [
+                (
+                    float(evidence_mapping(item).get("notional")),
+                    float(evidence_mapping(item).get("effective_cap")),
+                )
+                for item in envelope_rows
+            ]
+        except (TypeError, ValueError, OverflowError):
+            parsed_envelopes = []
+        valid_dynamic_envelopes = bool(
+            entry_count is not None
+            and len(parsed_envelopes) == entry_count
+            and all(
+                math.isfinite(notional)
+                and math.isfinite(cap)
+                and 0 < notional <= cap
+                for notional, cap in parsed_envelopes
+            )
+            and math.isfinite(notional_cap)
+            and math.isfinite(max_notional)
+            and notional_cap
+            == min(cap for _notional, cap in parsed_envelopes)
+            and max_notional
+            == max(notional for notional, _cap in parsed_envelopes)
+        )
+    valid_legacy_envelope = bool(
         math.isfinite(notional_cap)
         and math.isfinite(max_notional)
         and notional_cap > 0
         and 0 < max_notional <= notional_cap
-    ):
+    )
+    valid_reviewed_envelope = (
+        valid_dynamic_envelopes if envelope_rows else valid_legacy_envelope
+    )
+    if require_current_entry_coverage and not valid_reviewed_envelope:
         violations.append(
             violation(
                 "reviewed_entry_notional_envelope",
-                "positive observed entry notional must not exceed the positive reviewed cap",
+                "each positive observed entry notional must not exceed the exact "
+                "positive cap enforced for that entry",
             )
         )
     approved_symbols = {

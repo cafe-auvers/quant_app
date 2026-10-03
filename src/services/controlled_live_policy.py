@@ -222,12 +222,14 @@ def require_live_entry_allowed(
     limit_price: float,
     engine: Engine | None = None,
     account_equity_provider: Callable[[str, str], float] | None = None,
-) -> None:
+) -> float | None:
     """Fence a real production BUY at the final broker adapter boundary.
 
     SELLs remain available for protection and liquidation. Every path still
     passes through the existing kill switch, lease, ownership, scheduler, and
-    reconciliation gates.
+    reconciliation gates. A permitted CONTROLLED_LIVE BUY returns the exact
+    effective notional ceiling used for this check so qualification evidence
+    can prove percentage-of-NAV envelopes without requiring a fixed USD cap.
     """
 
     if str(environment or "").strip().upper() != "PROD":
@@ -295,6 +297,7 @@ def require_live_entry_allowed(
             f"notional ({maximum_notional:.2f}). No broker mutation was sent. Reduce "
             "the order or deliberately review the configured ceiling before retrying."
         )
+    return maximum_notional
 
 
 def controlled_live_symbols(
