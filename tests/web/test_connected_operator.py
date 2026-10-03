@@ -97,6 +97,32 @@ def _buylist_card(engine):
     )
 
 
+def test_operator_change_pulse_notifies_pc_listener(
+    web_config, tmp_path, monkeypatch
+):
+    _engine, _role, service = _service(web_config, tmp_path)
+    calls = []
+    from src.services import pc_remote_control
+
+    monkeypatch.setattr(
+        pc_remote_control,
+        "notify_pc_coordination_change",
+        lambda event_id, **kwargs: calls.append((event_id, kwargs)) or True,
+    )
+
+    assert service._publish_change_pulse("settings-1", "app_state_sync") is True
+    assert calls == [
+        (
+            "web-operator:settings-1",
+            {
+                "changed_tables": ("app_state_sync",),
+                "protocol_version": 3,
+                "timeout": 0.25,
+            },
+        )
+    ]
+
+
 def test_mobile_operator_direct_buy_today_round_trip(web_config, tmp_path, monkeypatch):
     engine, _role, service = _service(web_config, tmp_path, same_executor=True)
     monkeypatch.setattr(

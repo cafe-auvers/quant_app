@@ -1,12 +1,23 @@
 from __future__ import annotations
 
-from dataclasses import replace
-
 import pytest
 from fastapi.testclient import TestClient
 
 from src.web.api import build_services, create_api_app
 from src.web.config import WebConfig
+
+
+@pytest.fixture(autouse=True)
+def disable_real_pc_change_notifications(monkeypatch):
+    """Keep web unit tests from contacting a configured deployment PC."""
+
+    from src.services import pc_remote_control
+
+    monkeypatch.setattr(
+        pc_remote_control,
+        "notify_pc_coordination_change",
+        lambda *_args, **_kwargs: False,
+    )
 
 
 @pytest.fixture

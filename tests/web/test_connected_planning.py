@@ -16,6 +16,38 @@ from src.web.connected_planning import ConnectedPlanningService
 from src.web.operator_identity import mobile_web_role
 
 
+def test_planning_change_pulse_notifies_pc_listener(
+    web_config, tmp_path, monkeypatch
+):
+    config = replace(web_config, pc_repository_path=str(tmp_path))
+    service = ConnectedPlanningService(
+        config,
+        source=None,
+        engine=None,
+        unavailable_reason="",
+    )
+    calls = []
+    from src.services import pc_remote_control
+
+    monkeypatch.setattr(
+        pc_remote_control,
+        "notify_pc_coordination_change",
+        lambda event_id, **kwargs: calls.append((event_id, kwargs)) or True,
+    )
+
+    assert service._publish_change_pulse("planning-1") is True
+    assert calls == [
+        (
+            "web:planning-1",
+            {
+                "changed_tables": ("trade_cards",),
+                "protocol_version": 3,
+                "timeout": 0.25,
+            },
+        )
+    ]
+
+
 def test_connected_passive_planning_round_trip_uses_canonical_cards(
     web_config, tmp_path, monkeypatch
 ):
