@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional, Tuple
 
+from src.risk.orb_position import DEFAULT_MAX_CAPITAL_PERCENT
+
 
 MAX_PORTFOLIO_POSITIONS = 30
 
@@ -34,7 +36,9 @@ class PortfolioRiskLimits:
     max_simultaneous_positions: int = MAX_PORTFOLIO_POSITIONS
     max_total_open_risk_fraction: float = 0.10
     max_gross_notional_fraction: float = 1.0
-    max_single_position_notional_fraction: float = 0.25
+    max_single_position_notional_fraction: float = (
+        DEFAULT_MAX_CAPITAL_PERCENT / 100.0
+    )
     max_incremental_buying_power_fraction: float = 0.0
     max_daily_loss_fraction: float = 0.0
     max_drawdown_fraction: float = 0.0

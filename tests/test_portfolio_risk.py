@@ -59,6 +59,7 @@ def test_controlled_live_defaults_and_hard_position_ceiling():
     assert limits.max_simultaneous_positions == 30
     assert limits.max_total_open_risk_fraction == 0.10
     assert limits.max_gross_notional_fraction == 1.0
+    assert limits.max_single_position_notional_fraction == 0.30
     assert MAX_PORTFOLIO_POSITIONS == 30
     with pytest.raises(ValueError, match="between 1 and 30"):
         PortfolioRiskLimits(max_simultaneous_positions=31)
@@ -166,7 +167,7 @@ def test_one_hundred_percent_gross_notional_is_a_hard_ceiling():
     assert any("gross notional" in reason for reason in above.reasons)
 
 
-def test_single_symbol_filled_and_projected_exposure_cannot_exceed_25_percent():
+def test_single_symbol_filled_and_projected_exposure_cannot_exceed_30_percent():
     manager = PortfolioRiskManager(PortfolioRiskLimits())
     existing = PortfolioPositionRisk("AAPL", 10, 100.0, 95.0, "ORB")
 
@@ -174,14 +175,14 @@ def test_single_symbol_filled_and_projected_exposure_cannot_exceed_25_percent():
         _proposal(symbol="AAPL", environment="PROD", account_no="1"),
         _snapshot(
             positions=(existing,),
-            projected_exposures=(_projected("AAPL", gross=500.0),),
+            projected_exposures=(_projected("AAPL", gross=1_000.0),),
         ),
     )
     above = manager.evaluate_entry(
         _proposal(symbol="AAPL"),
         _snapshot(
             positions=(existing,),
-            projected_exposures=(_projected("AAPL", gross=500.01),),
+            projected_exposures=(_projected("AAPL", gross=1_000.01),),
         ),
     )
 
