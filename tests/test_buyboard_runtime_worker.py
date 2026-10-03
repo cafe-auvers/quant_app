@@ -2782,6 +2782,105 @@ def test_distinct_account_numbers_does_not_discover_for_a_scoped_worker(tmp_path
 # --- Periodic buying-power refresh / full reconciliation (review findings) --
 
 
+def _reset_runtime_fx_cache():
+    BuyboardRuntimeWorker._fx_rate_cache_value = 0.0
+    BuyboardRuntimeWorker._fx_rate_cache_recorded_at = None
+
+
+def test_account_balance_never_treats_krw_totals_as_usd_without_fx(monkeypatch):
+    from src.ui.workers import FxRateWorker
+
+    _reset_runtime_fx_cache()
+    monkeypatch.setattr(
+        FxRateWorker, "_extract_usd_krw_from_snapshot", lambda _snapshot: None
+    )
+    monkeypatch.setattr(FxRateWorker, "_download_yfinance_usd_krw", lambda: None)
+    snapshot = {
+        "domestic": {"summary": {"total_evaluation_krw": 18_995_455.0}},
+        "overseas": {
+            "holdings": [],
+            "summary_by_exchange": {},
+            "frcr_evlu_tota_krw": 7_811_119.0,
+            "tot_asst_krw": 18_995_455.0,
+        },
+    }
+
+    usable, equity = BuyboardRuntimeWorker._extract_account_balance(snapshot)
+
+    assert usable == 0.0
+    assert equity == 0.0
+
+
+def test_account_balance_converts_krw_totals_with_fallback_fx(monkeypatch):
+    from src.ui.workers import FxRateWorker
+
+    class _CloseSeries:
+        def dropna(self):
+            return self
+
+        @property
+        def iloc(self):
+            return self
+
+        def __getitem__(self, index):
+            assert index == -1
+            return 1342.51
+
+    class _FxFrame:
+        empty = False
+
+        def __getitem__(self, key):
+            assert key == "Close"
+            return _CloseSeries()
+
+    _reset_runtime_fx_cache()
+    monkeypatch.setattr(
+        FxRateWorker, "_extract_usd_krw_from_snapshot", lambda _snapshot: None
+    )
+    monkeypatch.setattr(
+        FxRateWorker, "_download_yfinance_usd_krw", lambda: _FxFrame()
+    )
+    snapshot = {
+        "domestic": {"summary": {"total_evaluation_krw": 11_184_336.0}},
+        "overseas": {
+            "holdings": [],
+            "summary_by_exchange": {},
+            "frcr_evlu_tota_krw": 7_811_119.0,
+            "tot_asst_krw": 18_995_455.0,
+        },
+    }
+
+    usable, equity = BuyboardRuntimeWorker._extract_account_balance(snapshot)
+
+    assert usable == pytest.approx(7_811_119.0 / 1342.51)
+    assert equity == pytest.approx(18_995_455.0 / 1342.51)
+
+
+def test_account_balance_preserves_explicit_usd_only_snapshot_without_fx(monkeypatch):
+    from src.ui.workers import FxRateWorker
+
+    _reset_runtime_fx_cache()
+    monkeypatch.setattr(
+        FxRateWorker, "_extract_usd_krw_from_snapshot", lambda _snapshot: None
+    )
+    monkeypatch.setattr(
+        FxRateWorker,
+        "_download_yfinance_usd_krw",
+        lambda: pytest.fail("USD-only snapshots must not require an FX request"),
+    )
+    snapshot = {
+        "overseas": {
+            "holdings": [],
+            "summary_by_exchange": {"NASD": {"cash_balance_usd": 5000.0}},
+        }
+    }
+
+    usable, equity = BuyboardRuntimeWorker._extract_account_balance(snapshot)
+
+    assert usable == 5000.0
+    assert equity == 5000.0
+
+
 def test_periodic_refresh_populates_buying_power_cache_on_first_cycle(tmp_path, monkeypatch):
     from src.core import execution_config
     from src.services import buying_power_cache
