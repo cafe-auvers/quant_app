@@ -478,6 +478,92 @@ def test_stale_revision_cannot_overwrite_newer_remote_state(tmp_path):
     assert _remote(engine, ss.WATCHLIST_KEY).payload["items"][0]["symbol"] == "NEWER"
 
 
+def test_current_operator_can_cas_update_only_shared_settings(tmp_path):
+    engine = _make_engine(tmp_path)
+    main = ss.LocalDeviceRole("pc-id", "PC", True)
+    mobile = ss.LocalDeviceRole("mobile-id", "Mobile Web", False)
+    intruder = ss.LocalDeviceRole("other-id", "OTHER", False)
+    assert ss.claim_main_device(engine, main).success
+    assert ss.set_operator_control(engine, main, mobile).success
+    seeded = ss.push_state(
+        engine,
+        ss.SETTINGS_KEY,
+        {"orb_settings": {"capital_max_percent": 30.0}},
+        device_id=main.device_id,
+        expected_revision=0,
+    )
+    assert seeded.status == ss.PUSH_WRITTEN
+
+    rejected = ss.push_operator_controlled_settings(
+        engine,
+        {"orb_settings": {"capital_max_percent": 40.0}},
+        role=intruder,
+        expected_revision=seeded.revision,
+    )
+    assert rejected.status == ss.PUSH_NOT_OPERATOR
+    assert _remote(engine, ss.SETTINGS_KEY).revision == seeded.revision
+
+    written = ss.push_operator_controlled_settings(
+        engine,
+        {"orb_settings": {"capital_max_percent": 35.0}},
+        role=mobile,
+        expected_revision=seeded.revision,
+    )
+    assert written.status == ss.PUSH_WRITTEN
+    assert _remote(engine, ss.SETTINGS_KEY).payload == {
+        "orb_settings": {"capital_max_percent": 35.0}
+    }
+
+    stale = ss.push_operator_controlled_settings(
+        engine,
+        {"orb_settings": {"capital_max_percent": 20.0}},
+        role=mobile,
+        expected_revision=seeded.revision,
+    )
+    assert stale.status == ss.PUSH_CONFLICT
+    assert _remote(engine, ss.SETTINGS_KEY).revision == written.revision
+
+
+def test_desktop_operator_settings_publish_merges_remote_and_updates_local_cache(
+    tmp_path, monkeypatch
+):
+    engine = _make_engine(tmp_path)
+    paths = _use_machine(monkeypatch, tmp_path / "pc")
+    main = ss.LocalDeviceRole("pc-id", "PC", True)
+    assert ss.claim_main_device(engine, main).success
+    assert ss.set_operator_control(engine, main, main).success
+    seeded = ss.push_state(
+        engine,
+        ss.SETTINGS_KEY,
+        {"shortcuts": {"draw_line": "D"}, "orb_settings": {}},
+        device_id=main.device_id,
+        expected_revision=0,
+    )
+    assert seeded.status == ss.PUSH_WRITTEN
+
+    result = app_state.publish_operator_orb_settings(
+        engine,
+        main,
+        {
+            "capital_min_percent": 10.0,
+            "capital_ideal_percent": 17.5,
+            "capital_max_percent": 30.0,
+            "stop_adr_min_percent": 15.0,
+            "stop_adr_ideal_percent": 65.0,
+            "stop_adr_max_percent": 66.0,
+        },
+        metadata_path=paths["STATE_METADATA_FILE"],
+    )
+
+    assert result.success is True
+    assert result.revision == seeded.revision + 1
+    assert result.document["shortcuts"] == {"draw_line": "D"}
+    assert app_state.load_json(paths["SETTINGS_FILE"], {}) == result.document
+    assert app_state.load_json(paths["STATE_METADATA_FILE"], {})[
+        "state_sync"
+    ][ss.SETTINGS_KEY]["revision"] == result.revision
+
+
 def test_offline_changes_on_both_devices_are_preserved_as_conflict(
     monkeypatch, tmp_path
 ):

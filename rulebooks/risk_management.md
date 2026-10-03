@@ -52,7 +52,7 @@ Step 4: Calculate position as % of account
   Position % = $3,200 / $10,000 = 32%
   
 Step 5: Verify constraints (see section below)
-  Position 32% > 25% max ❌ TOO LARGE
+  Position 32% > 30% default upper bound ❌ TOO LARGE
   Action: Reduce to 20 shares or tighter stop
 ```
 
@@ -62,19 +62,20 @@ Step 5: Verify constraints (see section below)
 
 ### Constraint 1: Maximum Single Position Size
 ```
-Rule: No single trade can exceed 25% of account
+Rule: No single trade can exceed the user-selected ORB capital-allocation
+upper bound (30% by default)
 
 Example:
   Account: $10,000
-  Max position size: $2,500 (25%)
+  Max position size: $3,000 (30% default)
   
   If entry $100 and stop $95:
-    Max shares = $2,500 / $100 = 25 shares max
-    Max risk = 25 × $5 = $125 (1.25% account) ✓
+    Max shares = $3,000 / $100 = 30 shares max
+    Max risk = 30 × $5 = $150 (1.5% account) ✓
     
   If entry $100 and stop $80:
-    Max shares = $2,500 / $100 = 25 shares max
-    Max risk = 25 × $20 = $500 (5% account) ❌ TOO MUCH
+    Max shares = $3,000 / $100 = 30 shares max
+    Max risk = 30 × $20 = $600 (6% account) ❌ TOO MUCH
     Action: Buy fewer shares or use tighter stop
 ```
 
@@ -179,8 +180,8 @@ Before executing ANY trade, verify ALL of these:
 │ ✓ Account risk ≤ 2% per trade?                        │
 │   Actual account risk = __% (must be ≤ 2%)           │
 │                                                          │
-│ ✓ Position size ≤ 25% of account?                     │
-│   Position size = __% (must be ≤ 25%)                │
+│ ✓ Position size ≤ selected ORB upper bound?           │
+│   Position size = __% (default bound: 30%)           │
 │                                                          │
 │ ✓ Breakout level and stop are valid?                          │
 │   Breakout is structural; stop risk fits plan                  │
@@ -316,7 +317,7 @@ Calculation:
   Risk/share: $50 - $48 = $2
   Shares: $100 / $2 = 50 shares
   Position value: 50 × $50 = $2,500
-  Position %: $2,500 / $10,000 = 25% ⚠️ AT MAX
+  Position %: $2,500 / $10,000 = 25% ✓ (within 30% default)
   Actual risk %: $100 / $10,000 = 1% ✓
   Stop distance %: $2 / $50 = 4% = ADR ✓
   
@@ -324,10 +325,10 @@ Verification:
   ✓ ADR 4% > 3.5%
   ✓ Stop 4% ≤ ADR 4%
   ✓ Account risk 1% ≤ 2%
-  ✓ Position 25% ≤ 25% (at limit)
+  ✓ Position 25% ≤ 30% configured default
   ✓ Breakout trigger and rule-based exit plan are defined
   
-Verdict: VALID (though at position size limit)
+Verdict: VALID (within the configured position-size limit)
          Consider using 0.5% risk instead = 25 shares = 12.5%
 ```
 
@@ -347,7 +348,7 @@ Calculation:
   Risk/share: $100 - $92 = $8
   Shares: $125 / $8 = 15.625 → 15 shares (round down)
   Position value: 15 × $100 = $1,500
-  Position %: $1,500 / $25,000 = 6% ✓ (well under 25%)
+  Position %: $1,500 / $25,000 = 6% ✓ (well under 30% default)
   Actual risk %: 15 × $8 / $25,000 = 0.48% ✓
   Stop distance %: $8 / $100 = 8%
   Max allowed for pivot: 3.5% × 1.5 = 5.25% ❌
@@ -361,7 +362,7 @@ Verification (Revised):
   ✓ ADR 3.5% > 3.5%
   ✓ Stop 3% ≤ 150% of ADR (5.25%)
   ✓ Account risk 0.5% ≤ 2%
-  ✓ Position 10% ≤ 25%
+  ✓ Position 10% ≤ 30% configured default
   ✓ Breakout trigger and rule-based exit plan are defined
   
 Verdict: VALID after adjustment
@@ -380,7 +381,7 @@ Verdict: VALID after adjustment
 │ Shares = (Risk % × Account) / (Entry - Stop)    │
 │                                                   │
 │ CONSTRAINTS (ALL MUST BE TRUE):                  │
-│ 1. Position ≤ 25% of account                    │
+│ 1. Position ≤ selected ORB upper bound (30% default) │
 │ 2. Account risk ≤ 2% per trade                  │
 │ 3. Stop distance ≤ ADR (momentum)               │
 │ 4. Stop distance ≤ 150% ADR (pivot)             │

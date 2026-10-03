@@ -164,7 +164,7 @@ Must satisfy all of these:
 ### Risk Rules
 - Target risk per trade: 0.25% to 2% of account
 - Aggressive episodic pivots may use up to 4% account risk only when thesis and liquidity justify it
-- Maximum position size: 25% of account value
+- Maximum position size: user-selected ORB upper bound (30% by default)
 
 ### Stop Loss Constraints
 - Stop loss distance should generally be less than ADR 20-day
@@ -179,7 +179,7 @@ Entry: $50
 Stop: $48
 Risk per share: $2
 Shares = $1,000 / $2 = 500
-Position value = $25,000 (25% max)
+Position value = $25,000 (25%, within the 30% default upper bound)
 ```
 
 ### Risk Validation
@@ -236,7 +236,7 @@ Reject any stock with one or more of the following:
 - [ ] Support and stop defined
 - [ ] AI verifies pivot thesis
 - [ ] Rule-based exit plan defined
-- [ ] Position size = 25% account
+- [ ] Position size is within the selected ORB upper bound (30% by default)
 
 ### Execution
 - [ ] Stop set before order entry

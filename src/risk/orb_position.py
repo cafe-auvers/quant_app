@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Mapping, Optional
 
 
-DEFAULT_MAX_CAPITAL_PERCENT = 25.0
+DEFAULT_MAX_CAPITAL_PERCENT = 30.0
 
 
 @dataclass(frozen=True)

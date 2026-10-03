@@ -274,7 +274,7 @@ def test_orb_position_validity_requires_capital_percent_between_10_and_30():
     }
     too_large = {
         "shares": 2.0,
-        "capital_percent": 30.0,
+        "capital_percent": 30.01,
         "stop_loss_percent": 5.0,
         "sl_adr": 50.0,
     }

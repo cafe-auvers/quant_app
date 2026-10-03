@@ -5,6 +5,12 @@ with the PC and laptop desktop applications. It covers Watchlist, Buylist,
 breakout, Buy Today, Buy Board, Operator Control, and runtime-readiness
 projection changes. It does not grant execution authority.
 
+The six ORB position-bound values are part of the same shared contract. Their
+default profile is capital allocation 10% / 17.5% / 30% and Stop/ADR
+15% / 65% / 66% (lower / ideal / upper). An authenticated browser or desktop
+may update them only while its device owns Operator Control. One revisioned
+settings row is then consumed by the PC, laptop, and mobile view.
+
 ## User-visible contract
 
 - An allowed planning or Buy Today action updates the initiating browser
@@ -18,6 +24,8 @@ projection changes. It does not grant execution authority.
 - Other open web/PWA sessions and running desktop applications refresh from
   canonical state automatically. Routine operation does not require a manual
   page reload or desktop refresh.
+- ORB-setting writes use compare-and-swap against the displayed shared
+  revision. A conflict reloads the newer values instead of overwriting them.
 - `QUEUED` confirms durable human intent only. It does not mean the command was
   executed, an order was accepted, or a fill occurred.
 
@@ -92,7 +100,8 @@ the execution lease, or interprets optimistic UI state as execution approval.
 ## When a manual reload is appropriate
 
 A manual page reload is not required after Watchlist, Buylist, breakout,
-Buy Today, Operator Control, runtime-state, or database-writability changes.
+Buy Today, shared ORB settings, Operator Control, runtime-state, or
+database-writability changes.
 Reload only for browser/session recovery, after deployment of new frontend
 assets, or as a diagnostic when the WebSocket and fallback revision checks are
 both unavailable. A desktop restart is likewise not part of normal state
@@ -107,6 +116,8 @@ Regression coverage must prove:
 - failure rolls back to canonical state;
 - authenticated WebSocket clients receive invalidations and refetch state;
 - connected mutations publish typed desktop change pulses;
+- shared ORB settings reject stale revisions and writes from a device that
+  does not own Operator Control;
 - desktop state/writability transitions emit `board_changed` only on change;
 - queued commands remain distinct from completed commands and broker facts;
 - no web route can create a broker, claim the execution lease, or bypass an

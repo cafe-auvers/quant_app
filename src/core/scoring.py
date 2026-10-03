@@ -462,6 +462,8 @@ def run_ai_review(
     if not user_notes:
         user_notes = reasoning
 
+    orb_capital_max_percent = get_orb_settings().capital_max_percent
+
     api_key = get_env_value("OPENAI_API_KEY")
     if not api_key:
         return _generate_fallback_ai_review(symbol, metrics or {}, headlines)
@@ -524,7 +526,7 @@ Episodic pivot requirements:
 - If no current news/catalyst data is provided, do not invent one
 
 Risk and exit rules:
-- Maximum position size: 25% of account value
+- Maximum position size: {orb_capital_max_percent:g}% of account value (the current shared ORB upper bound)
 - Standard account risk: 0.25% to 2%
 - Aggressive episodic pivot risk may reach 4% only if thesis, liquidity, catalyst, and execution quality are exceptional
 - Stop must be defined before entry

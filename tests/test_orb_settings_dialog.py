@@ -11,6 +11,8 @@ from src.risk.orb_position import (
     get_orb_settings,
 )
 from src.ui import main_window as main_window_module
+from src.services.app_state import SettingsPublishResult
+from src.services.state_sync import LocalDeviceRole
 from src.ui.orb_settings_dialog import OrbSettingsDialog
 
 
@@ -66,7 +68,7 @@ def test_main_window_saves_and_applies_accepted_orb_settings(monkeypatch):
         stop_adr_ideal_percent=50.0,
         stop_adr_max_percent=75.0,
     )
-    saved = {}
+    published = {}
     log_messages = []
     refresh_calls = []
 
@@ -85,6 +87,13 @@ def test_main_window_saves_and_applies_accepted_orb_settings(monkeypatch):
 
     class FakeWindow:
         settings = {"orb_settings": DEFAULT_ORB_SETTINGS.to_dict()}
+        state_sync_role = LocalDeviceRole("pc-id", "PC", True)
+
+        def _execution_state_engine(self):
+            return object()
+
+        def _execution_state_metadata_path(self):
+            return None
 
         def append_log(self, message):
             log_messages.append(message)
@@ -100,14 +109,28 @@ def test_main_window_saves_and_applies_accepted_orb_settings(monkeypatch):
     monkeypatch.setattr(main_window_module, "OrbSettingsDialog", AcceptedDialog)
     monkeypatch.setattr(
         main_window_module,
-        "save_json",
-        lambda path, values: saved.update({"path": path, "values": values}),
+        "publish_operator_orb_settings",
+        lambda engine, role, values, metadata_path=None: (
+            published.update(
+                {
+                    "engine": engine,
+                    "role": role,
+                    "values": values,
+                    "metadata_path": metadata_path,
+                }
+            )
+            or SettingsPublishResult(
+                True,
+                document={"orb_settings": dict(values)},
+                revision=7,
+            )
+        ),
     )
     try:
         main_window_module.MainWindow.show_orb_settings_dialog(window)
         assert window.settings["orb_settings"] == custom.to_dict()
-        assert saved["path"] == main_window_module.SETTINGS_FILE
-        assert saved["values"]["orb_settings"] == custom.to_dict()
+        assert published["values"] == custom.to_dict()
+        assert published["role"].device_id == "pc-id"
         assert get_orb_settings() == custom
         assert refresh_calls == [("PROD", False), "board"]
         assert log_messages

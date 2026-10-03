@@ -29,6 +29,7 @@ from src.services.state_sync import (
     PULL_OK,
     PUSH_CONFLICT,
     PUSH_NOT_MAIN,
+    PUSH_NOT_OPERATOR,
     PUSH_WRITTEN,
     SCANNER_SETUPS_KEY,
     SETTINGS_KEY,
@@ -45,6 +46,7 @@ from src.services.state_sync import (
     pull_state,
     publish_planning_snapshot,
     push_state,
+    push_operator_controlled_settings,
     release_main_device,
     set_local_device_main,
 )
@@ -151,6 +153,88 @@ class SaveResult:
     finished_at: datetime | None
     error: str = ""
     files_written: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class SettingsPublishResult:
+    success: bool
+    document: Dict[str, Any] = field(default_factory=dict)
+    revision: int = 0
+    error: str = ""
+
+
+def publish_operator_orb_settings(
+    engine,
+    role: LocalDeviceRole,
+    orb_settings: Dict[str, Any],
+    *,
+    metadata_path: Path | None = None,
+) -> SettingsPublishResult:
+    """Merge ORB bounds into the shared settings row and cache the revision.
+
+    The fresh remote document wins for unrelated settings, preventing a
+    standby PC/laptop from overwriting shortcuts or other settings with a
+    stale local copy. The state-sync transaction separately verifies that
+    ``role`` still owns Operator Control.
+    """
+
+    if engine is None:
+        return SettingsPublishResult(False, error="Shared settings are unavailable.")
+    pulled = pull_state(engine, SETTINGS_KEY)
+    if pulled.status == PULL_ERROR:
+        return SettingsPublishResult(
+            False,
+            error=pulled.error or "Could not read shared settings.",
+        )
+    if pulled.status == PULL_OK and pulled.state is not None:
+        document = dict(pulled.state.payload)
+        expected_revision = int(pulled.state.revision)
+    else:
+        document = load_json(SETTINGS_FILE, {})
+        document = dict(document) if isinstance(document, dict) else {}
+        expected_revision = 0
+    document["orb_settings"] = dict(orb_settings)
+    pushed = push_operator_controlled_settings(
+        engine,
+        document,
+        role=role,
+        expected_revision=expected_revision,
+    )
+    if pushed.status != PUSH_WRITTEN:
+        if pushed.status == PUSH_CONFLICT:
+            error = pushed.error or "Shared settings changed before save."
+        elif pushed.status == PUSH_NOT_OPERATOR:
+            error = pushed.error or "Another device owns Operator Control."
+        else:
+            error = pushed.error or "Shared settings could not be saved."
+        return SettingsPublishResult(False, error=error)
+    try:
+        save_json(SETTINGS_FILE, document)
+    except Exception as exc:
+        return SettingsPublishResult(
+            False,
+            document=document,
+            revision=int(pushed.revision or 0),
+            error=(
+                "Shared settings were saved, but the local settings cache "
+                f"could not be updated: {exc}"
+            ),
+        )
+    _update_sync_entries(
+        {
+            SETTINGS_KEY: _sync_entry(
+                int(pushed.revision or 0),
+                _state_payload_hash(document),
+                pushed.updated_at,
+            )
+        },
+        metadata_path,
+    )
+    return SettingsPublishResult(
+        True,
+        document=document,
+        revision=int(pushed.revision or 0),
+    )
 
 
 class StateSaveManager:

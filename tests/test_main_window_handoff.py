@@ -16,7 +16,6 @@ from sqlalchemy import create_engine
 
 import src.services.trading_state as trading_state
 import src.ui.main_window as main_window_module
-from src.services import app_state
 from src.services import state_sync as ss
 from src.services.app_state import StateReconcileResult
 from src.services.execution_authority import ExecutionAuthority, LeaseHandle
@@ -270,6 +269,42 @@ def test_main_state_sync_pulls_plans_only_when_operator_is_remote(
     assert len(created) == 1
     assert created[0].kwargs["ownership_only_when_main"] is ownership_only
     assert created[0].started is True
+
+
+def test_main_state_sync_force_pulls_operator_updated_settings(monkeypatch):
+    created = []
+
+    class _StateSyncWorkerStub:
+        def __init__(self, *args, **kwargs):
+            self.kwargs = kwargs
+            self.completed = _SignalStub()
+            created.append(self)
+
+        def start(self):
+            pass
+
+        @staticmethod
+        def isRunning():
+            return False
+
+    monkeypatch.setattr(main_window_module, "StateSyncWorker", _StateSyncWorkerStub)
+    window = _base_window(is_main=True, lease_token="tok-1", pc_engine=object())
+    window._database_shutting_down = False
+    window._database_transition_generation = 0
+    window._initial_state_sync_complete = True
+    window._cached_execution_owner_device_id = "pc-id"
+    window._operator_executor_sync_control = SimpleNamespace(
+        device_id="pc-id",
+        locked=False,
+    )
+    window._force_state_payload_reconcile = True
+    window._ensure_save_lock = lambda: object()
+    window._execution_state_metadata_path = lambda: None
+    window._track_worker = lambda *_args: None
+
+    MainWindow._start_state_sync(window)
+
+    assert created[0].kwargs["ownership_only_when_main"] is False
 
 
 def test_order_submission_blocked_when_never_reconciled(monkeypatch):

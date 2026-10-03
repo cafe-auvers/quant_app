@@ -83,7 +83,7 @@ def test_dashboard_is_a_static_shell_without_hydration_runtime():
     assert "new MutationObserver" not in script_source
     assert "bootApp();" in script_source
     assert 'id="quant-app"' in page_source
-    assert '/live-static/app.js?v=88' in page_source
+    assert '/live-static/app.js?v=89' in page_source
     assert page_source.index('id="market-summary"') < page_source.index('id="browser-status"')
     assert page_source.index('id="browser-status"') < page_source.index('id="web-status"')
     assert page_source.index('id="web-status"') < page_source.index('id="data-summary"')
@@ -203,6 +203,12 @@ def test_mobile_layout_uses_a_scrollable_stock_drawer_and_chart_edges():
     assert 'aria-selected="true" class="active" data-mobile-list="watchlist"' in page_source
     assert "listMode: 'watchlist'" in script_source
     assert 'id="display-settings-reset"' in page_source
+    assert 'id="mobile-orb-settings-form"' in page_source
+    assert 'id="orb-capital-max"' in page_source
+    assert 'id="orb-stop-adr-max"' in page_source
+    assert "capital_max_percent: 30" in script_source
+    assert "api('/api/v1/operator/orb-settings'" in script_source
+    assert "PC and laptop refresh automatically" in script_source
     assert 'data-display-setting="relativeStrength"' in page_source
     assert 'data-display-setting="marketAlignment"' in page_source
     assert 'id="mobile-logout-button"' in page_source

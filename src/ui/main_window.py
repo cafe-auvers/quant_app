@@ -75,6 +75,7 @@ from src.services.app_state import (
     load_trade_plans_state,
     load_watchlist_state,
     publish_handoff_snapshot,
+    publish_operator_orb_settings,
     reconcile_state_with_remote,
     release_main_device_and_demote,
     save_app_state,
@@ -186,7 +187,7 @@ from src.utils.market_calendar import (
     nyse_holidays,
     seconds_until_nyse_regular_session_open,
 )
-from src.utils.storage import load_json, save_json
+from src.utils.storage import load_json
 
 __all__ = [
     "MainWindow",
@@ -1362,6 +1363,9 @@ class MainWindow(
                 and self.state_sync_role.is_main
                 and self._initial_state_sync_complete
                 and not self._operator_executor_sync_required()
+                and not self.__dict__.get(
+                    "_force_state_payload_reconcile", False
+                )
             ),
             generation=self._execution_state_generation(),
             auto_claim=auto_claim,
@@ -1397,6 +1401,7 @@ class MainWindow(
             return
         if not self._execution_state_ready():
             return
+        self._force_state_payload_reconcile = False
         execution_engine = self._execution_state_engine()
         live_trading_error = str(getattr(result, "live_trading_error", "") or "")
         live_trading_enabled = getattr(result, "live_trading_enabled", None)
@@ -5165,6 +5170,8 @@ class MainWindow(
             "runtime_device_state",
             "operator_commands",
         }:
+            if broad_fallback or "app_state_sync" in tables:
+                self._force_state_payload_reconcile = True
             self._remote_coordination_sync_pending = True
             self._drain_remote_coordination_sync()
         if broad_fallback or tables & {
@@ -5667,22 +5674,26 @@ class MainWindow(
             return
 
         orb_settings = dialog.orb_settings()
-        updated_settings = dict(self.settings)
-        updated_settings["orb_settings"] = orb_settings.to_dict()
-        try:
-            save_json(SETTINGS_FILE, updated_settings)
-        except Exception as exc:
-            logger.exception("Failed to save ORB settings")
+        result = publish_operator_orb_settings(
+            self._execution_state_engine(),
+            self.state_sync_role,
+            orb_settings.to_dict(),
+            metadata_path=self._execution_state_metadata_path(),
+        )
+        if not result.success:
             QMessageBox.warning(
                 self,
                 "ORB Settings",
-                f"The ORB settings could not be saved:\n{exc}",
+                f"The shared ORB settings could not be saved:\n{result.error}",
             )
             return
 
-        self.settings = updated_settings
+        self.settings = result.document
         configure_orb_settings(orb_settings)
-        self.append_log("ORB scoring ideals and validity bounds updated.")
+        self.append_log(
+            "ORB scoring ideals and validity bounds updated in shared "
+            f"settings revision {result.revision}."
+        )
 
         refresh_queue = getattr(self, "refresh_execution_queue", None)
         if callable(refresh_queue):
