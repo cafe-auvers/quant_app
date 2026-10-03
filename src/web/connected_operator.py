@@ -323,12 +323,20 @@ class ConnectedOperatorService:
 
     def _publish_change_pulse(self, token: str, *tables: str) -> bool:
         from src.services.coordination_change_pulse import record_external_change_pulses
+        from src.services.pc_remote_control import notify_pc_coordination_change
 
-        return record_external_change_pulses(
-            self._repository() / "data",
-            f"web-operator:{token}",
-            tables=tables,
+        event_id = f"web-operator:{token}"
+        normalized_tables = tuple(str(table or "").strip() for table in tables if table)
+        local_recorded = record_external_change_pulses(
+            self._repository() / "data", event_id, tables=normalized_tables
         )
+        pc_notified = notify_pc_coordination_change(
+            event_id,
+            changed_tables=normalized_tables,
+            protocol_version=3,
+            timeout=0.25,
+        )
+        return bool(local_recorded or pc_notified)
 
     @staticmethod
     def _validated_orb_settings(values: Any) -> OrbSettings:

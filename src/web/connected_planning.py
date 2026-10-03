@@ -206,12 +206,22 @@ class ConnectedPlanningService:
         from src.services.coordination_change_pulse import (
             record_external_change_pulses,
         )
+        from src.services.pc_remote_control import notify_pc_coordination_change
 
-        return record_external_change_pulses(
+        event_id = f"web:{command_id}"
+        tables = ("trade_cards",)
+        local_recorded = record_external_change_pulses(
             repository / "data",
-            f"web:{command_id}",
-            tables=("trade_cards",),
+            event_id,
+            tables=tables,
         )
+        pc_notified = notify_pc_coordination_change(
+            event_id,
+            changed_tables=tables,
+            protocol_version=3,
+            timeout=0.25,
+        )
+        return bool(local_recorded or pc_notified)
 
     def apply(
         self,
