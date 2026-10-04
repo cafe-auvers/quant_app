@@ -3,7 +3,7 @@ import datetime as dt
 import numpy as np
 import pandas as pd
 import pytest
-from sqlalchemy import create_engine, delete, event, select
+from sqlalchemy import MetaData, create_engine, delete, event, select
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
 import src.utils.db_loader as db_loader
@@ -11,6 +11,85 @@ from src.infrastructure.database import schema as schema_module
 from src.infrastructure.database.repositories import (chart_indicators,
                                                       market_watermarks,
                                                       scanner)
+
+
+@pytest.mark.parametrize("incremental", [False, True])
+@pytest.mark.parametrize("previous_close", [0.0, np.nextafter(0.0, 1.0)])
+def test_undefined_daily_change_is_saved_without_breakout_marker(
+    engine, incremental, previous_close
+):
+    dates = pd.bdate_range("2026-09-10", periods=3)
+    history = _history(dates)
+    history["Close"] = [previous_close, 10.0, 11.0]
+    spy = _history(dates, 200)
+    if incremental:
+        indicators = chart_indicators.calculate_chart_indicators_since(
+            "TEST", history, spy, start_date=dates[1]
+        )
+    else:
+        indicators = chart_indicators.calculate_chart_indicators("TEST", history, spy)
+
+    recovered = indicators.loc[indicators["date"] == dates[1]].iloc[0]
+    assert pd.isna(recovered["pct_change_today"])
+    assert not recovered["is_plus_4pct_change"]
+    assert not recovered["is_minus_4pct_change"]
+    assert indicators.iloc[-1]["pct_change_today"] == pytest.approx(10.0)
+    assert indicators.iloc[-1]["is_plus_4pct_change"]
+    assert chart_indicators.save_chart_indicators_to_db("TEST", indicators, engine)
+    table = schema_module._get_chart_indicators_table(MetaData())
+    with engine.connect() as conn:
+        row = conn.execute(
+            select(table).where(table.c.symbol == "TEST", table.c.date == dates[1])
+        ).mappings().one()
+    assert row["pct_change_today"] is None
+    assert not row["is_plus_4pct_change"]
+
+
+@pytest.mark.parametrize("invalid", [np.inf, -np.inf, np.float32(np.inf), np.nan])
+def test_chart_indicator_persistence_converts_nonfinite_numbers_to_null(engine, invalid):
+    dates = pd.bdate_range("2026-09-10", periods=3)
+    indicators = chart_indicators.calculate_chart_indicators(
+        "TEST", _history(dates), _history(dates, 200)
+    )
+    indicators.loc[indicators.index[-1], "relative_strength"] = invalid
+    indicators.loc[indicators.index[-1], "avg_7"] = invalid
+    assert chart_indicators.save_chart_indicators_to_db("TEST", indicators, engine)
+    table = schema_module._get_chart_indicators_table(MetaData())
+    with engine.connect() as conn:
+        row = conn.execute(
+            select(table).where(table.c.symbol == "TEST", table.c.date == dates[-1])
+        ).mappings().one()
+    assert row["relative_strength"] is None
+    assert row["avg_7"] is None
+    assert row["avg_65"] == pytest.approx(101.0)
+    assert row["updated_at"] is not None
+
+
+def test_chart_refresh_completes_after_zero_close_without_nonfinite_sql_values(engine):
+    dates = pd.bdate_range("2026-09-10", periods=3)
+    history = _history(dates)
+    history["Close"] = [0.0, 10.0, 11.0]
+    assert db_loader.save_symbol_history_to_db("TEST", history, engine)
+    assert db_loader.save_symbol_history_to_db("SPY", _history(dates, 200), engine)
+
+    def reject_nonfinite(_conn, _cursor, statement, parameters, _context, _executemany):
+        if not statement.lower().startswith("insert"):
+            return
+        assert all(
+            not isinstance(value, (float, np.floating)) or np.isfinite(value)
+            for value in parameters
+        )
+
+    event.listen(engine, "before_cursor_execute", reject_nonfinite)
+    try:
+        assert chart_indicators.refresh_chart_indicators_to_db(
+            ["SPY", "TEST"], engine
+        ) == ["TEST"]
+        assert chart_indicators.get_chart_indicator_refresh_plan(
+            engine, ["SPY", "TEST"]
+        ) == {}
+    finally:
+        event.remove(engine, "before_cursor_execute", reject_nonfinite)
 
 
 @pytest.fixture

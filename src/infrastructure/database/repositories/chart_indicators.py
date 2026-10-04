@@ -63,7 +63,9 @@ def calculate_chart_indicators(
     relative_strength = close / df["spy_close"].replace(0, pd.NA).astype(float)
     rs_sma_50 = relative_strength.rolling(rs_sma_period, min_periods=1).mean()
     rs_score_current = _rolling_percent_rank(relative_strength, rs_score_lookback)
-    pct_change_today = close.pct_change() * 100.0
+    pct_change_today = (close.pct_change() * 100.0).replace(
+        [np.inf, -np.inf], np.nan
+    )
     avg_7 = close.rolling(7, min_periods=1).mean()
     avg_65 = close.rolling(65, min_periods=1).mean()
     ti65 = avg_7 / avg_65.replace(0, pd.NA)
@@ -163,8 +165,10 @@ def calculate_chart_indicators_since(
         avg_65 = window_mean(close, position, 65)
         ti65 = avg_7 / avg_65 if avg_65 != 0 else float("nan")
         if position > 0:
-            with np.errstate(divide="ignore", invalid="ignore"):
+            with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
                 pct_change_today = float((close[position] / close[position - 1] - 1.0) * 100.0)
+            if not np.isfinite(pct_change_today):
+                pct_change_today = float("nan")
             previous_rs = float(relative_strength[position - 1])
             previous_rs_sma = window_mean(relative_strength, position - 1, rs_sma_period)
         else:
@@ -240,7 +244,9 @@ def _chart_indicator_records(indicators: pd.DataFrame, chart_indicators: Table) 
         record = {}
         for column in value_columns:
             value = row.get(column)
-            if pd.isna(value):
+            if pd.isna(value) or (
+                isinstance(value, (float, np.floating)) and not np.isfinite(value)
+            ):
                 record[column] = None
             elif column == "date":
                 record[column] = _normalize_timestamp(pd.Timestamp(value))
