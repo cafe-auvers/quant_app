@@ -81,6 +81,7 @@ def repository_head(*, root: Path = ROOT_DIR) -> str:
             capture_output=True,
             text=True,
             timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -98,6 +99,7 @@ def repository_is_clean(*, root: Path = ROOT_DIR) -> bool:
             capture_output=True,
             text=True,
             timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (OSError, subprocess.SubprocessError):
         return False

@@ -31,6 +31,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+
 from src.services import (
     app_state,
     event_journal,
@@ -40,6 +41,13 @@ from src.services import (
 )  # noqa: E402  (needs sys.path set up above)
 from src.core import execution_config  # noqa: E402
 from src.web.windows_asyncio import install_web_event_loop_policy  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _isolate_monitor_equity(monkeypatch, tmp_path):
+    from src.services import monitor_equity
+
+    monkeypatch.setattr(monitor_equity, "MONITOR_EQUITY_FILE", tmp_path / "monitor_equity.json")
 
 
 @pytest.fixture(scope="session", autouse=True)

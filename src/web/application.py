@@ -9,7 +9,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-from .api import WebServices, build_services, register_api_routes
+from .api import WebServices, build_services, register_api_routes, web_services_lifespan
 from .auth import SESSION_COOKIE
 from .config import WebConfig, load_web_config
 from .pages import register_pages
@@ -29,12 +29,13 @@ def create_web_app(config: WebConfig) -> tuple[FastAPI, WebServices]:
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
+        lifespan=web_services_lifespan,
     )
     register_api_routes(app, services)
     app.mount("/web-static", StaticFiles(directory=STATIC_DIR), name="web-static")
     app.mount("/vendor", StaticFiles(directory=VENDOR_DIR), name="vendor")
-    # Live assets use paths the retired service worker never intercepted. This
-    # prevents an old cache from serving a previous chart renderer indefinitely.
+    # Keep legacy paths for already-open tabs; new pages use fingerprinted
+    # release assets so an older service worker cannot mix releases.
     app.mount("/live-static", StaticFiles(directory=STATIC_DIR), name="live-static")
     app.mount("/live-vendor", StaticFiles(directory=VENDOR_DIR), name="live-vendor")
 
