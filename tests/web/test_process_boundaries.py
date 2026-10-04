@@ -83,7 +83,7 @@ def test_dashboard_is_a_static_shell_without_hydration_runtime():
     assert "new MutationObserver" not in script_source
     assert "bootApp();" in script_source
     assert 'id="quant-app"' in page_source
-    assert '/live-static/app.js?v=89' in page_source
+    assert '/live-static/app.js?v=91' in page_source
     assert page_source.index('id="market-summary"') < page_source.index('id="browser-status"')
     assert page_source.index('id="browser-status"') < page_source.index('id="web-status"')
     assert page_source.index('id="web-status"') < page_source.index('id="data-summary"')
@@ -122,14 +122,17 @@ def test_pwa_registers_current_worker_and_caches_presentation_assets_only():
         assert "navigator.serviceWorker.register('/service-worker.js'" in source
         assert "updateViaCache: 'none'" in source
         assert "path === '/service-worker.js'" in source
-    assert "'/live-static/app.css'" in worker_source
-    assert "'/live-static/app.js'" in worker_source
-    assert "'/live-vendor/lightweight-charts.standalone.production.js'" in worker_source
+    assert "'/live-static/app.css'" not in worker_source
+    assert "'/live-static/app.js'" not in worker_source
+    assert "'/live-vendor/lightweight-charts.standalone.production.js'" not in worker_source
+    assert "cache.match(request)" in worker_source
+    assert "caches.match(url.pathname)" not in worker_source
     assert "'/api/" not in worker_source
     assert "request.method !== 'GET'" in worker_source
     assert "fetch" in worker_source
     assert "indexedDB" not in worker_source
-    assert "sync" not in worker_source.lower()
+    assert "addEventListener('sync'" not in worker_source
+    assert "addEventListener('periodicsync'" not in worker_source
 
 
 def test_symbol_selection_does_not_rebuild_the_scanner_list():
@@ -200,8 +203,8 @@ def test_mobile_layout_uses_a_scrollable_stock_drawer_and_chart_edges():
     assert 'data-mobile-page="summary" aria-label="Home"' in page_source
     assert '<span>Home</span>' in page_source
     assert '<span id="mobile-list-label">Watchlist</span>' in page_source
-    assert 'aria-selected="true" class="active" data-mobile-list="watchlist"' in page_source
-    assert "listMode: 'watchlist'" in script_source
+    assert 'aria-selected="true" class="active" data-mobile-list="monitor"' in page_source
+    assert "listMode: 'monitor'" in script_source
     assert 'id="display-settings-reset"' in page_source
     assert 'id="mobile-orb-settings-form"' in page_source
     assert 'id="orb-capital-max"' in page_source

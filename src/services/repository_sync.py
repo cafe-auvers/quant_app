@@ -97,6 +97,7 @@ def _run_git(
             errors="replace",
             timeout=timeout,
             check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except FileNotFoundError as exc:
         raise GitCommandError("Git is not installed or is not available on PATH.") from exc

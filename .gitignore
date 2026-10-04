@@ -73,6 +73,8 @@ data/refresh_status_*.json
 data/refresh_status_*.json.bak
 data/refresh_lock_*.lock
 data/logs/
+data/monitor_equity.json
+data/monitor_equity.json.bak
 
 # Logs
 *.log

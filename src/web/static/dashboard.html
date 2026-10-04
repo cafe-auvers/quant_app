@@ -8,9 +8,9 @@
   <title>Quant Web — Review Workspace</title>
   <link rel="manifest" href="/web-static/manifest.webmanifest">
   <link rel="icon" href="/web-static/icon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/live-static/app.css?v=87">
+  <link rel="stylesheet" href="/live-static/app.css?v=89">
   <script src="/live-vendor/lightweight-charts.standalone.production.js" defer></script>
-  <script src="/live-static/app.js?v=89" defer></script>
+  <script src="/live-static/app.js?v=91" defer></script>
 </head>
 <body class="dashboard-body">
   <div id="quant-app" class="app-shell">
@@ -281,9 +281,10 @@
             </button>
             <div id="mobile-list-popover" class="mobile-list-popover" role="dialog" aria-label="Stock lists" hidden>
               <div class="mobile-list-tabs" role="tablist" aria-label="Choose stock list">
+                <button type="button" role="tab" aria-selected="true" class="active" data-mobile-list="monitor">Monitor</button>
                 <button type="button" role="tab" aria-selected="false" data-mobile-list="scanner">Scanner</button>
                 <button type="button" role="tab" aria-selected="false" data-mobile-list="history">History</button>
-                <button type="button" role="tab" aria-selected="true" class="active" data-mobile-list="watchlist">Watchlist</button>
+                <button type="button" role="tab" aria-selected="false" data-mobile-list="watchlist">Watchlist</button>
                 <button type="button" role="tab" aria-selected="false" data-mobile-list="buylist">Buylist</button>
                 <button type="button" role="tab" aria-selected="false" data-mobile-list="buy_today">Buy Today</button>
               </div>
@@ -293,7 +294,18 @@
                 <button type="submit">Apply</button>
               </form>
               <div class="mobile-list-heading"><strong id="mobile-list-title">Watchlist</strong><span id="mobile-list-count">0</span></div>
+              <div id="mobile-monitor-controls" class="mobile-monitor-controls">
+                <div class="mobile-monitor-filters" role="group" aria-label="Filter monitored stocks">
+                  <button type="button" data-monitor-filter="all" class="active" aria-pressed="true">All</button>
+                  <button type="button" data-monitor-filter="breakouts" aria-pressed="false">Broken out</button>
+                  <button type="button" data-monitor-filter="orb" aria-pressed="false">ORB passed</button>
+                  <button type="button" data-monitor-filter="today" aria-pressed="false">Buy Today</button>
+                </div>
+                <input id="mobile-monitor-search" type="search" placeholder="Find a stock" aria-label="Find monitored stock" autocomplete="off">
+                <div id="mobile-monitor-legend" class="mobile-monitor-legend"><span>1m / 5m / 30m</span><span>Price breakout</span><span>Position bounds</span></div>
+              </div>
               <div id="mobile-list-items" class="mobile-list-items" role="listbox" aria-label="Watchlist stocks"></div>
+              <div id="mobile-monitor-status" class="mobile-monitor-status" role="status">Checking intraday prices…</div>
             </div>
           </div>
           <button class="mobile-nav-button mobile-workspace-tab active" type="button" data-mobile-page="chart" aria-label="Chart" aria-current="page">

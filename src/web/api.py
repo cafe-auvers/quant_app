@@ -37,6 +37,8 @@ from .connected_operator import (
 from .market_data import MarketDataUnavailable, MarketDataSource, build_market_data_source
 from .market_status import nyse_market_status
 from .live_updates import LiveUpdateHub
+from .intraday_monitor import IntradayMonitor
+from .monitor_source import load_monitor_context
 from .store import ConflictError, SessionRecord, ValidationError, WebStore
 from .watchlist_history import WatchlistHistorySource, merge_watchlist_history
 
@@ -127,9 +129,12 @@ class WebServices:
     connected_planning: ConnectedPlanningService
     connected_operator: ConnectedOperatorService
     live_updates: LiveUpdateHub
+    monitor: IntradayMonitor
 
 
 def build_services(config: WebConfig) -> WebServices:
+    from src.utils.config import get_env_value
+
     ensure_runtime_directories(config)
     store = WebStore(config.database_path)
     scanner_setups_path = (
@@ -148,6 +153,9 @@ def build_services(config: WebConfig) -> WebServices:
     connected_planning = ConnectedPlanningService.from_config(
         config, canonical_planning
     )
+    connected_operator = ConnectedOperatorService(
+        config, canonical_planning, connected_planning
+    )
     return WebServices(
         config=config,
         store=store,
@@ -164,10 +172,14 @@ def build_services(config: WebConfig) -> WebServices:
         watchlist_history=WatchlistHistorySource.from_config(config),
         canonical_planning=canonical_planning,
         connected_planning=connected_planning,
-        connected_operator=ConnectedOperatorService(
-            config, canonical_planning, connected_planning
-        ),
+        connected_operator=connected_operator,
         live_updates=LiveUpdateHub(),
+        monitor=IntradayMonitor(
+            lambda: load_monitor_context(config, store, canonical_planning),
+            enabled=config.mode == "CONNECTED",
+            refresh_seconds=float(get_env_value("WEB_MONITOR_REFRESH_SECONDS", "60")),
+            stale_seconds=float(get_env_value("WEB_MONITOR_QUOTE_MAX_AGE_SECONDS", "180")),
+        ),
     )
 
 
@@ -330,6 +342,7 @@ def register_api_routes(app: FastAPI, services: WebServices) -> None:
         result: dict[str, Any] | None = None,
     ) -> None:
         card = (result or {}).get("card") or {}
+        services.monitor.invalidate()
         services.live_updates.publish(
             {
                 "kind": kind,
@@ -514,6 +527,9 @@ def register_api_routes(app: FastAPI, services: WebServices) -> None:
             "executor_heartbeat_age_seconds": canonical.get(
                 "executor_heartbeat_age_seconds"
             ),
+            "executor_hostname": canonical.get("executor_hostname", ""),
+            "executor_state": canonical.get("executor_state", "UNKNOWN"),
+            "executor_reason": canonical.get("executor_reason", ""),
             "market_status": market,
             "watchlist_rollover": rollover,
             "mode": config.mode,
@@ -630,6 +646,12 @@ def register_api_routes(app: FastAPI, services: WebServices) -> None:
         await apply_watchlist_rollover()
         rows = await anyio.to_thread.run_sync(services.store.list_plans, stage)
         return {"rows": rows, "mode": "SANDBOX", "sync_state": "NOT SYNCED TO EXECUTOR"}
+
+    @app.get("/api/v1/intraday-monitor")
+    async def intraday_monitor(
+        _session: SessionRecord = Depends(current_session),
+    ) -> dict[str, Any]:
+        return await anyio.to_thread.run_sync(services.monitor.snapshot)
 
     @app.get("/api/v1/planning-history")
     async def planning_history(
@@ -1205,26 +1227,33 @@ def register_api_routes(app: FastAPI, services: WebServices) -> None:
         )
 
 
+@asynccontextmanager
+async def web_services_lifespan(app: FastAPI):
+    services = app.state.web_services
+    loop = asyncio.get_running_loop()
+    services.monitor.on_update = lambda: loop.call_soon_threadsafe(
+        services.live_updates.publish, {"kind": "intraday_monitor"}
+    )
+    try:
+        yield
+    finally:
+        services.monitor.close()
+        services.connected_planning.close()
+        services.canonical_planning.close()
+
+
 def create_api_app(
     config: WebConfig | None = None, *, services: WebServices | None = None
 ) -> FastAPI:
     config = config or load_web_config()
     services = services or build_services(config)
 
-    @asynccontextmanager
-    async def lifespan(_app: FastAPI):
-        try:
-            yield
-        finally:
-            services.connected_planning.close()
-            services.canonical_planning.close()
-
     app = FastAPI(
         title="Quant Web Localhost",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
-        lifespan=lifespan,
+        lifespan=web_services_lifespan,
     )
     register_api_routes(app, services)
     app.state.web_services = services

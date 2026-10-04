@@ -20,6 +20,7 @@ from src.infrastructure.database.engine import (
 from src.utils.market_calendar import current_or_next_nyse_session_date
 
 from .config import WebConfig
+from .executor_status import executor_status
 from .store import normalize_symbol
 
 
@@ -390,6 +391,21 @@ class CanonicalPlanningSource:
         result = self.list_plans("BUY_TODAY")
         return {"rows": result["rows"], "revision": result["revision"]}
 
+    def orb_monitor_inputs(self) -> dict[str, Any]:
+        """Read account scope and shared settings without write authority or bootstrap."""
+        if not self.available:
+            raise CanonicalPlanningUnavailable(self.unavailable_reason)
+        with self._lock, self.engine.connect() as connection:
+            account_no = self._account_no(connection)
+            payload = connection.execute(
+                text("SELECT payload FROM app_state_sync WHERE state_key=:key"),
+                {"key": "settings"},
+            ).scalar()
+        document = json.loads(payload) if isinstance(payload, str) else payload
+        if document is not None and not isinstance(document, dict):
+            raise CanonicalPlanningUnavailable("Shared settings are invalid")
+        return {"account_no": account_no, "document": document}
+
     @staticmethod
     def _enum_value(value: object) -> str | None:
         if value is None:
@@ -532,9 +548,12 @@ class CanonicalPlanningSource:
                     ),
                     {"environment": self.environment, "account_no": account_no},
                 ).first()
+                updated_at = collection.updated_at
+                if isinstance(updated_at, str):
+                    updated_at = dt.datetime.fromisoformat(updated_at)
                 revision = (
                     f"{int(collection.row_count)}:{int(collection.version_sum)}:"
-                    f"{collection.updated_at.isoformat() if collection.updated_at else ''}"
+                    f"{updated_at.isoformat() if updated_at else ''}"
                 )
                 main_payload = connection.execute(
                     text(
@@ -543,38 +562,13 @@ class CanonicalPlanningSource:
                     )
                 ).scalar()
                 main = json.loads(main_payload) if main_payload else {}
-                hostname = str(main.get("hostname") or "").strip().lower()
-                runtime = None
-                server_now = None
-                if hostname:
-                    runtime = connection.execute(
-                        text(
-                            "SELECT active, heartbeat_at FROM app_runtime_status "
-                            "WHERE hostname=:hostname AND process_name='main.py' LIMIT 1"
-                        ),
-                        {"hostname": hostname},
-                    ).first()
-                    server_now = connection.execute(text("SELECT UTC_TIMESTAMP(6)")).scalar()
-            executor = "UNKNOWN"
-            heartbeat_age = None
-            if runtime is not None and runtime.heartbeat_at is not None and server_now is not None:
-                heartbeat_age = max(
-                    0.0, (server_now - runtime.heartbeat_at).total_seconds()
-                )
-                executor = (
-                    "HEALTHY"
-                    if bool(runtime.active) and heartbeat_age <= 60.0
-                    else "STALE"
-                )
+                executor = executor_status(connection, main)
             return {
                 "state": "AVAILABLE",
                 "reason": "",
                 "revision": revision,
                 "scope": self.environment,
-                "executor": executor,
-                "executor_heartbeat_age_seconds": (
-                    round(heartbeat_age, 1) if heartbeat_age is not None else None
-                ),
+                **executor,
             }
         except Exception as exc:
             return {

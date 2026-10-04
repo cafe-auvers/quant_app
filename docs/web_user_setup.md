@@ -203,15 +203,54 @@ becomes `FAILED`; no archive generations are retained.
 The publishable key is not user authentication. The database password is not
 an API key. Supabase does not host the Python application.
 
-## Optional private phone access (later)
+## Private phone access from the always-on PC
 
 `localhost` on a phone means the phone itself. Keep the Python host running and
 use private Tailscale Serve HTTPS if phone access is needed. Add only the exact
 private hostname to trusted hosts/origins and authentication redirects. Do not
 enable Funnel, router port forwarding, public buckets, or exposed SQL ports.
 
+For PC-only availability, run both the Python web server and Tailscale Serve
+on the always-on PC. Open the **PC's** Tailscale HTTPS hostname on the phone.
+A laptop's Tailscale hostname routes to that laptop, even when the trading
+executor and canonical database are available on the PC. Restarting a laptop
+web server restores that topology but does not provide PC-only availability.
+
+Use a separate web deployment and environment on the PC. Set its
+`pc_repository_path`, `local_mirror_path`, and `watchlist_history_path` to the
+PC's local trading repository/data files. Set `base_url`, `trusted_hosts`,
+and `trusted_origins` to the PC web origin. When migrating an existing web
+dashboard, transfer a SQLite backup of its `web_state.db` to preserve the
+existing login, drawings, and drafts; stop the old web service before the final
+backup so it cannot keep accepting edits into a second database. Update the
+phone's bookmark/home-screen app to the PC URL.
+
 A desktop mobile viewport is emulation, not a real iPhone test. Installing the
 PWA installation does not make the authenticated local API available offline.
+
+Tailscale Serve forwards requests to the web process on the configured host.
+If that process stops or the host reboots without restarting it, the phone can
+keep showing the open dashboard while API requests fail with **502 Bad Gateway**.
+The trading executor running on another PC does not keep this web host alive.
+
+On Windows, register the web dashboard to start at logon and restart one minute
+after a process failure. Run this on the machine hosting Tailscale Serve, using
+the Python environment already installed for the web dashboard:
+
+```powershell
+.\scripts\setup_web_task.ps1 -PythonPath .\.venv-web\Scripts\python.exe -StartNow
+```
+
+Use an absolute `-PythonPath` if the web environment is in another checkout.
+The task uses `pythonw.exe` and a small supervisor to run in the background,
+and restart the web server after any exit. It preserves the configured
+authentication and connection settings and appends startup/errors to
+`data/logs/web_service.log`. Its runtime limit is disabled, it can run on
+battery, and duplicate task launches are ignored. Stop a manually launched web
+server before starting the task so that only one process owns the port.
+Inspect it with `Get-ScheduledTask -TaskName QuantApp_WebDashboard`; disable it
+with `Disable-ScheduledTask -TaskName QuantApp_WebDashboard`. Phone access still
+requires this host to be powered on, awake, and signed in.
 
 ## Known limitations and blocked checks
 
@@ -232,3 +271,68 @@ PWA installation does not make the authenticated local API available offline.
 
 See [Web/PWA Operator Synchronization](web_operator_sync.md) for the complete
 confirmation, pulse, fallback, and execution-safety contract.
+
+## Intraday Watchlist monitor
+
+The mobile bottom **Watchlist** button opens **Monitor** by default. It combines
+Watchlist, Buylist, canonical Buy Today, and current Buy Today drafts into one
+deduplicated list. Each stock shows its latest available price, saved breakout,
+distance from that level, and quote time. Stocks that broke out today appear
+first. **Broken out**, **ORB passed**, **Buy Today**, and symbol search narrow
+the view; tap a stock to review its chart and use the existing planning actions.
+New intraday additions enter the next refresh cycle automatically.
+
+For each 1m, 5m, and 30m range, two results are shown separately:
+
+- **Price breakout** passes after a regular-session minute bar, following the
+  completed opening range, trades strictly above both the saved breakout and
+  the opening-range high. Confirmation remains visible after a pullback; the
+  headline then says **Broke out · pulled back** when below the saved level.
+- **Position bounds** checks the existing passive entry geometry, uses ORH as
+  the execution level and ORL as the stop, and evaluates the desktop's eight
+  risk cases (0.25%–2%) against shared capital and stop/ADR bounds. A valid case
+  passes independently of the price test. Failed bounds include their reason.
+  Missing equity, shared settings, complete minute bars, or daily ADR show an
+  unavailable result instead of a pass.
+
+Connected mode uses a separate web-process Yahoo/yfinance worker with batches
+of at most 40 symbols and four download threads. It polls once per minute
+during extended US trading hours, caches completed daily ADR, pauses after
+three minutes without a visible monitoring client, and avoids repeated closed
+market downloads. Yahoo data can be delayed. Quote age and failed refreshes are
+explicit; partial failures retain prices but suppress fresh signals. A failed
+quote batch backs off for two minutes; failed daily history retries after
+15 minutes. There are no broker calls, scanner runs, order submissions, or
+execution-state changes from this monitor. Sandbox does not download quotes.
+
+Restart the updated web process and desktop app to enable the monitor and
+equity projection. The desktop publishes a small gitignored
+`data/monitor_equity.json` file asynchronously from its existing account
+snapshot; it preserves the actual account fetch time. Position checks require
+an account snapshot no more than 15 minutes old. Refresh the desktop account
+when the monitor reports unavailable equity. Timing overrides belong in
+`config/runtime.local.json`: `WEB_MONITOR_REFRESH_SECONDS` (minimum 60),
+`WEB_MONITOR_QUOTE_MAX_AGE_SECONDS` (default 180), and
+`WEB_MONITOR_EQUITY_MAX_AGE_SECONDS` (default 900). These display checks are
+advisory; the existing execution workflow still applies its own live gates.
+
+On weekends and holidays, Monitor keeps saved breakout levels and the latest
+available price visible with its actual quote date. Off-hours minute downloads
+use a five-day lookback; missing minute quotes fall back to completed daily
+closes from the existing ADR download. A daily close never supplies an intraday
+breakout or ORB pass. The closed-market layout focuses on the two prices and
+hides unavailable intraday checks until the next session.
+
+Pages and their CSS/JavaScript are loaded from one release snapshot. Content
+fingerprints in asset paths bypass older phone service workers immediately;
+the current worker removes obsolete Quant caches and caches only the icon and
+manifest. A normal refresh after restarting the web server loads the release.
+Price API requests time out after 25 seconds and retry on the next check;
+initial quote batches are observed through cached snapshots every five seconds.
+
+The Executor indicator reads the current execution owner's canonical
+`runtime_device_state` heartbeat and its existing freshness threshold, with
+the legacy process heartbeat used only for older deployments. Starting and
+standby states are amber; stale, stopped, or blocked owners remain unhealthy.
+The status includes the owner, heartbeat age, and reason without changing
+execution ownership or readiness gates.

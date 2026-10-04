@@ -56,6 +56,17 @@
     scannerTotal: 0,
     scannerLoading: false,
     planningRows: [],
+    monitorRows: [],
+    monitorFilter: 'all',
+    monitorQuery: '',
+    monitorLoading: false,
+    monitorError: '',
+    monitorPositionError: '',
+    monitorAsOf: null,
+    monitorEnabled: null,
+    monitorTimer: null,
+    monitorRetryTimer: null,
+    monitorStaleSeconds: 180,
     buyTodayRows: [],
     buyBoardRows: [],
     buyBoardRevision: '',
@@ -74,7 +85,7 @@
     historyRequestToken: 0,
     visibleRows: [],
     manualRows: [],
-    listMode: 'watchlist',
+    listMode: 'monitor',
     symbol: null,
     selectionToken: 0,
     timeframe: ['1D', '1H'].includes(localStorage.getItem('quant-web-timeframe'))
@@ -259,7 +270,10 @@
       throw new Error('Session expired.');
     }
     if (response.status === 304) return {notModified: true};
-    const result = await response.json().catch(() => ({}));
+    const result = await response.json().catch(error => {
+      if (error.name === 'AbortError') throw error;
+      return {};
+    });
     if (!response.ok) {
       const error = new Error(result.detail || `Request failed (${response.status})`);
       error.status = response.status;
@@ -307,8 +321,11 @@
     setStatusDot('data-dot', dataState === 'AVAILABLE' ? 'good' : 'closed');
 
     const executorState = String(payload.executor_health || 'UNKNOWN').toUpperCase();
-    byId('executor-status').title = `Executor: ${executorState}`;
-    setStatusDot('executor-dot', executorState === 'HEALTHY' ? 'good' : (executorState === 'UNKNOWN' ? 'stale' : 'closed'));
+    const executorReason = payload.executor_reason || '';
+    const executorHost = payload.executor_hostname || '';
+    byId('executor-status').title = `Executor: ${executorState}${executorHost ? ` · ${executorHost}` : ''}${executorReason ? ` · ${executorReason}` : ''}`;
+    setStatusDot('executor-dot', executorState === 'HEALTHY' ? 'good'
+      : (['UNKNOWN', 'STARTING', 'STANDBY', 'STANDBY_READY', 'SHUTTING_DOWN'].includes(executorState) ? 'stale' : 'closed'));
     if (payload.operator && state.session) state.session.operator = payload.operator;
     renderMobileWorkspace();
   }
@@ -1164,6 +1181,10 @@
   }
 
   function scheduleLivePlanningRefresh(event) {
+    if (event?.kind === 'intraday_monitor') {
+      void loadIntradayMonitor();
+      return;
+    }
     const symbol = String(event?.symbol || '').toUpperCase();
     if (symbol && planningPending(symbol)) return;
     if (state.liveUpdateRefreshTimer !== null) {
@@ -2557,6 +2578,143 @@
     return button;
   }
 
+  function monitoringRows() {
+    const cached = new Map(state.monitorRows.map(row => [row.symbol, row]));
+    const members = new Map();
+    state.planningRows.forEach(row => {
+      if (row.watchlist_member || row.buylist_member || row.buy_today_member) members.set(row.symbol, {...row});
+    });
+    state.buyTodayRows.forEach(row => members.set(row.symbol, {...members.get(row.symbol), ...row, buy_today_member: true}));
+    return [...members.values()].map(card => {
+      const quote = cached.get(card.symbol) || {};
+      const changedLevel = normalizeBreakoutPrice(quote.breakout_price) !== normalizeBreakoutPrice(card.breakout_price);
+      const result = {...quote, ...card};
+      const active = ['REGULAR', 'PRE_MARKET', 'AFTER_HOURS'].includes(state.session?.market_status?.phase);
+      const age = quote.quote_as_of ? (Date.now() - new Date(quote.quote_as_of).getTime()) / 1000 : Infinity;
+      const stale = Boolean(state.monitorError) || quote.quote_status === 'STALE' || (active && age > state.monitorStaleSeconds);
+      if (stale) result.quote_status = quote.current_price ? 'STALE' : 'UNAVAILABLE';
+      if (changedLevel || stale) {
+        result.breakout_status = normalizeBreakoutPrice(card.breakout_price) === null ? 'NO_LEVEL' : 'UNKNOWN';
+        result.broke_out_today = null;
+        result.orb = [];
+      }
+      return result;
+    }).filter(row => {
+      if (state.monitorQuery && !`${row.symbol} ${row.name || ''}`.toLowerCase().includes(state.monitorQuery)) return false;
+      if (state.monitorFilter === 'breakouts') return row.broke_out_today === true;
+      if (state.monitorFilter === 'orb') return (row.orb || []).some(orb => orb.price_status === 'PASS' && orb.position_status === 'PASS');
+      if (state.monitorFilter === 'today') return Boolean(row.buy_today_member);
+      return true;
+    }).sort((a, b) => (
+      Number(Boolean(b.broke_out_today)) - Number(Boolean(a.broke_out_today))
+      || Number(Boolean(b.buy_today_member)) - Number(Boolean(a.buy_today_member))
+      || a.symbol.localeCompare(b.symbol)
+    ));
+  }
+
+  function monitorMarketClosed() {
+    const phase = state.session?.market_status?.phase;
+    return Boolean(phase && !['REGULAR', 'PRE_MARKET', 'AFTER_HOURS'].includes(phase));
+  }
+
+  function mobileMonitorRow(row) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = `mobile-monitor-row${row.symbol === state.symbol ? ' active' : ''}`;
+    button.dataset.mobileSymbol = row.symbol;
+    button.setAttribute('role', 'option');
+    button.setAttribute('aria-selected', String(row.symbol === state.symbol));
+    const add = (parent, tag, text, className = '') => {
+      const node = document.createElement(tag);
+      node.textContent = text;
+      node.className = className;
+      parent.appendChild(node);
+      return node;
+    };
+    const top = add(button, 'span', '', 'mobile-monitor-top');
+    add(top, 'strong', row.symbol);
+    const labels = {ABOVE: 'Broken out', PULLED_BACK: 'Broke out · pulled back', WAITING: 'Waiting', NO_LEVEL: 'Set breakout', PRE_MARKET: 'Pre-market', CLOSED: 'Market closed', UNKNOWN: 'Awaiting data'};
+    const status = add(top, 'small', labels[row.breakout_status] || 'Awaiting data', 'mobile-monitor-breakout');
+    status.dataset.status = row.breakout_status || 'UNKNOWN';
+    const prices = add(button, 'span', '', 'mobile-monitor-prices');
+    const closed = monitorMarketClosed() || row.quote_status === 'CLOSED';
+    const price = add(prices, 'span', closed ? 'Latest price' : 'Current price', 'mobile-monitor-price-block');
+    const currentPrice = Number(row.current_price);
+    add(price, 'b', Number.isFinite(currentPrice) && currentPrice > 0 ? currentPrice.toFixed(currentPrice < 1 ? 4 : 2) : '—');
+    const level = add(prices, 'span', 'Breakout price', 'mobile-monitor-price-block');
+    add(level, 'b', normalizeBreakoutPrice(row.breakout_price)?.toFixed(2) || 'Not set');
+    const distance = normalizeBreakoutPrice(row.current_price) && normalizeBreakoutPrice(row.breakout_price)
+      ? (row.current_price / row.breakout_price - 1) * 100 : null;
+    const meta = add(button, 'span', '', 'mobile-monitor-meta');
+    const quoted = row.quote_as_of ? new Date(row.quote_as_of) : null;
+    const quoteDay = quoted?.toLocaleDateString('en-US', {timeZone: 'America/New_York', weekday: 'short', month: 'short', day: 'numeric'});
+    const today = new Date().toLocaleDateString('en-US', {timeZone: 'America/New_York', weekday: 'short', month: 'short', day: 'numeric'});
+    const quoteTime = quoted ? `${quoteDay === today ? '' : `${quoteDay} · `}${quoted.toLocaleTimeString('en-US', {timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false})}` : '';
+    const sourceLabel = row.quote_source === 'DAILY_CLOSE' ? 'Last close' : closed ? 'Last price' : '';
+    add(meta, 'small', !quoteTime ? state.monitorAsOf ? 'Quote unavailable' : 'Fetching latest price…'
+      : `${sourceLabel ? `${sourceLabel} · ` : ''}${quoteTime} ET${row.quote_status === 'STALE' ? ' · stale' : ''}`, `mobile-monitor-quote ${row.quote_status === 'STALE' ? 'stale' : ''}`);
+    add(meta, 'small', distance === null ? '' : `${Math.abs(distance).toFixed(2)}% ${distance > 0 ? 'above' : 'below'} breakout`, 'mobile-monitor-distance');
+    if (!closed) {
+      const table = add(button, 'span', '', 'mobile-monitor-orb');
+      ['1m', '5m', '30m'].forEach(window => {
+        const orb = (row.orb || []).find(item => item.window === window) || {};
+        const line = add(table, 'span', '', 'mobile-monitor-orb-line');
+        add(line, 'b', window);
+        const cell = (value, reason) => {
+          const names = {PASS: '✓ Passed', FAIL: '✕ Failed', WAITING: 'Waiting', FORMING: 'Forming', UNKNOWN: 'Unavailable'};
+          const node = add(line, 'span', names[value] || 'Unavailable', 'mobile-monitor-result');
+          node.dataset.status = value || 'UNKNOWN';
+          node.title = reason || '';
+        };
+        cell(orb.price_status, orb.price_reason);
+        cell(orb.position_status, orb.position_reason);
+        if (orb.position_status === 'FAIL' && orb.position_reason) add(table, 'small', `${window}: ${orb.position_reason}`, 'mobile-monitor-reason');
+      });
+    }
+    button.addEventListener('click', () => {
+      byId('mobile-list-popover').hidden = true;
+      byId('mobile-list-menu').setAttribute('aria-expanded', 'false');
+      void selectSymbol(row.symbol);
+    });
+    return button;
+  }
+
+  async function loadIntradayMonitor() {
+    if (state.monitorLoading || !state.session || !compactLayout.matches || document.hidden) return;
+    state.monitorLoading = true;
+    if (state.monitorRetryTimer !== null) window.clearTimeout(state.monitorRetryTimer);
+    state.monitorRetryTimer = null;
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 25_000);
+    try {
+      const result = await api('/api/v1/intraday-monitor', {signal: controller.signal});
+      state.monitorRows = result.rows || [];
+      state.monitorAsOf = result.as_of;
+      state.monitorEnabled = result.enabled;
+      state.monitorStaleSeconds = Number(result.stale_seconds || 180);
+      state.monitorError = result.error || '';
+      state.monitorPositionError = result.position_context_error || '';
+    } catch (error) {
+      state.monitorError = error.name === 'AbortError'
+        ? 'Price check timed out · retrying on the next check'
+        : `Prices unavailable: ${error.message}`;
+    } finally {
+      window.clearTimeout(timeout);
+      state.monitorLoading = false;
+      if (state.listMode === 'monitor') applyListMode('monitor');
+      // Poll only the shared snapshot while its first quote batch is loading.
+      if (!state.monitorAsOf && state.monitorEnabled === true && !state.monitorError) {
+        state.monitorRetryTimer = window.setTimeout(loadIntradayMonitor, 5_000);
+      }
+    }
+  }
+
+  function startIntradayMonitorPolling() {
+    if (state.monitorTimer !== null) window.clearInterval(state.monitorTimer);
+    void loadIntradayMonitor();
+    state.monitorTimer = window.setInterval(() => loadIntradayMonitor(), 60_000);
+  }
+
   function renderMobileStockList() {
     const list = byId('mobile-list-items');
     if (!compactLayout.matches) {
@@ -2565,7 +2723,7 @@
     }
     const fragment = document.createDocumentFragment();
     state.visibleRows.forEach((row, index) => {
-      fragment.appendChild(mobileStockRow(row, index));
+      fragment.appendChild(state.listMode === 'monitor' ? mobileMonitorRow(row) : mobileStockRow(row, index));
     });
     if (!state.visibleRows.length) {
       const empty = document.createElement('div');
@@ -2575,6 +2733,16 @@
     }
     list.replaceChildren(fragment);
     byId('mobile-list-count').textContent = String(state.visibleRows.length);
+    const monitor = state.listMode === 'monitor';
+    byId('mobile-monitor-controls').hidden = !monitor;
+    byId('mobile-monitor-status').hidden = !monitor;
+    byId('mobile-monitor-legend').hidden = monitorMarketClosed();
+    byId('mobile-monitor-status').textContent = state.monitorError || (state.monitorEnabled === false
+      ? 'Sandbox · intraday quotes are available in Connected mode'
+      : state.monitorAsOf ? monitorMarketClosed()
+        ? 'Market closed · showing latest available prices. ORB checks resume next session.'
+        : `Yahoo 1m · checks every minute · quotes may be delayed${state.monitorPositionError ? ` · ${state.monitorPositionError}` : ''}`
+      : 'Checking prices · Watchlist + Buylist + Buy Today');
   }
 
   function updateActiveStockRow() {
@@ -2618,15 +2786,16 @@
     if (state.listMode !== 'scanner') applyListMode(state.listMode);
     renderPlan();
     renderMobileWorkspace();
+    if (state.session) void loadIntradayMonitor();
   }
 
   function applyListMode(mode, render = true) {
     state.listMode = mode;
     document.querySelectorAll('.list-tab').forEach(button => button.classList.toggle('active', button.dataset.list === mode));
-    const listLabels = {scanner: 'Scanner', history: 'History', watchlist: 'Watchlist', buylist: 'Buylist', buy_today: 'Buy Today'};
+    const listLabels = {monitor: 'Intraday watch', scanner: 'Scanner', history: 'History', watchlist: 'Watchlist', buylist: 'Buylist', buy_today: 'Buy Today'};
     const activeListLabel = listLabels[mode] || 'Lists';
-    byId('mobile-list-label').textContent = activeListLabel;
-    byId('mobile-list-title').textContent = mode === 'history' ? 'Watchlist History' : activeListLabel;
+    byId('mobile-list-label').textContent = 'Watchlist';
+    byId('mobile-list-title').textContent = mode === 'history' ? 'Watchlist History' : mode === 'monitor' && monitorMarketClosed() ? 'Watchlist prices' : activeListLabel;
     byId('mobile-list-items').setAttribute('aria-label', `${activeListLabel} stocks`);
     document.querySelectorAll('[data-history-form]').forEach(form => {
       form.hidden = mode !== 'history';
@@ -2636,7 +2805,9 @@
       button.classList.toggle('active', active);
       button.setAttribute('aria-selected', String(active));
     });
-    if (mode === 'scanner') {
+    if (mode === 'monitor') {
+      state.visibleRows = monitoringRows();
+    } else if (mode === 'scanner') {
       state.visibleRows = [...state.manualRows, ...state.scanner.filter(row => !state.manualRows.some(manual => manual.symbol === row.symbol))];
     } else if (mode === 'history') {
       const knownRows = new Map([...state.manualRows, ...state.scanner].map(row => [row.symbol, row]));
@@ -3549,6 +3720,8 @@
       mobileListPopover.hidden = !opening;
       mobileListMenu.setAttribute('aria-expanded', String(opening));
       if (opening) {
+        applyListMode('monitor');
+        void loadIntradayMonitor();
         renderMobileStockList();
         requestAnimationFrame(() => {
           const selected = mobileListPopover.querySelector('.mobile-list-row.active');
@@ -3572,6 +3745,22 @@
       activateListMode(button.dataset.mobileList);
       byId('mobile-list-items').scrollTop = 0;
     }));
+    document.querySelectorAll('[data-monitor-filter]').forEach(button => button.addEventListener('click', () => {
+      state.monitorFilter = button.dataset.monitorFilter;
+      document.querySelectorAll('[data-monitor-filter]').forEach(filter => {
+        const active = filter.dataset.monitorFilter === state.monitorFilter;
+        filter.classList.toggle('active', active);
+        filter.setAttribute('aria-pressed', String(active));
+      });
+      applyListMode('monitor');
+    }));
+    byId('mobile-monitor-search').addEventListener('input', event => {
+      state.monitorQuery = event.target.value.trim().toLowerCase();
+      applyListMode('monitor');
+    });
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) void loadIntradayMonitor();
+    });
     document.querySelectorAll('[data-history-form]').forEach(form => form.addEventListener('submit', event => {
       event.preventDefault();
       const scope = form.dataset.historyForm;
@@ -3855,6 +4044,7 @@
     applyDisplayPreferences();
     updateTimeframeButtons();
     wireEvents();
+    if (!compactLayout.matches) applyListMode('watchlist');
     setMobilePage('chart');
     try {
       state.session = await api('/api/v1/session');
@@ -3862,6 +4052,7 @@
       byId('planning-eyebrow').textContent = state.session.mode === 'CONNECTED' ? 'PC PLANNING' : 'LOCAL PLANNING';
       connectLiveUpdates();
       startStatusStripRefresh();
+      startIntradayMonitorPolling();
       await Promise.all([loadScanner(), refreshPlanningLists(), loadOrbSettings()]);
       const remembered = localStorage.getItem('quant-web-symbol');
       const initial = state.scanner.find(row => row.symbol === remembered)?.symbol || state.scanner[0]?.symbol;

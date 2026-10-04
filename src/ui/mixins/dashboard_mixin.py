@@ -1158,7 +1158,7 @@ class DashboardMixin:
                         if fetched_at is not None:
                             from src.services import buying_power_cache
 
-                            buying_power_cache.record_snapshot(
+                            equity_snapshot = buying_power_cache.record_snapshot(
                                 environment=environment,
                                 account_no=account_no,
                                 usable_buying_power_usd=breakdown["ovrs_cash_usd"],
@@ -1166,6 +1166,9 @@ class DashboardMixin:
                                 source="kis_account_snapshot",
                                 received_at=fetched_at,
                             )
+                            from src.services.monitor_equity import queue_monitor_equity
+
+                            queue_monitor_equity(equity_snapshot)
                     old_block = self.account_size_input.blockSignals(True)
                     self.account_size_input.setText(f"{account_value_usd:.2f}")
                     self.account_size_input.blockSignals(old_block)
