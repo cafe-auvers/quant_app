@@ -1004,6 +1004,8 @@ class TradingEngine:
                     card.entry_runtime_status = _OUTCOME_TO_ENTRY_RUNTIME_STATUS.get(
                         result.outcome, card.entry_runtime_status
                     )
+                    if result.outcome == AttemptOutcome.REJECTED:
+                        card.entry_block_reason = result.detail or "Entry attempt rejected"
                     if result.outcome == AttemptOutcome.BROKER_ROUTING_REJECTED:
                         card.entry_block_reason = (
                             "KIS rejected the verified exchange route (APBK0656); "

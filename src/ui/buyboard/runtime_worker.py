@@ -363,7 +363,11 @@ class BuyboardRuntimeWorker(QThread):
         self._execution_authority = execution_authority
         self._execution_lease = execution_lease
         self._lease_engine = lease_engine
-        self._capital_reservation_engine = capital_reservation_engine
+        self._capital_reservation_engine = (
+            capital_reservation_engine
+            if capital_reservation_engine is not None
+            else db_engine
+        )
         # Review finding: "accounts without existing cards remain
         # undiscoverable" -- the unscoped production worker derived query
         # targets purely from already-loaded cards, so a manually-purchased
