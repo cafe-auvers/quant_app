@@ -86,3 +86,24 @@ Prices reuse existing Monitor or PC observations. The source, KST timestamp,
 age and stale status are visible. Yahoo prices are indicative, not execution
 permission. Estimated P&L and distance to stop require a dated observation
 within the display freshness threshold; actual KIS execution gates are unchanged.
+
+
+## Current-session ORB and feed feedback
+
+The mobile Buylist now displays the current-session Buy Today rejection after
+the PC returns an invalid plan to Buylist; prior-session history remains hidden.
+Web 3a7c14fe (PR #141) is deployed; the PC remains approved c106449c.
+
+The pending PC release 3a7c14fe uses the highest legal BUY tick at or below raw
+ORH for automatic limits. The raw high remains the confirmation threshold;
+manual prices are never silently rounded, and a collapsed passive zone still
+fails. ODD's actual cached 30m range (19.705/19.09) replays to a legal 19.70
+limit and valid sizing, while its 1m/5m plans remain risk-invalid. Exact-release
+approval and supervised activation are still required before this planner runs.
+
+Initial missing queue data waits for the PC calculation. A Fresh KIS block means
+the execution feed gate failed: disconnected/awaiting channels, missing or stale
+trade/quote, invalid timestamp/ask, or excessive evaluation lag. The combined
+fix preserves fresh observations and identifies the failed gate. It keeps the
+3-second trade/quote policy and 1-second queue budget; quiet symbols may still
+block tomorrow. An indicative Monitor price never authorizes an order.

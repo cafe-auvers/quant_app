@@ -103,8 +103,8 @@ SVIA reservation and correctly blocked subsequent BUYs as unreconciled risk.
 The worker now uses its canonical engine by default, and rejected attempts
 retain the reason for operator visibility. Risk and broker guards are retained.
 
-The separate web service runs `8693afa4bb64605004cd07c1c7cea3182c5d7df7`
-(PR #140, including PR #138/#139). Its far-right header stays on one row and shows `Open in Xm`
+The separate web service runs `3a7c14fe9cc269a2590f825e88aacafac7d98a21`
+(PR #141, including PR #138/#139/#140). Its far-right header stays on one row and shows `Open in Xm`
 before opening and `Close in Xm` during trading. Mobile Cancel Sell All can
 withdraw an unsubmitted regular-session or premarket exit to Open Position,
 preserving the holding and stop and clearing retired retry state. SELL
@@ -124,8 +124,31 @@ age are explicit; Yahoo is indicative, and stale prices do not produce P&L.
 Snapshots and canonical projections are reused without additional SQL queries,
 quote polling or broker calls. At 02:06 KST the PC remained ACTIVE on c106449c
 with live execution enabled/effective; its processes and configuration were
-preserved. The separate PC correction 8efad797 remains pending actual reviewer
-approval and a supervised restart. Its prepared activation preserves web 8693afa4.
+preserved. The combined PC correction 3a7c14fe (PR #141) supersedes the
+unapproved 8efad797 package and remains pending actual reviewer approval and a
+supervised restart. Its prepared activation preserves web 3a7c14fe.
+
+At 02:55 KST on 2026-10-06, the separate web source was updated to 3a7c14fe,
+preserving PC process IDs, source c106449c, credentials/configuration and Live
+Trading. The Buylist now shows the current-session Buy Today rejection memo.
+ODD's calculation had rejected fractional-cent 1m/30m highs as invalid order
+ticks, then returned it to Buylist; mobile had omitted the stored result.
+The prepared PC planner rounds automatic BUY limits down to the highest legal
+tick within the passive range and retains raw ORH for breakout confirmation.
+Actual cached KIS inputs replayed offline to a valid ODD 30m plan at $19.70,
+117 shares and 16.28% capital; 1m/5m remain risk-invalid. No order was placed
+or Buy Today intent restored by this diagnostic. Until approved activation,
+the PC still uses the old planner. Verification at 02:57 KST confirmed c106449c
+ACTIVE, reconciled, and Live Trading enabled/effective.
+
+The same pending release preserves the latest KIS trade alongside stop extrema,
+uses the newest observation timestamp, prevents minute refresh from repeatedly
+rearming a feed-blocked card, publishes worker equity with its actual timestamp,
+and shows the specific freshness block. A healthy socket does not guarantee a
+fresh per-symbol trade and quote. Missing acknowledgements, stale/quiet events,
+invalid timestamps/ask, or the processing queue limit still block entry after
+the fix. Freshness, sizing/risk, broker, ownership and manual-arming guards
+remain enforced; tomorrow does not guarantee every symbol can enter.
 
 At the operator's request, SVIA returned to Open at 00:09 KST with 643 shares
 and its $4.24 stop covering 643 shares. No SELL was working and no broker
