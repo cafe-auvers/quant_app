@@ -2116,6 +2116,10 @@ class BuyboardRuntimeWorker(QThread):
         # readiness: a reconciliation failure may block a command but must
         # never make the feed stop watching an existing position.
         self._sync_quote_subscriptions(observation_cards)
+        from src.services.live_session_checks import prepare_card_snapshot, observe_cycle
+
+        check_cards = prepare_card_snapshot(observation_cards)
+        check_quotes = []
         with self._stop_change_coordinator.lock_cards(stop_card_keys):
             # A stop can commit after this cycle loaded ``cards``. Overlay
             # that exact durable request before rotating/draining so the
@@ -2128,6 +2132,7 @@ class BuyboardRuntimeWorker(QThread):
             )
 
             quotes = self.runtime.market_data.poll_once()
+            check_quotes.extend(quotes)
             self.last_market_data_drain_at = datetime.now(timezone.utc)
             if allow_mutations:
                 for quote in quotes:
@@ -2191,6 +2196,7 @@ class BuyboardRuntimeWorker(QThread):
                     observation_cards, apply_pending_changes=True
                 ):
                     rotated_quotes = self.runtime.market_data.poll_once()
+                    check_quotes.extend(rotated_quotes)
                     self.last_market_data_drain_at = datetime.now(timezone.utc)
                     for quote in rotated_quotes:
                         _track(self.runtime.trading_engine.evaluate_quote(observation_cards, quote))
@@ -2231,6 +2237,8 @@ class BuyboardRuntimeWorker(QThread):
         )
         if changed or reconciliation_changed or operator_commands_changed:
             self.board_changed.emit()
+        observe_cycle(self.runtime.market_data, check_quotes, check_cards,
+                      self._account_equity_provider or self._buying_power_provider)
 
     def _process_operator_commands(self, *, limit: int = 20) -> bool:
         """Apply live human requests only while this runtime owns execution."""
