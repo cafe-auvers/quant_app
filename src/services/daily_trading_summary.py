@@ -138,7 +138,7 @@ def _table(metadata: MetaData) -> Table:
         Column("environment", String(10), nullable=False),
         Column("account_no", String(32), nullable=False, server_default=""),
         Column("symbol", String(20), nullable=False, server_default=""),
-        Column("payload", Text(length=16_777_215), nullable=False),
+        Column("payload", Text().with_variant(Text(length=16_777_215), "mysql"), nullable=False),
         UniqueConstraint("event_key", name="uq_daily_trading_events_key"),
     )
 

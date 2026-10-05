@@ -58,10 +58,11 @@ from sqlalchemy import (
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.dialects.mysql import insert as mysql_insert
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from src.core.capital_reservation import CapitalReservation, CapitalReservationStatus
-from src.infrastructure.database.coordination_engine import coordination_read_connection
+from src.infrastructure.database.coordination_engine import coordination_read_connection, coordination_server_now
 
 logger = logging.getLogger(__name__)
 
@@ -179,9 +180,7 @@ def _ensure_pr3_columns(engine: Engine) -> None:
 
 
 def _server_now(engine: Engine):
-    if engine.dialect.name == "mysql":
-        return func.utc_timestamp(6)
-    return func.current_timestamp()
+    return coordination_server_now(engine)
 
 
 def _row_to_reservation(row) -> CapitalReservation:
@@ -652,6 +651,12 @@ def _lock_account_reservation_scope(
             sqlite_insert(table)
             .values(**values)
             .on_conflict_do_nothing(index_elements=["environment", "account_no"])
+        )
+    elif conn.engine.dialect.name == "postgresql":
+        conn.execute(
+            postgresql_insert(table).values(**values).on_conflict_do_nothing(
+                index_elements=["environment", "account_no"]
+            )
         )
     else:
         existing = conn.execute(

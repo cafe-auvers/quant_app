@@ -9,13 +9,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import URL, create_engine, text
+from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from src.core.trade_card_state import BoardStatus, TradeCardState
-from src.infrastructure.database.engine import (
-    validate_mysql_identifier,
-    validate_mysql_port,
+from src.infrastructure.database.coordination_engine import (
+    create_coordination_connection_engine,
+    normalize_coordination_database_config,
 )
 from src.utils.market_calendar import current_or_next_nyse_session_date
 
@@ -25,12 +25,14 @@ from .store import normalize_symbol
 
 
 _COORDINATION_KEYS = (
+    "COORD_DB_BACKEND",
     "COORD_DB_HOST",
     "COORD_DB_PORT",
     "COORD_DB_USER",
     "COORD_DB_PASSWORD",
     "COORD_DB_NAME",
     "COORD_DB_SSL_CA",
+    "COORD_DB_SCHEMA",
 )
 
 
@@ -89,50 +91,8 @@ def _coordination_engine(repository: Path, *, read_only: bool) -> Engine:
         raise CanonicalPlanningUnavailable(
             "The PC coordination database credentials are incomplete"
         )
-    database = validate_mysql_identifier(
-        values["COORD_DB_NAME"], label="coordination database name"
-    )
-    port = validate_mysql_port(values["COORD_DB_PORT"] or "4000")
-    connect_args: dict[str, Any] = {
-        "connect_timeout": 5,
-        "read_timeout": 10,
-        "write_timeout": 10,
-        "ssl_verify_cert": True,
-        "ssl_verify_identity": True,
-    }
-    ca_path = values["COORD_DB_SSL_CA"]
-    if ca_path:
-        if not Path(ca_path).is_file():
-            raise CanonicalPlanningUnavailable(
-                "The PC coordination database CA certificate is unavailable"
-            )
-        connect_args["ssl_ca"] = ca_path
-    options: dict[str, Any] = {
-        "future": True,
-        "pool_pre_ping": not read_only,
-        "pool_recycle": 240,
-        "pool_size": 2,
-        "max_overflow": 0,
-        "pool_timeout": 3,
-        "connect_args": connect_args,
-    }
-    if read_only:
-        options.update(
-            isolation_level="AUTOCOMMIT",
-            skip_autocommit_rollback=True,
-            pool_pre_ping=False,
-        )
-    engine = create_engine(
-        URL.create(
-            "mysql+pymysql",
-            username=values["COORD_DB_USER"],
-            password=values["COORD_DB_PASSWORD"],
-            host=values["COORD_DB_HOST"],
-            port=port,
-            database=database,
-            query={"charset": "utf8mb4"},
-        ),
-        **options,
+    engine = create_coordination_connection_engine(
+        normalize_coordination_database_config(values), read_only=read_only
     )
     try:
         with engine.connect() as connection:
@@ -148,7 +108,7 @@ def _build_read_engine(repository: Path) -> Engine:
 
 
 def build_canonical_write_engine(repository: Path) -> Engine:
-    """Build a transactional TiDB engine without running schema bootstrap."""
+    """Build the canonical transactional engine without schema bootstrap."""
 
     return _coordination_engine(repository, read_only=False)
 
@@ -212,6 +172,12 @@ class CanonicalPlanningSource:
     def available(self) -> bool:
         return bool(self.enabled and self.engine is not None)
 
+    @property
+    def source_name(self) -> str:
+        if self.engine is not None and self.engine.dialect.name == "postgresql":
+            return "CANONICAL_SUPABASE"
+        return "CANONICAL_TIDB"
+
     def close(self) -> None:
         if self.engine is not None:
             self.engine.dispose()
@@ -264,6 +230,7 @@ class CanonicalPlanningSource:
             now = time.monotonic()
             if (
                 not force
+                and self.cache_seconds > 0
                 and self._snapshot is not None
                 and now - self._snapshot.loaded_at <= self.cache_seconds
             ):
@@ -271,13 +238,26 @@ class CanonicalPlanningSource:
             try:
                 with self.engine.connect() as connection:
                     account_no = self._account_no(connection)
+                    parameters = {"environment": self.environment, "account_no": account_no}
+                    if not force and self._snapshot is not None:
+                        stamp = connection.execute(
+                            text(
+                                "SELECT COUNT(*) AS card_count, COALESCE(SUM(version), 0) AS version_sum, "
+                                "MAX(updated_at) AS newest FROM trade_cards "
+                                "WHERE environment=:environment AND account_no=:account_no"
+                            ), parameters,
+                        ).one()
+                        revision = self._revision(stamp.card_count, stamp.version_sum, stamp.newest)
+                        if revision == self._snapshot.revision:
+                            self._snapshot = _Snapshot(self._snapshot.cards, revision, now)
+                            return self._snapshot
                     rows = connection.execute(
                         text(
                             "SELECT payload, version, updated_at FROM trade_cards "
                             "WHERE environment=:environment AND account_no=:account_no "
                             "ORDER BY board_status, symbol"
                         ),
-                        {"environment": self.environment, "account_no": account_no},
+                        parameters,
                     ).all()
             except CanonicalPlanningUnavailable:
                 raise
@@ -291,14 +271,14 @@ class CanonicalPlanningSource:
                 (row.updated_at for row in rows if row.updated_at is not None),
                 default=None,
             )
-            newest_text = (
-                newest.isoformat()
-                if newest is not None and hasattr(newest, "isoformat")
-                else str(newest or "")
-            )
-            revision = f"{len(cards)}:{version_sum}:{newest_text}"
+            revision = self._revision(len(cards), version_sum, newest)
             self._snapshot = _Snapshot(cards, revision, now)
             return self._snapshot
+
+    @staticmethod
+    def _revision(count, version_sum, newest) -> str:
+        newest_text = newest.isoformat() if newest is not None and hasattr(newest, "isoformat") else str(newest or "")
+        return f"{int(count)}:{int(version_sum)}:{newest_text}"
 
     @staticmethod
     def _positive_number(value: object) -> float | None:
@@ -361,7 +341,7 @@ class CanonicalPlanningSource:
                 if card.watchlist_session_date
                 else None
             ),
-            "source": "CANONICAL_TIDB",
+            "source": self.source_name,
         }
 
     def list_plans(
@@ -476,7 +456,7 @@ class CanonicalPlanningSource:
             "last_exit_error": str(card.last_exit_error or ""),
             "warnings": [str(item) for item in card.warnings if str(item).strip()],
             "updated_at": card.updated_at.isoformat(),
-            "source": "CANONICAL_TIDB",
+            "source": self.source_name,
         }
 
     def list_board(self, *, force: bool = False) -> dict[str, Any]:

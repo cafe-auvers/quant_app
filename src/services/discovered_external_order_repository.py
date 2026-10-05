@@ -57,7 +57,7 @@ from src.core.discovered_external_order import (
     ExternalOrderDisposition,
     adopt_external_order,
 )
-from src.infrastructure.database.coordination_engine import coordination_read_connection
+from src.infrastructure.database.coordination_engine import coordination_read_connection, coordination_server_now
 from src.core.execution_order_record import (
     AdoptedOrderPermission,
     ExecutionOrderRecord,
@@ -132,7 +132,7 @@ def _get_discovered_external_orders_table(metadata: MetaData) -> Table:
         Column("broker_identity_key", String(200), nullable=False),
         Column("disposition", String(32), nullable=False),
         Column("version", BigInteger, nullable=False, server_default="1"),
-        Column("payload", Text(length=16_777_215), nullable=False),
+        Column("payload", Text().with_variant(Text(length=16_777_215), "mysql"), nullable=False),
         Column("updated_at", DateTime, nullable=False),
         UniqueConstraint("external_order_id", name="uq_discovered_external_orders_external_order_id"),
         UniqueConstraint(
@@ -155,9 +155,7 @@ def ensure_discovered_external_orders_table(engine: Engine) -> Table:
 
 
 def _server_now(engine: Engine):
-    if engine.dialect.name == "mysql":
-        return func.utc_timestamp(6)
-    return func.current_timestamp()
+    return coordination_server_now(engine)
 
 
 def _identity_key(order: DiscoveredExternalOrder) -> str:

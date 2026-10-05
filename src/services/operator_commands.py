@@ -157,7 +157,7 @@ def _table(metadata: MetaData) -> Table:
         Column("idempotency_key", String(128), nullable=False, unique=True),
         Column("command_type", String(48), nullable=False),
         Column("symbol", String(32), nullable=False, server_default=""),
-        Column("payload_json", Text(length=16_777_215), nullable=False),
+        Column("payload_json", Text().with_variant(Text(length=16_777_215), "mysql"), nullable=False),
         Column("status", String(32), nullable=False),
         Column("requested_by_device", String(64), nullable=False),
         Column("requested_by_host", String(128), nullable=False),

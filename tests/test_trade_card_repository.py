@@ -6,7 +6,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.pool import NullPool
 
-from src.core.trade_card_state import BoardStatus, TradeCardState
+from src.core.trade_card_state import BoardStatus, StopType, TradeCardState
 from src.core.watchlist import BuylistItem, BuylistManager, Watchlist, WatchlistItem
 from src.services import trade_card_repository as repo
 
@@ -245,6 +245,19 @@ def test_migration_converts_buylist_percentage_points_to_card_fraction(tmp_path)
     )
 
     assert report.creates[0].card.risk_percent == pytest.approx(0.005)
+
+
+@pytest.mark.parametrize("shares_held", [0, 10])
+def test_migration_only_marks_held_position_stop_as_active(tmp_path, shares_held):
+    manager = BuylistManager()
+    manager.add(_buylist_item(shares_held=shares_held, stop_loss=95.0))
+    report = repo.migrate_buylist_to_trade_cards(
+        _make_engine(tmp_path), buylist_manager=manager, apply=False
+    )
+    card = report.creates[0].card
+    assert card.stop_type == (StopType.MANUAL_PRICE if shares_held else None)
+    assert card.active_stop_price == (95.0 if shares_held else None)
+    assert card.stop_quantity == shares_held
 
 
 def test_migration_apply_persists_and_is_idempotent(tmp_path):

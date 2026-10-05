@@ -29,6 +29,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from src.infrastructure.database.coordination_engine import (
     coordination_autocommit_connection,
     coordination_read_connection,
+    coordination_server_now,
 )
 
 MAIN_APP_PROCESS = "main.py"
@@ -86,9 +87,7 @@ def ensure_runtime_status_table(engine: Engine) -> Table:
 
 
 def _server_now(engine: Engine):
-    if engine.dialect.name == "mysql":
-        return func.utc_timestamp(6)
-    return func.current_timestamp()
+    return coordination_server_now(engine)
 
 
 def database_server_hostname(engine: Engine) -> str:

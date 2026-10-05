@@ -72,10 +72,12 @@
     buyBoardRevision: '',
     buyBoardColumn: 'BUYLIST',
     buyBoardLoading: false,
+    buyBoardEpoch: 0,
     buyBoardError: '',
     buyBoardSelectedSymbol: '',
     buyBoardOptimistic: new Map(),
     buyBoardPendingActions: new Map(),
+    buyBoardActionFeedback: new Map(),
     buyBoardTimer: null,
     historyRows: [],
     historyRange: {start: '', end: ''},
@@ -785,21 +787,26 @@
 
   async function loadBuyBoard(silent = false) {
     if (state.buyBoardLoading || state.session?.mode === 'SANDBOX') return;
+    const epoch = state.buyBoardEpoch;
     state.buyBoardLoading = true;
     if (!silent) renderBuyBoardPage();
     try {
       const result = await api('/api/v1/buyboard');
+      if (epoch !== state.buyBoardEpoch) return;
       state.buyBoardRows = mergeBuyBoardOptimistic(result.rows || []);
       state.buyBoardRevision = String(result.revision || '');
       state.buyBoardError = '';
     } catch (error) {
-      state.buyBoardError = `Board sync unavailable: ${error.message}`;
+      if (epoch === state.buyBoardEpoch) {
+        state.buyBoardError = `Board sync unavailable: ${error.message}`;
+      }
     } finally {
       state.buyBoardLoading = false;
       renderBuyBoardPage();
       if (!byId('buy-board-action-sheet').hidden && state.buyBoardSelectedSymbol) {
         renderBuyBoardActionSheet();
       }
+      if (epoch !== state.buyBoardEpoch) void loadBuyBoard(true);
     }
   }
 
@@ -818,6 +825,7 @@
   }
 
   function closeBuyBoardActionSheet() {
+    state.buyBoardActionFeedback.delete(state.buyBoardSelectedSymbol);
     byId('buy-board-action-sheet').hidden = true;
     byId('buy-board-action-input').hidden = true;
     byId('buy-board-action-status').textContent = '';
@@ -937,7 +945,10 @@
     );
     actions.replaceChildren(fragment);
     byId('buy-board-action-input').hidden = true;
-    byId('buy-board-action-status').textContent = pending ? 'Waiting for canonical confirmation…' : '';
+    const feedback = state.buyBoardActionFeedback.get(row.symbol);
+    byId('buy-board-action-status').textContent = pending
+      ? 'Saving…' : feedback?.message || '';
+    byId('buy-board-action-status').className = `mobile-inline-status ${pending ? '' : feedback?.kind || ''}`;
   }
 
   function openBuyBoardActionSheet(symbol) {
@@ -947,7 +958,6 @@
   }
 
   function optimisticBoardAction(row, action, payload) {
-    if (['move_watchlist', 'remove_buylist'].includes(action)) return null;
     const next = {...row, _pendingAction: action};
     const target = {
       activate_buy_today: 'BUY_TODAY',
@@ -988,9 +998,14 @@
         continue;
       }
       if (!command.terminal) continue;
+      state.buyBoardEpoch += 1;
       state.buyBoardPendingActions.delete(symbol);
       state.buyBoardOptimistic.delete(symbol);
       state.operatorPendingCommands.delete(symbol);
+      state.buyBoardActionFeedback.set(symbol, {
+        message: command.success ? 'Saved.' : `${command.status}: ${command.error || 'The change was not saved.'}`,
+        kind: command.success ? 'success' : 'error',
+      });
       await loadBuyBoard(false);
       if (state.buyBoardSelectedSymbol === symbol && !byId('buy-board-action-sheet').hidden) {
         byId('buy-board-action-status').textContent = command.success
@@ -1021,12 +1036,13 @@
       if (!accepted) return;
     }
     const requestId = commandId();
-    const previousRows = [...state.buyBoardRows];
+    state.buyBoardEpoch += 1;
+    state.buyBoardActionFeedback.delete(symbol);
     const optimistic = optimisticBoardAction(row, action, payload);
     state.buyBoardOptimistic.set(symbol, {row: optimistic});
     state.buyBoardPendingActions.set(symbol, {commandId: requestId, action});
     state.operatorPendingCommands.set(symbol, requestId);
-    state.buyBoardRows = mergeBuyBoardOptimistic(previousRows);
+    state.buyBoardRows = mergeBuyBoardOptimistic(state.buyBoardRows);
     if (optimistic) state.buyBoardColumn = optimistic.board_status;
     renderBuyBoardPage();
     if (!byId('buy-board-action-sheet').hidden) renderBuyBoardActionSheet();
@@ -1046,25 +1062,35 @@
         byId('buy-board-action-status').className = 'mobile-inline-status success';
         void reconcileBuyBoardCommand(symbol, requestId);
       } else {
+        state.buyBoardEpoch += 1;
         state.buyBoardPendingActions.delete(symbol);
         state.buyBoardOptimistic.delete(symbol);
         state.operatorPendingCommands.delete(symbol);
-        await Promise.all([loadBuyBoard(false), refreshPlanningLists()]);
-        if (state.buyBoardSelectedSymbol === symbol && !byId('buy-board-action-sheet').hidden) {
-          byId('buy-board-action-status').textContent = 'Canonical board confirmed. No browser broker call was made.';
-          byId('buy-board-action-status').className = 'mobile-inline-status success';
-        }
+        const confirmedRows = state.buyBoardRows.filter(item => item.symbol !== symbol);
+        if (result.card) confirmedRows.push(result.card);
+        state.buyBoardRows = mergeBuyBoardOptimistic(confirmedRows);
+        state.buyBoardRevision = String(result.board_revision || state.buyBoardRevision);
+        state.buyBoardActionFeedback.set(symbol, {message: 'Saved.', kind: 'success'});
+        renderBuyBoardPage();
+        if (!byId('buy-board-action-sheet').hidden) renderBuyBoardActionSheet();
+        // A failed follow-up read must not undo a confirmed canonical write.
+        void loadBuyBoard(true);
+        void refreshPlanningLists().catch(() => {});
       }
     } catch (error) {
+      state.buyBoardEpoch += 1;
       state.buyBoardPendingActions.delete(symbol);
       state.buyBoardOptimistic.delete(symbol);
       state.operatorPendingCommands.delete(symbol);
-      state.buyBoardRows = previousRows;
+      state.buyBoardRows = mergeBuyBoardOptimistic([
+        ...state.buyBoardRows.filter(item => item.symbol !== symbol), row,
+      ]);
+      state.buyBoardActionFeedback.set(symbol, {
+        message: `Not saved: ${error.message}`, kind: 'error',
+      });
       renderBuyBoardPage();
       if (state.buyBoardSelectedSymbol === symbol && !byId('buy-board-action-sheet').hidden) {
         renderBuyBoardActionSheet();
-        byId('buy-board-action-status').textContent = `Not synced: ${error.message}`;
-        byId('buy-board-action-status').className = 'mobile-inline-status error';
       }
     }
   }

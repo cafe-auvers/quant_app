@@ -8,6 +8,7 @@ numpy>=1.26.4,<2
 yfinance>=0.2.66,<0.3
 SQLAlchemy>=2.0.43,<2.1
 PyMySQL>=1.2.0,<2
+psycopg[binary]>=3.2,<4
 python-dotenv>=0.21.0,<2
 cryptography>=50.0.0,<51
 websockets==17.0.1

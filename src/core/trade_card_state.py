@@ -18,7 +18,7 @@ broker position actually exists (section 194).
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -885,6 +885,31 @@ def has_durable_execution_evidence(card: TradeCardState) -> bool:
         or card.exit_cancel_command_id
         or card.capital_reservation_id
         or card.return_to_buylist_after_close
+    )
+
+
+def has_legacy_planning_stop(card: TradeCardState) -> bool:
+    """Identify an untouched flat legacy candidate's incorrectly migrated stop."""
+
+    try:
+        positive_stop = (
+            card.active_stop_price is not None
+            and math.isfinite(card.active_stop_price)
+            and card.active_stop_price > 0
+        )
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not (
+        card.version == 1
+        and "migrated_from_buylist" in card.warnings
+        and card.board_status in {BoardStatus.WATCHLIST, BoardStatus.BUYLIST}
+        and card.stop_type == StopType.MANUAL_PRICE
+        and positive_stop
+        and card.stop_quantity == 0
+    ):
+        return False
+    return not has_durable_execution_evidence(
+        replace(card, stop_type=None, active_stop_price=None)
     )
 
 

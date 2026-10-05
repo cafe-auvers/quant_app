@@ -169,7 +169,7 @@ def _get_execution_commands_table(metadata: MetaData) -> Table:
         # TEXT/BLOB columns (error 1101). Every insert path already writes
         # the redacted JSON explicitly, so a server-side default is neither
         # needed nor portable.
-        Column("redacted_response", Text(length=16_777_215), nullable=False),
+        Column("redacted_response", Text().with_variant(Text(length=16_777_215), "mysql"), nullable=False),
         Column("response_hash", String(64), nullable=False, server_default=""),
         Column("version", BigInteger, nullable=False, server_default="1"),
         Column("source", String(32), nullable=False, server_default=""),

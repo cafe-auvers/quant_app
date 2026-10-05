@@ -66,7 +66,7 @@ from src.core.execution_order_record import (
 )
 from src.core.order_recovery_state import OrderRecoveryState
 from src.core.order_state import OrderIntent, OrderSide
-from src.infrastructure.database.coordination_engine import coordination_read_connection
+from src.infrastructure.database.coordination_engine import coordination_read_connection, coordination_server_now
 
 logger = logging.getLogger(__name__)
 
@@ -142,7 +142,7 @@ def _get_execution_orders_table(metadata: MetaData) -> Table:
         # same NULL-vs-empty-string reasoning as broker_identity_key.
         Column("adopted_from_external_order_id", String(64), nullable=True),
         Column("version", BigInteger, nullable=False, server_default="1"),
-        Column("payload", Text(length=16_777_215), nullable=False),
+        Column("payload", Text().with_variant(Text(length=16_777_215), "mysql"), nullable=False),
         Column("updated_at", DateTime, nullable=False),
         UniqueConstraint("client_order_id", name="uq_execution_orders_client_order_id"),
         UniqueConstraint("broker_identity_key", name="uq_execution_orders_broker_identity_key"),
@@ -166,9 +166,7 @@ def ensure_execution_orders_table(engine: Engine) -> Table:
 
 
 def _server_now(engine: Engine):
-    if engine.dialect.name == "mysql":
-        return func.utc_timestamp(6)
-    return func.current_timestamp()
+    return coordination_server_now(engine)
 
 
 def _identity_key_or_none(record: ExecutionOrderRecord) -> Optional[str]:

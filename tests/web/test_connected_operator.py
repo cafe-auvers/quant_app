@@ -8,7 +8,7 @@ from dataclasses import replace
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 
-from src.core.trade_card_state import BoardStatus, TradeCardState
+from src.core.trade_card_state import BoardStatus, StopType, TradeCardState
 from src.core.runtime_readiness import RuntimeDeviceState
 from src.core.execution_ownership import ExecutionOwner
 from src.services import trade_card_repository
@@ -324,6 +324,35 @@ def test_mobile_buyboard_remove_buylist_preserves_non_watchlist_state(
     assert stored.watchlist_member is False
     assert stored.buylist_member is False
     assert stored.breakout_price == 201.25
+
+
+def test_mobile_removes_untouched_flat_legacy_blkb_without_publishing_entry_intent(
+    web_config, tmp_path, monkeypatch
+):
+    engine, _role, service = _service(web_config, tmp_path, same_executor=False)
+    monkeypatch.setattr(trade_card_repository, "LOCAL_TRADE_CARDS_FILE", tmp_path / "cards.json")
+    card = trade_card_repository.create_trade_card(engine, TradeCardState(
+        environment="PROD", account_no="account-a", symbol="BLKB",
+        board_status=BoardStatus.BUYLIST, buylist_member=True, breakout_price=45.6,
+        stop_type=StopType.MANUAL_PRICE, active_stop_price=44.54,
+        warnings=["migrated_from_buylist"],
+    ))
+    result = service.apply_board_action(
+        command_id=str(uuid.uuid4()), action="remove_buylist", symbol="BLKB",
+        expected_revision=card.version,
+    )
+    assert result["card"] is None
+    assert result["queued"] is False
+    assert result["executable_intent"] is False
+    assert result["broker_order_placed"] is False
+    stored = trade_card_repository.get_trade_card(engine, "PROD", "account-a", "BLKB")
+    assert stored.version == card.version + 1
+    assert stored.board_status == BoardStatus.WATCHLIST
+    assert stored.buylist_member is False
+    assert stored.breakout_price == 45.6
+    assert stored.stop_type is None
+    assert stored.active_stop_price is None
+    assert service.board_snapshot(force=True)["rows"] == []
 
 
 def test_split_owner_consumes_mobile_cancel_partial_sell(
