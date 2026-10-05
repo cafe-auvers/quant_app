@@ -368,6 +368,73 @@ def test_construction_builds_nothing(tmp_path):
     assert worker.runtime is None
 
 
+@pytest.mark.parametrize("explicit_engine", [False, True])
+def test_production_composition_reads_existing_pending_buy_reservation(
+    tmp_path, monkeypatch, explicit_engine
+):
+    import src.ui.buyboard.runtime_worker as worker_module
+    from src.core.capital_reservation import CapitalReservation
+    from src.services import capital_reservation_repository
+
+    if explicit_engine:
+        (tmp_path / "reservations").mkdir()
+        reservation_engine = _db_engine(tmp_path / "reservations")
+        worker, engine = _worker(tmp_path, capital_reservation_engine=reservation_engine)
+    else:
+        worker, engine = _worker(tmp_path)
+        reservation_engine = engine
+    reservation = CapitalReservation.create(
+        environment="PROD", account_no="1", symbol="SVIA",
+        attempt_group_id="pending-svia", requested_notional=2797.05,
+        projected_open_risk=70.73,
+    )
+    capital_reservation_repository.save_reservation_strict(reservation_engine, reservation)
+    order = ExecutionOrderRecord(
+        environment="PROD", account_no="1", symbol="SVIA",
+        side=OrderSide.BUY, intent=OrderIntent.ENTRY,
+        client_order_id="pending-svia", broker_order_id="broker-svia",
+        broker_identity_status=BrokerIdentityStatus.EXACT,
+        status=ExecutionOrderStatus.WORKING,
+        submitted_quantity=643, remaining_quantity=643, submitted_limit_price=4.35,
+        capital_reservation_id=reservation.reservation_id,
+    )
+    record_execution_order(engine, order)
+    pending_card = _seed_card(engine, symbol="SVIA", entry_orb_low=4.24)
+    captured = {}
+
+    def capture_composition(**kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("composition captured")
+
+    lease = ExecutionLease(device_id="test", lease_token="test", lease_epoch=1)
+    worker._broker = ExecutionCommandGateway(
+        real_broker=FakeExecutionBroker(), engine=engine, mode_override=True,
+        lease_protocol=FakeExecutionLeaseProtocol(current=lease),
+        mutation_budget=AllowAllMutationBudget(), buying_power_provider=lambda *_: 100_000.0,
+    )
+    worker._schema_migration_manager = SimpleNamespace(prepare_cutover=lambda **_: None)
+    monkeypatch.setattr(worker_module, "is_buyboard_engine_enabled", lambda: True)
+    monkeypatch.setattr(execution_config, "KIS_LIVE_EXECUTION_MODE", "DISABLED")
+    monkeypatch.setattr(worker_module, "require_compatible_runtime_schema", lambda *_, **__: None)
+    monkeypatch.setattr(worker, "_set_device_state", lambda *_: None)
+    monkeypatch.setattr(worker, "_perform_shutdown_sequence", lambda: None)
+    monkeypatch.setattr(runtime_module, "build_buyboard_runtime", capture_composition)
+    worker.run()
+    assert captured
+
+    active = captured["portfolio_reservations_provider"]("PROD", "1")
+    orders = captured["portfolio_orders_provider"]("PROD", "1")
+    exposures = runtime_module._portfolio_projected_exposures(
+        cards=(pending_card,), execution_orders=orders, active_reservations=active,
+    )
+    assert len(exposures) == 1
+    assert exposures[0].source == "PENDING_BUY"
+    assert exposures[0].reservation_id == reservation.reservation_id
+    assert exposures[0].gross_notional_usd == pytest.approx(2797.05)
+    assert exposures[0].open_risk_usd == pytest.approx(70.73)
+    assert captured["portfolio_reservations_provider"]("PROD", "other-account") == []
+
+
 def test_unclaimed_new_store_allows_read_only_standby_migration_bootstrap(tmp_path):
     worker, engine = _worker(tmp_path, standby_only=True, device_id="laptop")
     manager = SchemaMigrationManager(

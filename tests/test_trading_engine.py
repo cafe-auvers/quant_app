@@ -158,6 +158,29 @@ def _make_engine(
 # --- Disabled engine is a strict no-op --------------------------------------
 
 
+def test_pre_broker_risk_rejection_is_visible_on_retrying_card(tmp_path):
+    from src.risk.pre_trade import PreTradeRiskRejectedError
+
+    reason = "Existing pending BUY has no active capital reservation"
+
+    def reject(**kwargs):
+        raise PreTradeRiskRejectedError(reason)
+
+    engine = _make_engine(tmp_path, submit_order=reject)
+    engine._market_is_open_fn = lambda: True
+    card = _buy_today_card()
+    engine._market_data.subscribe([card.symbol])
+    engine._market_data.poll_once()
+    changed = engine._evaluate_buy_today([card])
+
+    assert card in changed
+    assert card.board_status == BoardStatus.BUY_TODAY
+    assert card.entry_runtime_status == EntryRuntimeStatus.RETRY_COOLDOWN
+    assert card.entry_block_reason == reason
+    assert card.next_retry_at is not None
+    assert not card.entry_submission_unresolved
+
+
 def test_disabled_engine_ignores_everything(tmp_path, monkeypatch):
     import src.services.trading_engine as trading_engine_module
 
