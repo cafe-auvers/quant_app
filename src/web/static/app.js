@@ -70,6 +70,9 @@
     buyTodayRows: [],
     buyBoardRows: [],
     buyBoardRevision: '',
+    buyBoardNav: null,
+    buyBoardNavAt: null,
+    buyBoardNavNote: '',
     buyBoardColumn: 'BUYLIST',
     buyBoardLoading: false,
     buyBoardEpoch: 0,
@@ -713,6 +716,27 @@
     return unknownWhenZero && !number ? 'Not sized' : `${number.toLocaleString()} sh`;
   }
 
+  function boardAccountNav() {
+    const nav = boardNumber(state.buyBoardNav);
+    const age = (Date.now() - Date.parse(state.buyBoardNavAt || '')) / 1000;
+    return nav !== null && Number.isFinite(age) && age >= -5 && age <= 900 ? nav : null;
+  }
+
+  function boardNavMetric(amount) {
+    if (amount === null || !Number.isFinite(amount) || amount < 0) return 'Not sized';
+    const nav = boardAccountNav();
+    const percent = nav === null ? 'NAV unavailable' : `${(amount / nav * 100).toFixed(2)}% NAV`;
+    const dollars = amount.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+    return `${percent} · $${dollars}`;
+  }
+
+  function boardRiskBudget(row) {
+    const value = row.risk_percent;
+    const fraction = value === null || value === undefined ? NaN : Number(value);
+    return Number.isFinite(fraction) && fraction >= 0 && fraction <= 1
+      ? `${(fraction * 100).toFixed(2)}% NAV` : 'Unavailable';
+  }
+
   function boardTarget(row) {
     return Math.max(0, Number(row.broker_quantity) || 0,
       Number(row.target_position_quantity || row.planned_quantity) || 0);
@@ -748,7 +772,8 @@
   function boardDetails(row) {
     const price = boardPrice(row);
     if (row.board_status === 'BUYLIST') {
-      return {price, facts: [['Price', boardMoney(price.price)], ['Breakout', boardMoney(row.breakout_price)]]};
+      return {price, facts: [['Price', boardMoney(price.price)], ['Breakout', boardMoney(row.breakout_price)],
+        ['Risk budget', boardRiskBudget(row)], ['Planned allocation', 'Not sized']]};
     }
     const held = Math.max(0, Number(row.broker_quantity) || 0);
     const target = boardTarget(row);
@@ -761,6 +786,7 @@
         : boardMoney(row.entry_orb_low)]];
     if (!position) {
       facts.push(
+        ['Risk budget', boardRiskBudget(row)],
         ['Breakout', boardMoney(row.breakout_price)],
         ['Entry plan', boardMoney(row.entry_execution_price || row.entry_trigger)],
         ['ORB', row.entry_orb_window || row.selected_orb_window || 'Not selected'],
@@ -772,8 +798,13 @@
       }
       const entry = boardNumber(row.entry_execution_price || row.entry_trigger);
       const plannedStop = boardNumber(row.entry_orb_low);
+      facts.push(['Planned allocation', boardNavMetric(entry !== null && target > 0 ? entry * target : null)]);
       if (entry !== null && plannedStop !== null && entry > plannedStop && target > 0) {
-        facts.push(['Planned risk', boardMoney((entry - plannedStop) * target)]);
+        facts.push(['Planned risk', boardNavMetric((entry - plannedStop) * target)]);
+      }
+      if (held > 0) {
+        const average = boardNumber(row.average_entry_price);
+        facts.push(['Allocated', boardNavMetric(average !== null ? average * held : null)]);
       }
       if (row.next_retry_at) facts.push(['Retry after', boardTime(row.next_retry_at)]);
     } else {
@@ -782,6 +813,11 @@
         ['Stop coverage', stop === null ? 'Not active'
           : `${Math.max(0, Number(row.stop_quantity) || 0).toLocaleString()} / ${held.toLocaleString()} sh`]);
       const average = boardNumber(row.average_entry_price);
+      facts.push(['Allocated', boardNavMetric(average !== null && held > 0 ? average * held : null)],
+        ['Risk at stop', stop !== null && held > 0
+          && Number(row.stop_quantity || 0) >= held
+          ? average !== null ? boardNavMetric(Math.max(0, average - stop) * held) : 'Unavailable'
+          : 'Not fully covered']);
       if (price.fresh && average !== null && held > 0) {
         const pnl = (price.price - average) * held;
         const percent = (price.price / average - 1) * 100;
@@ -913,6 +949,10 @@
       ? Math.max(0, Number(row.broker_quantity) || 0) : boardTarget(row)), 0);
     const unsized = !position ? rows.filter(row => boardTarget(row) === 0).length : 0;
     byId('buy-board-column-summary').textContent = `${rows.length} stock${rows.length === 1 ? '' : 's'}${column.key === 'BUYLIST' ? '' : ` · ${shares.toLocaleString()} ${position ? 'held' : 'target'} shares${unsized ? ` · ${unsized} not sized` : ''}`}`;
+    const nav = boardAccountNav();
+    byId('buy-board-nav').textContent = nav === null
+      ? state.buyBoardNavNote || 'Account NAV stale or unavailable'
+      : `Account NAV $${nav.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
     const cards = document.createDocumentFragment();
     rows.forEach(row => cards.appendChild(mobileKanbanCard(row)));
     if (!rows.length) {
@@ -972,6 +1012,9 @@
       if (epoch !== state.buyBoardEpoch) return;
       state.buyBoardRows = mergeBuyBoardOptimistic(result.rows || []);
       state.buyBoardRevision = String(result.revision || '');
+      state.buyBoardNav = boardNumber(result.account_nav_usd);
+      state.buyBoardNavAt = result.account_nav_as_of || null;
+      state.buyBoardNavNote = String(result.account_nav_note || '');
       state.buyBoardError = '';
     } catch (error) {
       if (epoch === state.buyBoardEpoch) {

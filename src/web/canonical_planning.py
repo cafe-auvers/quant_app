@@ -14,6 +14,7 @@ from sqlalchemy.engine import Engine
 
 from src.core.trade_card_state import BoardStatus, TradeCardState, can_withdraw_sell_all_intent
 from src.core.buy_today_feedback import buy_today_feedback_is_current
+from src.services.monitor_equity import read_monitor_equity_snapshot
 from src.infrastructure.database.coordination_engine import (
     create_coordination_connection_engine,
     normalize_coordination_database_config,
@@ -130,6 +131,7 @@ class CanonicalPlanningSource:
         engine: Engine | None = None,
         unavailable_reason: str = "Canonical planning reads are disabled",
         cache_seconds: float = 2.0,
+        equity_path: Path | None = None,
     ) -> None:
         self.enabled = bool(enabled)
         self.environment = str(environment or "PROD").strip().upper()
@@ -137,6 +139,7 @@ class CanonicalPlanningSource:
         self.engine = engine
         self.unavailable_reason = str(unavailable_reason or "Canonical planning unavailable")
         self.cache_seconds = max(0.0, float(cache_seconds))
+        self.equity_path = equity_path
         self._resolved_account_no = ""
         self._snapshot: _Snapshot | None = None
         self._lock = threading.RLock()
@@ -167,6 +170,7 @@ class CanonicalPlanningSource:
             environment=config.canonical_environment,
             account_no=config.canonical_account_no,
             engine=engine,
+            equity_path=repository / "data" / "monitor_equity.json",
         )
 
     @property
@@ -412,6 +416,7 @@ class CanonicalPlanningSource:
             "previous_board_status": self._enum_value(card.previous_board_status),
             "version": int(card.version),
             "kanban_priority": int(card.kanban_priority or 0),
+            "risk_percent": float(card.risk_percent),
             "breakout_price": self._positive_number(card.breakout_price),
             "buffer_pct": float(card.buffer_pct or 0.0),
             "session_date": self._date_value(card.session_date),
@@ -501,7 +506,18 @@ class CanonicalPlanningSource:
                 str(row["symbol"]),
             )
         )
-        return {"rows": rows, "revision": snapshot.revision}
+        nav, nav_as_of, nav_note = None, None, "Account NAV unavailable; refresh the PC account"
+        account_no = self._resolved_account_no or self.configured_account_no
+        if self.equity_path is not None and account_no:
+            nav, nav_as_of, nav_note = read_monitor_equity_snapshot(
+                self.equity_path, self.environment, account_no,
+                dt.datetime.now(dt.timezone.utc),
+            )
+        return {
+            "rows": rows, "revision": snapshot.revision,
+            "account_nav_usd": nav, "account_nav_as_of": nav_as_of,
+            "account_nav_note": nav_note,
+        }
 
     def get_plan(
         self,

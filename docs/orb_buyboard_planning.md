@@ -199,3 +199,28 @@ The hidden `WATCHLIST` lifecycle value and synchronized `watchlist.json` remain
 the user-managed passive candidate stage. Watchlist items are accessible in the
 sidebar and can be promoted to Buylist, but they do not create a dedicated tab,
 visible board column, live subscription, or alternate execution path.
+
+## Mobile Buy Board risk and NAV allocation
+
+The card and its detail sheet show the selected risk budget as a percentage
+of NAV. Today and Entry also show estimated planned risk and planned allocation
+as both percentages and dollars. Planned risk is target shares multiplied by
+the difference between execution price and the planned stop; planned allocation
+is target shares multiplied by execution price. An unsized plan stays labelled
+`Not sized`.
+
+Filled Entry cards and Open, Partial and Sell All cards show `Allocated` using
+the broker-confirmed remaining shares multiplied by average fill price. A sell
+request does not reduce this amount before the shares actually leave the
+holding. Positions show `Risk at stop` using the positive entry-to-active-stop
+loss and remaining shares; a stop above entry implies zero estimated loss from
+entry. Incomplete stop coverage is labelled rather than assigned zero risk.
+These estimates exclude fees and slippage.
+
+The denominator is the account-matched USD equity snapshot already published
+by the PC. Its actual fetch time accompanies the value. Snapshots older than
+15 minutes, missing, invalid, or from another account cannot supply NAV
+percentages. The browser also expires a previously received NAV during a
+failed/offline poll; known dollar amounts remain visible. The NAV header shows
+the current usable denominator. Rendering makes no broker calls and adds no
+canonical database query for NAV.
