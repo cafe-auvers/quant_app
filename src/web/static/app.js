@@ -301,8 +301,53 @@
     if (tone) dot.classList.add(tone);
   }
 
+  let marketClockSchedule = null;
+  let marketClockTimer = null;
+  const marketClockFormat = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Seoul', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  });
+
+  function renderMarketCountdown(market = null) {
+    if (market?.as_of) {
+      const schedule = {
+        asOf: Date.parse(market.as_of),
+        open: Date.parse(market.session_open),
+        close: Date.parse(market.session_close),
+        nextOpen: Date.parse(market.next_session_open),
+        nextClose: Date.parse(market.next_session_close),
+        receivedAt: performance.now(),
+      };
+      marketClockSchedule = [schedule.asOf, schedule.open, schedule.close].every(Number.isFinite)
+        ? schedule : null;
+    }
+    const now = marketClockSchedule
+      ? marketClockSchedule.asOf + performance.now() - marketClockSchedule.receivedAt
+      : Date.now();
+    const clock = byId('market-clock');
+    const clockLabel = `${marketClockFormat.format(now)} KST`;
+    if (clock.textContent !== clockLabel) clock.textContent = clockLabel;
+    clock.dateTime = new Date(now).toISOString();
+    let open = marketClockSchedule?.open;
+    let close = marketClockSchedule?.close;
+    if (now >= close) {
+      open = marketClockSchedule.nextOpen;
+      close = marketClockSchedule.nextClose;
+    }
+    const hasSchedule = Number.isFinite(open) && Number.isFinite(close) && now < close;
+    const minutesUntil = boundary => Math.max(1, Math.ceil((boundary - now) / 60_000));
+    const openLabel = hasSchedule ? (now < open ? `Open in ${minutesUntil(open)}m` : 'Open now') : 'Open —';
+    const closeLabel = hasSchedule ? `Close in ${minutesUntil(close)}m` : 'Close —';
+    for (const [id, label] of [['market-open-countdown', openLabel], ['market-close-countdown', closeLabel]]) {
+      if (byId(id).textContent !== label) byId(id).textContent = label;
+    }
+    byId('market-countdown').title = hasSchedule
+      ? `NYSE regular session · Open ${new Date(open).toLocaleString('en-GB', {timeZone: 'Asia/Seoul'})} KST · Close ${new Date(close).toLocaleString('en-GB', {timeZone: 'Asia/Seoul'})} KST`
+      : 'Waiting for the NYSE session schedule';
+  }
+
   function renderStatusStrip(payload = {}) {
     const market = payload.market_status || state.session?.market_status || {};
+    renderMarketCountdown(market);
     const longLabel = market.label || 'Market Status: Checking';
     const compactLabel = market.compact_label || 'Market Checking';
     byId('market-status-long').textContent = longLabel;
@@ -1293,6 +1338,8 @@
     refreshStatusStrip();
     if (state.statusTimer !== null) window.clearInterval(state.statusTimer);
     state.statusTimer = window.setInterval(refreshStatusStrip, 10_000);
+    if (marketClockTimer !== null) window.clearInterval(marketClockTimer);
+    marketClockTimer = window.setInterval(renderMarketCountdown, 1_000);
   }
 
   function createPane(containerId, rsContainerId, overlayId, timeframe) {
