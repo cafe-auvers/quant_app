@@ -11,6 +11,8 @@ from src.core.trade_card_state import (
     PositionRuntimeStatus,
     StopType,
     TradeCardState,
+    has_durable_execution_evidence,
+    has_legacy_planning_stop,
 )
 
 
@@ -18,6 +20,37 @@ def _make_card(**overrides) -> TradeCardState:
     fields = dict(environment="PROD", account_no="12345678-01", symbol="aapl")
     fields.update(overrides)
     return TradeCardState(**fields)
+
+
+def test_legacy_planning_stop_is_narrowly_identified_without_changing_risk_predicate():
+    card = _make_card(
+        board_status=BoardStatus.BUYLIST, warnings=["migrated_from_buylist"],
+        stop_type=StopType.MANUAL_PRICE, active_stop_price=44.54,
+    )
+    assert has_legacy_planning_stop(card)
+    assert has_durable_execution_evidence(card)
+    assert card.active_stop_price == 44.54
+
+
+@pytest.mark.parametrize("evidence", [
+    {"version": 2}, {"warnings": []}, {"board_status": BoardStatus.BUY_TODAY},
+    {"stop_quantity": 1}, {"stop_type": StopType.ORB_LOW},
+    {"active_stop_price": float("nan")}, {"active_stop_price": float("inf")},
+    {"active_stop_price": 0}, {"active_stop_price": None}, {"active_stop_price": "unknown"},
+    {"broker_quantity": 1}, {"orderable_quantity": 1}, {"average_entry_price": 40.0},
+    {"position_runtime_status": PositionRuntimeStatus.OPEN},
+    {"entry_client_order_id": "entry-1"}, {"entry_attempt_count": 1},
+    {"entry_submission_unresolved": True}, {"entry_cancel_in_flight": True},
+    {"capital_reservation_id": "reserved"}, {"pending_stop_price": 43.0},
+    {"exit_all_required": True}, {"exit_client_order_id": "exit-1"},
+])
+def test_legacy_stop_exception_never_hides_durable_risk_or_unknown_provenance(evidence):
+    fields = dict(
+        board_status=BoardStatus.BUYLIST, warnings=["migrated_from_buylist"],
+        stop_type=StopType.MANUAL_PRICE, active_stop_price=44.54,
+    )
+    fields.update(evidence)
+    assert not has_legacy_planning_stop(_make_card(**fields))
 
 
 def test_symbol_is_upper_cased_and_required():

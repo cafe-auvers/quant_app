@@ -14,6 +14,7 @@ from src.core.board_workflow import (
     BoardProjectionContext,
     MoveToBuylist,
     MoveToWatchlist,
+    RemoveFromBuylist,
 )
 from src.core.discovered_external_order import new_discovered_external_order
 from src.core.execution_order_record import (
@@ -622,6 +623,71 @@ def test_move_to_watchlist_cannot_hide_active_unowned_external_order(engine):
     stored = trade_card_repository.get_trade_card(engine, "PROD", "1", "AAPL")
     assert stored.board_status == BoardStatus.BUYLIST
     assert stored.version == card.version
+
+
+@pytest.mark.parametrize("status", [ExecutionOrderStatus.WORKING, ExecutionOrderStatus.FILLED, ExecutionOrderStatus.REJECTED])
+def test_legacy_stop_exception_rejects_any_owned_order_history(engine, status):
+    card = trade_card_repository.create_trade_card(engine, TradeCardState(
+        environment="PROD", account_no="1", symbol="BLKB",
+        board_status=BoardStatus.BUYLIST, buylist_member=True,
+        stop_type=StopType.MANUAL_PRICE, active_stop_price=44.54,
+        warnings=["migrated_from_buylist"],
+    ))
+    record_execution_order(engine, ExecutionOrderRecord(
+        environment="PROD", account_no="1", symbol="BLKB",
+        side=OrderSide.BUY, intent=OrderIntent.UNKNOWN, client_order_id="historic-1",
+        status=status, submitted_quantity=1,
+        broker_identity_status=BrokerIdentityStatus.EXACT,
+        broker_order_id="historic-broker-1",
+    ))
+    with pytest.raises(BoardCommandRejectedError, match="Planning membership"):
+        request_board_action(engine, RemoveFromBuylist(
+            environment="PROD", account_no="1", symbol="BLKB",
+            expected_card_version=card.version,
+        ), context=BoardActionContext())
+    stored = trade_card_repository.get_trade_card(engine, "PROD", "1", "BLKB")
+    assert stored.version == card.version
+    assert stored.buylist_member is True
+    assert stored.active_stop_price == 44.54
+
+
+@pytest.mark.parametrize("_label,evidence", DURABLE_EVIDENCE_CASES)
+def test_legacy_migration_marker_does_not_bypass_execution_evidence(engine, _label, evidence):
+    fields = dict(
+        board_status=BoardStatus.BUYLIST, buylist_member=True,
+        stop_type=StopType.MANUAL_PRICE, active_stop_price=44.54,
+        warnings=["migrated_from_buylist"],
+    )
+    fields.update(evidence)
+    card = trade_card_repository.create_trade_card(engine, TradeCardState(
+        environment="PROD", account_no="1", symbol="BLKB", **fields,
+    ))
+    with pytest.raises(BoardCommandRejectedError, match="Planning membership"):
+        request_board_action(engine, RemoveFromBuylist(
+            environment="PROD", account_no="1", symbol="BLKB",
+            expected_card_version=card.version,
+        ), context=BoardActionContext())
+    assert trade_card_repository.get_trade_card(engine, "PROD", "1", "BLKB").version == card.version
+
+
+def test_legacy_stop_exception_cannot_hide_unowned_order(engine):
+    card = trade_card_repository.create_trade_card(engine, TradeCardState(
+        environment="PROD", account_no="1", symbol="BLKB",
+        board_status=BoardStatus.BUYLIST, buylist_member=True,
+        stop_type=StopType.MANUAL_PRICE, active_stop_price=44.54,
+        warnings=["migrated_from_buylist"],
+    ))
+    record_discovered_external_order(engine, new_discovered_external_order(
+        environment="PROD", account_no="1", symbol="BLKB", side=OrderSide.BUY,
+        broker_order_id="external-1", quantity_requested=1,
+        broker_status=ExecutionOrderStatus.WORKING,
+    ))
+    with pytest.raises(BoardCommandRejectedError, match="unowned external"):
+        request_board_action(engine, RemoveFromBuylist(
+            environment="PROD", account_no="1", symbol="BLKB",
+            expected_card_version=card.version,
+        ), context=BoardActionContext())
+    assert trade_card_repository.get_trade_card(engine, "PROD", "1", "BLKB").version == card.version
 
 
 def test_hidden_watchlist_card_never_suppresses_active_order_warning_rows(engine):

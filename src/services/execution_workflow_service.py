@@ -814,6 +814,7 @@ def _require_board_action_not_conflicted(engine, command, card) -> List[Executio
         BoardStatus,
         PositionRuntimeStatus,
         has_durable_execution_evidence,
+        has_legacy_planning_stop,
     )
     from src.services.execution_order_repository import list_execution_orders_for_card
 
@@ -947,7 +948,11 @@ def _require_board_action_not_conflicted(engine, command, card) -> List[Executio
         isinstance(command, types.MoveToBuylist)
         and card.board_status == BoardStatus.WATCHLIST
     )
-    if planning_stage_move and has_durable_entry_or_position_evidence():
+    legacy_planning_stop = has_legacy_planning_stop(card) and not owned_orders
+    if planning_stage_move and (
+        active_orders
+        or (has_durable_execution_evidence(card) and not legacy_planning_stop)
+    ):
         raise BoardCommandRejectedError(
             "Planning membership cannot change while order, reservation, or "
             "position evidence exists"
@@ -1067,6 +1072,7 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
         PositionRuntimeStatus,
         StopType,
         has_durable_execution_evidence,
+        has_legacy_planning_stop,
     )
     from src.services.position_manager import (
         compute_breakeven_stop_price,
@@ -1074,8 +1080,13 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
     )
 
     types = _load_board_types()
+    legacy_planning_stop = has_legacy_planning_stop(card)
 
     def clear_executable_entry_plan() -> None:
+        if legacy_planning_stop:
+            card.stop_type = None
+            card.active_stop_price = None
+            card.stop_quantity = 0
         card.selected_orb_window = None
         card.position_percent = 0.0
         card.planned_quantity = 0

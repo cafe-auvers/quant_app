@@ -716,9 +716,11 @@ def build_trade_card_migration(
             # persisted stop as a manual price rather than guessing it was
             # the original ORB low, per the "never recalculate the historical
             # entry ORB" guidance (section 620) applied conservatively.
-            stop_type=StopType.MANUAL_PRICE if stop_loss > 0 else None,
-            active_stop_price=stop_loss if stop_loss > 0 else None,
-            stop_quantity=shares_held if stop_loss > 0 else 0,
+            stop_type=(
+                StopType.MANUAL_PRICE if shares_held > 0 and stop_loss > 0 else None
+            ),
+            active_stop_price=stop_loss if shares_held > 0 and stop_loss > 0 else None,
+            stop_quantity=shares_held if shares_held > 0 and stop_loss > 0 else 0,
             warnings=["migrated_from_buylist"],
         )
 
