@@ -1259,7 +1259,7 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
             overrides = tuple((rule.card_key, rule.price) for rule in detached.stop_rules)
             breach_identities = tuple(sorted(pending.breached_stop_versions))
             representative_trades: list[QuoteSnapshot] = []
-            for representative in (pending.minimum_trade, pending.maximum_trade):
+            for representative in (pending.minimum_trade, pending.maximum_trade, pending.latest_trade):
                 if representative is not None and representative not in representative_trades:
                     representative_trades.append(representative)
             if not representative_trades and pending.latest_trade is not None:
@@ -1283,8 +1283,9 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
             # unacknowledged breach, not a new market observation.  Never let
             # its historical event regress the latest-quote cache or fire a
             # normal quote callback.
-            latest = None if detached.latch_replay else (
-                pending.latest_quote or pending.latest_trade
+            observations = [item for item in (pending.latest_quote, pending.latest_trade) if item is not None]
+            latest = None if detached.latch_replay else max(
+                observations, key=lambda item: (item.received_at, item.broker_event_at), default=None
             )
             if latest is not None:
                 current = self._cache.get(detached.symbol)
@@ -1416,6 +1417,31 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         )
         record_entry_readiness(symbol=symbol, ready=ready)
         return ready
+
+    def entry_quote_unavailable_reason(self, symbol: str, *, now: Optional[datetime] = None) -> str:
+        """Explain the exact feed gate without changing its freshness policy."""
+        reference = now or self._clock()
+        state = self.symbol_state(symbol)
+        if not self.is_connected():
+            return "KIS WebSocket is disconnected"
+        if not state.trade_acked or not state.quote_acked:
+            return "KIS trade and quote subscriptions are awaiting acknowledgement"
+        if state.last_error or state.clock_health != ClockHealth.HEALTHY:
+            return "KIS event timestamp or channel health is unavailable"
+        quote = self.latest_quote(symbol)
+        if quote is None:
+            return "Waiting for the first KIS trade and quote events"
+        if quote.queue_delay_seconds() > execution_config.MAX_MARKET_DATA_QUEUE_DELAY_SECONDS:
+            return "PC evaluation delayed: the KIS event exceeded the processing queue limit"
+        if state.last_trade_event_at is None or (reference - state.last_trade_event_at).total_seconds() > execution_config.BROKER_EVENT_STALE_SECONDS:
+            return "Waiting for a fresh KIS trade event for this symbol"
+        if state.last_quote_event_at is None or (reference - state.last_quote_event_at).total_seconds() > execution_config.BROKER_EVENT_STALE_SECONDS:
+            return "Waiting for a fresh KIS bid/ask event for this symbol"
+        if not quote.is_execution_fresh(now=reference):
+            return "KIS event exceeded the broker or local receive freshness limit"
+        if quote.ask is None or quote.ask <= 0 or quote.last_price <= 0:
+            return "KIS trade price or best ask is unavailable"
+        return ""
 
     def _on_connection(self, connected: bool, reason: str, generation: int) -> None:
         was_connected = self._connected

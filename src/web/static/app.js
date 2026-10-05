@@ -2676,16 +2676,22 @@
       const age = quote.quote_as_of ? (Date.now() - new Date(quote.quote_as_of).getTime()) / 1000 : Infinity;
       const stale = Boolean(state.monitorError) || quote.quote_status === 'STALE' || (active && age > state.monitorStaleSeconds);
       if (stale) result.quote_status = quote.current_price ? 'STALE' : 'UNAVAILABLE';
-      if (changedLevel || stale) {
+      if (changedLevel) {
         result.breakout_status = normalizeBreakoutPrice(card.breakout_price) === null ? 'NO_LEVEL' : 'UNKNOWN';
         result.broke_out_today = null;
         result.orb = [];
+      } else if (stale) {
+        result.breakout_status = normalizeBreakoutPrice(card.breakout_price) === null ? 'NO_LEVEL' : 'UNKNOWN';
+        result.broke_out_today = null;
+        const sessionDay = new Intl.DateTimeFormat('en-CA', {timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit'}).format(new Date());
+        result.orb = quote.orb_session_date === sessionDay ? (quote.orb || []).map(orb =>
+          orb.price_status === 'PASS' ? {...orb} : {...orb, price_status: 'UNKNOWN', price_reason: 'Quote is stale'}) : [];
       }
       return result;
     }).filter(row => {
       if (state.monitorQuery && !`${row.symbol} ${row.name || ''}`.toLowerCase().includes(state.monitorQuery)) return false;
       if (state.monitorFilter === 'breakouts') return row.broke_out_today === true;
-      if (state.monitorFilter === 'orb') return (row.orb || []).some(orb => orb.price_status === 'PASS' && orb.position_status === 'PASS');
+      if (state.monitorFilter === 'orb') return (row.orb || []).some(orb => orb.price_status === 'PASS');
       if (state.monitorFilter === 'today') return Boolean(row.buy_today_member);
       return true;
     }).sort((a, b) => (
@@ -2744,13 +2750,16 @@
         const line = add(table, 'span', '', 'mobile-monitor-orb-line');
         add(line, 'b', window);
         const cell = (value, reason) => {
-          const names = {PASS: '✓ Passed', FAIL: '✕ Failed', WAITING: 'Waiting', FORMING: 'Forming', UNKNOWN: 'Unavailable'};
+          const names = {PASS: '✓ Passed', FAIL: '✕ Failed', WAITING: 'Await breakout', FORMING: 'Forming', UNKNOWN: 'Unavailable'};
           const node = add(line, 'span', names[value] || 'Unavailable', 'mobile-monitor-result');
           node.dataset.status = value || 'UNKNOWN';
           node.title = reason || '';
         };
         cell(orb.price_status, orb.price_reason);
         cell(orb.position_status, orb.position_reason);
+        if (orb.price_status === 'WAITING') add(table, 'small', `${window}: Range complete · waiting above $${Number(orb.breakout_trigger || Math.max(row.breakout_price || 0, orb.high || 0)).toFixed(2)}`, 'mobile-monitor-reason');
+        if (orb.price_status === 'UNKNOWN' && orb.price_reason) add(table, 'small', `${window}: ${orb.price_reason}`, 'mobile-monitor-reason');
+        if (orb.price_status === 'PASS' && row.quote_status === 'STALE') add(table, 'small', `${window}: Passed earlier · latest quote stale`, 'mobile-monitor-reason');
         if (orb.position_status === 'FAIL' && orb.position_reason) add(table, 'small', `${window}: ${orb.position_reason}`, 'mobile-monitor-reason');
       });
     }

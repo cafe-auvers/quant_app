@@ -155,6 +155,21 @@ def test_periodic_orb_sync_cannot_bypass_retry_cooldown():
     assert card.entry_orb_low == 95.0
 
 
+def test_periodic_orb_sync_does_not_rearm_feed_blocked_entry_or_churn_its_state():
+    now = datetime(2026, 8, 19, 14, 5, tzinfo=timezone.utc)
+    candidate = _candidate(status=OrbCandidateStatus.EXECUTE_READY, source_session_date="2026-08-19")
+    item = _queue_item(candidate, last_updated=now)
+    card = _card()
+    evaluator = TradeCardOrbEvaluator(clock=lambda: now)
+    evaluator.update_card(card, item)
+    card.entry_runtime_status = EntryRuntimeStatus.DATA_UNAVAILABLE
+    card.entry_block_reason = "Fresh KIS events are required"
+    before = card.to_dict()
+    for _ in range(5):
+        evaluator.update_card(card, item)
+        assert card.to_dict() == before
+
+
 def test_live_cross_selects_lower_trigger_risk_valid_window_in_auto_mode():
     now = datetime(2026, 8, 19, 14, 5, tzinfo=timezone.utc)
     one_minute = _candidate(

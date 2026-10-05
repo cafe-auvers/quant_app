@@ -255,6 +255,17 @@ def test_stale_quote_blocks_entry_and_flags_data_unavailable(tmp_path):
     assert "Fresh KIS WebSocket trade and quote events" in card.entry_block_reason
 
 
+def test_entry_guard_displays_specific_feed_reason_and_keeps_order_blocked(tmp_path):
+    engine = _make_engine(tmp_path)
+    engine._market_data.entry_quote_unavailable_reason = lambda symbol, now=None: "PC evaluation delayed: the KIS event exceeded the processing queue limit"
+    card = _buy_today_card()
+    engine.run_heartbeat([card])
+    assert card.entry_runtime_status == EntryRuntimeStatus.DATA_UNAVAILABLE
+    assert "processing queue limit" in card.entry_block_reason
+    assert card.board_status == BoardStatus.BUY_TODAY
+    assert not card.entry_client_order_id
+
+
 def test_fresh_quote_allows_entry_submission_and_moves_to_entry_pending(tmp_path):
     engine = _make_engine(tmp_path)
     engine._market_data.subscribe(["AAPL"])
