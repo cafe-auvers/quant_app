@@ -3526,7 +3526,7 @@ class BuyboardRuntimeWorker(QThread):
             if item is None:
                 block_unverified_plan(
                     card,
-                    "Current-session ORB plan is unavailable",
+                    "Waiting for the PC's current-session ORB calculation",
                 )
                 continue
             before = _orb_plan_state(card)

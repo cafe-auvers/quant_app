@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event, text
 
 from src.core.trade_card_state import BoardStatus, TradeCardState
+from src.core.exit_policy import market_session_date
 from src.utils.market_calendar import current_or_next_nyse_session_date
 from src.web.api import build_services, create_api_app
 from src.web.canonical_planning import CanonicalPlanningSource
@@ -177,6 +178,26 @@ def test_unchanged_board_checks_revision_without_redownloading_payloads(tmp_path
     statements.clear()
     source.list_plans(force=True)
     assert any("SELECT payload" in statement for statement in statements)
+    source.close()
+
+
+def test_mobile_buylist_shows_current_session_rejection_without_stale_history(tmp_path):
+    source = canonical_source(tmp_path)
+    card = TradeCardState(
+        environment="PROD", account_no="account-a", symbol="ODD",
+        board_status=BoardStatus.BUYLIST,
+        buy_today_note="Buy Today rejected - all ORB plans invalid.",
+        last_buy_today_session_date=market_session_date(),
+    )
+    statements = []
+    event.listen(source.engine, "before_cursor_execute", lambda _c, _cur, sql, *_a: statements.append(sql))
+    assert source._project_board_card(card)["buy_today_note"] == card.buy_today_note
+    card.last_buy_today_session_date -= dt.timedelta(days=1)
+    assert source._project_board_card(card)["buy_today_note"] == ""
+    card.last_buy_today_session_date = market_session_date()
+    card.board_status = BoardStatus.BUY_TODAY
+    assert source._project_board_card(card)["buy_today_note"] == ""
+    assert statements == []
     source.close()
 
 

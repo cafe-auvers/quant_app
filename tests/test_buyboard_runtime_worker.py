@@ -3580,6 +3580,26 @@ def test_sync_orb_plans_blocks_same_symbol_active_in_multiple_accounts(tmp_path)
     assert "multiple accounts" in second.entry_block_reason
 
 
+def test_sync_orb_plans_waits_for_initial_calculation_and_clears_unverified_sizing(tmp_path):
+    worker, engine = _worker(tmp_path)
+    worker._execution_queue_item_lookup = lambda *_args: None
+    card = _seed_card(
+        engine, board_status=BoardStatus.BUY_TODAY,
+        entry_runtime_status=EntryRuntimeStatus.EXECUTE_READY,
+        entry_trigger=19.705, entry_execution_price=19.705,
+        entry_orb_high=19.705, entry_orb_low=19.09,
+        planned_quantity=100, target_position_quantity=100,
+        selected_orb_window="30m",
+    )
+    assert worker._sync_orb_plans([card]) == [card]
+    assert card.entry_runtime_status == EntryRuntimeStatus.DATA_UNAVAILABLE
+    assert card.entry_block_reason == "Waiting for the PC's current-session ORB calculation"
+    assert card.entry_trigger is None and card.entry_execution_price is None
+    assert card.planned_quantity == card.target_position_quantity == 0
+    assert card.selected_orb_window is None
+    assert worker._sync_orb_plans([card]) == []
+
+
 def test_sync_orb_plans_does_not_mark_price_only_movement_for_db_write(tmp_path):
     worker, engine = _worker(tmp_path)
     card = _seed_card(
