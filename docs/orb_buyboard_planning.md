@@ -222,5 +222,32 @@ local suite passed (3,363 tests, 7 skipped); the isolated PC stage and MySQL
 temporary-table checks passed without historical or canonical record writes.
 
 The new release is prepared, **not activated**, pending exact-release review
-and a supervised restart. Approved PC/web 3a7c14fe continues running. No TiDB
+and a supervised restart. Approved PC 3a7c14fe continues running; the separate web display release is recorded below. No TiDB
 dependency or feed-freshness/risk-policy change is introduced.
+
+## Mobile Buy Board risk and NAV allocation
+
+The card and its detail sheet show the selected risk budget as a percentage
+of NAV. Today and Entry also show estimated planned risk and planned allocation
+as both percentages and dollars. Planned risk is target shares multiplied by
+the difference between execution price and the planned stop; planned allocation
+is target shares multiplied by execution price. An unsized plan stays labelled
+`Not sized`.
+
+Filled Entry cards and Open, Partial and Sell All cards show `Allocated` using
+the broker-confirmed remaining shares multiplied by average fill price. A sell
+request does not reduce this amount before the shares actually leave the
+holding. Positions show `Risk at stop` using the positive entry-to-active-stop
+loss and remaining shares; a stop above entry implies zero estimated loss from
+entry. Incomplete stop coverage is labelled rather than assigned zero risk.
+These estimates exclude fees and slippage.
+
+The denominator is the account-matched USD equity snapshot already published
+by the PC. Its actual fetch time accompanies the value. Snapshots older than
+15 minutes, missing, invalid, or from another account cannot supply NAV
+percentages. The browser also expires a previously received NAV during a
+failed/offline poll; known dollar amounts remain visible. The NAV header shows
+the current usable denominator. Rendering makes no broker calls and adds no
+canonical database query for NAV.
+
+Deployment: web `dfd80c1d62b949826a1107f04b20df469cc3f98f` ([PR #143](https://github.com/cafe-auvers/quant_app/pull/143)) at 04:39 KST on 2026-10-06. The running PC executor remains at approved `3a7c14fe9cc269a2590f825e88aacafac7d98a21`; process identities, configuration and Live Trading were preserved. Read-only verification at 04:39:59 KST confirmed ACTIVE and Live Trading enabled/effective. 317 compatibility tests and mobile checks at 320/390/820 pixels passed. The live mobile browser confirmed SVIA's held allocation and stop risk, and EFOR's planned values. The CURV executor correction remains prepared and unactivated; its deployment preserves this web source.
