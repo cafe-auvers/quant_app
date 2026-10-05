@@ -39,7 +39,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from src.core.execution_config import (
     COORDINATION_DEVICE_HEARTBEAT_MAX_AGE_SECONDS,
 )
-from src.infrastructure.database.coordination_engine import coordination_read_connection
+from src.infrastructure.database.coordination_engine import coordination_read_connection, coordination_server_now
 from src.services.runtime_status import MAIN_APP_PROCESS, heartbeat_row_is_stale
 from src.utils.config import DATA_DIR, get_env_value
 from src.utils.market_calendar import current_or_next_nyse_session_date
@@ -385,7 +385,7 @@ def _get_state_sync_table(metadata: MetaData) -> Table:
         "app_state_sync",
         metadata,
         Column("state_key", String(40), primary_key=True),
-        Column("payload", Text(length=16_777_215)),
+        Column("payload", Text().with_variant(Text(length=16_777_215), "mysql")),
         Column("revision", BigInteger, nullable=False, server_default=text("1")),
         Column("updated_at", DateTime, nullable=False),
         Column("updated_by_host", String(128)),
@@ -476,9 +476,7 @@ def ensure_state_sync_tables(engine: Engine) -> None:
 
 
 def _server_now(engine: Engine):
-    if engine.dialect.name == "mysql":
-        return func.utc_timestamp(6)
-    return func.current_timestamp()
+    return coordination_server_now(engine)
 
 
 def _select_row(

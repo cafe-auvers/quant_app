@@ -54,7 +54,7 @@ from src.core.trade_card_state import (
     StopType,
     TradeCardState,
 )
-from src.infrastructure.database.coordination_engine import coordination_read_connection
+from src.infrastructure.database.coordination_engine import coordination_read_connection, coordination_server_now
 from src.utils.config import DATA_DIR
 from src.utils.storage import load_json, save_json
 
@@ -144,7 +144,7 @@ def _get_trade_cards_table(metadata: MetaData) -> Table:
         Column("symbol", String(20), nullable=False),
         Column("board_status", String(32), nullable=False),
         Column("version", BigInteger, nullable=False, server_default="1"),
-        Column("payload", Text(length=16_777_215), nullable=False),
+        Column("payload", Text().with_variant(Text(length=16_777_215), "mysql"), nullable=False),
         Column("updated_at", DateTime, nullable=False),
         UniqueConstraint(
             "environment", "account_no", "symbol", name="uq_trade_cards_symbol"
@@ -171,9 +171,7 @@ def ensure_trade_cards_table(engine: Engine) -> Table:
 
 
 def _server_now(engine: Engine):
-    if engine.dialect.name == "mysql":
-        return func.utc_timestamp(6)
-    return func.current_timestamp()
+    return coordination_server_now(engine)
 
 
 def _row_to_card(row) -> TradeCardState:

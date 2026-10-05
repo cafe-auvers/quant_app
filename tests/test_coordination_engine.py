@@ -3,6 +3,8 @@ from sqlalchemy.engine import URL
 
 from src.infrastructure.database import coordination_engine as coordination
 from src.services.coordination_schema import ensure_coordination_schema
+import pytest
+from sqlalchemy.dialects import postgresql
 
 
 def _values(**overrides):
@@ -121,3 +123,36 @@ def test_coordination_schema_excludes_historical_market_tables():
     assert "price_history" not in tables
     assert "hourly_price_history" not in tables
     assert "scanner_metrics" not in tables
+
+
+def test_postgresql_connection_requires_verified_tls_and_private_schema(tmp_path):
+    ca = tmp_path / "ca.crt"
+    ca.write_text("test certificate")
+    config = coordination.normalize_coordination_database_config(
+        _values(COORD_DB_BACKEND="postgresql", COORD_DB_PORT="5432",
+                COORD_DB_NAME="postgres", COORD_DB_SCHEMA="quant_coordination",
+                COORD_DB_SSL_CA=str(ca))
+    )
+    url = coordination.coordination_connection_url(config)
+    args = coordination._coordination_connect_args(config)
+    assert url.drivername == "postgresql+psycopg"
+    assert "secret-value" not in str(url)
+    assert args["sslmode"] == "verify-full"
+    assert args["sslrootcert"] == str(ca.resolve())
+
+
+@pytest.mark.parametrize("schema", ["public", "auth", "storage", "pg_catalog", "bad;schema", "x" * 64])
+def test_postgresql_rejects_exposed_or_invalid_schemas(schema):
+    with pytest.raises(ValueError):
+        coordination.normalize_coordination_database_config(
+            _values(COORD_DB_BACKEND="postgresql", COORD_DB_SCHEMA=schema)
+        )
+
+
+def test_postgresql_lease_clock_advances_within_transactions():
+    class Engine:
+        dialect = postgresql.dialect()
+
+    sql = str(coordination.coordination_server_now(Engine()).compile(dialect=Engine.dialect))
+    assert "clock_timestamp()" in sql
+    assert "CURRENT_TIMESTAMP" not in sql

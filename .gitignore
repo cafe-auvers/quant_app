@@ -50,6 +50,7 @@ wheels/
 *.p12
 *.pfx
 *.crt
+!config/certificates/supabase-prod-ca-2021.crt
 *.token
 .secrets/
 config/kis_config.py
@@ -65,6 +66,7 @@ data/*.json.bak
 data/*.jsonl
 data/*.lock
 data/cache/
+data/coordination_backups/
 data/web/
 data/pre_restore_backup_*/
 

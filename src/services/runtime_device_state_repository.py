@@ -34,6 +34,7 @@ from src.core.execution_config import (
 from src.infrastructure.database.coordination_engine import (
     coordination_autocommit_connection,
     coordination_read_connection,
+    coordination_server_now,
 )
 from src.services.state_sync import get_main_device
 from src.services.runtime_status import get_runtime_process_status
@@ -102,7 +103,7 @@ def _table(metadata: MetaData):
         # columns (error 1101).  Save paths always publish this JSON
         # explicitly, while readers already treat NULL/blank legacy values as
         # an empty object.
-        Column("details_json", Text(length=16_777_215), nullable=True),
+        Column("details_json", Text().with_variant(Text(length=16_777_215), "mysql"), nullable=True),
         Column("updated_at", DateTime, nullable=False),
     )
 
@@ -146,9 +147,7 @@ def ensure_runtime_device_state_table(engine: Engine):
 
 
 def _server_now(engine: Engine):
-    if engine.dialect.name == "mysql":
-        return func.utc_timestamp(6)
-    return func.current_timestamp()
+    return coordination_server_now(engine)
 
 
 def _record(row) -> RuntimeDeviceRecord:

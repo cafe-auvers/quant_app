@@ -270,7 +270,7 @@ def _reconciliation_table(metadata: MetaData) -> Table:
         Column("requested_sequence", BigInteger, nullable=False),
         Column("idempotency_key", String(160), nullable=False),
         Column("request_checksum", String(64), nullable=False),
-        Column("payload", Text(length=16_777_215), nullable=False),
+        Column("payload", Text().with_variant(Text(length=16_777_215), "mysql"), nullable=False),
         Column("reconciled_at", DateTime, nullable=False),
         UniqueConstraint(
             "journal_id",
@@ -293,7 +293,9 @@ def ensure_emergency_reconciliation_table(engine: Engine) -> Table:
 
 
 def _server_now(engine: Engine):
-    return func.utc_timestamp(6) if engine.dialect.name == "mysql" else func.current_timestamp()
+    from src.infrastructure.database.coordination_engine import coordination_server_now
+
+    return coordination_server_now(engine)
 
 
 class EmergencyJournal:

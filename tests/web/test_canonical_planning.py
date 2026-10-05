@@ -5,7 +5,7 @@ import json
 from dataclasses import replace
 
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 
 from src.core.trade_card_state import BoardStatus, TradeCardState
 from src.utils.market_calendar import current_or_next_nyse_session_date
@@ -127,6 +127,28 @@ def test_canonical_projection_preserves_independent_memberships(tmp_path):
     assert historical["display_stage"] == "BREAKOUT"
     assert historical["watchlist_member"] is False
     assert historical["breakout_price"] == 88.5
+    source.close()
+
+
+def test_unchanged_board_checks_revision_without_redownloading_payloads(tmp_path):
+    source = canonical_source(tmp_path)
+    statements = []
+    event.listen(source.engine, "before_cursor_execute", lambda _conn, _cursor, statement, *_args: statements.append(statement))
+    original = source.list_plans()
+    statements.clear()
+    assert source.list_plans() == original
+    assert len(statements) == 1
+    assert "COUNT(*)" in statements[0]
+    assert "payload" not in statements[0]
+    with source.engine.begin() as connection:
+        connection.execute(text("UPDATE trade_cards SET version=version+1 WHERE symbol='AAPL'"))
+    statements.clear()
+    changed = source.list_plans()
+    assert changed["revision"] != original["revision"]
+    assert any("SELECT payload" in statement for statement in statements)
+    statements.clear()
+    source.list_plans(force=True)
+    assert any("SELECT payload" in statement for statement in statements)
     source.close()
 
 

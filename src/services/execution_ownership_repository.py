@@ -28,7 +28,7 @@ from sqlalchemy import (
 from sqlalchemy.engine import Connection, Engine
 
 from src.core.execution_ownership import ExecutionOwner, ExecutionOwnership
-from src.infrastructure.database.coordination_engine import coordination_read_connection
+from src.infrastructure.database.coordination_engine import coordination_read_connection, coordination_server_now
 
 logger = logging.getLogger(__name__)
 
@@ -74,9 +74,7 @@ def ensure_execution_ownership_table(engine: Engine) -> Table:
 
 
 def _server_now(engine: Engine):
-    if engine.dialect.name == "mysql":
-        return func.utc_timestamp(6)
-    return func.current_timestamp()
+    return coordination_server_now(engine)
 
 
 def _row_to_ownership(row) -> ExecutionOwnership:
