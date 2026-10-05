@@ -903,6 +903,50 @@ def test_one_healthy_symbol_does_not_mark_a_failing_symbol_ready():
     assert not service.is_symbol_execution_ready("MSFT", now=NOW)
 
 
+def test_latest_trade_is_evaluated_without_older_quote_or_extrema_timestamps():
+    service, _ = _service()
+    service.configure_desired_channels(trade_priorities={"AAPL": 1}, quote_priorities={"AAPL": 1})
+    _ack(service, "AAPL", "HDFSCNT0")
+    _ack(service, "AAPL", "HDFSASP0")
+    assert service.ingest_quote(_event(channel="HDFSASP0", seconds=-2, fingerprint="quote"))
+    assert service.ingest_trade(_event(price=99, seconds=-2.8, fingerprint="minimum"))
+    assert service.ingest_trade(_event(price=105, seconds=-2.6, fingerprint="maximum"))
+    assert service.ingest_trade(_event(price=102, seconds=-0.1, fingerprint="latest"))
+    events = service.poll_once()
+    fresh_trade = [event for event in events if event.channel == "HDFSCNT0" and event.last_price == 102]
+    assert fresh_trade and fresh_trade[0].is_execution_fresh(now=NOW)
+    assert any(event.last_price == 99 for event in events)
+    assert any(event.last_price == 105 for event in events)
+    assert service.latest_quote("AAPL").received_at == NOW - dt.timedelta(seconds=0.1)
+    assert service.latest_quote("AAPL").ask is not None
+    assert service.entry_quote_ready("AAPL", now=NOW)
+
+
+def test_fresh_trade_cannot_hide_stale_quote_channel_and_explains_block():
+    service, _ = _service()
+    service.configure_desired_channels(trade_priorities={"AAPL": 1}, quote_priorities={"AAPL": 1})
+    _ack(service, "AAPL", "HDFSCNT0")
+    _ack(service, "AAPL", "HDFSASP0")
+    assert service.ingest_quote(_event(channel="HDFSASP0", seconds=-2, fingerprint="quote"))
+    assert service.ingest_trade(_event(seconds=-0.1, fingerprint="trade"))
+    service.poll_once()
+    reference = NOW + dt.timedelta(seconds=1.1)
+    assert not service.entry_quote_ready("AAPL", now=reference)
+    assert "fresh KIS bid/ask" in service.entry_quote_unavailable_reason("AAPL", now=reference)
+
+
+def test_delayed_processing_is_explained_and_still_blocks_entry():
+    service, _ = _service()
+    service.configure_desired_channels(trade_priorities={"AAPL": 1}, quote_priorities={"AAPL": 1})
+    _ack(service, "AAPL", "HDFSCNT0")
+    _ack(service, "AAPL", "HDFSASP0")
+    assert service.ingest_quote(_event(channel="HDFSASP0", seconds=-2, fingerprint="quote"))
+    assert service.ingest_trade(_event(seconds=-2, fingerprint="trade"))
+    service.poll_once()
+    assert not service.entry_quote_ready("AAPL", now=NOW)
+    assert "processing queue limit" in service.entry_quote_unavailable_reason("AAPL", now=NOW)
+
+
 def test_trade_channel_for_open_position_outranks_quote_channel_for_buy_today():
     service, transport = _service(trade_capacity=1, quote_capacity=1)
     service.configure_desired_channels(

@@ -13,6 +13,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from src.core.trade_card_state import BoardStatus, TradeCardState, can_withdraw_sell_all_intent
+from src.core.buy_today_feedback import buy_today_feedback_is_current
 from src.infrastructure.database.coordination_engine import (
     create_coordination_connection_engine,
     normalize_coordination_database_config,
@@ -427,6 +428,12 @@ class CanonicalPlanningSource:
             "next_retry_at": self._date_value(card.next_retry_at),
             "entry_runtime_status": self._enum_value(card.entry_runtime_status),
             "entry_block_reason": str(card.entry_block_reason or ""),
+            "buy_today_note": (
+                str(card.buy_today_note or "")
+                if card.board_status == BoardStatus.BUYLIST
+                and buy_today_feedback_is_current(card)
+                else ""
+            ),
             "entry_order_pending": bool(
                 card.entry_client_order_id
                 or card.entry_pending_attempt_number

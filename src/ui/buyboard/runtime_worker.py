@@ -2720,13 +2720,16 @@ class BuyboardRuntimeWorker(QThread):
         from src.services import buying_power_cache
 
         usable_usd, equity_usd = self._extract_account_balance(position_snapshot)
-        buying_power_cache.record_snapshot(
+        snapshot = buying_power_cache.record_snapshot(
             environment=self._environment,
             account_no=account_no,
             usable_buying_power_usd=usable_usd,
             total_equity_usd=equity_usd,
             source="buyboard_runtime_periodic_refresh",
         )
+        from src.services.monitor_equity import queue_monitor_equity
+
+        queue_monitor_equity(snapshot)
 
     def _record_reconciliation_balance(
         self, account_no: str, result: AccountReconciliationResult
@@ -2734,13 +2737,17 @@ class BuyboardRuntimeWorker(QThread):
         from src.services import buying_power_cache
 
         snapshot = result.snapshot
-        buying_power_cache.record_snapshot(
+        equity_snapshot = buying_power_cache.record_snapshot(
             environment=self._environment,
             account_no=account_no,
             usable_buying_power_usd=float(snapshot.account_buying_power or 0.0),
             total_equity_usd=float(snapshot.account_equity or 0.0),
             source="buyboard_runtime_account_reconciliation",
+            received_at=snapshot.observed_at,
         )
+        from src.services.monitor_equity import queue_monitor_equity
+
+        queue_monitor_equity(equity_snapshot)
 
     @staticmethod
     def _reconciliation_snapshot_complete(result: AccountReconciliationResult) -> bool:
@@ -3519,7 +3526,7 @@ class BuyboardRuntimeWorker(QThread):
             if item is None:
                 block_unverified_plan(
                     card,
-                    "Current-session ORB plan is unavailable",
+                    "Waiting for the PC's current-session ORB calculation",
                 )
                 continue
             before = _orb_plan_state(card)

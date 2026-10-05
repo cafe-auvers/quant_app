@@ -1051,6 +1051,16 @@ class TradeCardOrbEvaluator:
         if prior_runtime_status == EntryRuntimeStatus.RETRY_COOLDOWN:
             card.entry_runtime_status = prior_runtime_status
             card.entry_block_reason = prior_block_reason
+        elif prior_runtime_status == EntryRuntimeStatus.DATA_UNAVAILABLE and candidate.status in {
+            OrbCandidateStatus.WAITING_BREAKOUT,
+            OrbCandidateStatus.VALID,
+            OrbCandidateStatus.EXECUTE_READY,
+        }:
+            # Only the live feed check may recover a data-blocked entry.
+            # Re-arming from a minute-bar refresh caused a no-op status write
+            # every cycle when the heartbeat immediately blocked it again.
+            card.entry_runtime_status = prior_runtime_status
+            card.entry_block_reason = prior_block_reason
 
         # Deliberately does not touch card.warnings -- STOP_REQUIRED/
         # DATA_STALE and any other warning set elsewhere (position_manager,

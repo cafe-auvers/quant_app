@@ -63,7 +63,10 @@ Therefore:
 
 - `orb_high` must be strictly above both the structural breakout price and the
   ORB low; otherwise no passive execution zone exists.
-- The automatic execution price defaults to that candidate's `orb_high`.
+- The automatic BUY execution price is the highest legal tick at or below that
+  candidate's raw `orb_high`. Fractional-cent market highs are rounded down,
+  never above the range. The raw high remains the breakout confirmation trigger.
+  If rounding leaves no price strictly above the floor, the plan is rejected.
 - A manual execution price may be below `orb_high`, but it must remain strictly
   above both `breakout_price` and `orb_low`.
 - A manual price is never silently changed.

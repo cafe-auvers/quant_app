@@ -813,7 +813,8 @@
   function boardWarning(row) {
     const reason = ['PARTIAL_SELL', 'SELL_ALL'].includes(row.board_status)
       ? row.last_exit_error
-      : ['BUY_TODAY', 'ENTRY_PENDING'].includes(row.board_status) ? row.entry_block_reason : '';
+      : ['BUY_TODAY', 'ENTRY_PENDING'].includes(row.board_status) ? row.entry_block_reason
+        : row.board_status === 'BUYLIST' ? row.buy_today_note : '';
     return [reason, ...(row.warnings || [])].find(value => String(value || '').trim()) || '';
   }
 

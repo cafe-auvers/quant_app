@@ -24,6 +24,13 @@ from PyQt5.QtWidgets import QApplication
 from sqlalchemy import create_engine
 from sqlalchemy.pool import NullPool
 
+
+@pytest.fixture(autouse=True)
+def isolated_monitor_equity_writer(monkeypatch, tmp_path):
+    from src.services import monitor_equity
+
+    monkeypatch.setattr(monitor_equity, "MONITOR_EQUITY_FILE", tmp_path / "monitor_equity.json")
+
 from src.api.kis_account_snapshot_dual import (
     KisRateLimitError,
     KisTransientApiError,
@@ -2948,6 +2955,32 @@ def test_account_balance_preserves_explicit_usd_only_snapshot_without_fx(monkeyp
     assert equity == 5000.0
 
 
+def test_worker_balance_refresh_and_reconciliation_publish_real_equity_timestamp(tmp_path, monkeypatch):
+    from src.services import monitor_equity
+
+    published = []
+    monkeypatch.setattr(monitor_equity, "queue_monitor_equity", published.append)
+    worker, _ = _worker(tmp_path)
+    monkeypatch.setattr(worker, "_extract_account_balance", lambda _snapshot: (4000.0, 6000.0))
+    worker._record_buying_power("1", {})
+    assert published[-1].total_equity_usd == 6000.0
+    assert published[-1].source == "buyboard_runtime_periodic_refresh"
+    fetched = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=10)
+    broker_snapshot = AccountBrokerSnapshot(
+        environment="PROD", account_no="1", completeness=SnapshotCompleteness(account_balance_complete=True),
+        account_buying_power=3000.0, account_equity=7000.0, observed_at=fetched,
+    )
+    worker._record_reconciliation_balance("1", SimpleNamespace(snapshot=broker_snapshot))
+    assert published[-1].received_at == fetched
+    assert published[-1].total_equity_usd == 7000.0
+    path = tmp_path / "equity-projection.json"
+    monitor_equity.publish_monitor_equity(path, published[-1])
+    equity, error = monitor_equity.read_monitor_equity(path, "PROD", "1", fetched + dt.timedelta(seconds=5))
+    assert equity == 7000.0 and not error
+    equity, error = monitor_equity.read_monitor_equity(path, "PROD", "1", fetched + dt.timedelta(seconds=901))
+    assert equity is None and "stale" in error
+
+
 def test_periodic_refresh_populates_buying_power_cache_on_first_cycle(tmp_path, monkeypatch):
     from src.core import execution_config
     from src.services import buying_power_cache
@@ -3545,6 +3578,26 @@ def test_sync_orb_plans_blocks_same_symbol_active_in_multiple_accounts(tmp_path)
     assert second.entry_runtime_status == EntryRuntimeStatus.RISK_INVALID
     assert "multiple accounts" in first.entry_block_reason
     assert "multiple accounts" in second.entry_block_reason
+
+
+def test_sync_orb_plans_waits_for_initial_calculation_and_clears_unverified_sizing(tmp_path):
+    worker, engine = _worker(tmp_path)
+    worker._execution_queue_item_lookup = lambda *_args: None
+    card = _seed_card(
+        engine, board_status=BoardStatus.BUY_TODAY,
+        entry_runtime_status=EntryRuntimeStatus.EXECUTE_READY,
+        entry_trigger=19.705, entry_execution_price=19.705,
+        entry_orb_high=19.705, entry_orb_low=19.09,
+        planned_quantity=100, target_position_quantity=100,
+        selected_orb_window="30m",
+    )
+    assert worker._sync_orb_plans([card]) == [card]
+    assert card.entry_runtime_status == EntryRuntimeStatus.DATA_UNAVAILABLE
+    assert card.entry_block_reason == "Waiting for the PC's current-session ORB calculation"
+    assert card.entry_trigger is None and card.entry_execution_price is None
+    assert card.planned_quantity == card.target_position_quantity == 0
+    assert card.selected_orb_window is None
+    assert worker._sync_orb_plans([card]) == []
 
 
 def test_sync_orb_plans_does_not_mark_price_only_movement_for_db_write(tmp_path):

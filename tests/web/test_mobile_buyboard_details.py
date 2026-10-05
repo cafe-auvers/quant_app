@@ -19,7 +19,7 @@ def test_buyboard_stage_details_and_stale_prices(width, tmp_path, browser_event_
     rows = []
     for symbol, stage in [("TODAY", "BUY_TODAY"), ("ENTRY", "ENTRY_PENDING"),
                           ("OPEN", "OPEN_POSITION"), ("PARTIAL", "PARTIAL_SELL"),
-                          ("SELL", "SELL_ALL"), ("UNSIZED", "BUY_TODAY")]:
+                          ("SELL", "SELL_ALL"), ("UNSIZED", "BUY_TODAY"), ("ODD", "BUYLIST")]:
         rows.append({
             "symbol": symbol, "name": symbol, "board_status": stage, "version": 1,
             "breakout_price": 10, "entry_execution_price": 10.1,
@@ -35,6 +35,7 @@ def test_buyboard_stage_details_and_stale_prices(width, tmp_path, browser_event_
             "entry_block_reason": "Waiting for fresh quote and trade events" if symbol == "TODAY" else "",
             "warnings": ["migrated_from_buylist"] if symbol == "TODAY" else [],
             "last_exit_error": "Live Trading is OFF" if symbol == "SELL" else "",
+            "buy_today_note": "Buy Today rejected - all ORB plans invalid. 30m: invalid tick" if symbol == "ODD" else "",
         })
     monitor = [{"symbol": "OPEN", "current_price": 11, "quote_as_of": now.isoformat(), "quote_status": "CURRENT"}]
     session = {"mode": "CONNECTED", "csrf_token": "test",
@@ -69,6 +70,7 @@ def test_buyboard_stage_details_and_stale_prices(width, tmp_path, browser_event_
             page.goto("http://localhost:8779/")
             page.get_by_role("button", name="Buy Board", exact=True).click()
             for tab, symbol, expected in [
+                ("Buylist", "ODD", ["Buy Today rejected", "30m: invalid tick"]),
                 ("Today", "TODAY", ["Target shares", "100 sh", "Planned stop", "$9.50", "Entry plan", "$10.10", "Planned risk", "$60.00", "Waiting for fresh quote"]),
                 ("Entry", "ENTRY", ["Held / target", "20 / 100 sh", "Average fill", "$10.00"]),
                 ("Open", "OPEN", ["Held", "100 sh", "Sellable", "75 sh", "Active stop", "100 / 100 sh", "$11.00", "+$100.00 (+10.00%)", "Yahoo", "indicative"]),
@@ -86,7 +88,11 @@ def test_buyboard_stage_details_and_stale_prices(width, tmp_path, browser_event_
                     assert page.locator("#buy-board-column-summary").inner_text() == "2 stocks · 100 target shares · 1 not sized"
                 card.click()
                 sheet = page.locator("#buy-board-action-facts").inner_text().lower()
-                assert "price" in sheet and ("planned stop" if tab in ("Today", "Entry") else "active stop") in sheet
+                assert "price" in sheet
+                if tab != "Buylist":
+                    assert ("planned stop" if tab in ("Today", "Entry") else "active stop") in sheet
+                if symbol == "ODD":
+                    assert "Buy Today rejected" in page.locator("#buy-board-action-warning").inner_text()
                 if symbol == "TODAY":
                     assert "Waiting for fresh quote" in page.locator("#buy-board-action-warning").inner_text()
                 page.locator("#buy-board-action-close").click()
