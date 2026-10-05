@@ -76,12 +76,17 @@ def test_pulled_back_breakout_and_orb_confirmation_are_retained():
     assert all(window["price_status"] == "PASS" for window in row["orb"])
 
 
-@pytest.mark.parametrize("inputs", [
-    {"fetch_failed": True}, {"now": moment("10:10")},
-    {"frame": bars(day="2026-10-01")},
-])
-def test_failed_old_or_previous_day_data_never_reports_current_passes(inputs):
+@pytest.mark.parametrize("inputs", [{"fetch_failed": True}, {"now": moment("10:10")}])
+def test_stale_quote_preserves_observed_session_pass_without_claiming_current_quote(inputs):
     row = evaluate(**inputs)
+    assert row["quote_status"] == "STALE"
+    assert row["broke_out_today"] is None
+    assert all(window["price_status"] == "PASS" for window in row["orb"])
+    assert row["orb_session_date"] == "2026-10-02"
+
+
+def test_previous_day_data_never_reports_current_passes():
+    row = evaluate(frame=bars(day="2026-10-01"))
     assert row["quote_status"] == "STALE"
     assert row["broke_out_today"] is None
     assert all(window["price_status"] == "UNKNOWN" for window in row["orb"])
@@ -403,7 +408,7 @@ def test_shared_bounds_failure_preserves_price_monitoring_membership(web_config,
     assert context.position_error == "Shared ORB settings unavailable"
 
 
-def test_cached_reads_do_not_recalculate_orb_and_stale_or_next_day_signals_clear(monkeypatch):
+def test_cached_reads_keep_session_history_but_clear_it_next_day(monkeypatch):
     clock = [moment()]
     monitor = IntradayMonitor(lambda: MonitorContext(rows=[{"symbol": "AAA", "breakout_price": 101, "watchlist_member": True}],
                                                    settings=OrbSettings(), equity=100_000),
@@ -414,7 +419,7 @@ def test_cached_reads_do_not_recalculate_orb_and_stale_or_next_day_signals_clear
     clock[0] = moment("10:10")
     row = monitor.snapshot()["rows"][0]
     assert row["quote_status"] == "STALE"
-    assert row["orb"][0]["price_status"] == "UNKNOWN"
+    assert row["orb"][0]["price_status"] == "PASS"
     clock[0] = moment("10:05", "2026-10-04")
     row = monitor.snapshot()["rows"][0]
     assert row["quote_status"] == "CLOSED"

@@ -5,6 +5,16 @@ with the PC and laptop desktop applications. It covers Watchlist, Buylist,
 breakout, Buy Today, Buy Board, Operator Control, and runtime-readiness
 projection changes. It does not grant execution authority.
 
+The mobile intraday monitor is advisory and uses Yahoo minute bars. Its
+`ORB passed` filter includes any price window that crossed the configured
+breakout and opening-range high after the range ended. Position bounds are
+shown independently; a price pass does not certify position sizing or permit
+a broker order. A completed range without a crossing says `Await breakout`
+and shows the required price. Missing bars remain unavailable with a reason.
+Same-session observed passes survive a stale latest quote and are explicitly
+marked as historical; the next session clears them. Actual entries still
+require fresh KIS trade and quote events and the full execution guards.
+
 The six ORB position-bound values are part of the same shared contract. Their
 default profile is capital allocation 10% / 17.5% / 30% and Stop/ADR
 15% / 65% / 66% (lower / ideal / upper). An authenticated browser or desktop
