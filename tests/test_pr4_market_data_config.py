@@ -173,6 +173,7 @@ def test_environment_template_is_credential_only_and_runtime_has_no_symbols():
         "MYSQL_PASSWORD",
         "COORD_DB_USER",
         "COORD_DB_PASSWORD",
+        "SUPABASE_DB_PASSWORD",
         "KIS_PROD_APP_KEY",
         "KIS_PROD_APP_SECRET",
         "KIS_PROD_ACCOUNT_NO",

@@ -230,6 +230,7 @@ class CanonicalPlanningSource:
             now = time.monotonic()
             if (
                 not force
+                and self.cache_seconds > 0
                 and self._snapshot is not None
                 and now - self._snapshot.loaded_at <= self.cache_seconds
             ):
