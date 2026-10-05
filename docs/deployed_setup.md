@@ -103,8 +103,8 @@ SVIA reservation and correctly blocked subsequent BUYs as unreconciled risk.
 The worker now uses its canonical engine by default, and rejected attempts
 retain the reason for operator visibility. Risk and broker guards are retained.
 
-The separate web service runs `08aed225c5eb1223b6148f9b19a483732567f7b0`
-(PR #138). Its far-right header stays on one row and shows `Open in Xm`
+The separate web service runs `8693afa4bb64605004cd07c1c7cea3182c5d7df7`
+(PR #140, including PR #138/#139). Its far-right header stays on one row and shows `Open in Xm`
 before opening and `Close in Xm` during trading. Mobile Cancel Sell All can
 withdraw an unsubmitted regular-session or premarket exit to Open Position,
 preserving the holding and stop and clearing retired retry state. SELL
@@ -113,6 +113,19 @@ cancellation block withdrawal. This is a canonical intent edit, with no broker
 submit or cancel. The 2026-10-06 web-only update preserved the running PC
 processes, approved executor source, live switch, credentials and configuration.
 The web commit is not approved for activation as a trading executor.
+
+
+The 02:04 KST web-only deployment on 2026-10-06 also includes the ORB display
+correction (PR #139) and stage-specific Buy Board details (PR #140). Cards and
+detail sheets show stock/share totals, target or held quantities, entry plan,
+planned/active stop, sellable shares, average entry, working exit quantities,
+retry/block reasons and estimated P&L. Price source, KST observation time and
+age are explicit; Yahoo is indicative, and stale prices do not produce P&L.
+Snapshots and canonical projections are reused without additional SQL queries,
+quote polling or broker calls. At 02:06 KST the PC remained ACTIVE on c106449c
+with live execution enabled/effective; its processes and configuration were
+preserved. The separate PC correction 8efad797 remains pending actual reviewer
+approval and a supervised restart. Its prepared activation preserves web 8693afa4.
 
 At the operator's request, SVIA returned to Open at 00:09 KST with 643 shares
 and its $4.24 stop covering 643 shares. No SELL was working and no broker

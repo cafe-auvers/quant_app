@@ -67,3 +67,22 @@ upgrade and moves broker-confirmed quantity to Open Position.
 
 See [Current Order Logic](https://github.com/cafe-auvers/quant_app/blob/master/docs/current_order_logic.md).
 See also [Web/PWA Operator Synchronization](https://github.com/cafe-auvers/quant_app/blob/master/docs/web_operator_sync.md).
+
+
+## Mobile stage details
+
+Stage headers count stocks and total target/held shares; unsized plans are
+identified. Cards and detail sheets show the same stage facts:
+
+| Stage | Details |
+| --- | --- |
+| Today | Target shares, ORB window, breakout/trigger, entry price, planned stop/risk and block/retry reason |
+| Entry | Entry plan, held/target shares and average fill |
+| Open | Held/sellable shares, average entry, active/pending stop and stop shares, estimated P&L and distance to stop |
+| Partial | Position details, requested sell and working remaining shares |
+| Sell All | Position details, working remaining shares, submit/cancel state and exit/retry reason |
+
+Prices reuse existing Monitor or PC observations. The source, KST timestamp,
+age and stale status are visible. Yahoo prices are indicative, not execution
+permission. Estimated P&L and distance to stop require a dated observation
+within the display freshness threshold; actual KIS execution gates are unchanged.

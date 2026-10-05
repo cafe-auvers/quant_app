@@ -54,14 +54,27 @@ entries. Rejected attempts now retain their reason. All risk/broker guards
 remain in place. Shared ORB settings, mobile membership writes and execution
 still use Supabase PostgreSQL; the app does not use TiDB.
 
-The separate web service runs `08aed225c5eb1223b6148f9b19a483732567f7b0`
-(PR #138). The far-right header remains one row: `Open in Xm` before opening,
+The separate web service runs `8693afa4bb64605004cd07c1c7cea3182c5d7df7`
+(PR #140, including PR #138/#139). The far-right header remains one row: `Open in Xm` before opening,
 then `Close in Xm` during trading. Cancel Sell All now withdraws an unsubmitted
 exit in premarket or regular hours and preserves the holding and stop.
 A SELL identity, reservation, working/ambiguous order or unresolved cancel
 prevents withdrawal. No broker order is submitted or cancelled by that edit.
 The web-only deployment preserved the running, armed PC executor and its
 configuration; the new web SHA is not approved as an executor release.
+
+
+The 02:04 KST web-only deployment on 2026-10-06 also includes the ORB display
+correction (PR #139) and stage-specific Buy Board details (PR #140). Cards and
+detail sheets show stock/share totals, target or held quantities, entry plan,
+planned/active stop, sellable shares, average entry, working exit quantities,
+retry/block reasons and estimated P&L. Price source, KST observation time and
+age are explicit; Yahoo is indicative, and stale prices do not produce P&L.
+Snapshots and canonical projections are reused without additional SQL queries,
+quote polling or broker calls. At 02:06 KST the PC remained ACTIVE on c106449c
+with live execution enabled/effective; its processes and configuration were
+preserved. The separate PC correction 8efad797 remains pending actual reviewer
+approval and a supervised restart. Its prepared activation preserves web 8693afa4.
 
 The operator requested SVIA's return to Open. At 00:09 KST it returned with
 643 shares and its $4.24 stop covering 643 shares; no SELL was working and no
