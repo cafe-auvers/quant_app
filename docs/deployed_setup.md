@@ -1,6 +1,6 @@
 # Deployed PC, mobile, and laptop setup
 
-Verified deployment snapshot: **2026-10-05**. This page describes the deployed
+Verified deployment snapshot: **2026-10-06**. This page describes the deployed
 installation; fresh installations retain conservative defaults and need their
 own configuration and release approval.
 
@@ -88,16 +88,31 @@ A legacy planning stop on a flat Buylist card is not an active stop order;
 positions, working orders, unresolved exposure, and actual protection remain
 guarded. See [operator synchronization](web_operator_sync.md).
 
-The approved PC trading release is
-`c106449c46accc6f249280bea372242bb816f8d5` (PR #137). The operator approved
-its supervised 2026-10-05 restart and manually armed the new release after
-broker reconciliation. Verification at 00:27 KST on 2026-10-06 confirmed
-`ACTIVE`, executor/broker/feed/ownership/shared-state readiness, and live
-execution enabled and effective for the 2026-10-05 NYSE session.
-Future executor release changes require fresh exact-release review and manual
-arming. This is a dated snapshot, not proof of future sessions or fills.
+The approved PC executor release is
+`3a7c14fe9cc269a2590f825e88aacafac7d98a21` (PR #141). The operator approved this exact
+release and its supervised restart at 03:05 KST on 2026-10-06. A fresh heartbeat
+at 03:20:54 KST confirmed `ACTIVE`, PC execution ownership, KIS feed readiness,
+command consumption, broker reconciliation and current shared state. The initial
+launch failed; the retried dashboard also needed its local coordination pulse
+to absorb the guarded owner handoff. The monitoring pause exceeded the estimated
+1–2 minutes. Read-only verification at 03:21:15 KST confirmed SVIA's 643-share
+holding and EFOR's working BUY of 73 at $34.77, matching canonical records and
+active reservations. No broker order was submitted, cancelled or replaced by
+deployment.
 
-This release fixes the canonical capital-reservation reader used by portfolio
+Live Trading was armed from DESKTOP-E42GSKJ at 03:23:46 KST. Read-only
+verification at 03:25:32 KST confirmed enabled and effective for exact release
+3a7c14fe and the 2026-10-05 NYSE session, durable revision 48. The passive
+collector also recorded MANUAL_ARM. Deployment and verification did not enable
+the switch. The post-arming broker check at 03:24:46 KST still matched SVIA
+643 shares and EFOR BUY 73 at $34.77, with no unsettled broker commands.
+SVIA's configured $4.24 stop covers all 643 held shares; position monitoring
+continues in the ACTIVE runtime. Actual exits remain subject to current feed,
+broker and execution guards. A configured stop is not a broker-hosted order.
+Future executor changes require fresh exact-release review and manual arming.
+This is a dated snapshot, not proof of future sessions or fills.
+
+The inherited c106449c correction fixes the canonical capital-reservation reader used by portfolio
 risk checks. A missing optional reader engine previously hid the existing
 SVIA reservation and correctly blocked subsequent BUYs as unreconciled risk.
 The worker now uses its canonical engine by default, and rejected attempts
@@ -112,7 +127,8 @@ identities, reserved shares, working/ambiguous orders and unresolved
 cancellation block withdrawal. This is a canonical intent edit, with no broker
 submit or cancel. The 2026-10-06 web-only update preserved the running PC
 processes, approved executor source, live switch, credentials and configuration.
-The web commit is not approved for activation as a trading executor.
+That earlier web-only deployment did not activate the executor; the same SHA
+is now approved and ACTIVE on the PC as recorded above.
 
 
 The 02:04 KST web-only deployment on 2026-10-06 also includes the ORB display
@@ -125,23 +141,25 @@ Snapshots and canonical projections are reused without additional SQL queries,
 quote polling or broker calls. At 02:06 KST the PC remained ACTIVE on c106449c
 with live execution enabled/effective; its processes and configuration were
 preserved. The combined PC correction 3a7c14fe (PR #141) supersedes the
-unapproved 8efad797 package and remains pending actual reviewer approval and a
-supervised restart. Its prepared activation preserves web 3a7c14fe.
+unapproved 8efad797 package. The operator approved and activated 3a7c14fe
+through the supervised restart recorded above, preserving web 3a7c14fe.
 
 At 02:55 KST on 2026-10-06, the separate web source was updated to 3a7c14fe,
 preserving PC process IDs, source c106449c, credentials/configuration and Live
 Trading. The Buylist now shows the current-session Buy Today rejection memo.
 ODD's calculation had rejected fractional-cent 1m/30m highs as invalid order
 ticks, then returned it to Buylist; mobile had omitted the stored result.
-The prepared PC planner rounds automatic BUY limits down to the highest legal
+The activated PC planner rounds automatic BUY limits down to the highest legal
 tick within the passive range and retains raw ORH for breakout confirmation.
 Actual cached KIS inputs replayed offline to a valid ODD 30m plan at $19.70,
 117 shares and 16.28% capital; 1m/5m remain risk-invalid. No order was placed
-or Buy Today intent restored by this diagnostic. Until approved activation,
-the PC still uses the old planner. Verification at 02:57 KST confirmed c106449c
-ACTIVE, reconciled, and Live Trading enabled/effective.
+or Buy Today intent restored by this diagnostic. The corrected planner now
+runs on PC source 3a7c14fe. ODD remains in Buylist until explicitly added again;
+current sizing and normal signal/feed guards still apply. The earlier 02:57 KST
+snapshot had c106449c ACTIVE with Live Trading enabled; it is historical after
+the approved restart disarmed Live Trading.
 
-The same pending release preserves the latest KIS trade alongside stop extrema,
+The activated release preserves the latest KIS trade alongside stop extrema,
 uses the newest observation timestamp, prevents minute refresh from repeatedly
 rearming a feed-blocked card, publishes worker equity with its actual timestamp,
 and shows the specific freshness block. A healthy socket does not guarantee a
@@ -155,8 +173,8 @@ and its $4.24 stop covering 643 shares. No SELL was working and no broker
 mutation was made. The deployed mobile API confirmed Open, 643 shares and
 $4.24 at 00:27 KST. Stops and other live risk policies still apply.
 
-Passive Gate 2/3/4 collectors run alongside live trading under
-`quant_evidence/qmco_reservation_fix_20261005/session/checks_report.json`;
+Passive Gate 2/3/4 collectors are RUNNING alongside enabled live trading. Evidence is under
+`quant_evidence/odd_orb_fix_20261006/session/checks_report.json`;
 the earlier release's evidence remains preserved. They collect feed health,
 isolated shadow decisions and actual execution events. Reports explicitly say
 `NOT_CERTIFIED`; full-session fault probes, complete branch/fence replay,

@@ -92,14 +92,18 @@ within the display freshness threshold; actual KIS execution gates are unchanged
 
 The mobile Buylist now displays the current-session Buy Today rejection after
 the PC returns an invalid plan to Buylist; prior-session history remains hidden.
-Web 3a7c14fe (PR #141) is deployed; the PC remains approved c106449c.
+Web and PC 3a7c14fe (PR #141) are deployed. The approved PC executor was
+verified ACTIVE and reconciled at 03:20–03:21 KST on 2026-10-06. Manual arming
+from the PC at 03:23:46 KST was verified enabled/effective at 03:25:32 KST
+for this exact release and the 2026-10-05 NYSE session (revision 48).
 
-The pending PC release 3a7c14fe uses the highest legal BUY tick at or below raw
+The activated PC release 3a7c14fe uses the highest legal BUY tick at or below raw
 ORH for automatic limits. The raw high remains the confirmation threshold;
 manual prices are never silently rounded, and a collapsed passive zone still
 fails. ODD's actual cached 30m range (19.705/19.09) replays to a legal 19.70
-limit and valid sizing, while its 1m/5m plans remain risk-invalid. Exact-release
-approval and supervised activation are still required before this planner runs.
+limit and valid sizing, while its 1m/5m plans remain risk-invalid. The operator
+approved this exact release and the supervised restart; the planner now runs
+on the PC. The diagnostic did not re-add ODD to Buy Today or place an order.
 
 Initial missing queue data waits for the PC calculation. A Fresh KIS block means
 the execution feed gate failed: disconnected/awaiting channels, missing or stale
