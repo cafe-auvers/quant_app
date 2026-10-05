@@ -250,4 +250,46 @@ failed/offline poll; known dollar amounts remain visible. The NAV header shows
 the current usable denominator. Rendering makes no broker calls and adds no
 canonical database query for NAV.
 
-Deployment: web `dfd80c1d62b949826a1107f04b20df469cc3f98f` ([PR #143](https://github.com/cafe-auvers/quant_app/pull/143)) at 04:39 KST on 2026-10-06. The running PC executor remains at approved `3a7c14fe9cc269a2590f825e88aacafac7d98a21`; process identities, configuration and Live Trading were preserved. Read-only verification at 04:39:59 KST confirmed ACTIVE and Live Trading enabled/effective. 317 compatibility tests and mobile checks at 320/390/820 pixels passed. The live mobile browser confirmed SVIA's held allocation and stop risk, and EFOR's planned values. The CURV executor correction remains prepared and unactivated; its deployment preserves this web source.
+Earlier NAV deployment: web `dfd80c1d62b949826a1107f04b20df469cc3f98f` ([PR #143](https://github.com/cafe-auvers/quant_app/pull/143)) at 04:39 KST on 2026-10-06. The running PC executor remains at approved `3a7c14fe9cc269a2590f825e88aacafac7d98a21`; process identities, configuration and Live Trading were preserved. Read-only verification at 04:39:59 KST confirmed ACTIVE and Live Trading enabled/effective. 317 compatibility tests and mobile checks at 320/390/820 pixels passed. The live mobile browser confirmed SVIA's held allocation and stop risk, and EFOR's planned values. That web source has since been superseded by the re-entry update described below.
+
+
+## Explicit re-entry after a completed exit
+
+A stop hit starts liquidation. A new entry cannot start while the stock remains
+held or its exit is pending. Once broker reconciliation confirms zero shares and
+the completed cycle is Closed, select the stock and confirm Buy Today again on
+mobile, or use Re-enter on the PC chart. The original breakout price and risk
+budget are retained; editing the breakout price is no longer required.
+
+Each explicit activation starts a fresh planning cycle. Previous entry/exit
+identities, frozen ORB execution values, stop state and retry projections are
+retired, while the immutable order history remains available. The PC calculates
+a current-session ORB plan and creates a new broker-order identity. There is no
+one-entry-per-symbol-per-day lock and no automatic reactivation after another
+stop. Repeated same-day attempts still require a new user activation each time,
+current ORB qualification, fresh KIS trade/quote data, account equity/buying power,
+portfolio risk, execution ownership, Live Trading and broker-boundary checks.
+Existing attempt-rate limits and cooldowns remain in force.
+
+Re-entry rejects nonzero held/sellable shares, nonterminal position/entry/exit
+state, pending stop changes, reserved capital, active owned/external orders and
+unresolved broker commands. These checks run again before the canonical update.
+Closed remains outside the ordinary drag graph; only a validated new-cycle
+command can reopen it.
+
+A Closed card can retain a historical reservation ID. The new-cycle check reads
+the canonical reservation ledger and retires that reference only when its
+environment/account/symbol match, its status is Consumed/Released/Expired and
+both remaining reserved money and projected risk are zero. Missing, mismatched,
+active or inconsistent reservations still block; an active reservation for the
+symbol also blocks even if its card reference is missing. No reservation is
+released by a re-entry request.
+
+An ambiguous historical cancel stops blocking only when its exact target order
+has a unique matching account/symbol identity, zero remaining quantity and a
+Filled/Cancelled/Expired broker observation reconciled after that cancel was
+requested. Missing, earlier or inconsistent evidence still blocks. An unresolved
+submit, replace or in-flight requested cancel always blocks. This check retains
+the original command and order records; it does not retry or send a cancel.
+
+Current deployment: mobile/web `04bffd4f6a2f44eddb4c0f822db2c4c9cd3664b2` ([PR #144](https://github.com/cafe-auvers/quant_app/pull/144)) at 05:29 KST on 2026-10-06. The update retained NAV/risk/allocation details and added explicit re-entry after a fully reconciled exit. The real Closed-card read-only preflight and served HTTPS assets passed. No real re-entry intent/order was created during verification. 148 focused checks, 12 mobile browser checks and 3,428 full-suite tests passed (7 skipped). The PC remains on approved `3a7c14fe9cc269a2590f825e88aacafac7d98a21`; its processes, configuration and live-control value were preserved. After market close, the control remains armed for October 5 and must be re-armed for the October 6 session. The new PC Re-enter control and CURV executor correction are prepared together at `04bffd4f6a2f44eddb4c0f822db2c4c9cd3664b2`, pending exact-release review and activation; this supersedes the earlier unactivated CURV-only `0f15aa7b` packet. The PC activation workflow preserves the current web source.
