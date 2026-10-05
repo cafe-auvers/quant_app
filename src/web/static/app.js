@@ -3287,6 +3287,9 @@
     );
     const buyTodayActionEligible = hasBuyToday || buyTodayDraftEligible || (
       !connectedReadOnly && (card?.canonical_stage || card?.stage) === 'WATCHLIST'
+    ) || (
+      (card?.canonical_stage || card?.stage) === 'CLOSED'
+      && Boolean(card?.breakout_price) && operatorBuyTodayEnabled
     );
     const displayStage = card?.display_stage || card?.canonical_stage || card?.stage || 'NOT PLANNED';
     byId('plan-stage').textContent = displayStage;
@@ -3507,9 +3510,12 @@
       return;
     }
     if (enabled) {
+      const reentry = (previousPlan.canonical_stage || previousPlan.stage) === 'CLOSED';
       const confirmed = await confirmOperatorAction(
-        `Publish ${actionSymbol} to Buy Today?`,
-        'This creates executable intent on the shared Buy Board. It does not place an order now, but the Execution Owner may act later when every runtime, risk, market-data, and broker gate passes.',
+        reentry ? `Re-enter ${actionSymbol} through Buy Today?` : `Publish ${actionSymbol} to Buy Today?`,
+        reentry
+          ? 'This starts a new trade cycle after a fully reconciled exit. The Execution Owner may buy again when current ORB, fresh market data, risk, capital and broker checks pass. It does not automatically repeat after another stop.'
+          : 'This creates executable intent on the shared Buy Board. It does not place an order now, but the Execution Owner may act later when every runtime, risk, market-data, and broker gate passes.',
         'Publish to Buy Today',
       );
       if (!confirmed) return;
@@ -3611,6 +3617,11 @@
     const actionSymbol = state.symbol;
     const canonicalActive = canonicalBuyTodayActive();
     const hasDraft = hasCurrentBuyTodayDraft() && !canonicalActive;
+    if ((state.plan?.canonical_stage || state.plan?.stage) === 'CLOSED'
+        && operatorOperationEnabled('activate_buy_today')) {
+      await toggleCanonicalBuyToday();
+      return;
+    }
     if (!canonicalActive && !hasDraft && !state.plan?.buylist_member) {
       if (!state.plan?.breakout_price) {
         requestBreakoutForList('buy_today');

@@ -261,3 +261,27 @@ percentages. The browser also expires a previously received NAV during a
 failed/offline poll; known dollar amounts remain visible. The NAV header shows
 the current usable denominator. Rendering makes no broker calls and adds no
 canonical database query for NAV.
+
+## Explicit re-entry after a completed exit
+
+A stop hit starts liquidation. A new entry cannot start while the stock remains
+held or its exit is pending. Once broker reconciliation confirms zero shares and
+the completed cycle is Closed, select the stock and confirm Buy Today again on
+mobile, or use Re-enter on the PC chart. The original breakout price and risk
+budget are retained; editing the breakout price is no longer required.
+
+Each explicit activation starts a fresh planning cycle. Previous entry/exit
+identities, frozen ORB execution values, stop state and retry projections are
+retired, while the immutable order history remains available. The PC calculates
+a current-session ORB plan and creates a new broker-order identity. There is no
+one-entry-per-symbol-per-day lock and no automatic reactivation after another
+stop. Repeated same-day attempts still require a new user activation each time,
+current ORB qualification, fresh KIS trade/quote data, account equity/buying power,
+portfolio risk, execution ownership, Live Trading and broker-boundary checks.
+Existing attempt-rate limits and cooldowns remain in force.
+
+Re-entry rejects nonzero held/sellable shares, nonterminal position/entry/exit
+state, pending stop changes, reserved capital, active owned/external orders and
+unresolved broker commands. These checks run again before the canonical update.
+Closed remains outside the ordinary drag graph; only a validated new-cycle
+command can reopen it.

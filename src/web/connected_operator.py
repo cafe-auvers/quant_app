@@ -495,8 +495,10 @@ class ConnectedOperatorService:
         if card is None:
             raise ConflictError("No canonical Buy Board card exists")
         if action == "activate_buy_today":
-            if card.board_status != BoardStatus.BUYLIST or not card.buylist_member:
-                raise ConflictError("Buy Today activation requires a Buylist card")
+            if card.board_status != BoardStatus.CLOSED and (
+                card.board_status != BoardStatus.BUYLIST or not card.buylist_member
+            ):
+                raise ConflictError("Buy Today activation requires a Buylist or fully closed card")
             breakout = self.source._positive_number(card.breakout_price)
             if breakout is None:
                 raise ConflictError("Set a breakout price before Buy Today activation")

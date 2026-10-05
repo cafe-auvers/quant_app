@@ -99,6 +99,28 @@ def _buylist_card(engine):
 
 
 @pytest.mark.parametrize("same_executor", [True, False])
+def test_mobile_reactivates_a_fully_closed_stock_with_original_breakout(
+    web_config, tmp_path, monkeypatch, same_executor
+):
+    engine, _role, service = _service(web_config, tmp_path, same_executor=same_executor)
+    monkeypatch.setattr(trade_card_repository, "LOCAL_TRADE_CARDS_FILE", tmp_path / "cards.json")
+    card = _buylist_card(engine)
+    card.board_status = BoardStatus.CLOSED
+    card.position_runtime_status = PositionRuntimeStatus.CLOSED
+    card.average_entry_price = 200.0
+    card = trade_card_repository.update_trade_card(engine, card, expected_version=card.version)
+    service.set_operator_control_target("mobile")
+    result = service.set_buy_today(command_id=str(uuid.uuid4()), symbol="AAPL",
+        expected_revision=card.version, enabled=True)
+    assert result["queued"] is False
+    assert result["card"]["canonical_stage"] == "BUY_TODAY"
+    assert result["card"]["breakout_price"] == 201.25
+    stored = trade_card_repository.get_trade_card(engine, "PROD", "account-a", "AAPL")
+    assert stored.position_runtime_status == PositionRuntimeStatus.NONE
+    assert stored.average_entry_price == 0 and stored.planned_quantity == 0
+
+
+@pytest.mark.parametrize("same_executor", [True, False])
 def test_mobile_withdraws_unsubmitted_regular_exit_directly_and_preserves_stop(
     web_config, tmp_path, monkeypatch, same_executor
 ):
