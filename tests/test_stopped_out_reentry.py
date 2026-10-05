@@ -13,7 +13,9 @@ from src.core.trade_card_state import BoardStatus, EntryRuntimeStatus, PositionR
 from src.services import trade_card_repository as cards
 from src.services.execution_command_repository import ExecutionCommand, record_command
 from src.services.execution_order_repository import record_execution_order, list_execution_orders_for_card
-from src.services.execution_workflow_service import BoardCommandRejectedError, request_board_action
+from src.services.execution_workflow_service import (
+    BoardCommandRejectedError, _cancel_target_is_confirmed_terminal, request_board_action,
+)
 from src.services.position_manager import PositionManager
 from src.services.capital_reservation_repository import save_reservation_strict
 
@@ -107,6 +109,82 @@ def test_reentry_blocks_unresolved_broker_command_without_an_order_row(engine, s
         environment="PROD", account_no="test", symbol="TEST", status=status, lease_epoch=0))
     with pytest.raises(BoardCommandRejectedError, match="broker command is unresolved"):
         request_board_action(engine, command(card), context=BoardActionContext())
+
+
+@pytest.mark.parametrize("terminal", [ExecutionOrderStatus.FILLED,
+    ExecutionOrderStatus.CANCELLED, ExecutionOrderStatus.EXPIRED])
+def test_reentry_can_retire_ambiguous_cancel_with_later_exact_terminal_observation(engine, terminal):
+    card = closed_card(engine)
+    order = ExecutionOrderRecord(environment="PROD", account_no="test", symbol="TEST",
+        side=OrderSide.BUY, intent=OrderIntent.ENTRY, client_order_id="old-buy",
+        broker_order_id="exact-old", broker_identity_status=BrokerIdentityStatus.EXACT,
+        status=terminal, submitted_quantity=10, remaining_quantity=0,
+        last_broker_seen_at="2026-08-28T15:22:41+00:00",
+        last_reconciled_at="2026-08-28T15:22:41+00:00")
+    record_execution_order(engine, order)
+    record_command(engine, ExecutionCommand(idempotency_key="old-cancel", command_type="cancel",
+        environment="PROD", account_no="test", symbol="TEST", status="AMBIGUOUS", lease_epoch=0,
+        target_broker_order_id="exact-old", requested_at="2026-08-28T15:22:14"))
+    updated = request_board_action(engine, command(card), context=BoardActionContext()).card
+    assert updated.board_status == BoardStatus.BUY_TODAY
+    assert len(list_execution_orders_for_card(engine, environment="PROD", account_no="test", symbol="TEST")) == 1
+
+
+@pytest.mark.parametrize("changes", [
+    {"target_broker_order_id": "wrong-target"}, {"target_broker_order_id": ""},
+    {"status": "REQUESTED"}, {"command_type": "submit"}, {"command_type": "replace"},
+    {"requested_at": "2026-08-28T15:22:42+00:00"},
+])
+def test_terminal_order_does_not_excuse_other_unresolved_commands(engine, changes):
+    card = closed_card(engine)
+    record_execution_order(engine, ExecutionOrderRecord(environment="PROD", account_no="test",
+        symbol="TEST", side=OrderSide.BUY, intent=OrderIntent.ENTRY, client_order_id="old-buy",
+        broker_order_id="exact-old", broker_identity_status=BrokerIdentityStatus.EXACT,
+        status=ExecutionOrderStatus.FILLED, remaining_quantity=0,
+        last_broker_seen_at="2026-08-28T15:22:41+00:00", last_reconciled_at="2026-08-28T15:22:41+00:00"))
+    fields = dict(idempotency_key="unresolved", command_type="cancel", environment="PROD",
+        account_no="test", symbol="TEST", status="AMBIGUOUS", lease_epoch=0,
+        target_broker_order_id="exact-old", requested_at="2026-08-28T15:22:14+00:00")
+    fields.update(changes)
+    record_command(engine, ExecutionCommand(**fields))
+    with pytest.raises(BoardCommandRejectedError, match="broker command is unresolved"):
+        request_board_action(engine, command(card), context=BoardActionContext())
+
+
+@pytest.mark.parametrize("changes", [
+    {"last_broker_seen_at": None}, {"last_reconciled_at": None},
+    {"last_broker_seen_at": "invalid"}, {"last_reconciled_at": "invalid"},
+    {"last_broker_seen_at": "2026-08-28T15:22:13+00:00"},
+    {"last_reconciled_at": "2026-08-28T15:22:13+00:00"},
+    {"last_reconciled_at": "2099-01-01T00:00:00+00:00"}, {"remaining_quantity": 1},
+])
+def test_terminal_cancel_requires_complete_later_broker_evidence(engine, changes):
+    card = closed_card(engine)
+    fields = dict(environment="PROD", account_no="test", symbol="TEST", side=OrderSide.BUY,
+        intent=OrderIntent.ENTRY, client_order_id="old-buy", broker_order_id="exact-old",
+        broker_identity_status=BrokerIdentityStatus.EXACT, status=ExecutionOrderStatus.CANCELLED,
+        submitted_quantity=10, remaining_quantity=0, last_broker_seen_at="2026-08-28T15:22:41+00:00",
+        last_reconciled_at="2026-08-28T15:22:41+00:00")
+    fields.update(changes)
+    record_execution_order(engine, ExecutionOrderRecord(**fields))
+    record_command(engine, ExecutionCommand(idempotency_key="old-cancel", command_type="cancel",
+        environment="PROD", account_no="test", symbol="TEST", status="AMBIGUOUS", lease_epoch=0,
+        target_broker_order_id="exact-old", requested_at="2026-08-28T15:22:14+00:00"))
+    with pytest.raises(BoardCommandRejectedError, match="broker command is unresolved"):
+        request_board_action(engine, command(card), context=BoardActionContext())
+
+
+def test_cancel_terminal_evidence_rejects_invalid_request_timestamp_and_duplicate_target():
+    old_cancel = ExecutionCommand(idempotency_key="old-cancel", command_type="cancel",
+        environment="PROD", account_no="test", symbol="TEST", status="AMBIGUOUS", lease_epoch=0,
+        target_broker_order_id="exact-old", requested_at="invalid")
+    terminal = ExecutionOrderRecord(environment="PROD", account_no="test", symbol="TEST",
+        side=OrderSide.BUY, intent=OrderIntent.ENTRY, client_order_id="old-buy", broker_order_id="exact-old",
+        broker_identity_status=BrokerIdentityStatus.EXACT, status=ExecutionOrderStatus.FILLED,
+        last_broker_seen_at="2026-08-28T15:22:41+00:00", last_reconciled_at="2026-08-28T15:22:41+00:00")
+    assert not _cancel_target_is_confirmed_terminal(old_cancel, [terminal])
+    old_cancel.requested_at = "2026-08-28T15:22:14+00:00"
+    assert not _cancel_target_is_confirmed_terminal(old_cancel, [terminal, terminal])
 
 
 def test_multiple_stopped_out_cycles_need_a_new_explicit_activation_each_time(engine):

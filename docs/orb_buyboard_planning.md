@@ -293,3 +293,10 @@ both remaining reserved money and projected risk are zero. Missing, mismatched,
 active or inconsistent reservations still block; an active reservation for the
 symbol also blocks even if its card reference is missing. No reservation is
 released by a re-entry request.
+
+An ambiguous historical cancel stops blocking only when its exact target order
+has a unique matching account/symbol identity, zero remaining quantity and a
+Filled/Cancelled/Expired broker observation reconciled after that cancel was
+requested. Missing, earlier or inconsistent evidence still blocks. An unresolved
+submit, replace or in-flight requested cancel always blocks. This check retains
+the original command and order records; it does not retry or send a cancel.

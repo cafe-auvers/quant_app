@@ -831,6 +831,47 @@ def _active_external_orders(engine, card):
     ]
 
 
+def _cancel_target_is_confirmed_terminal(command, orders) -> bool:
+    """A later exact broker observation can retire an ambiguous cancel blocker."""
+    if (
+        command.command_type != "cancel"
+        or command.status != "AMBIGUOUS"
+        or not command.target_broker_order_id
+    ):
+        return False
+    targets = [order for order in orders if (
+        order.environment == command.environment
+        and order.account_no == command.account_no
+        and order.symbol == command.symbol
+        and order.broker_order_id == command.target_broker_order_id
+    )]
+    if len(targets) != 1:
+        return False
+    target = targets[0]
+    if (
+        target.broker_identity_status != BrokerIdentityStatus.EXACT
+        or target.status not in {
+            ExecutionOrderStatus.FILLED, ExecutionOrderStatus.CANCELLED,
+            ExecutionOrderStatus.EXPIRED,
+        }
+        or target.remaining_quantity != 0
+    ):
+        return False
+
+    def timestamp(raw):
+        value = datetime.fromisoformat(str(raw or "").replace("Z", "+00:00"))
+        return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+
+    try:
+        requested = timestamp(command.requested_at)
+        reconciled = timestamp(target.last_reconciled_at)
+        broker_seen = timestamp(target.last_broker_seen_at)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    now = datetime.now(timezone.utc)
+    return requested <= broker_seen <= reconciled <= now
+
+
 def _require_board_action_not_conflicted(engine, command, card) -> List[ExecutionOrderRecord]:
     types = _load_board_types()
     from src.core.trade_card_state import (
@@ -957,7 +998,9 @@ def _require_board_action_not_conflicted(engine, command, card) -> List[Executio
         )
 
         if any(
-            row.symbol == card.symbol and row.status in {"REQUESTED", "AMBIGUOUS"}
+            row.symbol == card.symbol
+            and row.status in {"REQUESTED", "AMBIGUOUS"}
+            and not _cancel_target_is_confirmed_terminal(row, owned_orders)
             for row in list_execution_commands_for_account(
                 engine, environment=card.environment, account_no=card.account_no
             )
