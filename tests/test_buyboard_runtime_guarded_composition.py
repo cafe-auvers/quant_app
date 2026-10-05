@@ -488,6 +488,16 @@ def test_runtime_pre_broker_abort_retries_with_attempt_two_and_a_fresh_identity(
     runtime, broker, gateway, engine, market_data = _make_runtime(
         tmp_path, monkeypatch
     )
+    # Advance the quote and engine clocks together across the retry cooldown.
+    # Wall-clock quotes otherwise sit exactly on the three-second freshness limit.
+    clock = [datetime.now(timezone.utc)]
+    runtime.entry_attempt_manager._clock = lambda: clock[0]
+    runtime.trading_engine._clock = lambda: clock[0]
+    market_data._clock = lambda: clock[0]
+    market_data._quote_fetcher = lambda symbol: QuoteSnapshot(
+        symbol=symbol, last_price=101.0, bid=100.9, ask=101.1,
+        received_at=clock[0], broker_event_at=clock[0], processed_at=clock[0],
+    )
     card = _persist_owned_card(engine, _card())
     raced_external = {}
     lease_checks = {"count": 0}
@@ -545,6 +555,7 @@ def test_runtime_pre_broker_abort_retries_with_attempt_two_and_a_fresh_identity(
     )
 
     after_cooldown = card.next_retry_at + timedelta(milliseconds=1)
+    clock[0] = after_cooldown
     runtime.entry_attempt_manager._clock = lambda: after_cooldown
     runtime.trading_engine._clock = lambda: after_cooldown
     market_data.poll_once()
