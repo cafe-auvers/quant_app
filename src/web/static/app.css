@@ -31,7 +31,8 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--green); out
 .status-strip { min-width: 0; display: flex; align-items: center; gap: 18px; padding: 0 18px; border-bottom: 1px solid var(--line-soft); color: var(--muted); background: #091512; font-size: 11px; white-space: nowrap; overflow: hidden; }
 .status-strip span { display: flex; align-items: center; gap: 6px; }
 #market-status-compact { display: none; }
-#global-message { margin-left: auto; color: var(--ink); overflow: hidden; text-overflow: ellipsis; }
+#global-message { min-width: 0; flex: 1 1 0; margin-left: auto; color: var(--ink); overflow: hidden; text-overflow: ellipsis; }
+#market-countdown { flex: 0 0 auto; margin-left: auto; color: var(--ink); font-variant-numeric: tabular-nums; }
 .status-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--faint); box-shadow: 0 0 0 3px rgba(100, 119, 111, .1); }
 .status-dot.good { background: var(--green); box-shadow: 0 0 0 3px rgba(72, 214, 165, .1); }
 .status-dot.stale { background: var(--amber); box-shadow: 0 0 0 3px rgba(245, 201, 106, .1); }
@@ -541,6 +542,13 @@ input::placeholder { color: #65776f; }
   .mobile-bottom-nav { padding-left: 2px; padding-right: 2px; }
   .mobile-nav-button { padding-left: 2px; padding-right: 2px; font-size: 8px; }
   .mobile-segment-control { padding-left: 2px; padding-right: 2px; }
+}
+
+@media (max-width: 480px) {
+  .status-strip { gap: 6px; }
+  .status-strip > #market-summary { flex: 0 1 auto; min-width: 0; overflow: hidden; }
+  #market-status-compact { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .status-strip .status-dot { flex-shrink: 0; }
 }
 
 @media (prefers-reduced-motion: reduce) {
