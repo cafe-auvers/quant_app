@@ -1,5 +1,11 @@
 # Web/PWA Operator Synchronization
 
+**Store and host, verified 2026-10-05:** shared state uses the private Supabase PostgreSQL
+schema. The always-on PC hosts both the supervised web service and executor. The laptop is
+optional. Direct PC/laptop pulses use LAN/Tailscale; neither those pulses nor their
+configured canonical refetch uses TiDB. Optional web Supabase Auth/Storage features are
+separate. See [Deployed setup](deployed_setup.md).
+
 This document defines how the authenticated web/PWA controller stays aligned
 with the PC and laptop desktop applications. It covers Watchlist, Buylist,
 breakout, Buy Today, Buy Board, Operator Control, and runtime-readiness
@@ -13,8 +19,10 @@ settings row is then consumed by the PC, laptop, and mobile view.
 
 ## User-visible contract
 
-- An allowed planning or Buy Today action updates the initiating browser
-  immediately and is shown as pending while the request is saved.
+- An allowed planning or Buy Today action is shown as pending while saved.
+  Passive Buylist removal keeps its row visible until canonical confirmation;
+  failure remains visible and stale polls cannot resurrect confirmed removal.
+  Other actions retain immediate optimistic feedback with canonical rollback.
 - The server revalidates authentication, CSRF, the operation allowlist,
   environment/account scope, expected revision, lifecycle rules, and Operator
   Control where required.
@@ -33,9 +41,9 @@ settings row is then consumed by the PC, laptop, and mobile view.
 
 ```mermaid
 flowchart LR
-    A[Phone, PWA, or browser action] --> B[Immediate optimistic UI]
+    A[Phone, PWA, or browser action] --> B[Pending browser feedback]
     A --> C[Authenticated FastAPI command]
-    C --> D[(Canonical coordination SQL)]
+    C --> D[(Supabase PostgreSQL private coordination schema)]
     C --> E[In-process live-update hub]
     E --> F[Other open web/PWA sessions]
     F --> D

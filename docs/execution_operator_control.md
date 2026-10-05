@@ -24,16 +24,19 @@ passive-limit and higher-score cancel-then-replace behavior is documented in
 
 The roles are stored in the shared coordination database as `__main_device__`
 and `__operator_control__`. When `COORD_DB_*` is configured, that authority is
-the TLS-connected TiDB Cloud SQL database; otherwise the legacy deployment
-uses PC MySQL. A real app window never falls back to its private SQLite
+the selected TLS-connected SQL store: Supabase PostgreSQL in the deployment
+verified on 2026-10-05. Legacy unconfigured deployments can use PC MySQL. A real app window never falls back to its private SQLite
 database for ownership. If the selected shared store is unavailable,
 ownership and live execution fail closed.
 
 Assigning **Execution Owner: Laptop** moves execution authority, not data
-storage. With TiDB coordination configured on both devices, the PC may be
-powered off: historical reads move to the laptop mirror while ownership,
-commands, orders, and TradeCards remain online. See
-[TiDB Cloud Coordination Store](tidb_coordination_store.md).
+storage. With Supabase configured on both devices and an explicitly ready
+laptop owner, historical reads may move to the laptop mirror while shared
+ownership, commands, orders, and TradeCards remain online. The current normal
+deployment instead keeps the PC on as executor and mobile web host; the laptop
+can be off. Powering off that PC also stops its web service. TiDB is not used
+for either coordination or direct PC/laptop communication. See
+[Deployed setup](deployed_setup.md).
 
 Each running device also publishes an explicit `device_kind` (`PC` or
 `Laptop`) with its readiness record. On Windows this is derived from system
@@ -42,7 +45,8 @@ laptop to appear as a PC.
 
 ## Normal setup
 
-1. Start `main.py` on the PC and laptop and wait for both readiness rows.
+1. Start `main.py` on the PC and wait for its fresh readiness row. Start the laptop only if
+you need its desktop or a ready handoff target; it is not required for PC/mobile operation.
 2. Set **Execution Owner: PC**.
 3. Set **Operator Control: PC**, **Laptop**, or **Mobile** according to the
    surface used for manual intervention, or **Locked** when no more manual
@@ -75,11 +79,11 @@ cap will not be submitted. `Live Trading: Enabled` is not sufficient by
 itself; confirm the mode, symbol scope, and cap shown beside it.
 
 Live Trading has two layers. `TRADING_ENABLED` in each machine's private
-`.env` is a one-way local administrative lock. If it is false on the laptop,
+`config/runtime.local.json` is a one-way local administrative lock. If it is false on the laptop,
 that laptop must show **LOCKED OFF** even when the shared switch is ON. If it
 is true on the PC, the PC may display the shared switch, but it still cannot
 submit unless it is the Execution Owner and every runtime/broker gate passes.
-The durable ON/OFF switch itself is shared; the local `.env` locks are
+The durable ON/OFF switch itself is shared; the local runtime locks are
 intentionally not synchronized.
 
 ## Buy Today: pre-market versus market-open
@@ -191,7 +195,7 @@ typed change pulse arrives. Periodic revision checks are the recovery fallback.
 ## Switching execution
 
 An execution switch is rejected unless the target publishes a fresh
-`STANDBY_READY` generation with healthy MySQL, KIS reconciliation, realtime
+`STANDBY_READY` generation with a healthy canonical coordination store, KIS reconciliation, realtime
 market data, command consumer, order reconciliation, synchronized revisions,
 and awake/sleep-safety state. Operator Control never changes implicitly during
 an execution switch.
@@ -241,19 +245,20 @@ The outage policy distinguishes continuity from authority:
 - That emergency authority is deliberately short: 30 seconds by default
   (`EMERGENCY_LEASE_ALLOWANCE_SECONDS`). It cannot safely become an unlimited
   offline lease because a network partition is indistinguishable from another
-  device still reaching MySQL.
+  device still reaching the canonical Supabase store.
 - A cold-started or not-yet-active laptop has no offline execution authority.
-  It waits closed for MySQL rather than guessing from the recovery snapshot.
+  It waits closed for the configured shared store rather than guessing from the recovery snapshot.
 - When the shared store returns, the emergency journal is folded into canonical state and
   a full fresh KIS reconciliation must succeed before ordinary execution
   reopens. A failed database read is never interpreted as an empty card list.
 
 The dashboard's remote **Turn Off** action is blocked during the regular
 session while the Buy Board engine and Live Trading are armed. A physical or
-OS-level shutdown cannot be prevented by the app. For either trading device to
-run while the other is fully powered off, move the canonical MySQL service to
-an independent always-on host or managed service; dual local writable databases
-are not a safe substitute.
+OS-level shutdown cannot be prevented by the app. Shared coordination is already independent of either workstation through
+Supabase. A different executor still requires an explicit ready-owner handoff,
+valid market/broker evidence, and all gates. The PC-hosted phone website remains
+unavailable while the PC is off; the current operating model keeps it on.
+Dual local writable coordination databases are not a safe substitute.
 
 ## Device identity and restart safety
 

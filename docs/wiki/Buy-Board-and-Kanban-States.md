@@ -31,6 +31,11 @@ stateDiagram-v2
 
 ## Drag and command behavior
 
+The deployed canonical card state is in Supabase's private PostgreSQL schema. Mobile Buylist
+removal waits for authoritative confirmation instead of optimistically hiding the row;
+failures and revision conflicts remain visible. It is not a broker order or cancellation.
+See [Supabase Deployment](Supabase-Deployment).
+
 A drag carries the card revision and interaction fingerprint. The UI marks that
 card pending immediately, queues database work outside the UI thread, and then
 reloads canonical projections. A stale fingerprint or revision is rejected.

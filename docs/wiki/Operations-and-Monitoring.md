@@ -2,6 +2,12 @@
 
 ## Daily operator checks
 
+For the deployed Supabase system, keep the PC powered on and signed in. The laptop is
+optional. Check the separate shared PostgreSQL connection, local market MySQL, supervised
+web service, and today's exact release/session; no TiDB quota is required. Confirm the daily
+09:15 KST PostgreSQL backup and preserve encrypted off-PC recovery material separately. See
+[Supabase Deployment](Supabase-Deployment).
+
 - Confirm device role, Execution Owner, Operator Control, and Live Trading
   state.
 - Review Health for MySQL, KIS snapshot age, mirror freshness, account

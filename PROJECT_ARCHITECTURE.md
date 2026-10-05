@@ -42,7 +42,7 @@ browser / installed PWA
        -> isolated sandbox planning/drawing store (data/web/web_state.db)
        -> one-current gzip chart cache (data/web/chart_cache)
        -> optional read-only SQLite market mirror
-       -> optional read-only canonical TiDB TradeCard projection
+       -> configured canonical Supabase PostgreSQL TradeCard projection
        -> optional Supabase identity/chart/drawing projection
 
 PyQt main.py / canonical SQL state / executor / KIS
@@ -77,11 +77,19 @@ default password; opaque expiring sessions are server-side. Cookies never
 contain passwords or canonical state. Login is rate limited, mutations require
 CSRF, and Host/Origin allowlists apply to HTTP and WebSocket connections.
 
-Supabase is optional and off by default. Reviewed migrations contain only an
-access allowlist, scanner projection, chart manifests, private chart-cache
-Storage policies, and ordinary drawing rows with RLS. They intentionally do
-not reproduce canonical TradeCards, orders, reservations, ownership, or
-execution ledgers. Canonical connected planning writes default off. The web
+The deployed shared coordination store is Supabase PostgreSQL in the private
+`quant_coordination` schema. All 20 coordination tables were copied and
+verified before target runtime writes on 2026-10-05. A restricted server-side
+role uses verified TLS through the Session pooler; browser roles cannot access
+the schema. Historical prices remain in PC MySQL. There are no ongoing TiDB
+calls and no fallback to the stale TiDB source.
+
+The optional Supabase web Auth/Storage/Realtime/public-projection adapters
+remain off unless separately configured. Their versioned public migrations
+cover access allowlists, scanner projections, chart manifests, private chart
+storage, and drawing RLS; they are separate from the private coordination
+schema and do not create a second order/ownership ledger. Canonical connected
+planning writes default off in fresh installations. The web
 gateway can explicitly allowlist passive Watchlist/Buylist and breakout
 operations; every request is authenticated and revision-fenced, and breakout
 edits additionally verify that either the stable `Mobile Web` identity or the
@@ -628,16 +636,23 @@ main.py "Update 1D/1H Data" action or scripts/run_daily_refresh.py
 
 An optional second machine -- an always-on PC reachable over LAN or Tailscale -- can host the single canonical MySQL database while both desktops share planning/control state and the laptop keeps an offline mirror. This is fully documented in [docs/pc_sync_data_pipeline.md](docs/pc_sync_data_pipeline.md); summary:
 
-- **Roles**: the PC hosts canonical MySQL and runs `historical.py` on a schedule (BIOS wake -> auto-login -> `scripts/pc_morning_routine.ps1` -> freshness-gated refresh -> auto-shutdown). Either desktop may be the guarded Execution Owner when it is fresh and fully ready; exactly one owner can cross the broker boundary. `data/local_mirror.db` is the laptop's offline safety copy, not a peer database.
-- **Device identity**: `data/device_role.json` (device id, hostname, `is_main`) determines which device may push compatibility planning collections; it does not grant execution ownership. `src/services/state_sync.py` syncs watchlist, buylist, trade plans, the execution queue, scanner setups, and settings through a revision-tracked MySQL table so a stale device cannot clobber a newer remote copy.
+- **Roles**: the PC hosts canonical MySQL and runs `historical.py` on a schedule (`scripts/pc_morning_routine.ps1` -> freshness-gated refresh; the current deployment stays on). Either desktop may be the guarded Execution Owner when it is fresh and fully ready; exactly one owner can cross the broker boundary. `data/local_mirror.db` is the laptop's offline safety copy, not a peer database.
+- **Device identity**: `data/device_role.json` (device id, hostname, `is_main`) determines which device may push compatibility planning collections; it does not grant execution ownership. `src/services/state_sync.py` syncs watchlist, buylist, trade plans, the execution queue, scanner setups, and settings through revision-tracked `app_state_sync` in the configured shared coordination store (Supabase PostgreSQL in the deployed setup) so a stale device cannot clobber a newer remote copy.
 - **Runtime visibility**: the guarded runtime publishes canonical readiness to `runtime_device_state` every 240 seconds with a 300-second freshness fence; `src/services/runtime_status.py` remains the process-lifecycle fallback. Together with `src/services/pc_remote_control.py`, the dashboard reports independent `PC` / `DB` / `Listener` / `main.py` signals. These lights do not replace a fresh `STANDBY_READY` identity for owner transfer.
 - **Change notification**: connected web/PWA writes publish typed pulses for the affected canonical tables. The desktops perform scoped refreshes automatically; startup reads and revision polling are recovery fallbacks, not a manual-refresh requirement.
-- **Fallback behavior**: connection to MySQL is checked once at startup/reconnect; a success routes reads/writes to MySQL immediately, a failure routes to the local SQLite mirror with cross-machine sync and heartbeats disabled. The mirror top-up afterward is incremental and checkpointed (row-count/revision signatures first, full comparison only on mismatch).
+- **Fallback behavior**: historical-data connection to PC MySQL is checked at startup/reconnect; success routes market reads/writes there, while a laptop failure can route market data to its SQLite mirror. Supabase coordination remains independent of that market route. A Supabase outage blocks ordinary shared mutations; it never promotes the mirror or old TiDB source. Mirror top-up remains incremental and checkpointed.
+- **Current PC/mobile deployment**: the PC hosts the executor and supervised web service; the laptop can be off. `Automatic-PC-Shutdown` and AC sleep/hibernation are disabled. A verified PostgreSQL backup runs at 09:15 KST. See [Deployed setup](docs/deployed_setup.md).
 - **Automation scripts** live in `scripts/` (`pc_morning_routine.ps1`, `run_daily_refresh.py`, `sync_local_mirror_from_pc.py`, `setup_pc_autologin.ps1`, `setup_pc_morning_task.ps1`, `setup_mysql_lan_access.ps1`, `setup_mysql_tailscale_access.ps1`, `pc_remote_control_listener.py`, `Configure-AutomaticShutdown.ps1`, WinRM setup/log-tailing scripts, and the one-time `backfill_hourly_history_200d_once.py` repair).
 
 A single-machine setup is unaffected: `data/device_role.json` still exists but `is_main` is irrelevant with no peer, and MySQL is simply the optional local cache described in [Market Data Layer](#market-data-layer).
 
 ## Cloud Backup
+
+The deployed coordination database has a separate daily checksummed PostgreSQL export under
+`data/coordination_backups/`, created by `scripts/backup_coordination_store.py` at 09:15
+KST. This local SQL backup covers all 20 tables and is distinct from the local JSON backup
+below and the web SQLite backup. Preserve encrypted off-PC copies separately; see [Supabase
+migration and backup](docs/supabase_coordination_migration.md).
 
 Best-effort offsite backup of local state, separate from the MySQL sync above and from git. Documented in full in [docs/cloud_backup.md](docs/cloud_backup.md); summary:
 

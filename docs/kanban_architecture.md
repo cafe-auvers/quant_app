@@ -536,7 +536,7 @@ Every successful standalone card write updates `data/trade_cards.json` using the
 During a canonical-database outage, normal entry mutation is closed. The narrowly bounded emergency path permits only eligible protective work with a recently verified lease/ownership proof and durable local emergency-journal evidence. Recovery requires reconciliation before the canonical mutation gate reopens.
 
 Strict runtime reads propagate database failure instead of converting it to an
-empty TradeCard collection. If MySQL disappears between the write probe and a
+empty TradeCard collection. If the selected coordination store disappears between the write probe and a
 cycle read, the worker preserves its last canonical card cache, marks the
 gateway offline immediately, and stops database heartbeat/incident-table calls
 until recovery. This keeps the cycle available for bounded protection rather
@@ -545,12 +545,14 @@ are fsynced to the local spool without retrying the database or waiting on a
 webhook from the execution thread; the independent watchdog observes the
 missing heartbeat, and the spool is imported after database recovery.
 
-Execution ownership does not relocate the database. In the documented
-two-machine deployment, Laptop-as-Execution-Owner still depends on MySQL hosted
-by the PC. The local SQLite market-data mirror and TradeCard recovery snapshot
-are intentionally not writable peer authorities. Continuous operation with
-either trading device powered off requires an independent highly available
-canonical MySQL deployment.
+Execution ownership does not relocate the database. In the deployment verified
+on 2026-10-05, Supabase PostgreSQL holds canonical coordination independently
+of PC MySQL, which retains historical market data. The PC owns execution and
+hosts the mobile web service, so it stays on; the laptop can be off. A laptop
+executor requires an explicit ready-owner handoff and valid market/broker
+evidence. Neither the local SQLite mirror nor TradeCard recovery JSON becomes
+a writable peer authority. TiDB is not a runtime dependency or fallback. See
+[Deployed setup](deployed_setup.md).
 
 Shutdown is ordered: close command acceptance, flush journals, perform final read-only reconciliation, close market data, and persist the final device state. Failed shutdown preparation remains visible instead of pretending the runtime stopped cleanly.
 

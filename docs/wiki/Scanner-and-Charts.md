@@ -54,3 +54,6 @@ published plans remain immutable.
 
 See [Current Order Logic](https://github.com/cafe-auvers/quant_app/blob/master/docs/current_order_logic.md)
 for order submission and higher-score ORB replacement.
+
+For current host, shared-store, and backup prerequisites, see
+[Supabase Deployment](Supabase-Deployment).

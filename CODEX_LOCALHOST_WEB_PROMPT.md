@@ -1,5 +1,11 @@
 # Codex implementation prompt — Quant Web, localhost milestone
 
+**Deployment update — 2026-10-05:** PC/mobile/laptop shared coordination now uses private
+Supabase PostgreSQL. PC-local MySQL remains the market-data authority. TiDB is not required.
+The original sandbox-first workflow below is for isolated development, not authorization to
+reset today's armed release or reconfigure the live database. See [Deployed
+setup](docs/deployed_setup.md).
+
 > **Implementation status — 2026-10-02:** This file preserves the original
 > localhost safety baseline. The implemented connected milestone now also has
 > separately allowlisted canonical Watchlist/Buylist/breakout writes, guarded
@@ -29,7 +35,9 @@ Read `AGENTS.md` wherever applicable, `README.md`, `PROJECT_ARCHITECTURE.md`, an
 - `docs/current_order_logic.md`
 - `docs/orb_buyboard_planning.md`
 - `docs/execution_operator_control.md`
-- `docs/tidb_coordination_store.md`
+- `docs/deployed_setup.md`
+- `docs/supabase_coordination_migration.md`
+- `docs/tidb_coordination_store.md` (historical former backend)
 - `docs/kanban_architecture.md`
 - `docs/activation_gate_specification.md`
 - `docs/web_operator_sync.md`
@@ -69,7 +77,7 @@ SANDBOX, default:
 
 CONNECTED:
 - Read real market data through existing local repositories or configured Supabase adapters.
-- TiDB reads are allowed only with explicit configuration; shared planning writes default OFF.
+- Configured canonical SQL reads are allowed only with explicit configuration; the deployed backend is Supabase PostgreSQL. Shared planning writes default OFF in new installations.
 - Implement an independently enabled allowlist of passive canonical planning commands through the existing services. Require authenticated operator identity, explicit account/environment, valid current Operator Control where required, expected revisions, and existing lifecycle fences.
 - Keep a separate operator allowlist for guarded Buy Today activation/removal and closed-session plan publication. Revalidate that either the stable Mobile Web identity or the exact hosting-desktop identity owns Operator Control for every request; never grant the browser Execution Owner authority.
 - Do not impersonate the PC's operator identity. Unsupported authority combinations must remain read-only with a clear reason.
@@ -91,10 +99,14 @@ Do not modify `.env`, `.env.pc`, live runtime configuration, live database schem
 Keep each authoritative store unambiguous:
 - PC MySQL: existing full market history, indicators, and scanner calculations.
 - Laptop SQLite mirror: existing read-only market-data fallback, with its actual coverage limits.
-- TiDB: canonical TradeCards, Watchlist/Buylist/Buy Today, breakout targets, orders, reservations, ownership, and execution state.
-- Supabase: optional Auth, mobile scanner/metadata projections, chart object storage, and ordinary visual drawings.
+- Supabase private PostgreSQL `quant_coordination`: canonical TradeCards, Watchlist/Buylist/Buy Today, breakout targets, orders, reservations, ownership, shared settings, and execution state.
+- Optional Supabase web Auth/Storage/Realtime/public projections: mobile scanner/metadata, chart objects, and ordinary visual drawings; separate from the private coordination schema.
 
-Do not migrate TiDB to PostgreSQL. Do not create a second production Watchlist/Buylist in Supabase. Do not sync full production ledgers or secrets into Supabase.
+The authorized TiDB-to-Supabase coordination migration was completed and verified on
+2026-10-05. Preserve this single private canonical store. Do not create a second production
+Watchlist/Buylist or replicate private execution ledgers into browser-facing/public
+projection tables. Do not move authority again during ordinary web work. Keep credentials
+server-side.
 
 Provide clean interfaces for market/scanner reads, current chart-bundle storage, drawings, identity, and planning commands. Supply working local implementations and optional Supabase implementations. Core localhost acceptance must not require a Supabase account, Docker, public hosting, or a domain. Missing optional credentials must not prevent sandbox startup.
 
@@ -174,7 +186,10 @@ Same command ID plus same payload must not reapply. Same ID plus changed payload
 
 Respect session restrictions, immutable active targets, existing orders/positions/reservations, and the separate Operator Control rules. Display position-size calculations as estimates unless fresh exact-account inputs meet current requirements. Never equate a draft with executable authorization.
 
-After commit, reuse/bridge existing typed change notifications. Other clients reload canonical state. Supabase Realtime does not automatically observe TiDB; implement the bridge explicitly and add bounded revision-based recovery. Do not introduce one-second TiDB polling or per-card query fan-out.
+After commit, reuse existing authenticated invalidations and typed desktop change pulses.
+Other clients reload canonical Supabase state. Private coordination tables are not browser
+Realtime subscriptions; keep bounded revision recovery and revision-first payload caching.
+Do not introduce one-second remote SQL polling or per-card query fan-out.
 
 Render permitted planning and Buy Today actions optimistically on the
 initiating browser before waiting for persistence. Replace the pending state

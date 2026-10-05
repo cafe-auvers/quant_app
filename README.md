@@ -2,12 +2,11 @@
 
 A desktop trading dashboard for US-market swing trading with scanner workflows, Buy Board ORB planning, chart review, KIS account visibility, and guarded KIS order submission.
 
-> **Immediate project priority:** the authenticated localhost web review and
-> planning dashboard is being delivered before the remaining live activation
-> gates. Start with [the localhost plan](docs/web_localhost_plan.md), track
-> progress in [the web task list](docs/web_localhost_todo.md), and use
-> [the user setup guide](docs/web_user_setup.md). The PyQt executor remains
-> functional and authoritative for execution during this transition.
+> **Deployed setup, verified 2026-10-05:** the always-on PC runs the executor
+> and mobile web service. Supabase PostgreSQL holds shared trading state; PC
+> MySQL holds historical prices. The laptop is optional, and TiDB is no longer
+> required. Read [Deployed PC/mobile/laptop setup](docs/deployed_setup.md) for
+> access, configuration, backups, readiness, and recovery.
 
 New to the project? Open the large-picture
 [Project Tour](docs/project_tour.html), or use its
@@ -93,7 +92,12 @@ The **Buy Board** is the operator surface for planning and execution. Its cards 
 3. Run the app: `python main.py`
 4. Run the supported full suite: `python -m pytest tests -q`
 
-The app can run without MySQL. Database-backed scanning and cache freshness features require valid `MYSQL_*` settings. For PC-independent execution coordination, configure the separate TLS-only `COORD_DB_*` SQL connection described in [TiDB Cloud Coordination Store](docs/tidb_coordination_store.md); historical prices are never uploaded there.
+The app can run without MySQL. Database-backed scanning and cache freshness features require
+valid `MYSQL_*` settings. The deployed shared coordination connection uses
+`COORD_DB_BACKEND=postgresql` and a private Supabase schema; historical prices remain in PC
+MySQL. Configure it using [Shared coordination
+migration](docs/supabase_coordination_migration.md). Legacy MySQL backend support does not
+imply an active TiDB dependency.
 
 `requirements.txt` contains the intentionally supported direct dependency ranges.
 `requirements.lock` pins the full Python 3.11/3.12 dependency graph and package
@@ -105,13 +109,14 @@ supported Python versions before committing it.
 
 ## Authenticated Localhost Web Dashboard
 
-Final integration validation is recorded in
-[Quant Web Final Validation](docs/web_final_validation.md). The validated
-implementation is `c882a22dc3417a3c034f74e33a32c062a01d1c14` on
-`codex/mobile-operator-control`: 3,141 supported tests and 96 web tests pass.
-`codex/localhost-web` is already contained and is not a second development
-line. Physical iPhone/PWA acceptance and optional live Supabase verification
-remain external checks.
+The current deployed Supabase cutover and its exact-release verification are
+recorded in [Deployed setup](docs/deployed_setup.md). Earlier 2026-10-02 web
+integration evidence remains in [Quant Web Final Validation](docs/web_final_validation.md);
+its 3,141-test result is historical. The deployed migration release passed
+3,283 supported tests with 10 opt-in skips, 7 cloud PostgreSQL tests, and all
+five exact-commit CI checks. Physical iPhone gesture acceptance and optional
+Supabase Auth/Storage/Realtime checks remain separate from the verified private
+PostgreSQL coordination connection.
 
 The web workspace is a separate loopback-only process. It does not import the
 PyQt entry point, construct a broker, start the execution runtime, or contact
@@ -134,7 +139,7 @@ Today preview. Sandbox mode explicitly denies execution, order, ownership,
 risk, power, and real Buy Today activation endpoints.
 
 `CONNECTED` mode can point at the PC repository to show its read-only market
-mirror and canonical TiDB Watchlist, breakout, Buylist, and Buy Today state on
+mirror and canonical Supabase Watchlist, breakout, Buylist, and Buy Today state on
 the phone/PWA. Allowed actions update the initiating browser optimistically,
 then reconcile with canonical state. Authenticated WebSocket invalidations
 refresh other open browser/PWA sessions; typed coordination pulses refresh the
@@ -172,7 +177,7 @@ and known limitations. The measured local data-path results are in
 [Web Review Performance](docs/web_performance_report.md).
 
 If you're running this across two machines (a dev laptop + an always-on
-data-refresh PC, sharing one MySQL database over LAN/Tailscale), see
+execution/web PC, with PC MySQL over LAN/Tailscale and Supabase shared state), see
 [docs/pc_sync_data_pipeline.md](docs/pc_sync_data_pipeline.md) for the full
 architecture and automation.
 
@@ -227,6 +232,10 @@ Only enable KIS intraday after the endpoint, TR ID, request parameters, output f
 - Do not bypass reconciliation when updating buylist position state after order submission.
 
 ## Documentation
+
+- `docs/deployed_setup.md` records the current Supabase deployment and PC/mobile/laptop requirements.
+- `docs/supabase_coordination_migration.md` defines private-schema provisioning, verified migration, backup, and recovery.
+- `docs/tidb_coordination_store.md` is the former TiDB configuration and RU audit, retained as historical reference.
 
 - `PROJECT_ARCHITECTURE.md` is the canonical architecture and maintenance map.
 - `docs/current_order_logic.md` is the canonical implemented entry, Entry Pending, cancel-replace, fill, rejection, and EOD behavior.

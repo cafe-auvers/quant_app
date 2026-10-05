@@ -18,6 +18,12 @@ requires the applicable combination of:
 
 ## Fail-closed invariants
 
+Changing the canonical store to Supabase does not change any trading predicate. If the
+configured PostgreSQL store fails, ordinary entries/shared mutations stay closed; there is
+no automatic TiDB/PC/SQLite authority switch. Live activation is tied to the approved exact
+release and session. A dated readiness snapshot is not new qualification of later activation
+gates.
+
 - Invalid, blank, stale, or unavailable gates block mutation.
 - Exits are not prevented by entry sizing approval.
 - Broker acceptance never means fill.
@@ -56,3 +62,6 @@ evidence checklist; default remains disabled.
 
 See [Current Order Logic](https://github.com/cafe-auvers/quant_app/blob/master/docs/current_order_logic.md)
 for the exact entry and replacement invariants.
+
+For current host, shared-store, and backup prerequisites, see
+[Supabase Deployment](Supabase-Deployment).

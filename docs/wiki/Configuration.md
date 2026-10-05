@@ -1,15 +1,23 @@
 # Configuration
 
+The deployment verified on 2026-10-05 selects `COORD_DB_BACKEND=postgresql`, Session pooler
+port 5432, database `postgres`, and private schema `quant_coordination`. Preserve those
+local overrides on PC, laptop, and the web deployment; tracked `mysql` defaults support
+legacy installations and do not select an active TiDB service. `MYSQL_*` still describes PC
+historical prices. Optional web `supabase_enabled` is unrelated to the coordination backend.
+See [Supabase Deployment](Supabase-Deployment).
+
 Configuration is split by sensitivity. `.env` contains credentials only, while
 non-secret hosts, ports, flags, limits, and timing values belong in
 `config/runtime.json` or the gitignored `config/runtime.local.json` override.
-`.env.example` is the authoritative credential schema and safe-default
-reference; startup migrates recognized legacy runtime keys out of `.env`.
+`.env.example` is the authoritative credential schema; runtime JSON contains
+feature defaults. Startup migrates recognized legacy runtime keys out of `.env`.
 
 | Family | Purpose | Default posture |
 |---|---|---|
 | `MYSQL_*` | Canonical market-data database | Optional |
-| `COORD_DB_*` | Cross-device control/coordination SQL | Optional, TLS required |
+| `COORD_DB_*` | Shared control/coordination SQL | Deployed PostgreSQL; optional only for isolated/legacy setup, verified TLS required |
+| `SUPABASE_DB_PASSWORD` | Administrator provisioning/migration credential | Not a runtime/browser login |
 | `KIS_PROD_*` | Production account/API configuration | No secret defaults |
 | `TRADING_ENABLED` | Administrative hard-lock | Fail-closed |
 | `BUYBOARD_ENGINE_ENABLED` | Guarded Kanban runtime availability | `true`; not broker authorization |

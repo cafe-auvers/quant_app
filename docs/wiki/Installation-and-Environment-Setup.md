@@ -2,6 +2,11 @@
 
 ## Supported environment
 
+For the existing deployed installation, use [Supabase Deployment](Supabase-Deployment). It
+already has verified coordination, the PC-hosted mobile site, and a daily PostgreSQL backup;
+do not recreate databases, overwrite credentials, or reconfigure the armed release from this
+fresh-install checklist.
+
 - Windows desktop
 - Python 3.11 or 3.12
 - PyQt5/PyQtWebEngine
@@ -40,7 +45,8 @@ keys, account state, database files, or `data/*.json` runtime state.
 ## Optional services
 
 - MySQL: put username/password in `.env` and host/port/database in runtime config.
-- Coordination SQL: put username/password in `.env` and host/port/TLS path in runtime config.
+- Coordination SQL: the deployed backend is private Supabase PostgreSQL. Put restricted `COORD_DB_USER`/`COORD_DB_PASSWORD` in `.env`; backend, Session-pooler host/port, database, private schema, and CA path go in runtime config.
+- Optional Supabase web Auth/Storage adapters have separate settings; they are not required for shared PostgreSQL coordination.
 - KIS: configure only the required `KIS_PROD_*` values locally.
 - Cloud backup: configure `QUANT_BACKUP_DIR` in runtime config or use supported Google Drive
   auto-detection.

@@ -19,6 +19,12 @@ not interchangeable with local planning labels.
 
 ## Safe movement
 
+Mobile Buylist removal was verified after the Supabase cutover. Its row remains visible
+while pending and disappears only after canonical confirmation. Errors are visible, stale
+revisions are rejected, and delayed polls cannot resurrect a confirmed removal. This passive
+operation never authorizes a broker order; existing positions/orders/protection remain
+guarded.
+
 - Watchlist to Buylist is a versioned planning action.
 - Watchlist membership is independent of Buylist membership and execution
   evidence. **Remove from Watchlist** (or `W`) may clear the passive Watchlist
@@ -37,3 +43,6 @@ not interchangeable with local planning labels.
   desktop pulses update the other running surfaces without a manual refresh.
 
 See [Buy Board and Kanban States](Buy-Board-and-Kanban-States).
+
+For current host, shared-store, and backup prerequisites, see
+[Supabase Deployment](Supabase-Deployment).

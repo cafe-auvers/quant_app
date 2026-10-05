@@ -7,6 +7,7 @@
 | Breakout price | Persisted daily structural breakout level |
 | Buy Today | Pre-entry card with a selected/published plan for the session |
 | Canonical state | Authoritative persisted state, not a transient widget |
+| Coordination store | Private Supabase PostgreSQL schema in the deployed PC/laptop/mobile setup |
 | Change pulse | Small typed invalidation token that tells another process which canonical scope to refetch; not state or authority itself |
 | Controlled live | Restricted live envelope for canonical active Trade Cards and entry notional |
 | Entry Pending | System-owned state for a durable unresolved/submitted entry |
@@ -29,5 +30,10 @@
 | Revision fence | Rejects a command based on stale canonical state |
 | RS/TI65 | Relative-strength and trend indicators used by charts/scanner |
 | Standby ready | Dependencies are healthy and handoff-ready, but this runtime is not the active owner |
+| Supabase projection | Optional public web Auth/Storage/Realtime feature, separate from private SQL coordination |
+| TiDB archive | Former coordination source retained for migration recovery; no current runtime dependency or fallback |
 | Unknown submission state | Broker outcome is ambiguous; never safe to retry blindly |
 | Watchlist | Passive persisted planning stage; no dedicated tab |
+
+For current host, shared-store, and backup prerequisites, see
+[Supabase Deployment](Supabase-Deployment).

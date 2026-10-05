@@ -1,5 +1,12 @@
 # Your setup checklist — Quant Web localhost
 
+**Current deployed installation — 2026-10-05:** Supabase private PostgreSQL coordination is
+already configured and verified. The PC runs both execution and the supervised mobile
+website; keep it on and signed in. The laptop is optional and the existing phone URL is
+unchanged. TiDB is not required. These original sandbox/optional public-projection setup
+steps are for development, not additional migration work. See [Deployed
+setup](docs/deployed_setup.md).
+
 Prepared: October 1, 2026. The localhost application is the first milestone; cloud integration is optional until the local workflow is working.
 
 > **Current connected-mode update — 2026-10-02:** The original sandbox-first
@@ -21,7 +28,10 @@ Prepared: October 1, 2026. The localhost application is the first milestone; clo
 
 You do not need to buy a domain, subscribe to hosting, create a Supabase project, install Docker, or configure Wake-on-LAN for this first test. The prompt requires local adapters so these are not blockers.
 
-## B. Optional Supabase setup, after the local interface works
+## B. Optional Supabase web Auth/Storage/projection setup
+
+This section is separate from the already active private PostgreSQL coordination connection.
+It may remain off without disabling PC/mobile board synchronization.
 
 ### Project and account
 
@@ -53,13 +63,17 @@ Expected configuration concepts, with exact names supplied by Codex:
 | `SUPABASE_SECRET_KEY` | Privileged publisher/server credential only |
 | `WEB_CANONICAL_PLANNING_WRITES` | Remains false until a separate explicit integration test |
 
-The Postgres database password is not an API key. Existing TiDB/MySQL credentials stay separate; do not replace them with Supabase values.
+The Postgres database password is not an API key. Runtime coordination uses restricted
+Supabase `COORD_DB_USER`/`COORD_DB_PASSWORD`; PC historical `MYSQL_*` credentials remain
+separate and must not be replaced. Administrator `SUPABASE_DB_PASSWORD` is
+provisioning-only. Existing legacy TiDB credentials belong only in protected migration
+recovery material.
 
 ### Database and chart storage
 
 - [ ] Review and apply the migrations produced by Codex to the dedicated development project. Do not manually invent tables in advance: table names, policies, and application code must match.
 - [ ] Create or verify a PRIVATE bucket named `chart-cache`. Apply generated Storage policies and table Row Level Security policies; do not temporarily make the bucket public to fix access errors.
-- [ ] Enable Realtime only for the tables/channels the implementation actually uses. It does not automatically subscribe to TiDB changes.
+- [ ] Enable Realtime only for the tables/channels the implementation actually uses. The private coordination schema is not exposed to browser subscriptions; connected updates use the authenticated API, invalidations, and typed desktop pulses.
 - [ ] Run the provided integration/readiness tests: permitted user succeeds; signed-out and wrong-user requests fail; upload/read/overwrite/delete behave correctly; no secret appears in the browser.
 - [ ] Upload a small selection of symbols first, verify actual chart dates/indicators/checksums, then publish the relevant scanner/planning universe. Review measured storage and transfer in the dashboard rather than relying on earlier estimates.
 

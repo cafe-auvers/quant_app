@@ -106,7 +106,7 @@ following still hold:
 - both `last_trade > execution_price` and `best_ask > execution_price`;
 - quantity, account, exchange, buying power, capital reservation, portfolio
   risk, and controlled-live limits pass;
-- canonical MySQL state, reconciliation, ownership, lease, live controls,
+- canonical shared SQL state (private Supabase PostgreSQL in the deployed setup), reconciliation, ownership, lease, live controls,
   release identity, mutation budgets, alerts, and all other broker-boundary
   gates pass; and
 - no existing or ambiguous entry identity already blocks the symbol.

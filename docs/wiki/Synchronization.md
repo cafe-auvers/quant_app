@@ -9,7 +9,7 @@ flowchart TB
     MySQL -->|checkpointed pull only| Mirror[(Laptop SQLite mirror)]
     Laptop[Laptop] -->|reads| Mirror
 
-    PC -->|revisioned control/state| Coord[(TLS coordination/operational SQL)]
+    PC -->|revisioned control/state| Coord[(Supabase PostgreSQL private coordination schema)]
     Laptop -->|revisioned control/state| Coord
     Web[Authenticated phone / PWA] -->|allowlisted canonical commands| Coord
     Coord --> PC
@@ -27,14 +27,20 @@ canonical MySQL. Copy workers use checkpoints/watermarks and tolerate restarts.
 
 ## Planning and execution state
 
+The deployed PC and any running laptop select the same Supabase Session-pooler connection.
+The web service uses the PC repository's canonical configuration. The PC is the normal
+executor and web host, so it stays on; the laptop can be off. TiDB is not used for
+synchronization, direct connectivity, ownership, commands, or recovery polling.
+
 Watchlist, Buylist, trade plans, execution queue, Execution Owner, Operator
 Control, Live Trading control, TradeCards, commands, and orders use shared,
 revision/fence-aware operational state. Writer ownership is explicit; stale
 devices remain pull-only.
 
 Machine identity and local permission are intentionally not synchronized.
-`data/device_role.json`, each machine's `.env` (including its
-`TRADING_ENABLED` lock), and chart drawings remain local files. The 1D/1H
+`data/device_role.json`, each machine's credential-only `.env`, its private
+`config/runtime.local.json` administrative `TRADING_ENABLED` lock, and chart
+drawings remain local files. The 1D/1H
 "drawing sync" means the two split panes inside one running app share the same
 drawing; it is not laptop-to-PC drawing replication.
 
@@ -71,3 +77,6 @@ Trading switch.
 
 See [Operations and Monitoring](Operations-and-Monitoring) before enabling
 physical sleep/wake automation.
+
+For current host, shared-store, and backup prerequisites, see
+[Supabase Deployment](Supabase-Deployment).

@@ -1,5 +1,10 @@
 # User Workflow
 
+In the deployed setup, the PC runs execution and hosts the phone API. Mobile changes commit
+to private Supabase state and the PC consumes them; the laptop can be off. Use the existing
+Tailscale HTTPS origin. Confirm today's release/session and current PC readiness, not a
+historical enabled screenshot. See [Supabase Deployment](Supabase-Deployment).
+
 The normal workflow narrows candidates before any execution intent exists.
 
 1. Refresh or inspect cached market data and Health.

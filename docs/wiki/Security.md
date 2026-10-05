@@ -12,6 +12,12 @@
 
 ## Network and database
 
+The private Supabase coordination schema is server-only: revoke PUBLIC/anon/authenticated
+schema access and keep it out of browser/PostgREST schemas. Use the restricted runtime
+DML/sequence role and verified TLS with the official CA; administrator credentials are
+provisioning-only. Optional public web migrations are separate. A stale TiDB source must
+never run as a second writer. Keep exported trade records and runtime backups private.
+
 - Use TLS identity verification for Internet coordination SQL.
 - Restrict MySQL LAN/Tailscale access to intended hosts/accounts.
 - Treat Tailscale, WinRM trust, remote-control tokens, and autologin settings as
@@ -49,3 +55,6 @@ Before publishing:
 3. verify `.gitignore` covers restore backups and runtime files;
 4. rotate/revoke any credential that was ever exposed—deleting it from the
    latest commit is not sufficient.
+
+For current host, shared-store, and backup prerequisites, see
+[Supabase Deployment](Supabase-Deployment).

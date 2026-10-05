@@ -32,6 +32,12 @@ OS variables, configures logging/Qt handling, creates `QApplication`, imports
 
 ## Responsibility boundaries
 
+Shared execution/control repositories select PostgreSQL through `coordination_engine.py` in
+the current deployment. The private Supabase schema holds all 20 coordination tables; local
+PC MySQL remains the historical-data cache. Optional public Supabase Auth/Storage
+projections are a separate feature. The former TiDB source is not a fallback. See [Supabase
+Deployment](Supabase-Deployment).
+
 - `src/ui`: presentation, interaction routing, and background worker lifecycle.
 - `src/web`: authenticated read/command boundary, optimistic browser UX, and
   non-authoritative live-update invalidations; it never constructs a broker or
