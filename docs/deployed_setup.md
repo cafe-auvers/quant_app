@@ -89,17 +89,21 @@ positions, working orders, unresolved exposure, and actual protection remain
 guarded. See [operator synchronization](web_operator_sync.md).
 
 The approved trading release is
-`aad7f204c9e8a908e5cf753df63e71a081c1dac2`. The user manually enabled its
-2026-10-05 live session, and the PC reported `ACTIVE` with executor, broker
+`7ea107ece347ad41d954e8d2a533ef7d740a2f3f`. The operator approved its
+2026-10-05 deployment, and the PC reported `ACTIVE` with executor, broker
 reconciliation, market-data, ownership, and shared-state readiness passing.
+Live trading requires fresh manual arming after this release change. Passive
+Gate 2/3/4 collectors are running with no collection errors or dropped batches.
 This is a dated readiness snapshot, not proof of subsequent fills, a future
 session, or new qualification of Gates 2–5. Always recheck current readiness,
 the current session/release, plans, and risk/capital gates before trading.
 
-The separate web service runs frontend fix
-`aab0792466e5c062380bca971f0b6c7006f4b439`. Its only runtime changes are HTML,
-CSS, and JavaScript; Python/API/core/broker code is unchanged. The PC executor
-remains on the approved release above, with its existing live session enabled.
+The separate web service runs the same approved release, including the mobile
+list-action fix from PR #134. Passive diagnostics collect feed health, isolated
+shadow decisions, and actual runtime execution events alongside live trading.
+Reports explicitly say `NOT_CERTIFIED`; full-session fault probes, complete
+branch/fence replay, reviewed gate chains, and Gate 4's three supervised dates
+remain required for formal closure. See [live-session checks](live_session_checks.md).
 
 Documentation is maintained separately from that armed executor checkout.
 Do not pull even a documentation commit into the active executor: exact release
