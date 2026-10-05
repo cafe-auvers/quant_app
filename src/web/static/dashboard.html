@@ -8,9 +8,9 @@
   <title>Quant Web — Review Workspace</title>
   <link rel="manifest" href="/web-static/manifest.webmanifest">
   <link rel="icon" href="/web-static/icon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/live-static/app.css?v=91">
+  <link rel="stylesheet" href="/live-static/app.css?v=92">
   <script src="/live-vendor/lightweight-charts.standalone.production.js" defer></script>
-  <script src="/live-static/app.js?v=95" defer></script>
+  <script src="/live-static/app.js?v=96" defer></script>
 </head>
 <body class="dashboard-body">
   <div id="quant-app" class="app-shell">
@@ -127,7 +127,7 @@
           <div id="buy-board-tabs" class="mobile-kanban-tabs" role="tablist" aria-label="Buy Board columns"></div>
           <section class="mobile-kanban-column" aria-live="polite">
             <div class="mobile-kanban-heading">
-              <div><span id="buy-board-column-kicker" class="mobile-card-label">Planning</span><strong id="buy-board-column-title">Buylist</strong></div>
+              <div><span id="buy-board-column-kicker" class="mobile-card-label">Planning</span><strong id="buy-board-column-title">Buylist</strong><small id="buy-board-column-summary">0 stocks</small></div>
               <span id="buy-board-column-count">0</span>
             </div>
             <div id="buy-board-cards" class="mobile-kanban-cards"></div>
@@ -340,6 +340,8 @@
     <div class="mobile-board-action-card">
       <div class="mobile-board-action-heading"><div><span id="buy-board-action-stage" class="mobile-card-label"></span><strong id="buy-board-action-symbol">—</strong><small id="buy-board-action-name"></small></div><button id="buy-board-action-close" type="button" aria-label="Close">×</button></div>
       <div id="buy-board-action-facts" class="mobile-board-action-facts"></div>
+      <div id="buy-board-action-price-note" class="mobile-kanban-price-note"></div>
+      <div id="buy-board-action-warning" class="mobile-kanban-card-warning"></div>
       <div id="buy-board-action-input" class="mobile-board-action-input" hidden><label id="buy-board-action-input-label" for="buy-board-action-value">Value</label><input id="buy-board-action-value" type="number" min="0" step="0.01" inputmode="decimal"><button id="buy-board-action-input-submit" type="button">Apply</button></div>
       <div id="buy-board-action-buttons" class="mobile-board-action-buttons"></div>
       <button id="buy-board-open-chart" class="mobile-secondary-action" type="button">Open chart</button>

@@ -130,6 +130,34 @@ def test_canonical_projection_preserves_independent_memberships(tmp_path):
     source.close()
 
 
+def test_board_details_project_only_public_card_facts(tmp_path):
+    source = canonical_source(tmp_path)
+    now = dt.datetime.now(dt.timezone.utc)
+    card = TradeCardState(
+        environment="PROD", account_no="private-account", symbol="DETAIL",
+        board_status=BoardStatus.PARTIAL_SELL, broker_quantity=100,
+        orderable_quantity=75, average_entry_price=10, active_stop_price=9.5,
+        stop_quantity=100, pending_stop_price=9.8, pending_stop_quantity=100,
+        pending_partial_sell_quantity=25, reserved_sell_quantity=25,
+        entry_execution_price=10.1, entry_breakout_trigger=10.05,
+        entry_remaining_target_quantity=20, next_retry_at=now,
+        next_exit_retry_at=now, market_data_last_trusted_price=10.5,
+        market_data_last_trusted_at=now, entry_client_order_id="private-entry",
+        exit_client_order_id="private-exit",
+    )
+    row = source._project_board_card(card)
+    assert row["last_reported_price"] == 10.5 and row["price_as_of"] == now.isoformat()
+    assert row["entry_execution_price"] == 10.1 and row["entry_breakout_trigger"] == 10.05
+    assert row["stop_quantity"] == row["pending_stop_quantity"] == 100
+    assert row["entry_remaining_target_quantity"] == 20
+    assert row["reserved_sell_quantity"] == row["pending_partial_sell_quantity"] == 25
+    assert row["next_retry_at"] == row["next_exit_retry_at"] == now.isoformat()
+    assert not any(value.startswith("private-") for value in row.values() if isinstance(value, str))
+    empty = source._project_board_card(TradeCardState(environment="PROD", account_no="a", symbol="EMPTY"))
+    assert empty["last_reported_price"] is None and empty["price_as_of"] is None
+    source.close()
+
+
 def test_unchanged_board_checks_revision_without_redownloading_payloads(tmp_path):
     source = canonical_source(tmp_path)
     statements = []
