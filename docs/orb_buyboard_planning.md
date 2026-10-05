@@ -199,3 +199,28 @@ The hidden `WATCHLIST` lifecycle value and synchronized `watchlist.json` remain
 the user-managed passive candidate stage. Watchlist items are accessible in the
 sidebar and can be promoted to Buylist, but they do not create a dedicated tab,
 visible board column, live subscription, or alternate execution path.
+
+## CURV sparse opening history (fix prepared)
+
+The October 5 CURV KIS chart starts at 09:43 ET, including after paging into
+the previous session. Its 1m/5m opening windows have no returned bars; the
+09:30–10:00 range has eleven minute bars, low $2.48 and high $2.51. The exact
+09:30-bar requirement incorrectly blocked this calculable longer range.
+
+[PR #142](https://github.com/cafe-auvers/quant_app/pull/142), exact source
+`0f15aa7b4d3e321d35f74409d250ee30b725cb15`, accepts sparse KIS history only
+with explicit New York provenance, valid rows, coverage before the open and
+beyond the window, and a matching opening-row digest. Atomic local cache
+metadata and resampling retain the evidence. Empty, truncated, changed or
+mismatched windows stay unavailable, and automatic cards explain all blocked
+windows. No bar is fabricated and no opening window is shifted.
+
+The actual-response replay calculates CURV's 30m range, but the saved $2.52
+breakout is above its $2.51 high, so the existing passive-entry rule still
+rejects the plan. No setting change or forced entry was performed. The full
+local suite passed (3,363 tests, 7 skipped); the isolated PC stage and MySQL
+temporary-table checks passed without historical or canonical record writes.
+
+The new release is prepared, **not activated**, pending exact-release review
+and a supervised restart. Approved PC/web 3a7c14fe continues running. No TiDB
+dependency or feed-freshness/risk-policy change is introduced.
