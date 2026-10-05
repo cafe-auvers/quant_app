@@ -3,6 +3,9 @@ from __future__ import annotations
 import datetime as dt
 import json
 from dataclasses import replace
+from types import SimpleNamespace
+
+import pytest
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event, text
@@ -12,6 +15,7 @@ from src.core.exit_policy import market_session_date
 from src.utils.market_calendar import current_or_next_nyse_session_date
 from src.web.api import build_services, create_api_app
 from src.web.canonical_planning import CanonicalPlanningSource
+from src.services.monitor_equity import publish_monitor_equity
 
 from .conftest import login
 
@@ -135,7 +139,7 @@ def test_board_details_project_only_public_card_facts(tmp_path):
     source = canonical_source(tmp_path)
     now = dt.datetime.now(dt.timezone.utc)
     card = TradeCardState(
-        environment="PROD", account_no="private-account", symbol="DETAIL",
+        environment="PROD", account_no="private-account", symbol="DETAIL", risk_percent=0.005,
         board_status=BoardStatus.PARTIAL_SELL, broker_quantity=100,
         orderable_quantity=75, average_entry_price=10, active_stop_price=9.5,
         stop_quantity=100, pending_stop_price=9.8, pending_stop_quantity=100,
@@ -147,6 +151,7 @@ def test_board_details_project_only_public_card_facts(tmp_path):
         exit_client_order_id="private-exit",
     )
     row = source._project_board_card(card)
+    assert row["risk_percent"] == 0.005
     assert row["last_reported_price"] == 10.5 and row["price_as_of"] == now.isoformat()
     assert row["entry_execution_price"] == 10.1 and row["entry_breakout_trigger"] == 10.05
     assert row["stop_quantity"] == row["pending_stop_quantity"] == 100
@@ -156,6 +161,46 @@ def test_board_details_project_only_public_card_facts(tmp_path):
     assert not any(value.startswith("private-") for value in row.values() if isinstance(value, str))
     empty = source._project_board_card(TradeCardState(environment="PROD", account_no="a", symbol="EMPTY"))
     assert empty["last_reported_price"] is None and empty["price_as_of"] is None
+    source.close()
+
+
+@pytest.mark.parametrize("case", ["fresh", "stale", "future", "wrong_account", "zero", "missing"])
+def test_board_nav_uses_only_the_matching_fresh_account_snapshot(case, tmp_path):
+    source = canonical_source(tmp_path)
+    source.equity_path = tmp_path / "monitor_equity.json"
+    now = dt.datetime.now(dt.timezone.utc)
+    if case != "missing":
+        publish_monitor_equity(source.equity_path, SimpleNamespace(
+            environment="PROD", account_no="other-account" if case == "wrong_account" else "account-a",
+            total_equity_usd=0 if case == "zero" else 10_000,
+            received_at=now + dt.timedelta(seconds=1_000 if case == "future" else -1_000 if case == "stale" else 0),
+        ))
+    result = source.list_board()
+    if case == "fresh":
+        assert result["account_nav_usd"] == 10_000
+        assert result["account_nav_as_of"] == now.isoformat()
+        assert result["account_nav_note"] == ""
+    else:
+        assert result["account_nav_usd"] is None and result["account_nav_as_of"] is None
+        assert result["account_nav_note"]
+    assert "account-a" not in json.dumps(result)
+    source.close()
+
+
+def test_board_nav_refreshes_without_changing_card_revisions(tmp_path):
+    source = canonical_source(tmp_path)
+    source.equity_path = tmp_path / "monitor_equity.json"
+    now = dt.datetime.now(dt.timezone.utc)
+    for amount in (10_000, 12_000):
+        publish_monitor_equity(source.equity_path, SimpleNamespace(
+            environment="PROD", account_no="account-a", total_equity_usd=amount, received_at=now,
+        ))
+        result = source.list_board()
+        assert result["account_nav_usd"] == amount
+        if amount == 10_000:
+            revision = result["revision"]
+        else:
+            assert result["revision"] == revision
     source.close()
 
 

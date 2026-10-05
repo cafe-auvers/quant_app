@@ -23,6 +23,7 @@ def test_buyboard_stage_details_and_stale_prices(width, tmp_path, browser_event_
         rows.append({
             "symbol": symbol, "name": symbol, "board_status": stage, "version": 1,
             "breakout_price": 10, "entry_execution_price": 10.1,
+            "risk_percent": 0.005,
             "entry_orb_low": 9.5, "selected_orb_window": "5m",
             "target_position_quantity": 100 if symbol != "UNSIZED" else 0,
             "broker_quantity": 20 if symbol == "ENTRY" else 100 if stage in ("OPEN_POSITION", "PARTIAL_SELL", "SELL_ALL") else 0,
@@ -48,7 +49,8 @@ def test_buyboard_stage_details_and_stale_prices(width, tmp_path, browser_event_
             mutations.append(path)
             route.fulfill(status=405)
         elif path == "/api/v1/buyboard":
-            route.fulfill(json={"rows": rows, "revision": "1"})
+            route.fulfill(json={"rows": rows, "revision": "1", "account_nav_usd": 10_000,
+                                "account_nav_as_of": now.isoformat(), "account_nav_note": ""})
         elif path == "/api/v1/intraday-monitor":
             route.fulfill(json={"rows": monitor, "as_of": now.isoformat(), "enabled": True})
         elif path.startswith("/api/"):
@@ -70,7 +72,7 @@ def test_buyboard_stage_details_and_stale_prices(width, tmp_path, browser_event_
             page.goto("http://localhost:8779/")
             page.get_by_role("button", name="Buy Board", exact=True).click()
             for tab, symbol, expected in [
-                ("Buylist", "ODD", ["Buy Today rejected", "30m: invalid tick"]),
+                ("Buylist", "ODD", ["Buy Today rejected", "30m: invalid tick", "Risk budget", "0.50% NAV", "Not sized"]),
                 ("Today", "TODAY", ["Target shares", "100 sh", "Planned stop", "$9.50", "Entry plan", "$10.10", "Planned risk", "$60.00", "Waiting for fresh quote"]),
                 ("Entry", "ENTRY", ["Held / target", "20 / 100 sh", "Average fill", "$10.00"]),
                 ("Open", "OPEN", ["Held", "100 sh", "Sellable", "75 sh", "Active stop", "100 / 100 sh", "$11.00", "+$100.00 (+10.00%)", "Yahoo", "indicative"]),
@@ -83,6 +85,14 @@ def test_buyboard_stage_details_and_stale_prices(width, tmp_path, browser_event_
                 text = card.inner_text()
                 for value in expected:
                     assert value in text, (symbol, value, text)
+                if symbol in ("TODAY", "ENTRY"):
+                    assert "10.10% NAV · $1,010.00" in text
+                    assert "0.60% NAV · $60.00" in text
+                if symbol == "ENTRY":
+                    assert "2.00% NAV · $200.00" in text
+                if symbol in ("OPEN", "PARTIAL", "SELL"):
+                    assert "10.00% NAV · $1,000.00" in text
+                    assert "0.50% NAV · $50.00" in text
                 assert "KST" in text
                 if symbol == "TODAY":
                     assert page.locator("#buy-board-column-summary").inner_text() == "2 stocks · 100 target shares · 1 not sized"
@@ -100,9 +110,31 @@ def test_buyboard_stage_details_and_stale_prices(width, tmp_path, browser_event_
             unknown = page.locator(".mobile-kanban-card").filter(has_text=re.compile(r"^UNSIZED"))
             assert "Not sized" in unknown.inner_text()
             assert "Price not reported yet" in unknown.inner_text()
+            assert "Account NAV $10,000.00" in page.locator("#buy-board-nav").inner_text()
             assert not errors and not mutations
             assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
             assert page.locator(".mobile-kanban-card-details").evaluate_all("items => items.every(item => item.scrollWidth <= item.clientWidth)")
             page.screenshot(path=str(tmp_path / f"buyboard-{width}.png"))
+            # A failed/offline poll must not keep percentages based on expired NAV.
+            page.evaluate(f"Date.now = () => {int(now.timestamp() * 1000) + 1_000_000}")
+            page.get_by_role("tab", name=re.compile(r"^Open ")).click()
+            opened = page.locator(".mobile-kanban-card").filter(has_text=re.compile(r"^OPEN"))
+            assert "NAV unavailable · $1,000.00" in opened.inner_text()
+            assert "10.00% NAV" not in opened.inner_text()
+            assert "stale or unavailable" in page.locator("#buy-board-nav").inner_text()
+            # Remaining holdings, not a requested-but-unfilled sell, determine allocation.
+            partial = next(row for row in rows if row["symbol"] == "PARTIAL")
+            partial.update(broker_quantity=75, stop_quantity=75)
+            opened_row = next(row for row in rows if row["symbol"] == "OPEN")
+            opened_row["stop_quantity"] = 20
+            page.reload()
+            page.get_by_role("button", name="Buy Board", exact=True).click()
+            page.get_by_role("tab", name=re.compile(r"^Partial ")).click()
+            partial_card = page.locator(".mobile-kanban-card").filter(has_text=re.compile(r"^PARTIAL"))
+            assert "7.50% NAV · $750.00" in partial_card.inner_text()
+            assert "0.38% NAV · $37.50" in partial_card.inner_text()
+            page.get_by_role("tab", name=re.compile(r"^Open ")).click()
+            assert "Not fully covered" in opened.inner_text()
+            assert not errors and not mutations
         finally:
             browser.close()
