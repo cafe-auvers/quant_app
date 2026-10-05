@@ -26,7 +26,7 @@ def list_browser():
         asyncio.set_event_loop_policy(previous)
 
 
-def open_watchlist(page, *, delegated=True, reject=""):
+def open_watchlist(page, *, delegated=True, reject="", closed=False):
     root = Path(__file__).resolve().parents[2]
     static = root / "src/web/static"
     assets = ReleaseAssets(static, root / "src/ui/static/vendor")
@@ -37,6 +37,8 @@ def open_watchlist(page, *, delegated=True, reject=""):
         "breakout_price": None, "version": 1,
     }
     state = {"card": card, "posts": [], "errors": [], "draft": False}
+    if closed:
+        card.update(stage="BREAKOUT", canonical_stage="CLOSED", breakout_price=2.75)
     session = {
         "mode": "CONNECTED", "csrf_token": "test", "planning_writable": True,
         "operator": {"delegated": delegated, "operations": ["activate_buy_today", "deactivate_buy_today"]},
@@ -178,4 +180,29 @@ def test_rejected_save_stays_visible_and_cannot_activate_buy_today(list_browser,
         ["set_breakout"] if reject == "set_breakout" else ["set_breakout", "promote_buylist"]
     )
     assert state["errors"] == []
+    page.close()
+
+
+@pytest.mark.parametrize("width", [320, 390, 1400])
+def test_closed_stock_can_explicitly_reenter_without_editing_breakout(list_browser, width):
+    page = list_browser.new_page(viewport={"width": width, "height": 844})
+    state = open_watchlist(page, closed=True)
+    button = page.locator("#quick-buy-today")
+    assert button.is_enabled()
+    button.click()
+    dialog = page.locator("#operator-confirm-dialog")
+    dialog.wait_for(state="visible")
+    assert "Re-enter SHMD" in dialog.inner_text()
+    assert state["posts"] == []
+    page.locator("#operator-confirm-cancel").click()
+    assert state["posts"] == []
+    button.click()
+    page.locator("#operator-confirm-submit").click()
+    page.wait_for_function("document.querySelector('#quick-buy-today').textContent === 'Cancel Today'")
+    assert len(state["posts"]) == 1
+    assert state["posts"][0][0].endswith("activate-buy-today")
+    assert state["posts"][0][1]["expected_revision"] == 1
+    assert state["card"]["breakout_price"] == 2.75
+    assert state["errors"] == []
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
     page.close()

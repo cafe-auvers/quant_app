@@ -738,8 +738,16 @@ def test_closed_cycle_retires_attempt_group_before_next_cycle_and_old_history_is
     assert card.entry_attempt_group_id == ""
     assert card.exit_attempt_group_id == ""
 
-    card.board_status = BoardStatus.BUYLIST
-    card.board_status = BoardStatus.BUY_TODAY
+    trade_card_repository.update_trade_card(engine, card, expected_version=card.version)
+    from src.core.board_workflow import ActivateForToday, BoardActionContext
+    from src.services.execution_workflow_service import request_board_action
+
+    card = request_board_action(engine, ActivateForToday(
+        environment=card.environment, account_no=card.account_no, symbol=card.symbol,
+        expected_card_version=card.version,
+    ), context=BoardActionContext(), local_snapshot_path=tmp_path / "cards.json").card
+    assert card.board_status == BoardStatus.BUY_TODAY
+    assert card.entry_execution_price is None and card.planned_quantity == 0
     runtime.trading_engine._prepare_entry_attempt(card)
     cycle_two_group = card.entry_attempt_group_id
     assert cycle_two_group
@@ -822,6 +830,46 @@ def test_entry_uses_one_gateway_owned_reservation_and_common_result(
     # The callback itself exposes one workflow result shape in guarded mode.
     persisted = fetch_execution_order(engine, card.entry_client_order_id)
     assert persisted.status == ExecutionOrderStatus.ACKNOWLEDGED
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_explicit_reentry_waits_for_a_new_plan_then_submits_once_with_new_identity(
+    tmp_path, monkeypatch
+):
+    from src.core.board_workflow import ActivateForToday, BoardActionContext
+    from src.services.execution_workflow_service import request_board_action
+
+    runtime, broker, _gateway, engine, market_data = _make_runtime(tmp_path, monkeypatch)
+    card = _persist_owned_card(engine, _card(
+        board_status=BoardStatus.CLOSED, position_runtime_status=PositionRuntimeStatus.CLOSED,
+        entry_attempt_group_id="previous-cycle", entry_client_order_id="previous-buy",
+        average_entry_price=100.0,
+    ))
+    card = request_board_action(engine, ActivateForToday(
+        environment="PROD", account_no="1", symbol="AAPL", expected_card_version=card.version,
+    ), context=BoardActionContext(), local_snapshot_path=tmp_path / "cards.json").card
+    market_data.subscribe([card.symbol])
+    market_data.poll_once()
+    runtime.trading_engine.run_heartbeat([card])
+    assert broker.submit_calls == []
+    assert card.board_status == BoardStatus.BUY_TODAY
+
+    # A later verified ORB evaluation supplies geometry, independently of activation.
+    approved_plan = _card()
+    for name in (
+        "entry_runtime_status", "planned_quantity", "target_position_quantity",
+        "entry_trigger", "entry_execution_price", "entry_floor_price", "entry_breakout_trigger",
+        "entry_breakout_confirmed_at", "entry_range_closed_at", "entry_orb_high", "entry_orb_low",
+        "entry_orb_window", "selected_orb_window", "stop_adr",
+    ):
+        setattr(card, name, getattr(approved_plan, name))
+    trade_card_repository.update_trade_card(engine, card, expected_version=card.version)
+    _submit_guarded_entry(runtime, broker, market_data, card)
+    runtime.trading_engine.run_heartbeat([card])
+    assert len(broker.submit_calls) == 1
+    assert card.entry_attempt_group_id != "previous-cycle"
+    assert card.entry_client_order_id != "previous-buy"
+    assert fetch_execution_order(engine, card.entry_client_order_id) is not None
 
 
 @pytest.mark.usefixtures("trading_enabled")
