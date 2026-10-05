@@ -105,6 +105,7 @@
     breakoutDraftPrice: null,
     breakoutDragging: null,
     breakoutSaving: false,
+    breakoutFollowup: null,
     drawings: [],
     drawMode: false,
     drawAnchor: null,
@@ -257,6 +258,10 @@
     const target = byId('plan-message');
     target.textContent = message;
     target.className = `panel-message ${kind}`.trim();
+    const quick = byId('quick-plan-message');
+    quick.textContent = message;
+    quick.className = `quick-plan-message ${kind}`.trim();
+    quick.hidden = !message;
   }
 
   async function api(path, options = {}) {
@@ -1741,20 +1746,31 @@
   function closeBreakoutPricePopup() {
     const popup = byId('breakout-price-popup');
     if (popup) popup.hidden = true;
+    state.breakoutFollowup = null;
   }
 
-  function openBreakoutPricePopup(price = breakoutVisualPrice()) {
+  function openBreakoutPricePopup(price = breakoutVisualPrice(), followup = null) {
     const normalized = normalizeBreakoutPrice(price);
-    if (!state.breakoutMode || normalized === null || state.breakoutSaving) return;
+    if ((!followup && (!state.breakoutMode || normalized === null)) || state.breakoutSaving) return;
     setBreakoutMode(false, false);
     const popup = byId('breakout-price-popup');
     const input = byId('breakout-price-popup-input');
-    input.value = normalized.toFixed(2);
+    state.breakoutFollowup = followup;
+    byId('breakout-price-title').textContent = followup
+      ? `Set ${followup.symbol} breakout for ${followup.target === 'buy_today' ? 'Buy Today' : 'Buylist'}`
+      : 'Set exact price';
+    input.value = normalized === null ? '' : normalized.toFixed(2);
+    input.setCustomValidity('');
     popup.hidden = false;
     requestAnimationFrame(() => {
       input.focus({preventScroll: true});
       input.select();
     });
+  }
+
+  function requestBreakoutForList(target) {
+    setPanel(`Set a breakout price for ${state.symbol} before adding it to ${target === 'buy_today' ? 'Buy Today' : 'Buylist'}.`, 'error');
+    openBreakoutPricePopup(null, {symbol: state.symbol, target});
   }
 
   function updateBreakoutModeUi() {
@@ -2459,6 +2475,7 @@
     const startedAt = performance.now();
     closeBreakoutPricePopup();
     state.symbol = symbol.toUpperCase();
+    setPanel('');
     const chartCacheHit = state.bundleCache.has(`${state.symbol}:${state.timeframe}`);
     state.planningBusy = planningPending(state.symbol);
     state.selectionToken += 1;
@@ -3046,7 +3063,9 @@
       state.session?.operator?.delegated
       && operatorOperations.has(canonicalBuyToday ? 'deactivate_buy_today' : 'activate_buy_today')
     );
-    const buyTodayActionEligible = hasBuyToday || buyTodayDraftEligible;
+    const buyTodayActionEligible = hasBuyToday || buyTodayDraftEligible || (
+      !connectedReadOnly && (card?.canonical_stage || card?.stage) === 'WATCHLIST'
+    );
     const displayStage = card?.display_stage || card?.canonical_stage || card?.stage || 'NOT PLANNED';
     byId('plan-stage').textContent = displayStage;
     byId('plan-revision').textContent = operatorPending()
@@ -3367,8 +3386,17 @@
 
   async function toggleBuyTodayDraft() {
     if (!state.symbol || planningPending() || operatorPending()) return;
+    const actionSymbol = state.symbol;
     const canonicalActive = canonicalBuyTodayActive();
     const hasDraft = hasCurrentBuyTodayDraft() && !canonicalActive;
+    if (!canonicalActive && !hasDraft && !state.plan?.buylist_member) {
+      if (!state.plan?.breakout_price) {
+        requestBreakoutForList('buy_today');
+        return;
+      }
+      const promoted = await moveToList('buylist');
+      if (!promoted || state.symbol !== actionSymbol) return;
+    }
     if (
       canonicalActive
       || (!hasDraft && operatorOperationEnabled('activate_buy_today'))
@@ -3380,7 +3408,6 @@
       await moveToList('buy_today');
       return;
     }
-    const actionSymbol = state.symbol;
     const previousRow = state.buyTodayRows.find(row => row.symbol === actionSymbol);
     const expectedRevision = state.plan.version;
     state.planningPendingSymbols.add(actionSymbol);
@@ -3416,7 +3443,7 @@
   }
 
   async function moveToList(target) {
-    if (!state.symbol || planningPending()) return;
+    if (!state.symbol || planningPending()) return false;
     const actionSymbol = state.symbol;
     const previousPlan = state.plan ? {...state.plan} : null;
     const previousBuyTodayRow = state.buyTodayRows.find(
@@ -3433,8 +3460,8 @@
       && !buylistMember
       && !previousPlan?.breakout_price
     ) {
-      setPanel('Set a breakout price before adding this symbol to Buylist.', 'error');
-      return;
+      requestBreakoutForList(target);
+      return false;
     }
     let optimisticOperation = '';
     if (target === 'watchlist') {
@@ -3516,6 +3543,7 @@
         setPanel(successMessage, 'success');
       }
       void refreshPlanningLists().catch(() => {});
+      return true;
     } catch (error) {
       state.optimisticPlans.delete(actionSymbol);
       state.optimisticBuyToday.delete(actionSymbol);
@@ -3531,6 +3559,7 @@
         setPanel(`UNAVAILABLE - ${error.message}`, 'error');
       }
       void refreshPlanningLists().catch(() => {});
+      return false;
     } finally {
       bumpPlanningEpoch(actionSymbol);
       state.planningPendingSymbols.delete(actionSymbol);
@@ -3864,7 +3893,7 @@
     byId('breakout-input').addEventListener('keydown', event => {
       if (event.key === 'Enter') saveManualBreakout();
     });
-    byId('breakout-price-form').addEventListener('submit', event => {
+    byId('breakout-price-form').addEventListener('submit', async event => {
       event.preventDefault();
       const input = byId('breakout-price-popup-input');
       const value = Number(input.value);
@@ -3874,8 +3903,13 @@
         return;
       }
       input.setCustomValidity('');
+      const actionSymbol = state.symbol;
+      const followup = state.breakoutFollowup;
       closeBreakoutPricePopup();
-      commitBreakoutPrice(value, `Breakout set to ${value.toFixed(2)} — saved locally.`);
+      const saved = await commitBreakoutPrice(value, `Breakout set to ${value.toFixed(2)} — saved.`);
+      if (!saved || state.symbol !== actionSymbol || followup?.symbol !== actionSymbol) return;
+      if (followup.target === 'buy_today') await toggleBuyTodayDraft();
+      else await moveToList('buylist');
     });
     byId('breakout-price-popup-input').addEventListener('input', event => event.target.setCustomValidity(''));
     byId('breakout-price-cancel').addEventListener('click', closeBreakoutPricePopup);
