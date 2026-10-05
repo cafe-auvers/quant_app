@@ -755,7 +755,7 @@
     const candidates = [
       {price: boardNumber(row.last_reported_price), at: row.price_as_of, source: 'PC reported'},
       {price: boardNumber(monitor?.current_price), at: monitor?.quote_as_of,
-        source: 'Yahoo · indicative', stale: monitor?.quote_status !== 'CURRENT'},
+        source: 'Yahoo · indicative', stale: Boolean(state.monitorError) || monitor?.quote_status !== 'CURRENT'},
     ].filter(item => item.price !== null);
     candidates.sort((a, b) => (Date.parse(b.at || '') || 0) - (Date.parse(a.at || '') || 0));
     if (!candidates.length) return {price: null, fresh: false, note: 'Price not reported yet'};
@@ -818,15 +818,15 @@
           && Number(row.stop_quantity || 0) >= held
           ? average !== null ? boardNavMetric(Math.max(0, average - stop) * held) : 'Unavailable'
           : 'Not fully covered']);
-      if (price.fresh && average !== null && held > 0) {
+      if (price.price !== null && average !== null && held > 0) {
         const pnl = (price.price - average) * held;
         const percent = (price.price / average - 1) * 100;
-        facts.push(['Est. P&L', `${pnl >= 0 ? '+' : '−'}$${Math.abs(pnl).toFixed(2)} (${percent >= 0 ? '+' : ''}${percent.toFixed(2)}%)`]);
+        facts.push(['Est. P&L', `${pnl >= 0 ? '+' : '−'}$${Math.abs(pnl).toFixed(2)} (${percent >= 0 ? '+' : ''}${percent.toFixed(2)}%)${price.fresh ? '' : ' · stale'}`]);
       } else {
-        facts.push(['Est. P&L', price.price !== null && !price.fresh ? 'Price stale' : '—']);
+        facts.push(['Est. P&L', '—']);
       }
-      if (price.fresh && stop !== null) {
-        facts.push(['To stop', `${((price.price - stop) / price.price * 100).toFixed(2)}%`]);
+      if (price.price !== null && stop !== null) {
+        facts.push(['To stop', `${((price.price - stop) / price.price * 100).toFixed(2)}%${price.fresh ? '' : ' · stale'}`]);
       }
       if (row.pending_stop_price) facts.push(['Pending stop',
         `${boardMoney(row.pending_stop_price)} · ${boardShares(row.pending_stop_quantity)}`]);
