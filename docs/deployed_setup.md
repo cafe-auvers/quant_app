@@ -101,9 +101,9 @@ This is a dated readiness snapshot, not proof of subsequent fills, a future
 session, or new qualification of Gates 2–5. Always recheck current readiness,
 the current session/release, plans, and risk/capital gates before trading.
 
-The separate web service runs `40b88b33d3c967e62b0586a6e190c67b2ca703d2`,
-which adds the far-right KST clock and market-open/close minute countdowns to
-the approved release's web UI. It includes the mobile list-action fix from
+The separate web service runs `784741039f86b2bd1ca6e5a3595b5c21d15e3f97`,
+which adds a single far-right minute countdown on the same status row:
+`Open in Xm` before market open and `Close in Xm` during trading. It includes the mobile list-action fix from
 PR #134. This web update preserved the armed PC executor and its configuration.
 Passive diagnostics collect feed health, isolated
 shadow decisions, and actual runtime execution events alongside live trading.

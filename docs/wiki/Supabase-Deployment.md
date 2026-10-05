@@ -53,9 +53,9 @@ Shared ORB settings matched the PC's applied settings. Passive mobile Buylist
 removal was verified. Removal waits for canonical confirmation, reports
 failures, and preserves real order/position/protection fences.
 
-The separate web service runs `40b88b33d3c967e62b0586a6e190c67b2ca703d2`.
-Its far-right header shows KST time and minutes until regular-session market
-open/close, using the exchange calendar and a local browser timer. This web-only
+The separate web service runs `784741039f86b2bd1ca6e5a3595b5c21d15e3f97`.
+Its far-right header stays on one row and shows `Open in Xm` before opening,
+then `Close in Xm` during trading, using the exchange calendar and a local browser timer. This web-only
 update preserved the armed PC executor and its configuration. Mobile Watchlist
 additions ask for a missing breakout price,
 confirm its saved revision, and show errors beneath the list buttons. Buy Today
