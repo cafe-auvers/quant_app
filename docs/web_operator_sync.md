@@ -15,6 +15,26 @@ Same-session observed passes survive a stale latest quote and are explicitly
 marked as historical; the next session clears them. Actual entries still
 require fresh KIS trade and quote events and the full execution guards.
 
+Buy Board cards and their detail sheets show stage-specific facts:
+
+| Stage | Details |
+| --- | --- |
+| Today | Target shares, planned ORL stop, breakout, entry plan/trigger, ORB window, planned risk, retry time and block reason |
+| Entry | The entry plan plus held/target shares and average fill price |
+| Open | Held and sellable shares, average entry, active/pending stop and monitored stop shares, estimated P&L and distance to stop |
+| Partial | Position details plus requested sell shares and remaining shares reserved for a working exit |
+| Sell All | Position details, remaining working sell shares, submission/cancel status, retry time and exit error |
+
+Each stage header counts stocks and sums target or held shares; unsized cards
+are identified separately. Price uses the newer of the existing mobile
+Monitor quote and the PC's persisted observation. Yahoo quotes are labelled
+indicative; PC observations are labelled reported. Source, KST observation
+time, age and stale status remain visible. The display freshness threshold is
+the Monitor threshold (180 seconds by default), not execution readiness.
+Estimated P&L and distance to stop are withheld for stale or undated prices.
+These fields reuse existing snapshots and the canonical card projection;
+they add no SQL query, quote polling, broker connection or order mutation.
+
 The six ORB position-bound values are part of the same shared contract. Their
 default profile is capital allocation 10% / 17.5% / 30% and Stop/ADR
 15% / 65% / 66% (lower / ideal / upper). An authenticated browser or desktop

@@ -387,8 +387,9 @@ input::placeholder { color: #65776f; }
   .mobile-kanban-heading { min-height: 50px; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 11px; border-bottom: 1px solid var(--line); background: #0e241d; }
   .mobile-kanban-heading strong, .mobile-kanban-heading .mobile-card-label { display: block; }
   .mobile-kanban-heading strong { margin-top: 2px; font-size: 15px; }
+  #buy-board-column-summary { display: block; margin-top: 3px; color: var(--muted); font-size: 10px; }
   .mobile-kanban-heading > span { min-width: 24px; padding: 3px 7px; border-radius: 999px; color: var(--green); background: #16342a; text-align: center; font-size: 9px; font-weight: 900; }
-  .mobile-kanban-cards { min-height: 84px; max-height: calc(100dvh - 395px); overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; touch-action: pan-y; }
+  .mobile-kanban-cards { min-height: 84px; max-height: calc(100dvh - 405px); overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; touch-action: pan-y; }
   .mobile-kanban-card { width: 100%; min-width: 0; min-height: 78px; display: flex; flex-direction: column; align-items: stretch; gap: 3px; padding: 9px 11px; border: 0; border-left: 3px solid #64766f; border-bottom: 1px solid var(--line-soft); border-radius: 0; color: var(--ink); background: transparent; text-align: left; }
   .mobile-kanban-card:last-child { border-bottom: 0; }
   .mobile-kanban-card[data-status="BUY_TODAY"] { border-left-color: #45d5ad; }
@@ -403,7 +404,14 @@ input::placeholder { color: #65776f; }
   .mobile-kanban-card-name { overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; font-size: 9px; }
   .mobile-kanban-card-facts small { overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; font-size: 8px; text-transform: capitalize; }
   .mobile-kanban-card-facts b { flex: 0 0 auto; color: var(--ink); font-size: 9px; font-variant-numeric: tabular-nums; }
-  .mobile-kanban-card-warning { margin-top: 2px; overflow: hidden; color: #ff9ba4; text-overflow: ellipsis; white-space: nowrap; font-size: 8px; }
+  .mobile-kanban-card-details { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px 12px; margin: 7px 0 4px; }
+  .mobile-kanban-card-details > span { min-width: 0; }
+  .mobile-kanban-card-details small, .mobile-kanban-card-details b { display: block; overflow-wrap: anywhere; }
+  .mobile-kanban-card-details small { color: var(--muted); font-size: 9px; }
+  .mobile-kanban-card-details b { margin-top: 2px; font-size: 12px; font-variant-numeric: tabular-nums; }
+  .mobile-kanban-price-note { color: var(--muted); font-size: 9px; line-height: 1.5; overflow-wrap: anywhere; }
+  .mobile-kanban-price-note[data-stale="true"] { color: var(--amber); }
+  .mobile-kanban-card-warning { margin-top: 3px; color: #ff9ba4; overflow-wrap: anywhere; font-size: 10px; line-height: 1.4; }
   .mobile-board-sync-status { min-height: 22px; display: flex; align-items: center; padding: 4px 3px 0; color: var(--green); font-size: 8px; }
   .mobile-board-sync-status.pending { color: var(--amber); }
   .mobile-board-sync-status.error { color: #ff9ba4; }
@@ -415,11 +423,11 @@ input::placeholder { color: #65776f; }
   .mobile-board-action-heading strong { margin-top: 2px; font-size: 22px; }
   .mobile-board-action-heading small { margin-top: 2px; color: var(--muted); font-size: 9px; }
   .mobile-board-action-heading button { width: 38px; height: 38px; border: 1px solid var(--line); border-radius: 9px; color: var(--ink); background: #132820; font-size: 23px; }
-  .mobile-board-action-facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 5px; margin: 9px 0; }
+  .mobile-board-action-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; margin: 9px 0; }
   .mobile-board-action-facts span { min-width: 0; padding: 7px; border: 1px solid var(--line-soft); border-radius: 8px; background: #091713; }
-  .mobile-board-action-facts small, .mobile-board-action-facts b { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mobile-board-action-facts small, .mobile-board-action-facts b { display: block; overflow-wrap: anywhere; }
   .mobile-board-action-facts small { color: var(--faint); font-size: 7px; text-transform: uppercase; }
-  .mobile-board-action-facts b { margin-top: 3px; font-size: 9px; font-variant-numeric: tabular-nums; }
+  .mobile-board-action-facts b { margin-top: 3px; font-size: 12px; font-variant-numeric: tabular-nums; }
   .mobile-board-action-buttons { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
   .mobile-board-action-buttons button { min-width: 0; min-height: 42px; padding: 4px 7px; border: 1px solid var(--green); border-radius: 9px; color: #07110f; background: var(--green); font-size: 9px; font-weight: 900; }
   .mobile-board-action-buttons button.secondary { color: var(--ink); border-color: #315548; background: #132a23; }

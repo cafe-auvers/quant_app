@@ -697,6 +697,126 @@
     return breakout === null ? 'No breakout' : `Breakout ${breakout.toFixed(2)}`;
   }
 
+  function boardNumber(value) {
+    if (value === null || value === undefined || value === '') return null;
+    const number = Number(value);
+    return Number.isFinite(number) && number > 0 ? number : null;
+  }
+
+  function boardMoney(value) {
+    const number = boardNumber(value);
+    return number === null ? '—' : `$${number.toFixed(number < 1 ? 4 : 2)}`;
+  }
+
+  function boardShares(value, unknownWhenZero = false) {
+    const number = Math.max(0, Math.trunc(Number(value) || 0));
+    return unknownWhenZero && !number ? 'Not sized' : `${number.toLocaleString()} sh`;
+  }
+
+  function boardTarget(row) {
+    return Math.max(0, Number(row.broker_quantity) || 0,
+      Number(row.target_position_quantity || row.planned_quantity) || 0);
+  }
+
+  function boardTime(value) {
+    const time = Date.parse(value || '');
+    return Number.isFinite(time) ? `${new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'Asia/Seoul', hour: '2-digit', minute: '2-digit', second: '2-digit',
+    }).format(time)} KST` : 'Time unavailable';
+  }
+
+  function boardPrice(row) {
+    // Reuse observations already loaded by Monitor; never request broker quotes.
+    const monitor = state.monitorRows.find(item => item.symbol === row.symbol);
+    const candidates = [
+      {price: boardNumber(row.last_reported_price), at: row.price_as_of, source: 'PC reported'},
+      {price: boardNumber(monitor?.current_price), at: monitor?.quote_as_of,
+        source: 'Yahoo · indicative', stale: monitor?.quote_status !== 'CURRENT'},
+    ].filter(item => item.price !== null);
+    candidates.sort((a, b) => (Date.parse(b.at || '') || 0) - (Date.parse(a.at || '') || 0));
+    if (!candidates.length) return {price: null, fresh: false, note: 'Price not reported yet'};
+    const quote = candidates[0];
+    const age = (Date.now() - Date.parse(quote.at || '')) / 1000;
+    const fresh = Number.isFinite(age) && age >= -5
+      && age <= state.monitorStaleSeconds && !quote.stale;
+    const elapsed = Number.isFinite(age) && age >= 0
+      ? age < 60 ? `${Math.floor(age)}s ago` : `${Math.floor(age / 60)}m ago`
+      : 'Age unavailable';
+    return {...quote, fresh, note: `${quote.source} · ${boardTime(quote.at)} · ${elapsed}${fresh ? '' : ' · stale'}`};
+  }
+
+  function boardDetails(row) {
+    const price = boardPrice(row);
+    if (row.board_status === 'BUYLIST') {
+      return {price, facts: [['Price', boardMoney(price.price)], ['Breakout', boardMoney(row.breakout_price)]]};
+    }
+    const held = Math.max(0, Number(row.broker_quantity) || 0);
+    const target = boardTarget(row);
+    const position = ['OPEN_POSITION', 'PARTIAL_SELL', 'SELL_ALL'].includes(row.board_status);
+    const stop = boardNumber(row.active_stop_price);
+    const facts = [['Price', boardMoney(price.price)],
+      [position ? 'Held' : 'Target shares', position ? boardShares(held) : boardShares(target, true)],
+      [position ? 'Active stop' : 'Planned stop', position
+        ? stop === null ? 'Not set' : boardMoney(stop)
+        : boardMoney(row.entry_orb_low)]];
+    if (!position) {
+      facts.push(
+        ['Breakout', boardMoney(row.breakout_price)],
+        ['Entry plan', boardMoney(row.entry_execution_price || row.entry_trigger)],
+        ['ORB', row.entry_orb_window || row.selected_orb_window || 'Not selected'],
+      );
+      if (row.entry_breakout_trigger) facts.push(['Entry trigger', boardMoney(row.entry_breakout_trigger)]);
+      if (row.board_status === 'ENTRY_PENDING') {
+        facts.push(['Held / target', `${held.toLocaleString()} / ${target > 0 ? target.toLocaleString() : '—'} sh`]);
+        if (held > 0) facts.push(['Average fill', boardMoney(row.average_entry_price)]);
+      }
+      const entry = boardNumber(row.entry_execution_price || row.entry_trigger);
+      const plannedStop = boardNumber(row.entry_orb_low);
+      if (entry !== null && plannedStop !== null && entry > plannedStop && target > 0) {
+        facts.push(['Planned risk', boardMoney((entry - plannedStop) * target)]);
+      }
+      if (row.next_retry_at) facts.push(['Retry after', boardTime(row.next_retry_at)]);
+    } else {
+      facts.push(['Average entry', boardMoney(row.average_entry_price)],
+        ['Sellable', boardShares(row.orderable_quantity)],
+        ['Stop coverage', stop === null ? 'Not active'
+          : `${Math.max(0, Number(row.stop_quantity) || 0).toLocaleString()} / ${held.toLocaleString()} sh`]);
+      const average = boardNumber(row.average_entry_price);
+      if (price.fresh && average !== null && held > 0) {
+        const pnl = (price.price - average) * held;
+        const percent = (price.price / average - 1) * 100;
+        facts.push(['Est. P&L', `${pnl >= 0 ? '+' : '−'}$${Math.abs(pnl).toFixed(2)} (${percent >= 0 ? '+' : ''}${percent.toFixed(2)}%)`]);
+      } else {
+        facts.push(['Est. P&L', price.price !== null && !price.fresh ? 'Price stale' : '—']);
+      }
+      if (price.fresh && stop !== null) {
+        facts.push(['To stop', `${((price.price - stop) / price.price * 100).toFixed(2)}%`]);
+      }
+      if (row.pending_stop_price) facts.push(['Pending stop',
+        `${boardMoney(row.pending_stop_price)} · ${boardShares(row.pending_stop_quantity)}`]);
+      if (row.board_status === 'PARTIAL_SELL') {
+        facts.push(['Sell requested', boardShares(row.pending_partial_sell_quantity)]);
+      }
+      if (['PARTIAL_SELL', 'SELL_ALL'].includes(row.board_status)) {
+        facts.push(['Working sell', row.exit_order_pending
+          ? row.reserved_sell_quantity > 0 ? boardShares(row.reserved_sell_quantity) : 'Quantity syncing'
+          : 'Not submitted']);
+        if (row.next_exit_retry_at) facts.push(['Retry after', boardTime(row.next_exit_retry_at)]);
+      }
+      if (row.entry_remaining_target_quantity > 0) {
+        facts.push(['Still to buy', boardShares(row.entry_remaining_target_quantity)]);
+      }
+    }
+    return {facts, price};
+  }
+
+  function boardWarning(row) {
+    const reason = ['PARTIAL_SELL', 'SELL_ALL'].includes(row.board_status)
+      ? row.last_exit_error
+      : ['BUY_TODAY', 'ENTRY_PENDING'].includes(row.board_status) ? row.entry_block_reason : '';
+    return [reason, ...(row.warnings || [])].find(value => String(value || '').trim()) || '';
+  }
+
   function mobileKanbanCard(row) {
     const button = document.createElement('button');
     button.type = 'button';
@@ -721,8 +841,16 @@
     metric.textContent = boardMetric(row);
     facts.append(status, metric);
     button.append(top, name, facts);
-    const warning = [...(row.warnings || []), row.entry_block_reason, row.last_exit_error]
-      .find(value => String(value || '').trim());
+    const details = boardDetails(row);
+    const grid = document.createElement('span');
+    grid.className = 'mobile-kanban-card-details';
+    grid.append(...details.facts.map(([label, value]) => boardFact(label, value)));
+    const priceNote = document.createElement('span');
+    priceNote.className = 'mobile-kanban-price-note';
+    priceNote.dataset.stale = String(!details.price.fresh);
+    priceNote.textContent = details.price.note;
+    button.append(grid, priceNote);
+    const warning = boardWarning(row);
     if (warning) {
       const alert = document.createElement('span');
       alert.className = 'mobile-kanban-card-warning';
@@ -779,6 +907,11 @@
     byId('buy-board-column-kicker').textContent = column.kicker;
     byId('buy-board-column-title').textContent = column.title;
     byId('buy-board-column-count').textContent = String(rows.length);
+    const position = ['OPEN_POSITION', 'PARTIAL_SELL', 'SELL_ALL'].includes(column.key);
+    const shares = rows.reduce((sum, row) => sum + (position
+      ? Math.max(0, Number(row.broker_quantity) || 0) : boardTarget(row)), 0);
+    const unsized = !position ? rows.filter(row => boardTarget(row) === 0).length : 0;
+    byId('buy-board-column-summary').textContent = `${rows.length} stock${rows.length === 1 ? '' : 's'}${column.key === 'BUYLIST' ? '' : ` · ${shares.toLocaleString()} ${position ? 'held' : 'target'} shares${unsized ? ` · ${unsized} not sized` : ''}`}`;
     const cards = document.createDocumentFragment();
     rows.forEach(row => cards.appendChild(mobileKanbanCard(row)));
     if (!rows.length) {
@@ -922,18 +1055,12 @@
     byId('buy-board-action-symbol').textContent = row.symbol;
     byId('buy-board-action-name').textContent = row.name || row.symbol;
     const facts = byId('buy-board-action-facts');
-    const factRows = [
-      boardFact('Status', boardStatusLabel(row)),
-      boardFact('Breakout', normalizeBreakoutPrice(row.breakout_price)?.toFixed(2) || '—'),
-    ];
-    if (['OPEN_POSITION', 'PARTIAL_SELL', 'SELL_ALL'].includes(row.board_status)) {
-      factRows.push(
-        boardFact('Quantity', String(Number(row.broker_quantity || 0))),
-        boardFact('Average', Number(row.average_entry_price || 0) > 0 ? Number(row.average_entry_price).toFixed(2) : '—'),
-        boardFact('Stop', Number(row.active_stop_price || 0) > 0 ? Number(row.active_stop_price).toFixed(2) : '—'),
-      );
-    }
+    const details = boardDetails(row);
+    const factRows = [boardFact('Status', boardStatusLabel(row)),
+      ...details.facts.map(([label, value]) => boardFact(label, value))];
     facts.replaceChildren(...factRows);
+    byId('buy-board-action-price-note').textContent = details.price.note;
+    byId('buy-board-action-warning').textContent = boardWarning(row);
     const actions = byId('buy-board-action-buttons');
     const fragment = document.createDocumentFragment();
     const pending = state.buyBoardPendingActions.has(row.symbol);
@@ -2794,6 +2921,8 @@
       window.clearTimeout(timeout);
       state.monitorLoading = false;
       if (state.listMode === 'monitor') applyListMode('monitor');
+      renderBuyBoardPage();
+      if (!byId('buy-board-action-sheet').hidden) renderBuyBoardActionSheet();
       // Poll only the shared snapshot while its first quote batch is loading.
       if (!state.monitorAsOf && state.monitorEnabled === true && !state.monitorError) {
         state.monitorRetryTimer = window.setTimeout(loadIntradayMonitor, 5_000);

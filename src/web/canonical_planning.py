@@ -419,6 +419,12 @@ class CanonicalPlanningSource:
             "entry_orb_high": card.entry_orb_high,
             "entry_orb_low": card.entry_orb_low,
             "entry_trigger": card.entry_trigger,
+            "entry_execution_price": card.entry_execution_price,
+            "entry_breakout_trigger": card.entry_breakout_trigger,
+            "entry_remaining_target_quantity": max(
+                0, int(card.entry_remaining_target_quantity or 0)
+            ),
+            "next_retry_at": self._date_value(card.next_retry_at),
             "entry_runtime_status": self._enum_value(card.entry_runtime_status),
             "entry_block_reason": str(card.entry_block_reason or ""),
             "entry_order_pending": bool(
@@ -439,8 +445,10 @@ class CanonicalPlanningSource:
             "average_entry_price": float(card.average_entry_price or 0.0),
             "stop_type": self._enum_value(card.stop_type),
             "active_stop_price": card.active_stop_price,
+            "stop_quantity": max(0, int(card.stop_quantity or 0)),
             "pending_stop_type": self._enum_value(card.pending_stop_type),
             "pending_stop_price": card.pending_stop_price,
+            "pending_stop_quantity": max(0, int(card.pending_stop_quantity or 0)),
             "pending_partial_sell_quantity": max(
                 0, int(card.pending_partial_sell_quantity or 0)
             ),
@@ -455,6 +463,9 @@ class CanonicalPlanningSource:
             ),
             "exit_cancel_in_flight": bool(card.exit_cancel_in_flight),
             "last_exit_error": str(card.last_exit_error or ""),
+            "next_exit_retry_at": self._date_value(card.next_exit_retry_at),
+            "last_reported_price": self._positive_number(card.market_data_last_trusted_price),
+            "price_as_of": self._date_value(card.market_data_last_trusted_at),
             "warnings": [str(item) for item in card.warnings if str(item).strip()],
             "updated_at": card.updated_at.isoformat(),
             "source": self.source_name,
