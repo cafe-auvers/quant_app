@@ -303,9 +303,6 @@
 
   let marketClockSchedule = null;
   let marketClockTimer = null;
-  const marketClockFormat = new Intl.DateTimeFormat('en-GB', {
-    timeZone: 'Asia/Seoul', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
-  });
 
   function renderMarketCountdown(market = null) {
     if (market?.as_of) {
@@ -323,10 +320,6 @@
     const now = marketClockSchedule
       ? marketClockSchedule.asOf + performance.now() - marketClockSchedule.receivedAt
       : Date.now();
-    const clock = byId('market-clock');
-    const clockLabel = `${marketClockFormat.format(now)} KST`;
-    if (clock.textContent !== clockLabel) clock.textContent = clockLabel;
-    clock.dateTime = new Date(now).toISOString();
     let open = marketClockSchedule?.open;
     let close = marketClockSchedule?.close;
     if (now >= close) {
@@ -335,12 +328,12 @@
     }
     const hasSchedule = Number.isFinite(open) && Number.isFinite(close) && now < close;
     const minutesUntil = boundary => Math.max(1, Math.ceil((boundary - now) / 60_000));
-    const openLabel = hasSchedule ? (now < open ? `Open in ${minutesUntil(open)}m` : 'Open now') : 'Open —';
-    const closeLabel = hasSchedule ? `Close in ${minutesUntil(close)}m` : 'Close —';
-    for (const [id, label] of [['market-open-countdown', openLabel], ['market-close-countdown', closeLabel]]) {
-      if (byId(id).textContent !== label) byId(id).textContent = label;
-    }
-    byId('market-countdown').title = hasSchedule
+    const label = hasSchedule
+      ? (now < open ? `Open in ${minutesUntil(open)}m` : `Close in ${minutesUntil(close)}m`)
+      : 'Market —';
+    const countdown = byId('market-countdown');
+    if (countdown.textContent !== label) countdown.textContent = label;
+    countdown.title = hasSchedule
       ? `NYSE regular session · Open ${new Date(open).toLocaleString('en-GB', {timeZone: 'Asia/Seoul'})} KST · Close ${new Date(close).toLocaleString('en-GB', {timeZone: 'Asia/Seoul'})} KST`
       : 'Waiting for the NYSE session schedule';
   }
