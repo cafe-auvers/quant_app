@@ -565,6 +565,18 @@ class TradeCardOrbEvaluator:
             if candidate.status in _BLOCKED_CANDIDATE_STATUSES
             else ""
         )
+        candidates = dict(execution_queue_item.candidates or {})
+        if (
+            candidate.status in _BLOCKED_CANDIDATE_STATUSES
+            and len(candidates) > 1
+            and not execution_queue_item.manual_window_lock
+            and all(item.status in _BLOCKED_CANDIDATE_STATUSES for item in candidates.values())
+        ):
+            card.entry_block_reason = "; ".join(
+                f"{window}: {candidates[window].reason}"
+                for window in ("1m", "5m", "30m")
+                if window in candidates and candidates[window].reason
+            )
 
     def select_crossed_candidate(
         self,

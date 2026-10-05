@@ -123,6 +123,43 @@ this dialog is not a second market-hours planning path.
 Any permitted pre-market refresh still uses the plan's persisted buffer, never
 the current local header default.
 
+## Sparse KIS opening history
+
+The verified KIS `xymd`/`xhms` timestamps carry explicit New York provenance,
+including through the cache. A late local 13:30 or 14:30 bar is never interpreted
+as a UTC opening bar. Arbitrary configured field mappings cannot establish this
+provenance. Invalid downloaded rows prevent sparse-range authorization.
+
+Some KIS minute-chart responses have no bar at exactly 09:30. This does not
+move the opening window: 1m remains 09:30–09:31 ET, 5m remains 09:30–09:35,
+and 30m remains 09:30–10:00. Bars are never filled or borrowed from a later
+minute to manufacture a missing short-window range.
+
+A longer window may use its actual KIS bars when a backward-paged download
+reaches before the session open and through the window end. The planner binds
+that coverage to a digest of the opening rows. The PC historical cache stores
+bars and the optional `intraday_history_coverage` record in the same transaction;
+the record is keyed by symbol, interval and source. This table is local MySQL
+cache metadata, separate from Supabase coordination. Older caches continue
+using the original exact-09:30 check until refreshed. Truncated downloads,
+malformed broker rows, wrong symbols/sessions, unfinished windows, changed
+cached opening rows, and non-KIS fallback data cannot use the sparse-history
+permission. The proof is also rebound when 1m bars are resampled to 5m.
+
+An empty completed window explains its exact time bounds and the first
+available bar. When every automatic candidate is blocked, the Buy Today card
+shows the reasons for all windows; an explicit manual window keeps its own
+reason. Price-zone, sizing, fresh WebSocket, broker, ownership and live-switch
+checks remain enforced.
+
+CURV diagnostic on 2026-10-05: direct KIS NYS responses paged into the previous
+session and still began at 09:43 ET. No 1m/5m opening bars were returned. Its
+actual 30m range was $2.51/$2.48, while the saved breakout was $2.52; that
+calculated plan is rejected because there is no passive entry zone above the
+breakout and at or below ORH. This is a dated data/plan diagnosis, not an entry
+recommendation or authorization to change the breakout. No live card or order
+was changed by the diagnostic replay.
+
 Locking a window or returning to automatic selection saves only this device's
 local execution-queue planning state. It is **not** a cross-device handoff.
 After either change, the Operator Control owner must click **Publish Today's
