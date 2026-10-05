@@ -836,6 +836,28 @@ class TradeCardState:
         )
 
 
+def can_withdraw_sell_all_intent(card: TradeCardState) -> bool:
+    """Allow only a held position whose SELL lifecycle has not started.
+
+    A regular-session liquidation objective is not evidence of a broker
+    order. Working orders are checked separately by the workflow service.
+    """
+
+    return bool(
+        card.board_status == BoardStatus.SELL_ALL
+        and card.broker_quantity > 0
+        and not (
+            card.exit_client_order_id
+            or card.exit_pending_attempt_number
+            or card.reserved_sell_quantity
+            or card.exit_submission_unresolved
+            or card.exit_cancel_in_flight
+            or card.exit_cancel_command_id
+            or card.exit_cancel_requested_at is not None
+        )
+    )
+
+
 def has_durable_execution_evidence(card: TradeCardState) -> bool:
     """Return whether a planning card carries live/attempted execution state.
 

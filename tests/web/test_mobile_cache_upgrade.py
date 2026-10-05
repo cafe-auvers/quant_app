@@ -31,7 +31,7 @@ self.addEventListener('fetch', e => {
 """
 
 
-def test_mobile_upgrade_bypasses_old_cache_and_recovers_price_timeout(tmp_path):
+def test_mobile_upgrade_bypasses_old_cache_and_recovers_price_timeout(tmp_path, browser_event_loop):
     playwright = pytest.importorskip("playwright.sync_api")
     static = ROOT / "src/web/static"
     vendor = ROOT / "src/ui/static/vendor"

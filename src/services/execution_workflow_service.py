@@ -813,6 +813,7 @@ def _require_board_action_not_conflicted(engine, command, card) -> List[Executio
     from src.core.trade_card_state import (
         BoardStatus,
         PositionRuntimeStatus,
+        can_withdraw_sell_all_intent,
         has_durable_execution_evidence,
         has_legacy_planning_stop,
     )
@@ -1056,11 +1057,11 @@ def _require_board_action_not_conflicted(engine, command, card) -> List[Executio
     if isinstance(command, types.RequestSellAll) and card.board_status.value == "SELL_ALL":
         raise BoardCommandRejectedError("Sell All is already pending")
     if isinstance(command, types.CancelQueuedSellAll) and (
-        card.exit_client_order_id
+        not can_withdraw_sell_all_intent(card)
         or any(order.side == OrderSide.SELL for order in active_orders)
     ):
         raise BoardCommandRejectedError(
-            "The market-open SELL has already reached the execution lifecycle; it cannot be withdrawn as a local queue gesture"
+            "Only an unsubmitted Sell All for a confirmed holding can be withdrawn; reconcile any SELL identity, reservation, or cancellation first"
         )
     return active_orders
 
@@ -1353,12 +1354,17 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
         return
 
     if isinstance(command, types.CancelQueuedSellAll):
-        if card.board_status != BoardStatus.SELL_ALL or not card.sell_all_at_market_open:
-            raise BoardCommandRejectedError("No queued market-open Sell All to cancel")
+        if card.board_status != BoardStatus.SELL_ALL:
+            raise BoardCommandRejectedError("No Sell All objective to withdraw")
         _move_board_card(card, BoardStatus.OPEN_POSITION)
         card.sell_all_at_market_open = False
         card.exit_all_required = False
+        card.pending_partial_sell_quantity = 0
         card.position_runtime_status = PositionRuntimeStatus.OPEN
+        card.next_exit_retry_at = None
+        card.exit_attempt_count = 0
+        card.exit_attempt_group_id = ""
+        card.last_exit_error = ""
         return
 
     if isinstance(command, types.ReorderCard):

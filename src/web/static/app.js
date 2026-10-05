@@ -959,8 +959,8 @@
     } else if (row.board_status === 'SELL_ALL') {
       fragment.append(boardActionButton('Cancel Sell All', 'cancel_sell_all', {
         secondary: true,
-        disabled: pending || !row.sell_all_at_market_open || row.exit_order_pending,
-        title: row.sell_all_at_market_open ? '' : 'Only a queued, unsubmitted market-open Sell All can be cancelled.',
+        disabled: pending || !row.can_cancel_sell_all || row.exit_order_pending,
+        title: row.can_cancel_sell_all ? '' : 'Only an unsubmitted Sell All can be cancelled. Reconcile any pending SELL first.',
       }));
     }
     if (['OPEN_POSITION', 'PARTIAL_SELL'].includes(row.board_status)) {
