@@ -38,10 +38,15 @@ def test_buyboard_stage_details_and_stale_prices(width, tmp_path, browser_event_
             "last_exit_error": "Live Trading is OFF" if symbol == "SELL" else "",
             "buy_today_note": "Buy Today rejected - all ORB plans invalid. 30m: invalid tick" if symbol == "ODD" else "",
         })
-    monitor = [{"symbol": "OPEN", "current_price": 11, "quote_as_of": now.isoformat(), "quote_status": "CURRENT"}]
+    monitor = [
+        {"symbol": "OPEN", "current_price": 11, "quote_as_of": now.isoformat(), "quote_status": "CURRENT"},
+        {"symbol": "SELL", "current_price": 11.2,
+         "quote_as_of": (now - timedelta(seconds=200)).isoformat(), "quote_status": "STALE"},
+    ]
     session = {"mode": "CONNECTED", "csrf_token": "test",
                "market_status": {"state": "OPEN", "phase": "REGULAR"}}
     errors, mutations = [], []
+    monitor_unavailable = [False]
 
     def handle(route):
         path = urlparse(route.request.url).path
@@ -52,7 +57,10 @@ def test_buyboard_stage_details_and_stale_prices(width, tmp_path, browser_event_
             route.fulfill(json={"rows": rows, "revision": "1", "account_nav_usd": 10_000,
                                 "account_nav_as_of": now.isoformat(), "account_nav_note": ""})
         elif path == "/api/v1/intraday-monitor":
-            route.fulfill(json={"rows": monitor, "as_of": now.isoformat(), "enabled": True})
+            if monitor_unavailable[0]:
+                route.fulfill(status=503, json={"detail": "Refresh temporarily unavailable"})
+            else:
+                route.fulfill(json={"rows": monitor, "as_of": now.isoformat(), "enabled": True})
         elif path.startswith("/api/"):
             route.fulfill(json=session if path.endswith("session") or path.endswith("status") else {"rows": []})
         elif path == "/":
@@ -67,6 +75,7 @@ def test_buyboard_stage_details_and_stale_prices(width, tmp_path, browser_event_
         browser = pw.chromium.launch(headless=True)
         try:
             page = browser.new_page(viewport={"width": width, "height": 844}, is_mobile=True)
+            page.clock.install(time=now)
             page.route("**/*", handle)
             page.on("pageerror", lambda error: errors.append(str(error)))
             page.goto("http://localhost:8779/")
@@ -77,7 +86,8 @@ def test_buyboard_stage_details_and_stale_prices(width, tmp_path, browser_event_
                 ("Entry", "ENTRY", ["Held / target", "20 / 100 sh", "Average fill", "$10.00"]),
                 ("Open", "OPEN", ["Held", "100 sh", "Sellable", "75 sh", "Active stop", "100 / 100 sh", "$11.00", "+$100.00 (+10.00%)", "Yahoo", "indicative"]),
                 ("Partial", "PARTIAL", ["Sell requested", "25 sh", "Working sell"]),
-                ("Sell All", "SELL", ["Not submitted", "stale", "Price stale", "Live Trading is OFF"]),
+                ("Sell All", "SELL", ["Not submitted", "Yahoo", "stale", "$11.20",
+                                     "+$120.00 (+12.00%) · stale", "15.18% · stale", "Live Trading is OFF"]),
             ]:
                 page.get_by_role("tab", name=re.compile(rf"^{tab} ")).click()
                 card = page.locator(".mobile-kanban-card").filter(has_text=re.compile(rf"^{symbol}"))
@@ -94,11 +104,17 @@ def test_buyboard_stage_details_and_stale_prices(width, tmp_path, browser_event_
                     assert "10.00% NAV · $1,000.00" in text
                     assert "0.50% NAV · $50.00" in text
                 assert "KST" in text
+                assert "Price stale" not in text
+                if symbol == "SELL":
+                    page.screenshot(path=str(tmp_path / f"stale-price-{width}.png"))
                 if symbol == "TODAY":
                     assert page.locator("#buy-board-column-summary").inner_text() == "2 stocks · 100 target shares · 1 not sized"
                 card.click()
                 sheet = page.locator("#buy-board-action-facts").inner_text().lower()
                 assert "price" in sheet
+                if symbol == "SELL":
+                    assert "+$120.00 (+12.00%) · stale" in sheet
+                    assert "15.18% · stale" in sheet
                 if tab != "Buylist":
                     assert ("planned stop" if tab in ("Today", "Entry") else "active stop") in sheet
                 if symbol == "ODD":
@@ -106,6 +122,24 @@ def test_buyboard_stage_details_and_stale_prices(width, tmp_path, browser_event_
                 if symbol == "TODAY":
                     assert "Waiting for fresh quote" in page.locator("#buy-board-action-warning").inner_text()
                 page.locator("#buy-board-action-close").click()
+            # The normal minute poll replaces the stale estimate without a reload.
+            monitor[1].update(current_price=11.4, quote_as_of=(now + timedelta(seconds=60)).isoformat(),
+                              quote_status="CURRENT")
+            page.clock.fast_forward(60_000)
+            page.get_by_role("tab", name=re.compile(r"^Sell All ")).click()
+            sold = page.locator(".mobile-kanban-card").filter(has_text=re.compile(r"^SELL"))
+            page.wait_for_function("document.querySelector('#buy-board-cards').textContent.includes('$11.40')")
+            assert "+$140.00 (+14.00%)" in sold.inner_text()
+            assert "16.67%" in sold.inner_text()
+            assert "stale" not in sold.inner_text()
+            monitor_unavailable[0] = True
+            page.clock.fast_forward(60_000)
+            page.wait_for_function("document.querySelector('#buy-board-cards').textContent.includes('· stale')")
+            assert "$11.40" in sold.inner_text()
+            assert "+$140.00 (+14.00%) · stale" in sold.inner_text()
+            assert "16.67% · stale" in sold.inner_text()
+            assert "KST" in sold.inner_text()
+            monitor_unavailable[0] = False
             page.get_by_role("tab", name=re.compile(r"^Today ")).click()
             unknown = page.locator(".mobile-kanban-card").filter(has_text=re.compile(r"^UNSIZED"))
             assert "Not sized" in unknown.inner_text()
@@ -120,6 +154,8 @@ def test_buyboard_stage_details_and_stale_prices(width, tmp_path, browser_event_
             page.get_by_role("tab", name=re.compile(r"^Open ")).click()
             opened = page.locator(".mobile-kanban-card").filter(has_text=re.compile(r"^OPEN"))
             assert "NAV unavailable · $1,000.00" in opened.inner_text()
+            assert "+$100.00 (+10.00%) · stale" in opened.inner_text()
+            assert "13.64% · stale" in opened.inner_text()
             assert "10.00% NAV" not in opened.inner_text()
             assert "stale or unavailable" in page.locator("#buy-board-nav").inner_text()
             # Remaining holdings, not a requested-but-unfilled sell, determine allocation.

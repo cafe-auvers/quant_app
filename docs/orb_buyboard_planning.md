@@ -1,5 +1,11 @@
 # Buy Board ORB Planning
 
+Buy Board prices are indicative observations, labelled with their source, timestamp,
+and age. When Yahoo is delayed or a refresh fails, the last available price remains
+visible. Estimated P&L and distance to the active stop also remain visible, marked
+`stale` until a later quote replaces them through the normal minute refresh.
+These display estimates do not satisfy automatic entry freshness requirements.
+
 The Buy Board is the only operator-facing ORB planning surface. The former
 Watchlist tab, its AI analysis, snapshots, bulk scoring table, and embedded ORB
 matrix are not part of the active UI. Watchlist membership itself remains a

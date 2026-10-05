@@ -169,7 +169,14 @@ def test_worker_caches_daily_inputs_and_adds_new_stocks_next_cycle():
     assert provider.calls[-2:] == [(["AAA", "BBB"], "1m"), (["BBB"], "1d")]
     provider.failed = True
     monitor.refresh_once()
-    assert monitor.snapshot()["rows"][0]["quote_status"] == "STALE"
+    stale = monitor.snapshot()["rows"][0]
+    assert stale["quote_status"] == "STALE"
+    assert stale["current_price"] == 103
+    assert stale["quote_as_of"] == moment().isoformat()
+    assert stale["broke_out_today"] is None
+    provider.failed = False
+    monitor.refresh_once()
+    assert monitor.snapshot()["rows"][0]["quote_status"] == "CURRENT"
 
 
 def test_snapshot_reads_never_download_or_start_multiple_workers():
