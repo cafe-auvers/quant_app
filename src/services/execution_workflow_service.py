@@ -539,12 +539,13 @@ def _is_breakout_plan_command(command) -> bool:
     return isinstance(command, (types.SetBreakoutPrice, types.ClearBreakoutPrice))
 
 
-def _closed_card_cycle_blockers(card) -> tuple[str, ...]:
+def _closed_card_cycle_blockers(card, *, reservation_retired: bool = False) -> tuple[str, ...]:
     """Return unresolved state that prevents a CLOSED card from being reused.
 
     CLOSED is the durable end of one trade cycle, not a permanent tombstone
     for the symbol. An explicit Buy Today, Buylist, or breakout-price request
-    may start a fresh cycle, but only when the aggregate is broker-flat and no unresolved
+    may start a fresh cycle, but only when the aggregate is broker-flat and no
+    unresolved
     order/stop/exit operation remains.  Historical price, stop, correlation,
     and terminal-order evidence intentionally is not a blocker; the restart
     mutation retires those completed-cycle fields.
@@ -590,9 +591,31 @@ def _closed_card_cycle_blockers(card) -> tuple[str, ...]:
         or card.exit_cancel_command_id
     ):
         blockers.append("exit reconciliation is not terminal")
-    if card.capital_reservation_id:
+    if card.capital_reservation_id and not reservation_retired:
         blockers.append("capital remains reserved")
     return tuple(blockers)
+
+
+def _closed_card_reservation_is_retired(engine, card) -> bool:
+    """Verify a completed reservation before retiring its old card reference."""
+    if not card.capital_reservation_id:
+        return False
+    from src.core.capital_reservation import CapitalReservationStatus
+    from src.services.capital_reservation_repository import fetch_reservation
+
+    reservation = fetch_reservation(engine, card.capital_reservation_id)
+    return bool(
+        reservation is not None
+        and (reservation.environment, reservation.account_no, reservation.symbol)
+        == (card.environment, card.account_no, card.symbol)
+        and reservation.status in {
+            CapitalReservationStatus.CONSUMED,
+            CapitalReservationStatus.RELEASED,
+            CapitalReservationStatus.EXPIRED,
+        }
+        and reservation.remaining_reserved_notional == 0
+        and reservation.remaining_projected_open_risk == 0
+    )
 
 
 def _require_breakout_plan_mutation_policy(command, card, context) -> None:
@@ -903,7 +926,17 @@ def _require_board_action_not_conflicted(engine, command, card) -> List[Executio
     if card.board_status == BoardStatus.CLOSED and isinstance(
         command, (types.SetBreakoutPrice, types.MoveToBuylist, types.ActivateForToday)
     ):
-        blockers = _closed_card_cycle_blockers(card)
+        from src.services.capital_reservation_repository import list_active_reservations
+
+        if any(row.symbol == card.symbol for row in list_active_reservations(
+            engine, environment=card.environment, account_no=card.account_no
+        )):
+            raise BoardCommandRejectedError(
+                "Cannot start a new trade cycle from CLOSED while capital remains reserved"
+            )
+        blockers = _closed_card_cycle_blockers(
+            card, reservation_retired=_closed_card_reservation_is_retired(engine, card)
+        )
         if blockers:
             raise BoardCommandRejectedError(
                 "Cannot start a new breakout plan from CLOSED while "

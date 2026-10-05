@@ -285,3 +285,11 @@ state, pending stop changes, reserved capital, active owned/external orders and
 unresolved broker commands. These checks run again before the canonical update.
 Closed remains outside the ordinary drag graph; only a validated new-cycle
 command can reopen it.
+
+A Closed card can retain a historical reservation ID. The new-cycle check reads
+the canonical reservation ledger and retires that reference only when its
+environment/account/symbol match, its status is Consumed/Released/Expired and
+both remaining reserved money and projected risk are zero. Missing, mismatched,
+active or inconsistent reservations still block; an active reservation for the
+symbol also blocks even if its card reference is missing. No reservation is
+released by a re-entry request.

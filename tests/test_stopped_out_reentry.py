@@ -6,6 +6,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.pool import NullPool
 
 from src.core.board_workflow import ActivateForToday, BoardActionContext, MoveToBuylist
+from src.core.capital_reservation import CapitalReservation, CapitalReservationStatus
 from src.core.execution_order_record import BrokerIdentityStatus, ExecutionOrderRecord, ExecutionOrderStatus
 from src.core.order_state import OrderIntent, OrderSide
 from src.core.trade_card_state import BoardStatus, EntryRuntimeStatus, PositionRuntimeStatus, TradeCardState
@@ -14,6 +15,7 @@ from src.services.execution_command_repository import ExecutionCommand, record_c
 from src.services.execution_order_repository import record_execution_order, list_execution_orders_for_card
 from src.services.execution_workflow_service import BoardCommandRejectedError, request_board_action
 from src.services.position_manager import PositionManager
+from src.services.capital_reservation_repository import save_reservation_strict
 
 
 @pytest.fixture
@@ -129,4 +131,43 @@ def test_multiple_stopped_out_cycles_need_a_new_explicit_activation_each_time(en
 def test_reentry_requires_a_breakout_price(engine, price):
     card = closed_card(engine, breakout_price=price)
     with pytest.raises(BoardCommandRejectedError, match="breakout price"):
+        request_board_action(engine, command(card), context=BoardActionContext())
+
+
+@pytest.mark.parametrize("status", [CapitalReservationStatus.CONSUMED,
+    CapitalReservationStatus.RELEASED, CapitalReservationStatus.EXPIRED])
+def test_closed_card_can_retire_a_verified_terminal_reservation_reference(engine, status):
+    reservation = CapitalReservation(reservation_id="completed", environment="PROD",
+        account_no="test", symbol="TEST", attempt_group_id="old-entry", requested_notional=100,
+        remaining_reserved_notional=0, remaining_projected_open_risk=0, status=status)
+    save_reservation_strict(engine, reservation)
+    card = closed_card(engine, capital_reservation_id=reservation.reservation_id)
+    updated = request_board_action(engine, command(card), context=BoardActionContext()).card
+    assert updated.board_status == BoardStatus.BUY_TODAY
+    assert updated.capital_reservation_id == ""
+
+
+@pytest.mark.parametrize("values", [
+    {"remaining_reserved_notional": 1}, {"remaining_projected_open_risk": 1},
+    {"account_no": "another"}, {"symbol": "OTHER"},
+    {"status": CapitalReservationStatus.RESERVED},
+    {"status": CapitalReservationStatus.PARTIALLY_CONSUMED},
+])
+def test_reentry_cannot_ignore_an_active_inconsistent_or_wrong_scope_reservation(engine, values):
+    fields = dict(reservation_id="unsafe", environment="PROD", account_no="test", symbol="TEST",
+        attempt_group_id="old-entry", requested_notional=100, remaining_reserved_notional=0,
+        remaining_projected_open_risk=0, status=CapitalReservationStatus.RELEASED)
+    fields.update(values)
+    save_reservation_strict(engine, CapitalReservation(**fields))
+    card = closed_card(engine, capital_reservation_id="unsafe")
+    with pytest.raises(BoardCommandRejectedError, match="capital remains reserved"):
+        request_board_action(engine, command(card), context=BoardActionContext())
+
+
+def test_reentry_blocks_active_symbol_reservation_even_without_a_card_reference(engine):
+    save_reservation_strict(engine, CapitalReservation(reservation_id="unlinked", environment="PROD",
+        account_no="test", symbol="TEST", attempt_group_id="old-entry", requested_notional=100,
+        remaining_reserved_notional=100))
+    card = closed_card(engine)
+    with pytest.raises(BoardCommandRejectedError, match="capital remains reserved"):
         request_board_action(engine, command(card), context=BoardActionContext())
