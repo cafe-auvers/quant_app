@@ -1,5 +1,11 @@
 # Stock-management tunable-variable audit
 
+> Deployment update (2026-10-05): shared coordination now uses private Supabase
+> PostgreSQL; TiDB is not required. Recorded code/default-value audit rows below
+> do not expose or replace workstation-specific active configuration. Preserve
+> private runtime overrides and exact-release gates. See
+> [Deployed setup](../deployed_setup.md) for current hosts, roles, and backups.
+
 > Post-audit resolution (2026-08-29): the active entry path is now the
 > confirmed-breakout passive-pullback state machine in
 > [Current Order Logic](../current_order_logic.md). References below to a

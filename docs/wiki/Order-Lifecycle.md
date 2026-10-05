@@ -116,3 +116,6 @@ Liquidation is not blocked by entry risk rules. Outside the U.S. regular
 session, eligible manual production partial/full exits use the persisted KIS
 market-on-open reservation policy. Broker acceptance still requires later
 reconciliation.
+
+For current host, shared-store, and backup prerequisites, see
+[Supabase Deployment](Supabase-Deployment).

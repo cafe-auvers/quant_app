@@ -45,3 +45,6 @@ the repository KIS capability matrix and Gate 2 checklist.
 
 See [Current Order Logic](https://github.com/cafe-auvers/quant_app/blob/master/docs/current_order_logic.md)
 for the complete entry and replacement sequence.
+
+For current host, shared-store, and backup prerequisites, see
+[Supabase Deployment](Supabase-Deployment).

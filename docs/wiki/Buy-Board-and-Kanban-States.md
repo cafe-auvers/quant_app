@@ -31,6 +31,11 @@ stateDiagram-v2
 
 ## Drag and command behavior
 
+The deployed canonical card state is in Supabase's private PostgreSQL schema. Mobile Buylist
+removal waits for authoritative confirmation instead of optimistically hiding the row;
+failures and revision conflicts remain visible. It is not a broker order or cancellation.
+See [Supabase Deployment](Supabase-Deployment).
+
 A drag carries the card revision and interaction fingerprint. The UI marks that
 card pending immediately, queues database work outside the UI thread, and then
 reloads canonical projections. A stale fingerprint or revision is rejected.
@@ -62,3 +67,47 @@ upgrade and moves broker-confirmed quantity to Open Position.
 
 See [Current Order Logic](https://github.com/cafe-auvers/quant_app/blob/master/docs/current_order_logic.md).
 See also [Web/PWA Operator Synchronization](https://github.com/cafe-auvers/quant_app/blob/master/docs/web_operator_sync.md).
+
+
+## Mobile stage details
+
+Stage headers count stocks and total target/held shares; unsized plans are
+identified. Cards and detail sheets show the same stage facts:
+
+| Stage | Details |
+| --- | --- |
+| Today | Target shares, ORB window, breakout/trigger, entry price, planned stop/risk and block/retry reason |
+| Entry | Entry plan, held/target shares and average fill |
+| Open | Held/sellable shares, average entry, active/pending stop and stop shares, estimated P&L and distance to stop |
+| Partial | Position details, requested sell and working remaining shares |
+| Sell All | Position details, working remaining shares, submit/cancel state and exit/retry reason |
+
+Prices reuse existing Monitor or PC observations. The source, KST timestamp,
+age and stale status are visible. Yahoo prices are indicative, not execution
+permission. Estimated P&L and distance to stop require a dated observation
+within the display freshness threshold; actual KIS execution gates are unchanged.
+
+
+## Current-session ORB and feed feedback
+
+The mobile Buylist now displays the current-session Buy Today rejection after
+the PC returns an invalid plan to Buylist; prior-session history remains hidden.
+Web and PC 3a7c14fe (PR #141) are deployed. The approved PC executor was
+verified ACTIVE and reconciled at 03:20–03:21 KST on 2026-10-06. Manual arming
+from the PC at 03:23:46 KST was verified enabled/effective at 03:25:32 KST
+for this exact release and the 2026-10-05 NYSE session (revision 48).
+
+The activated PC release 3a7c14fe uses the highest legal BUY tick at or below raw
+ORH for automatic limits. The raw high remains the confirmation threshold;
+manual prices are never silently rounded, and a collapsed passive zone still
+fails. ODD's actual cached 30m range (19.705/19.09) replays to a legal 19.70
+limit and valid sizing, while its 1m/5m plans remain risk-invalid. The operator
+approved this exact release and the supervised restart; the planner now runs
+on the PC. The diagnostic did not re-add ODD to Buy Today or place an order.
+
+Initial missing queue data waits for the PC calculation. A Fresh KIS block means
+the execution feed gate failed: disconnected/awaiting channels, missing or stale
+trade/quote, invalid timestamp/ask, or excessive evaluation lag. The combined
+fix preserves fresh observations and identifies the failed gate. It keeps the
+3-second trade/quote policy and 1-second queue budget; quiet symbols may still
+block tomorrow. An indicative Monitor price never authorizes an order.

@@ -1,5 +1,11 @@
 # Quant App Wiki
 
+**Current deployment, verified 2026-10-05:** the PC runs execution and the mobile web
+service. Supabase PostgreSQL holds shared trading state; PC MySQL holds historical prices.
+The laptop can be off. TiDB is a retained migration archive, not a dependency or fallback.
+Start with [Supabase Deployment](Supabase-Deployment) for the current access, configuration,
+backup, and readiness checklist.
+
 Quant App is a Windows/PyQt5 desktop dashboard with a companion authenticated
 web/PWA operator surface for U.S. swing-trading research, planning,
 market-data review, KIS account visibility, and guarded order execution.

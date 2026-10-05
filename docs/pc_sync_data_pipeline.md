@@ -1,8 +1,11 @@
 # Two-PC Data Sync: Always-On PC as the Data Server
 
-Status: **built and verified working end-to-end**, including a real
-BIOS-wake → auto-login → morning-routine → auto-shutdown cycle, and remote
-access confirmed from a mobile hotspot (genuinely off the home network).
+Status: **Supabase coordination cutover verified on 2026-10-05**. The current
+PC hosts historical MySQL, the trading executor, and the supervised mobile web
+service. Keep it on and signed in; the laptop is optional. The old automatic
+10:00 shutdown is disabled, along with AC sleep/hibernation. Earlier physical
+wake/handoff validation is retained below as optional historical automation.
+See [Deployed setup](deployed_setup.md).
 
 > **Placeholders used in this doc** (real values live only in each machine's
 > local runtime/OS config, never in git): `<LAPTOP-HOSTNAME>`, `<PC-HOSTNAME>`
@@ -19,7 +22,7 @@ access confirmed from a mobile hotspot (genuinely off the home network).
   keeps an offline SQLite market-data mirror in `data/local_mirror.db` for the
   periods when the PC cannot be reached.
 - **Always-on PC** (`<PC-HOSTNAME>`) — never used for development. Two
-  jobs only:
+  primary data jobs, plus the executor and mobile web service:
   1. Host the single shared MySQL database (`quant_app`) that both machines
      read from.
   2. Run `historical.py` on a schedule to keep that database's price
@@ -27,7 +30,7 @@ access confirmed from a mobile hotspot (genuinely off the home network).
 
 There are two deliberately separate database roles. PC MySQL is the canonical
 historical-data source. When `COORD_DB_*` is configured, the small canonical
-execution-coordination store lives in TiDB Cloud; without it, PC MySQL remains
+execution-coordination store uses the selected backend: Supabase PostgreSQL in the current deployment; without it, PC MySQL remains
 the legacy coordination fallback. The laptop's SQLite file is an offline
 market-data mirror rather than a peer authority. Normal historical
 synchronization is PC to laptop, and laptop market data is never promoted back
@@ -59,11 +62,14 @@ exact handoff and publishing rules, and
 [Current Order Logic](current_order_logic.md) for Buy Today submission,
 Entry Pending, and ORB replacement behavior.
 
-These execution roles do not move storage roles. With TiDB coordination
-configured on both devices, powering off the PC removes only the historical
-source: the laptop mirror continues display while TiDB remains the writable execution
-authority. If TiDB is not configured, the legacy PC-hosted coordination path
-still closes new entries and operator commands until PC MySQL returns.
+These execution roles do not move storage roles. Supabase remains the shared
+authority independently of PC MySQL. With a deliberately handed-off, ready
+laptop executor, its market mirror can support the separate market-data route.
+In the current PC-owner deployment, powering off the PC stops both execution
+and the mobile web service; the laptop being off does not. Direct PC/laptop
+access uses LAN/Tailscale and the authenticated listener/WinRM, never TiDB.
+A configured Supabase outage fails closed instead of returning to TiDB or
+private coordination snapshots.
 
 ### Connected web/PWA state propagation
 
@@ -138,9 +144,10 @@ flowchart LR
                    (1y), not just "yesterday"
                 5. launches main.py so the dashboard is visible if you check in
                 6. launches pc_remote_control_listener.py for remote shutdown
-10:00 KST  "Automatic-PC-Shutdown" waits for any live historical refresh,
-           then shuts the PC down; after its configured wait limit it exits
-           safely without killing a partial refresh
+09:15 KST  "QuantApp_CoordinationBackup" saves a verified PostgreSQL export
+           under data/coordination_backups/ (all 20 shared tables)
+10:00 KST  Old "Automatic-PC-Shutdown" task: DISABLED in the current
+           always-on executor/web deployment
 ```
 
 Note: the `AtLogOn` trigger fires on *any* logon, not only the scheduled
@@ -148,15 +155,9 @@ Note: the `AtLogOn` trigger fires on *any* logon, not only the scheduled
 morning routine as a side effect. Harmless (the freshness check behaves the
 same regardless of when it runs), just worth knowing.
 
-Live trading/monitoring was originally out of scope for this machine, since
-it used to be off for the entire US trading session. **This changed** with
-the automatic laptop↔PC handoff feature below -- the PC now also sleeps
-(S3) instead of fully powering off, and wakes for the market session too, so
-it can actually take over monitoring/trading when the laptop shuts down. See
-"Automatic laptop↔PC trading handoff" further down for the full picture; the
-original 08:00-10:00 KST BIOS-driven window described above is kept as the
-data-refresh leg of one continuous overnight-into-morning awake span, not
-replaced.
+The PC now stays awake for normal execution and mobile access. The historical
+sleep/wake and laptop-handoff procedures below are optional alternative modes;
+do not re-enable their shutdown/sleep tasks as part of normal Supabase setup.
 
 ## What's built
 
@@ -348,7 +349,7 @@ non-secret overrides; `.env.pc` is only an initial credential setup copy.
 
 - **The laptop's `main.py` doesn't crash.** It falls back to
   `data/local_mirror.db`. Scanner and chart cache reads continue from the
-  mirror. TiDB-backed state synchronization and runtime coordination remain
+  mirror. Supabase-backed state synchronization and runtime coordination remain
   available; the legacy PC-hosted coordination path is disabled until MySQL
   returns.
 - **Staleness is explicit.** If the mirror is current through the latest
@@ -416,7 +417,12 @@ to force an immediate mirror top-up and print per-table row counts and
 watermarks. The local database and its WAL/SHM sidecars are runtime data and
 must not be committed.
 
-## Automatic laptop↔PC trading handoff
+## Optional laptop↔PC trading handoff
+
+The deployed PC stays on and is already the Execution Owner. This alternative
+procedure is not required for mobile access or for trading with the laptop
+off. Keep current always-on power settings unless intentionally changing the
+operating model through the guarded handoff workflow.
 
 > **Status: implemented and unit-tested, but never run against
 > a real PC, real S3 sleep/wake cycle, or real KIS credentials.** Follow the
@@ -591,7 +597,7 @@ the wake time itself is harmless idle time either way.
   in KIS until coordination recovers.
 - The dashboard remote-shutdown button refuses to power off the PC during live
   trading only when that PC MySQL instance is still the selected legacy
-  coordination authority. With TiDB coordination online, PC shutdown affects
+  coordination authority. With Supabase coordination online, PC shutdown affects
   historical-data freshness but not ordinary execution authority.
 - `orders.json`/`event_journal.jsonl` stay local-only per device. Broker-truth
   discovery makes this a completeness gap for the PC's own order-history

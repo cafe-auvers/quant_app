@@ -5,7 +5,7 @@
 ```powershell
 python -m pip check
 python -m compileall main.py src gate1 scripts tests -q
-pytest -q
+pytest tests -q
 python scripts/run_gate1.py --output artifacts/gate1_report.json
 ```
 
@@ -45,6 +45,16 @@ python scripts/benchmark_performance.py --sidebar-rows 6000 --db-symbols 2000 --
 
 ## Test boundaries
 
+Normal database/migration regressions use isolated fixtures: `pytest
+tests/test_coordination_store_migration.py -q`. The opt-in
+`tests/test_postgresql_coordination_integration.py` suite uses private
+`QUANT_POSTGRES_TEST_CONFIG` and `QUANT_POSTGRES_TEST_PASSWORD` values and creates
+disposable QA schemas/roles. Run it only against an explicitly authorized test connection
+with provisioning privileges; never point the test schema at production `quant_coordination`
+or print credentials. The 2026-10-05 migration release passed 3,283 supported tests (10
+opt-in skips), 7 cloud PostgreSQL tests, and all five exact-commit CI checks. These are
+dated release results, not evidence for subsequent code changes.
+
 Normal tests must not require a developer MySQL instance, KIS credentials, a
 live broker, or Internet access. Use in-memory SQLite, temporary paths, fakes,
 and recorded redacted protocol fixtures. A test named for broker behavior is
@@ -59,3 +69,6 @@ checks and `Gate 1 deterministic simulation`.
 
 Do not delete, suppress, or weaken a test to obtain a green result. Trading
 behavior changes need characterization and boundary tests.
+
+For current host, shared-store, and backup prerequisites, see
+[Supabase Deployment](Supabase-Deployment).

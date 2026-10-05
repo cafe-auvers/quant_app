@@ -20,13 +20,20 @@ flowchart LR
     Buylist --> Board[Buy Board]
     KIS[KIS account and order APIs] --> Reconcile[Broker reconciliation]
     Board --> Gateway[Guarded execution gateway]
-    Web[Phone / PWA] -->|allowlisted intent| Board
+    Web[Phone / PWA] -->|private Tailscale HTTPS| WebHost[PC web service]
+    WebHost -->|allowlisted intent| Shared[(Supabase private coordination)]
+    Board <-->|canonical state / commands| Shared
     Gateway --> KIS
     Reconcile --> Board
     Cache --> Mirror[(Laptop SQLite mirror)]
 ```
 
 ## Implemented
+
+The deployed shared store is private Supabase PostgreSQL, verified on 2026-10-05. The
+always-on PC hosts both the guarded executor and supervised mobile web service; the optional
+laptop is not needed for their operation. PC/laptop direct access and pulses use
+LAN/Tailscale. TiDB is not required. See [Supabase Deployment](Supabase-Deployment).
 
 - Daily/hourly/intraday cache and scanner workflows.
 - TradingView Lightweight Charts with drawings, ORB markers, fundamentals,

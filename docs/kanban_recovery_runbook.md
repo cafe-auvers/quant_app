@@ -1,5 +1,12 @@
 # Kanban recovery runbook
 
+The deployed canonical operational store is Supabase PostgreSQL, private schema
+`quant_coordination`. Restore that configured connection and verify current canonical/broker
+state; do not switch to the stale former TiDB source or a private SQLite file. Daily
+verified PostgreSQL exports and the stopped-writer migration export have different recovery
+roles. See [Supabase migration and recovery](supabase_coordination_migration.md) and
+[Deployed setup](deployed_setup.md).
+
 The recovery snapshot is an explicit safe state, not a silent execution
 fallback. If the Kanban operational store cannot be opened, the app keeps the
 last known cards and fresh KIS holdings, orderable quantities, and prices

@@ -1,5 +1,27 @@
 # Troubleshooting
 
+## Mobile board sync fails or returns 502
+
+The current mobile API and executor are both on the PC. Confirm the PC is awake and signed
+in, phone Tailscale is connected, and `QuantApp_WebDashboard` is running. Check the loopback
+web server on port 8080, Tailscale Serve, and `data/logs/web_service.log`. A cached page can
+remain visible after the upstream web server stops. The laptop being off is not a
+dependency.
+
+If login works but canonical board reads fail, check the configured Supabase PostgreSQL
+backend, Session-pooler host/port, verified CA, restricted role, and PC readiness. Check
+that the web deployment and PC use the same store/account/environment. Do not restore the
+stale TiDB source, buy more TiDB quota for this app, or bypass database/readiness checks.
+See [Supabase Deployment](Supabase-Deployment).
+
+## Remove from Buylist stays pending or returns
+
+Wait for the authoritative response. The mobile row stays visible until removal is
+confirmed; a failure displays its reason. A revision conflict must reload current canonical
+state. A flat legacy planning stop is not a working stop order, while actual orders,
+positions, unresolved exposure, and protection still block unsafe removal. Do not
+repeat-click or delete local JSON to force a move.
+
 ## App opens without database data
 
 - Check Health, MySQL credentials in `.env`, and MySQL connection settings in `config/runtime.local.json`.

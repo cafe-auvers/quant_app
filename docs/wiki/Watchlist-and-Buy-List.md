@@ -19,6 +19,20 @@ not interchangeable with local planning labels.
 
 ## Safe movement
 
+A saved positive breakout price is required before Watchlist promotion. On
+mobile, tap **Buylist** or **Buy Today** to enter a missing price in the editor.
+The browser waits for the canonical price save and uses its returned revision
+for promotion. **Buy Today** then asks for explicit activation confirmation
+when Operator Control permits it; otherwise it creates a non-executable draft.
+Canceling the editor or a rejected save prevents activation. Saving, success,
+and error messages remain visible beneath the list buttons on mobile and web.
+
+Mobile Buylist removal was verified after the Supabase cutover. Its row remains visible
+while pending and disappears only after canonical confirmation. Errors are visible, stale
+revisions are rejected, and delayed polls cannot resurrect a confirmed removal. This passive
+operation never authorizes a broker order; existing positions/orders/protection remain
+guarded.
+
 - Watchlist to Buylist is a versioned planning action.
 - Watchlist membership is independent of Buylist membership and execution
   evidence. **Remove from Watchlist** (or `W`) may clear the passive Watchlist
@@ -37,3 +51,6 @@ not interchangeable with local planning labels.
   desktop pulses update the other running surfaces without a manual refresh.
 
 See [Buy Board and Kanban States](Buy-Board-and-Kanban-States).
+
+For current host, shared-store, and backup prerequisites, see
+[Supabase Deployment](Supabase-Deployment).

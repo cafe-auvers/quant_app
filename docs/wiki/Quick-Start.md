@@ -1,5 +1,13 @@
 # Quick Start
 
+## Existing PC/mobile installation
+
+Use [Supabase Deployment](Supabase-Deployment) for the current system. Keep the PC on,
+awake, and signed in; connect phone Tailscale and open the same private PC HTTPS origin. The
+laptop can be off and TiDB is not required. Verify the current approved release/session and
+runtime readiness before trading. The steps below describe a safe fresh development start,
+not resetting an already armed executor.
+
 ## Safe local start
 
 1. Use Python 3.11 or 3.12 on Windows.

@@ -1,13 +1,19 @@
 # Localhost Web Dashboard Plan
 
-Status: **READY FOR USER ACCEPTANCE; PHYSICAL/OPTIONAL EXTERNAL CHECKS PENDING**
+**Deployed update — 2026-10-05:** private Supabase coordination is active and verified;
+PC-hosted mobile access, shared settings, passive removal, readiness, and daily backups
+passed cutover checks. TiDB is no longer required. The 2026-10-02 branch/test evidence below
+is historical; physical-phone gestures and optional public Supabase web integrations remain
+separate acceptance work. See [Deployed setup](deployed_setup.md).
+
+Historical 2026-10-02 validation status: **LOCAL WEB READY; PHYSICAL/OPTIONAL WEB FEATURE CHECKS PENDING**
 
 Validated implementation: `c882a22dc3417a3c034f74e33a32c062a01d1c14` on 2026-10-02
 
-Single integration branch: `codex/mobile-operator-control`
+Historical integration branch: `codex/mobile-operator-control` (now merged)
 
 The former `codex/localhost-web` branch is fully contained in the integration
-branch and is retained only as Git history. Current evidence is consolidated in
+branch and is retained only as Git history. That dated evidence is consolidated in
 [web_final_validation.md](web_final_validation.md).
 
 ## Priority and scope
@@ -90,11 +96,11 @@ remain Python-side and are not copied into browser code.
 
 - Read-only real market/scanner data comes from the explicitly configured PC
   SQLite mirror. Canonical Watchlist/Buylist/Buy Today/breakout state is read
-  from TiDB with authenticated invalidation/change-pulse updates, a bounded
+  from the configured Supabase PostgreSQL store with authenticated invalidation/change-pulse updates, a bounded
   revision fallback, and no schema bootstrap.
 - Non-executable Buy Today drafts remain available when guarded operator
   operations are not enabled.
-- Canonical TiDB planning writes default off. This workstation's local config
+- Canonical shared planning writes default off. This workstation's local config
   explicitly enables only Watchlist add/remove, Watchlist/Buylist movement,
   and breakout Set/Clear through existing typed services with authenticated
   actor, account/environment, command ID, expected revision, lifecycle checks,

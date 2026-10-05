@@ -1,5 +1,13 @@
 # Shared coordination store migration
 
+**Completed deployment: 2026-10-05.** PC desktop, laptop configuration, and the PC-hosted
+web deployment now select the same private Supabase PostgreSQL store. All 20 source tables
+were copied and verified before runtime writes; mobile settings, passive Buylist removal,
+fresh PC readiness, and post-activation backup were checked. The user manually armed the
+approved current session. TiDB is now an optional stale archive, with no ongoing app calls
+or fallback. See [Deployed setup](deployed_setup.md). The repeatable procedure below remains
+the migration/recovery runbook, not unfinished setup.
+
 Desktop execution and the PC-hosted mobile web app must use the same canonical
 store. `COORD_DB_BACKEND=postgresql` selects PostgreSQL; the default `mysql`
 retains existing TiDB deployments. Historical market data remains in PC MySQL.
@@ -86,13 +94,16 @@ existing freshness requirements.
 Once every writer has moved, the app makes no ongoing TiDB coordination calls.
 Monitor Supabase database size and egress in its dashboard. Keep dated verified
 coordination exports on the PC and an encrypted off-PC backup; the Free plan
-does not provide managed automatic database backups. Credentials and trade
-records must remain private.
+requires independent exports/off-site backup planning rather than relying on
+paid-plan daily backup access; see
+[Supabase backup documentation](https://supabase.com/docs/guides/platform/backups).
+Credentials and trade records must remain private.
 
 `python scripts/backup_coordination_store.py` writes a dated, checksummed backup
 under the gitignored `data/coordination_backups` folder using a repeatable-read
-transaction. Schedule it once daily on the PC after cutover. It refuses the
-MySQL backend to avoid automatic TiDB usage. A recovery backup taken while
+transaction. The deployed `QuantApp_CoordinationBackup` task runs daily at
+09:15 KST on the PC. It refuses the MySQL backend to avoid automatic TiDB usage.
+A recovery backup taken while
 writers are active must not be substituted for the stopped-writer cutover
 export. Retention and encrypted off-PC replication are operator policies;
 the script does not delete older backups.

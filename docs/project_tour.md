@@ -21,9 +21,15 @@ uses broker evidence to decide what actually happened.
 
 ## Why there are two computers
 
+In the deployment verified on 2026-10-05, the PC also runs execution and the mobile web
+server. It must stay on and signed in; the laptop can be off. Direct PC/laptop access uses
+Tailscale/LAN and PC-local MySQL for prices. Supabase holds shared state. TiDB is no longer
+required. The mobile website keeps the same private PC HTTPS address. See [Deployed
+setup](deployed_setup.md).
+
 - The **PC** normally stores and refreshes the large market-history database.
 - The **laptop** keeps a pull-only market-data safety mirror.
-- Both connect to one small shared coordination database for plans, controls,
+- Both connect to Supabase PostgreSQL, the small shared coordination database for plans, controls,
   cards, commands, orders, and runtime readiness.
 - Exactly one running process is the **Execution Owner**. Only it may cross the
   broker boundary.
@@ -39,7 +45,7 @@ steady heartbeat is every 240 seconds and stays fresh for 300 seconds.
 
 There are two layers:
 
-1. Each machine has a private `TRADING_ENABLED` lock in its `.env`. False means
+1. Each machine has a private `TRADING_ENABLED` lock in `config/runtime.local.json`. False means
    that machine is always locked off.
 2. The shared database holds the durable Live Trading ON/OFF switch seen by
    both machines that are locally permitted.
@@ -161,7 +167,7 @@ If one required check is missing, the correct outcome is no order.
 - [Current Order Logic](current_order_logic.md)
 - [Leadership and Market Context](market_alignment.md)
 - [Supervised Controlled-Live Pilot](controlled_live_pilot_runbook.md)
-- [TiDB Cloud Coordination Store](tidb_coordination_store.md)
+- [Supabase coordination migration and recovery](supabase_coordination_migration.md)
 - [Database Architecture](database_architecture.md)
 - [Web/PWA Operator Synchronization](web_operator_sync.md)
 - [Main README](../README.md)

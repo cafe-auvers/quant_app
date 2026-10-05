@@ -1,12 +1,18 @@
 # Localhost Web Dashboard User Setup
 
+**Current deployment, verified 2026-10-05:** the always-on PC hosts the web service and
+executor; private Supabase PostgreSQL holds shared boards, settings, and commands. TiDB and
+an awake laptop are not required. Use the existing private PC HTTPS origin; the local
+login/drawings were preserved. See [Deployed setup](deployed_setup.md).
+
 The local SANDBOX workflow is the first acceptance target. Supabase, public
 hosting, Docker, and a domain are not required.
 
-The current validated implementation and 20-30 minute acceptance checklist are
-in [web_final_validation.md](web_final_validation.md). Use
-`codex/mobile-operator-control`; do not continue feature work independently on
-the already-contained `codex/localhost-web` branch.
+The earlier 2026-10-02 implementation and 20-30 minute acceptance checklist
+remain in [web_final_validation.md](web_final_validation.md). For new work, use
+an isolated branch from current `master`; the former web integration branches
+are merged history. Keep the active trading/web checkouts pinned to their
+reviewed exact release during development.
 
 ## Local workstation
 
@@ -94,7 +100,7 @@ server re-verifies the current shared Operator Control owner at request time.
 An empty `canonical_account_no` is accepted only when exactly one production
 account exists. The server reads the PC mirror with SQLite read-only mode and
 loads only the PC repository's `COORD_DB_*` credentials into a dedicated
-SELECT-only TiDB adapter. It never copies those credentials to the browser or
+SELECT-only configured coordination adapter (Supabase PostgreSQL in the deployed installation). It never copies those credentials to the browser or
 the web database, and it never runs schema creation during adapter startup.
 
 In this mode the phone receives current Scanner/search/chart data and
@@ -164,7 +170,11 @@ files are reported instead of silently overwriting one another:
 - Confirm there is no ARM, order, ownership, global-risk, or
   workstation-power action.
 
-## Optional Supabase setup (later)
+## Optional Supabase web Auth/Storage/projection setup
+
+This feature is separate from the deployed private PostgreSQL coordination
+connection. Its `supabase_enabled` web flag may remain false while shared
+boards/settings/commands use Supabase SQL.
 
 After local acceptance, create a dedicated development Supabase project and:
 
@@ -228,7 +238,9 @@ phone's bookmark/home-screen app to the PC URL.
 A desktop mobile viewport is emulation, not a real iPhone test. Installing the
 PWA installation does not make the authenticated local API available offline.
 
-Tailscale Serve forwards requests to the web process on the configured host.
+In the deployed installation, Tailscale Serve and the supervised web process
+are on the always-on PC. The laptop can be off. Tailscale Serve forwards
+requests to the web process on the configured host.
 If that process stops or the host reboots without restarting it, the phone can
 keep showing the open dashboard while API requests fail with **502 Bad Gateway**.
 The trading executor running on another PC does not keep this web host alive.
@@ -254,8 +266,9 @@ requires this host to be powered on, awake, and signed in.
 
 ## Known limitations and blocked checks
 
-- Supabase Auth/RLS/Storage/Realtime and two-browser cloud synchronization are
-  unverified until a user-owned development project and credentials exist.
+- Optional Supabase web Auth/Storage/Realtime/public-projection acceptance
+  remains separate from the verified private PostgreSQL coordination cutover.
+  A successful database migration does not claim those optional checks passed.
 - Canonical CONNECTED reads and explicitly allowlisted writes are supported.
   New installations keep writes off until the account/environment, hosting-PC
   identity, Operator Control, revision recovery, and rollback behavior are

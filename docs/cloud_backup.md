@@ -1,5 +1,16 @@
 # Offsite Backup of User-State Files
 
+## Shared PostgreSQL and web backups
+
+The current Supabase deployment has a separate verified export of all 20 coordination
+tables: `python scripts/backup_coordination_store.py`. `QuantApp_CoordinationBackup` runs at
+09:15 KST and writes private dated checksummed files under `data/coordination_backups/`;
+encrypted off-PC replication is a separate operator policy. Back up web `web_state.db`
+separately to preserve logins, sessions, drawings, and drafts. Neither is covered by the
+JSON-only copy described below. A retired TiDB export is historical recovery material, not a
+current database backup. See [Deployed setup](deployed_setup.md) and [the migration/recovery
+runbook](supabase_coordination_migration.md).
+
 ## Why
 
 Most of `data/*.json` is gitignored (see `.gitignore`) -- it's runtime

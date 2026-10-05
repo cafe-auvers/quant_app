@@ -1,5 +1,11 @@
 # Kanban Production Readiness — Requirements & Invariants
 
+**Deployment chronology update — 2026-10-05:** the private Supabase coordination cutover and
+PC/mobile checks are recorded in [Deployed setup](deployed_setup.md). Older dated commits,
+test counts, gate outcomes, and blockers below remain historical evidence for their own
+scope; they are not current store configuration or a new full-session qualification. Never
+treat a readiness snapshot or documentation update as certification of a later gate.
+
 > Current implementation note (2026-08-29): this remains the detailed
 > historical requirements/evidence record. The finalized automatic entry,
 > passive-limit, higher-score ORB cancel-then-replace, rejection, fill, and EOD

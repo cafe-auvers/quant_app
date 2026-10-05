@@ -24,6 +24,14 @@ processes and support termination/recovery reporting.
 
 ## Windows PC automation
 
+Current always-on deployment: `QuantApp_StartMainOnDemand` runs the executor,
+`QuantApp_WebDashboard` supervises the web server, and the morning data routine runs at
+08:00 KST. `QuantApp_CoordinationBackup` exports all 20 PostgreSQL coordination tables at
+09:15 KST into private `data/coordination_backups/`. It verifies the snapshot and refuses a
+MySQL backend. The old `Automatic-PC-Shutdown` task and AC sleep/hibernation are disabled.
+The sleep/wake tools below are optional alternatives, not required daily steps. See
+[Supabase Deployment](Supabase-Deployment).
+
 - `pc_morning_routine.ps1`: update/environment/dependency/data routine
 - `setup_pc_morning_task.ps1`: scheduled wake/run registration
 - `Configure-MarketHoursWake.ps1`: evening market-hours wake

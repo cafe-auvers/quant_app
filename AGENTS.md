@@ -42,6 +42,13 @@ Pull requests should include a short summary, test results such as `pytest -q`, 
 
 ## Security & Configuration Tips
 
+The deployment verified on 2026-10-05 uses Supabase PostgreSQL
+(`COORD_DB_BACKEND=postgresql`) for shared coordination and local PC MySQL for historical
+data. TiDB is a retained migration source, not an active dependency or fallback. Keep
+documentation work in an isolated worktree: the armed executor is pinned to an exact
+approved Git SHA, including documentation files. See `docs/deployed_setup.md` and
+`docs/supabase_coordination_migration.md`.
+
 Keep secrets out of source control. Store credentials and private tokens only in `.env`; non-secret hosts, ports, feature flags, limits, and timing settings belong in `config/runtime.json` or the gitignored `config/runtime.local.json` override. Treat files in `data/` as local state unless intentionally adding sample data. Live symbol lists belong only in their dedicated `data/` files, never in an environment file.
 
 Application startup and the PC morning routine synchronize the credential-only `.env.example` schema, migrate recognized legacy runtime keys out of `.env` into `config/runtime.local.json`, and regenerate the gitignored credential-only `.env.pc` copy. Run `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\sync_pc_env.ps1` when an immediate manual sync is needed. Preserve credential values, preserve migrated runtime overrides, and keep generated `MYSQL_*` credentials blank in `.env.pc`; never commit `.env`, `.env.pc`, or `config/runtime.local.json`.

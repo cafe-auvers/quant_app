@@ -7,6 +7,7 @@ These files are kept for history only. The maintained project documentation is:
 - `../README.md`
 - `../PROJECT_ARCHITECTURE.md`
 - `../docs/current_order_logic.md`
+- `../docs/deployed_setup.md` (current Supabase/PC/mobile deployment)
 - `../AGENTS.md`
 - `../rulebooks/*.md`
 

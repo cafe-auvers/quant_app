@@ -5,11 +5,18 @@
 - PC MySQL: canonical market history, indicators, scanner metrics,
   fundamentals, Market Pulse, and alignment data in the two-machine setup.
 - Laptop SQLite mirror: offline, pull-only copy of supported market tables.
-- Operational/coordination SQL: small durable control, card, command, order,
-  lease, and synchronized-state records according to configuration.
+- Supabase PostgreSQL: 20 private `quant_coordination` tables for durable
+  control, cards, commands, orders, account reservation locks, daily trading
+  events, leases, alerts, and synchronized settings/state.
+- Former TiDB source: optional migration archive; no runtime authority or fallback.
 - Local JSON: shutdown-safe compatibility/planning state and local order ledger.
 
 ## Main tables
+
+The Supabase migration copied and verified every source row/ID before runtime writes.
+Runtime SQL uses verified TLS through the IPv4 Session pooler on port 5432, UTC server time,
+transactional row locks, and a restricted application role. PC-local MySQL on port 3306 is a
+separate historical-data service. See [Supabase Deployment](Supabase-Deployment).
 
 - `price_history`, `hourly_price_history`, `intraday_price_history`
 - `chart_indicators`, `scanner_metrics`, refresh manifests/failures

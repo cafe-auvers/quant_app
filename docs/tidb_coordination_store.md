@@ -1,5 +1,15 @@
 # TiDB Cloud Coordination Store
 
+**Historical configuration and RU audit — superseded for the deployed installation on
+2026-10-05.** Shared trading coordination now uses Supabase PostgreSQL. PC/laptop direct
+access uses LAN/Tailscale and PC-local MySQL for historical data; mobile runs on the PC. No
+app path requires TiDB or falls back to it. The former source was retained as a stale
+migration archive and may be retired after preserving verified recovery material. Do not
+apply the old connection/setup steps below to the current deployment. See [Deployed
+setup](deployed_setup.md) and [Supabase migration and
+recovery](supabase_coordination_migration.md). Pricing/usage observations below describe the
+former TiDB deployment at their recorded dates.
+
 ## Purpose
 
 TiDB Cloud stores only the small, safety-critical state that both trading
