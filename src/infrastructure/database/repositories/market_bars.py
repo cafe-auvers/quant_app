@@ -11,6 +11,9 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
 from src.utils.data_loader import _extract_symbol_history
+from src.core.intraday_coverage import KIS_COVERAGE_ATTR
+
+from .intraday_coverage import coverage_table, load_intraday_coverage, save_intraday_coverage
 
 from ..schema import (_ensure_hourly_price_history_table,
                       _ensure_intraday_price_history_table,
@@ -340,6 +343,12 @@ def save_intraday_history_to_db(
     if not records:
         return False
 
+    proof = history.attrs.get(KIS_COVERAGE_ATTR)
+    proof_table = None
+    if source == "kis" and isinstance(proof, dict) and proof.get("symbol") == symbol.upper():
+        proof_table = coverage_table()
+        proof_table.create(engine, checkfirst=True)
+
     with engine.begin() as conn:
         if engine.dialect.name == "mysql":
             stmt = mysql_insert(intraday_history).values(records)
@@ -360,6 +369,9 @@ def save_intraday_history_to_db(
                 index_elements=["symbol", "timestamp", "interval", "source"],
                 set_=update_cols,
             ))
+        if proof_table is not None:
+            save_intraday_coverage(conn, proof_table, symbol=symbol, interval=interval,
+                                  source=source, coverage=proof)
     return True
 
 
@@ -383,10 +395,13 @@ def load_intraday_history_from_db(
         stmt = stmt.where(intraday_history.c.timestamp >= since)
     stmt = stmt.order_by(intraday_history.c.timestamp)
 
+    proof = {}
     try:
         _ensure_intraday_price_history_table(engine)
         with engine.connect() as conn:
             df = pd.read_sql(stmt, conn)
+            if source == "kis":
+                proof = load_intraday_coverage(conn, symbol=symbol, interval=interval, source=source)
     except SQLAlchemyError:
         return pd.DataFrame()
 
@@ -395,7 +410,7 @@ def load_intraday_history_from_db(
 
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     df = df.set_index("timestamp")
-    return df.rename(
+    bars = df.rename(
         columns={
             "open": "Open",
             "high": "High",
@@ -404,6 +419,9 @@ def load_intraday_history_from_db(
             "volume": "Volume",
         }
     )[["Open", "High", "Low", "Close", "Volume"]]
+    if proof:
+        bars.attrs[KIS_COVERAGE_ATTR] = proof
+    return bars
 
 
 def prune_intraday_history(engine: Engine, keep_days: int = 7) -> int:
@@ -514,5 +532,4 @@ def load_universe_history_from_db(
         result[symbol] = symbol_df
 
     return result
-
 

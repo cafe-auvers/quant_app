@@ -115,6 +115,29 @@ def test_unavailable_candidate_status_maps_to_data_unavailable_with_reason():
     assert card.entry_block_reason == "09:30 opening bar is unavailable"
 
 
+def test_blocked_automatic_plan_explains_all_windows_without_overriding_a_manual_choice():
+    card = _card()
+    item = _queue_item(_candidate(window="1m", status=OrbCandidateStatus.NOT_AVAILABLE, valid=False,
+        reason="KIS returned no bars in the 1m opening window", source_session_date="2026-08-19"))
+    item.candidates["1m"] = item.selected_candidate
+    item.candidates["5m"] = _candidate(status=OrbCandidateStatus.NOT_AVAILABLE, valid=False,
+        reason="KIS returned no bars in the 5m opening window", source_session_date="2026-08-19")
+    item.candidates["5m"].window = "5m"
+    item.candidates["30m"] = _candidate(status=OrbCandidateStatus.REJECTED, valid=False,
+        reason="No valid passive-pullback execution zone", source_session_date="2026-08-19")
+    item.candidates["30m"].window = "30m"
+    evaluator = TradeCardOrbEvaluator(clock=lambda: datetime(2026, 8, 19, 14, 0, tzinfo=timezone.utc))
+    evaluator.update_card(card, item)
+    assert card.entry_runtime_status == EntryRuntimeStatus.DATA_UNAVAILABLE
+    assert "1m: KIS returned no bars" in card.entry_block_reason
+    assert "5m: KIS returned no bars" in card.entry_block_reason
+    assert "30m: No valid passive-pullback execution zone" in card.entry_block_reason
+    item.manual_window_lock = True
+    item.selected_window = "1m"
+    evaluator.update_card(card, item)
+    assert card.entry_block_reason == item.candidates["1m"].reason
+
+
 def test_waiting_breakout_status_maps_correctly():
     card = _card()
     item = _queue_item(_candidate(status=OrbCandidateStatus.WAITING_BREAKOUT))
