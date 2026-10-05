@@ -88,28 +88,44 @@ A legacy planning stop on a flat Buylist card is not an active stop order;
 positions, working orders, unresolved exposure, and actual protection remain
 guarded. See [operator synchronization](web_operator_sync.md).
 
-The approved trading release is
-`7ea107ece347ad41d954e8d2a533ef7d740a2f3f`. The operator approved its
-2026-10-05 deployment, and the PC reported `ACTIVE` with executor, broker
-reconciliation, market-data, ownership, and shared-state readiness passing.
-The operator manually armed the new release; the 20:56 KST check confirmed
-live execution enabled and effective for the 2026-10-05 session, with 13 Buy Today
-plans. Future release changes require fresh manual arming. Passive Gate 2/3/4
-collectors are running with no collection errors or dropped batches and recorded
-the actual `MANUAL_ARM` event.
-This is a dated readiness snapshot, not proof of subsequent fills, a future
-session, or new qualification of Gates 2–5. Always recheck current readiness,
-the current session/release, plans, and risk/capital gates before trading.
+The approved PC trading release is
+`c106449c46accc6f249280bea372242bb816f8d5` (PR #137). The operator approved
+its supervised 2026-10-05 restart and manually armed the new release after
+broker reconciliation. Verification at 00:27 KST on 2026-10-06 confirmed
+`ACTIVE`, executor/broker/feed/ownership/shared-state readiness, and live
+execution enabled and effective for the 2026-10-05 NYSE session.
+Future executor release changes require fresh exact-release review and manual
+arming. This is a dated snapshot, not proof of future sessions or fills.
 
-The separate web service runs `784741039f86b2bd1ca6e5a3595b5c21d15e3f97`,
-which adds a single far-right minute countdown on the same status row:
-`Open in Xm` before market open and `Close in Xm` during trading. It includes the mobile list-action fix from
-PR #134. This web update preserved the armed PC executor and its configuration.
-Passive diagnostics collect feed health, isolated
-shadow decisions, and actual runtime execution events alongside live trading.
-Reports explicitly say `NOT_CERTIFIED`; full-session fault probes, complete
-branch/fence replay, reviewed gate chains, and Gate 4's three supervised dates
-remain required for formal closure. See [live-session checks](live_session_checks.md).
+This release fixes the canonical capital-reservation reader used by portfolio
+risk checks. A missing optional reader engine previously hid the existing
+SVIA reservation and correctly blocked subsequent BUYs as unreconciled risk.
+The worker now uses its canonical engine by default, and rejected attempts
+retain the reason for operator visibility. Risk and broker guards are retained.
+
+The separate web service runs `08aed225c5eb1223b6148f9b19a483732567f7b0`
+(PR #138). Its far-right header stays on one row and shows `Open in Xm`
+before opening and `Close in Xm` during trading. Mobile Cancel Sell All can
+withdraw an unsubmitted regular-session or premarket exit to Open Position,
+preserving the holding and stop and clearing retired retry state. SELL
+identities, reserved shares, working/ambiguous orders and unresolved
+cancellation block withdrawal. This is a canonical intent edit, with no broker
+submit or cancel. The 2026-10-06 web-only update preserved the running PC
+processes, approved executor source, live switch, credentials and configuration.
+The web commit is not approved for activation as a trading executor.
+
+At the operator's request, SVIA returned to Open at 00:09 KST with 643 shares
+and its $4.24 stop covering 643 shares. No SELL was working and no broker
+mutation was made. The deployed mobile API confirmed Open, 643 shares and
+$4.24 at 00:27 KST. Stops and other live risk policies still apply.
+
+Passive Gate 2/3/4 collectors run alongside live trading under
+`quant_evidence/qmco_reservation_fix_20261005/session/checks_report.json`;
+the earlier release's evidence remains preserved. They collect feed health,
+isolated shadow decisions and actual execution events. Reports explicitly say
+`NOT_CERTIFIED`; full-session fault probes, complete branch/fence replay,
+reviewed gate chains and Gate 4's three supervised dates remain required for
+formal closure. See [live-session checks](live_session_checks.md).
 
 Documentation is maintained separately from that armed executor checkout.
 Do not pull even a documentation commit into the active executor: exact release
