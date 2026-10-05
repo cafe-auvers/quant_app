@@ -40,8 +40,11 @@ If Supabase is unavailable, shared writes and new entries fail closed.
 ## Trading and mobile actions
 
 The approved deployed release is
-`aad7f204c9e8a908e5cf753df63e71a081c1dac2`. The user manually armed the
-2026-10-05 session; the PC reported `ACTIVE` and executor readiness passed.
+`7ea107ece347ad41d954e8d2a533ef7d740a2f3f`. The operator approved the
+2026-10-05 deployment; the PC reported `ACTIVE` and executor readiness passed.
+The operator manually armed the new release. Verification at 20:56 KST confirmed
+live execution enabled and effective for the 2026-10-05 session, with 13 Buy Today
+plans. Future release changes require fresh manual arming.
 This dated snapshot does not certify future sessions, actual fills, or new
 qualification of Gates 2–5. Recheck current release/session, broker truth,
 quotes, plan, ownership, and risk/capital gates before trading.
@@ -50,12 +53,22 @@ Shared ORB settings matched the PC's applied settings. Passive mobile Buylist
 removal was verified. Removal waits for canonical confirmation, reports
 failures, and preserves real order/position/protection fences.
 
-The separate web service runs frontend fix
-`aab0792466e5c062380bca971f0b6c7006f4b439`; Python/API/core/broker code is
-unchanged. Mobile Watchlist additions now ask for a missing breakout price,
+The separate web service runs the same approved release. Mobile Watchlist
+additions ask for a missing breakout price,
 confirm its saved revision, and show errors beneath the list buttons. Buy Today
-still requires explicit activation confirmation. The approved PC executor and
-its existing live session were preserved during this web-only deployment.
+still requires explicit activation confirmation.
+
+Passive Gate 2/3/4 collectors now run on the PC alongside live trading, using
+the existing feed and copied inputs. The collectors have no production broker,
+transport, database, or lease access. Their dated report updates every ten
+seconds under `quant_evidence/live_checks_20261005/session/checks_report.json`.
+Verification found zero collector errors or dropped batches, and the collector
+recorded the actual `MANUAL_ARM` event.
+These diagnostics explicitly say `NOT_CERTIFIED`. Full Gate 2 fault probes,
+Gate 3 branch/fence replay and reviewed chain, and Gate 4's three supervised
+dates/lifecycle/disarm coverage still need formal qualification. The old gate
+launcher remains disabled because it would stop live trading and load an
+obsolete release. See [the deployed collector documentation](https://github.com/cafe-auvers/quant_app/blob/7ea107ece347ad41d954e8d2a533ef7d740a2f3f/docs/live_session_checks.md).
 
 Documentation changes are kept separate from the armed trading checkout.
 Pulling a newer executor Git SHA, even for documentation, requires the existing exact

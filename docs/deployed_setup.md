@@ -92,8 +92,11 @@ The approved trading release is
 `7ea107ece347ad41d954e8d2a533ef7d740a2f3f`. The operator approved its
 2026-10-05 deployment, and the PC reported `ACTIVE` with executor, broker
 reconciliation, market-data, ownership, and shared-state readiness passing.
-Live trading requires fresh manual arming after this release change. Passive
-Gate 2/3/4 collectors are running with no collection errors or dropped batches.
+The operator manually armed the new release; the 20:56 KST check confirmed
+live execution enabled and effective for the 2026-10-05 session, with 13 Buy Today
+plans. Future release changes require fresh manual arming. Passive Gate 2/3/4
+collectors are running with no collection errors or dropped batches and recorded
+the actual `MANUAL_ARM` event.
 This is a dated readiness snapshot, not proof of subsequent fills, a future
 session, or new qualification of Gates 2–5. Always recheck current readiness,
 the current session/release, plans, and risk/capital gates before trading.
