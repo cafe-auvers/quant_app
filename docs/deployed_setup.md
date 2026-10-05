@@ -77,6 +77,11 @@ revision-fenced canonical writes or durable commands consumed by that owner;
 the browser never calls KIS directly.
 
 Shared ORB settings were read back and matched the PC's applied settings.
+The mobile list buttons now show saving, confirmation, and errors beneath the
+buttons. Adding a Watchlist card without a breakout price opens a price editor;
+the saved price and returned revision are confirmed before promotion. Buy Today
+still requires explicit activation confirmation. Canceling or a rejected save
+does not activate the card.
 Passive Buylist removal was verified through the deployed mobile API. Removal
 waits for canonical confirmation, reports failure, and rejects stale revisions.
 A legacy planning stop on a flat Buylist card is not an active stop order;
@@ -91,9 +96,14 @@ This is a dated readiness snapshot, not proof of subsequent fills, a future
 session, or new qualification of Gates 2–5. Always recheck current readiness,
 the current session/release, plans, and risk/capital gates before trading.
 
-Documentation is maintained separately from that armed checkout. Do not pull
-even a documentation commit into an active executor or web deployment: exact
-release identity uses the full Git SHA. Deploy a newer checkout only through
+The separate web service runs frontend fix
+`aab0792466e5c062380bca971f0b6c7006f4b439`. Its only runtime changes are HTML,
+CSS, and JavaScript; Python/API/core/broker code is unchanged. The PC executor
+remains on the approved release above, with its existing live session enabled.
+
+Documentation is maintained separately from that armed executor checkout.
+Do not pull even a documentation commit into the active executor: exact release
+identity uses the full Git SHA. Deploy a newer executor checkout only through
 the existing reviewed release and operator activation procedure.
 
 ## Automation and backups

@@ -50,8 +50,15 @@ Shared ORB settings matched the PC's applied settings. Passive mobile Buylist
 removal was verified. Removal waits for canonical confirmation, reports
 failures, and preserves real order/position/protection fences.
 
+The separate web service runs frontend fix
+`aab0792466e5c062380bca971f0b6c7006f4b439`; Python/API/core/broker code is
+unchanged. Mobile Watchlist additions now ask for a missing breakout price,
+confirm its saved revision, and show errors beneath the list buttons. Buy Today
+still requires explicit activation confirmation. The approved PC executor and
+its existing live session were preserved during this web-only deployment.
+
 Documentation changes are kept separate from the armed trading checkout.
-Pulling a newer Git SHA, even for documentation, requires the existing exact
+Pulling a newer executor Git SHA, even for documentation, requires the existing exact
 release review and operator activation process before live execution resumes.
 
 ## PC tasks and recovery
