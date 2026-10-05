@@ -86,6 +86,11 @@ Synchronization and execution readiness are separate:
 - A permitted Buy Today activation uses the same canonical workflow as the
   desktop and, when eligible, claims `KANBAN` ownership for that symbol. A
   passive card may otherwise continue to display `LEGACY` ownership.
+- Cancel Sell All withdraws an unsubmitted exit directly in canonical state,
+  including during regular hours and with a separate Execution Owner. It
+  preserves the confirmed holding and stop and clears the retired retry state.
+  A SELL identity, reserved shares, working/ambiguous order or unresolved cancel
+  blocks withdrawal. This action never submits or cancels a broker order.
 - Broker mutation still requires a live execution lease, `ACTIVE` runtime,
   writable canonical store, fresh reconciliation, healthy execution-grade
   market data, matching per-symbol ownership, live-trading permission, and all

@@ -12,7 +12,7 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from src.core.trade_card_state import BoardStatus, TradeCardState
+from src.core.trade_card_state import BoardStatus, TradeCardState, can_withdraw_sell_all_intent
 from src.infrastructure.database.coordination_engine import (
     create_coordination_connection_engine,
     normalize_coordination_database_config,
@@ -446,6 +446,7 @@ class CanonicalPlanningSource:
             ),
             "reserved_sell_quantity": max(0, int(card.reserved_sell_quantity or 0)),
             "sell_all_at_market_open": bool(card.sell_all_at_market_open),
+            "can_cancel_sell_all": can_withdraw_sell_all_intent(card),
             "exit_all_required": bool(card.exit_all_required),
             "exit_order_pending": bool(
                 card.exit_client_order_id
