@@ -103,6 +103,11 @@ def test_mobile_removal_keeps_rejection_visible_and_ignores_stale_poll(tmp_path,
             page.wait_for_timeout(100)
             assert state["board_reads"] > before
             assert "Not saved:" in page.locator("#buy-board-action-status").inner_text()
+            assert page.locator("#buy-board-action-status").evaluate("""node => {
+                const r = node.getBoundingClientRect();
+                const top = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+                return r.top >= 0 && r.bottom <= window.innerHeight && node.contains(top);
+            }""")
             page.screenshot(path=str(tmp_path / f"removal-rejected-{width}.png"))
             # Hold a snapshot taken before the successful removal, then return
             # it after confirmation while the secondary planning read fails.
