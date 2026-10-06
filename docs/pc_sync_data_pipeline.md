@@ -37,6 +37,32 @@ database immediately. The SQLite safety backup is disposable and updates in
 the background; it never blocks PC routing. Full hourly backup is limited to
 SPY and symbols in scanner results, watchlist, or buylist.
 
+The mobile web mirror also needs hourly history for symbols outside those
+desktop selections. Run `scripts/sync_web_hourly_mirror.py --repository <PC-checkout>`
+as a separate daily job after the PC historical refresh. It discovers every
+symbol already present in PC MySQL's hourly table and copies only that table
+in small checkpointed groups. `--priority SYMBOL` moves requested charts to
+the front without excluding other symbols. The source sessions enforce
+MySQL read-only transactions, the Windows worker uses idle CPU priority, and
+the existing SQLite WAL mirror remains readable during each group. This job
+defers during the regular trading session and rolls back an unfinished group
+if the session opens. For immediate mobile access to all available PC hourly
+history, enable `pc_hourly_reads` in the connected web configuration. Hourly
+charts then make bounded, indexed reads from the PC source under enforced
+MySQL read-only transactions; daily charts and chart context retain the local
+mirror. Requested symbols do not need to be in the desktop scanner results.
+The hourly cache includes the symbol's PC data revision and shows stale source
+dates explicitly. Unavailable PC data is reported rather than replaced with
+invented candles or an unverified old mirror.
+
+The backup job
+does not refresh providers, access the broker, publish plans, change risk or
+live controls, or restart the executor. Source data which is itself stale or
+unavailable remains labelled by its real chart dates; the copy cannot create
+missing provider bars. Schedule the job in Task Scheduler with overlapping
+instances disabled. A failed group rolls back and can be retried; successful
+groups retain their checkpoints.
+
 The normal dashboard backup is checkpointed and incremental. A successful
 SQLite transaction records each table's PC row count, latest revision, and
 hourly-symbol scope. Startup and the 15-minute timer first compare those small

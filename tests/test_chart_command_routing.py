@@ -174,8 +174,9 @@ def test_queue_toggle_promotes_a_standalone_breakout_to_buylist():
     assert isinstance(window.commands[0][0], MoveToBuylist)
 
 
-def test_activate_toggle_uses_only_canonical_card_and_exact_fences():
-    window = _Window([_projection(status=BoardStatus.BUYLIST)])
+@pytest.mark.parametrize("status", [BoardStatus.BUYLIST, BoardStatus.CLOSED])
+def test_activate_toggle_uses_only_canonical_card_and_exact_fences(status):
+    window = _Window([_projection(status=status)])
 
     window._chart_activate_toggle("WEX")
 

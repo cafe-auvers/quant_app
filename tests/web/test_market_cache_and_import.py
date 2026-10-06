@@ -155,6 +155,35 @@ def test_cache_reloads_when_the_pc_mirror_revision_changes(tmp_path):
     ) is None
 
 
+def test_compressed_chart_survives_mirror_update_during_preparation(tmp_path):
+    class UpdatingSource(DemoMarketDataSource):
+        def __init__(self):
+            super().__init__()
+            self.revision = 1
+            self.loads = 0
+
+        def cache_revision(self):
+            return str(self.revision)
+
+        def chart_bundle(self, *args, **kwargs):
+            self.loads += 1
+            payload = super().chart_bundle(*args, **kwargs)
+            self.revision += 1
+            return payload
+
+    async def run():
+        source = UpdatingSource()
+        coordinator = ChartLoadCoordinator(source, ChartBundleCache(tmp_path), daily_bars=50, hourly_months=1)
+        first, first_hit = await coordinator.get_compressed("AAPL", "1H")
+        assert not first_hit
+        assert json.loads(gzip.decompress(first.content))["coverage"]["source_revision"] == "1"
+        second, second_hit = await coordinator.get_compressed("AAPL", "1H")
+        assert not second_hit and source.loads == 2
+        assert json.loads(gzip.decompress(second.content))["coverage"]["source_revision"] == "2"
+
+    asyncio.run(run())
+
+
 def test_coordinator_rebuilds_cache_when_generation_policy_changes(tmp_path):
     async def run():
         cache = ChartBundleCache(tmp_path, max_symbols=25)

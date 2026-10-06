@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 import json
 import logging
+import math
 import os
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -21,6 +22,7 @@ except ImportError:  # pragma: no cover - requirements include python-dotenv.
     load_dotenv = None
 
 from src.api.kis_fetch_all_daily import DEFAULT_US_EXCHANGES
+from src.core.intraday_coverage import KIS_INVALID_ROWS_ATTR, annotate_kis_history_coverage
 from src.services.intraday_provider import normalize_ohlcv_frame
 
 
@@ -115,6 +117,10 @@ class KisIntradayClient:
                     date_field=config.get("date_field"),
                 )
                 if not result.bars.empty:
+                    # Only the verified overseas local date/time fields establish
+                    # New York provenance; arbitrary configured mappings do not.
+                    if config.get("date_field") == "xymd" and config["time_field"] == "xhms":
+                        annotate_kis_history_coverage(result.bars, symbol)
                     result = _filter_result_window(result, window_days)
                     return result
                 last_error = KisIntradayError(
@@ -198,8 +204,10 @@ def normalize_intraday_rows(
     date_field: Optional[str] = None,
 ) -> IntradayFetchResult:
     records = []
+    invalid_rows = 0
     for row in rows:
         if not isinstance(row, dict):
+            invalid_rows += 1
             continue
         try:
             if date_field and date_field in row:
@@ -210,17 +218,26 @@ def normalize_intraday_rows(
                 )
             else:
                 timestamp = pd.to_datetime(str(row[time_field]))
-            records.append(
-                {
-                    "timestamp": timestamp,
-                    "Open": float(str(row[open_field]).replace(",", "")),
-                    "High": float(str(row[high_field]).replace(",", "")),
-                    "Low": float(str(row[low_field]).replace(",", "")),
-                    "Close": float(str(row[close_field]).replace(",", "")),
-                    "Volume": float(str(row.get(volume_field, 0) or 0).replace(",", "")),
-                }
-            )
+            record = {
+                "timestamp": timestamp,
+                "Open": float(str(row[open_field]).replace(",", "")),
+                "High": float(str(row[high_field]).replace(",", "")),
+                "Low": float(str(row[low_field]).replace(",", "")),
+                "Close": float(str(row[close_field]).replace(",", "")),
+                "Volume": float(str(row.get(volume_field, 0) or 0).replace(",", "")),
+            }
+            prices = [record[key] for key in ("Open", "High", "Low", "Close")]
+            if (
+                pd.isna(timestamp)
+                or not all(math.isfinite(value) and value > 0 for value in prices)
+                or not math.isfinite(record["Volume"])
+                or record["Volume"] < 0
+                or record["Low"] > record["High"]
+            ):
+                raise ValueError("Invalid KIS minute bar")
+            records.append(record)
         except (KeyError, TypeError, ValueError):
+            invalid_rows += 1
             continue
 
     frame = pd.DataFrame(records)
@@ -230,6 +247,7 @@ def normalize_intraday_rows(
         bars = normalize_ohlcv_frame(
             frame.drop_duplicates(subset=["timestamp"]).set_index("timestamp").sort_index()
         )
+    bars.attrs[KIS_INVALID_ROWS_ATTR] = invalid_rows
 
     return IntradayFetchResult(
         symbol=symbol.upper(),

@@ -15,6 +15,11 @@ from enum import Enum
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 import pandas as pd
+from src.core.intraday_coverage import (
+    has_verified_opening_coverage,
+    kis_history_has_invalid_rows,
+    kis_market_timezone,
+)
 
 from src.risk.orb_position import (
     calculate_orb_position_values,
@@ -595,7 +600,9 @@ def _intraday_source_session_date(intraday: pd.DataFrame) -> Optional[str]:
     """
 
     try:
-        local_index = market_local_index(intraday.sort_index().index)
+        local_index = market_local_index(
+            intraday.sort_index().index, naive_timezone=kis_market_timezone(intraday)
+        )
         if local_index is None or local_index.empty:
             return None
         return local_index[-1].date().isoformat()
@@ -606,18 +613,20 @@ def _intraday_source_session_date(intraday: pd.DataFrame) -> Optional[str]:
 def _missing_orb_range_state(
     intraday: pd.DataFrame,
     window: str,
+    symbol: str = "",
 ) -> tuple[OrbCandidateStatus, str]:
     """Explain why a supported ORB range could not be calculated.
 
-    A completed window with later current-session bars but no 09:30 bar is a
-    data failure, not a window that is still forming.  Keeping those cases
-    separate prevents a missing opening bar from leaving the 1m plan in
-    ``FORMING`` for the rest of the session.
+    An elapsed window never stays FORMING because its opening bar is absent.
+    Verified sparse history distinguishes an empty window from missing data;
+    an unproven download retains the conservative unavailable state.
     """
 
     window_minutes = {"1m": 1, "5m": 5, "30m": 30}.get(window)
     if window_minutes is None:
         return OrbCandidateStatus.NOT_AVAILABLE, f"unsupported ORB window {window}"
+    if kis_history_has_invalid_rows(intraday):
+        return OrbCandidateStatus.NOT_AVAILABLE, "KIS minute history contains invalid rows"
     if "High" not in intraday.columns or "Low" not in intraday.columns:
         return (
             OrbCandidateStatus.NOT_AVAILABLE,
@@ -625,7 +634,10 @@ def _missing_orb_range_state(
         )
 
     try:
-        local_index = market_local_index(intraday.sort_index().index)
+        local_index = market_local_index(
+            intraday.sort_index().index,
+            naive_timezone=kis_market_timezone(intraday, symbol=symbol),
+        )
         if local_index is None or local_index.empty:
             raise ValueError("invalid intraday timestamp index")
         session_start = local_index[-1].normalize() + pd.Timedelta(
@@ -641,6 +653,18 @@ def _missing_orb_range_state(
     if session_index.empty or session_index[-1] < window_end:
         return OrbCandidateStatus.FORMING, "ORB window has not completed"
     if not (session_index == session_start).any():
+        if has_verified_opening_coverage(intraday, session_start, window_end, symbol=symbol):
+            opening_rows = session_index[
+                (session_index >= session_start) & (session_index < window_end)
+            ]
+            if opening_rows.empty:
+                later_rows = session_index[session_index >= window_end]
+                first = later_rows[0].strftime("%H:%M") if len(later_rows) else "unavailable"
+                return (
+                    OrbCandidateStatus.NOT_AVAILABLE,
+                    f"KIS returned no bars in the {window} opening window "
+                    f"(09:30–{window_end.strftime('%H:%M')} ET); first available bar is {first} ET",
+                )
         return (
             OrbCandidateStatus.NOT_AVAILABLE,
             f"09:30 opening bar is unavailable for the completed {window} ORB window",
@@ -736,7 +760,7 @@ def build_orb_candidate(
     )
     orb_range = strategy_evaluation.orb_range
     if orb_range is None:
-        status, reason = _missing_orb_range_state(intraday, window)
+        status, reason = _missing_orb_range_state(intraday, window, symbol)
         return _candidate_unavailable(
             symbol,
             window,

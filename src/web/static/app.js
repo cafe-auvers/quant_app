@@ -70,6 +70,9 @@
     buyTodayRows: [],
     buyBoardRows: [],
     buyBoardRevision: '',
+    buyBoardNav: null,
+    buyBoardNavAt: null,
+    buyBoardNavNote: '',
     buyBoardColumn: 'BUYLIST',
     buyBoardLoading: false,
     buyBoardEpoch: 0,
@@ -105,6 +108,7 @@
     breakoutDraftPrice: null,
     breakoutDragging: null,
     breakoutSaving: false,
+    breakoutFollowup: null,
     drawings: [],
     drawMode: false,
     drawAnchor: null,
@@ -257,6 +261,10 @@
     const target = byId('plan-message');
     target.textContent = message;
     target.className = `panel-message ${kind}`.trim();
+    const quick = byId('quick-plan-message');
+    quick.textContent = message;
+    quick.className = `quick-plan-message ${kind}`.trim();
+    quick.hidden = !message;
   }
 
   async function api(path, options = {}) {
@@ -296,8 +304,46 @@
     if (tone) dot.classList.add(tone);
   }
 
+  let marketClockSchedule = null;
+  let marketClockTimer = null;
+
+  function renderMarketCountdown(market = null) {
+    if (market?.as_of) {
+      const schedule = {
+        asOf: Date.parse(market.as_of),
+        open: Date.parse(market.session_open),
+        close: Date.parse(market.session_close),
+        nextOpen: Date.parse(market.next_session_open),
+        nextClose: Date.parse(market.next_session_close),
+        receivedAt: performance.now(),
+      };
+      marketClockSchedule = [schedule.asOf, schedule.open, schedule.close].every(Number.isFinite)
+        ? schedule : null;
+    }
+    const now = marketClockSchedule
+      ? marketClockSchedule.asOf + performance.now() - marketClockSchedule.receivedAt
+      : Date.now();
+    let open = marketClockSchedule?.open;
+    let close = marketClockSchedule?.close;
+    if (now >= close) {
+      open = marketClockSchedule.nextOpen;
+      close = marketClockSchedule.nextClose;
+    }
+    const hasSchedule = Number.isFinite(open) && Number.isFinite(close) && now < close;
+    const minutesUntil = boundary => Math.max(1, Math.ceil((boundary - now) / 60_000));
+    const label = hasSchedule
+      ? (now < open ? `Open in ${minutesUntil(open)}m` : `Close in ${minutesUntil(close)}m`)
+      : 'Market —';
+    const countdown = byId('market-countdown');
+    if (countdown.textContent !== label) countdown.textContent = label;
+    countdown.title = hasSchedule
+      ? `NYSE regular session · Open ${new Date(open).toLocaleString('en-GB', {timeZone: 'Asia/Seoul'})} KST · Close ${new Date(close).toLocaleString('en-GB', {timeZone: 'Asia/Seoul'})} KST`
+      : 'Waiting for the NYSE session schedule';
+  }
+
   function renderStatusStrip(payload = {}) {
     const market = payload.market_status || state.session?.market_status || {};
+    renderMarketCountdown(market);
     const longLabel = market.label || 'Market Status: Checking';
     const compactLabel = market.compact_label || 'Market Checking';
     byId('market-status-long').textContent = longLabel;
@@ -654,6 +700,160 @@
     return breakout === null ? 'No breakout' : `Breakout ${breakout.toFixed(2)}`;
   }
 
+  function boardNumber(value) {
+    if (value === null || value === undefined || value === '') return null;
+    const number = Number(value);
+    return Number.isFinite(number) && number > 0 ? number : null;
+  }
+
+  function boardMoney(value) {
+    const number = boardNumber(value);
+    return number === null ? '—' : `$${number.toFixed(number < 1 ? 4 : 2)}`;
+  }
+
+  function boardShares(value, unknownWhenZero = false) {
+    const number = Math.max(0, Math.trunc(Number(value) || 0));
+    return unknownWhenZero && !number ? 'Not sized' : `${number.toLocaleString()} sh`;
+  }
+
+  function boardAccountNav() {
+    const nav = boardNumber(state.buyBoardNav);
+    const age = (Date.now() - Date.parse(state.buyBoardNavAt || '')) / 1000;
+    return nav !== null && Number.isFinite(age) && age >= -5 && age <= 900 ? nav : null;
+  }
+
+  function boardNavMetric(amount) {
+    if (amount === null || !Number.isFinite(amount) || amount < 0) return 'Not sized';
+    const nav = boardAccountNav();
+    const percent = nav === null ? 'NAV unavailable' : `${(amount / nav * 100).toFixed(2)}% NAV`;
+    const dollars = amount.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+    return `${percent} · $${dollars}`;
+  }
+
+  function boardRiskBudget(row) {
+    const value = row.risk_percent;
+    const fraction = value === null || value === undefined ? NaN : Number(value);
+    return Number.isFinite(fraction) && fraction >= 0 && fraction <= 1
+      ? `${(fraction * 100).toFixed(2)}% NAV` : 'Unavailable';
+  }
+
+  function boardTarget(row) {
+    return Math.max(0, Number(row.broker_quantity) || 0,
+      Number(row.target_position_quantity || row.planned_quantity) || 0);
+  }
+
+  function boardTime(value) {
+    const time = Date.parse(value || '');
+    return Number.isFinite(time) ? `${new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'Asia/Seoul', hour: '2-digit', minute: '2-digit', second: '2-digit',
+    }).format(time)} KST` : 'Time unavailable';
+  }
+
+  function boardPrice(row) {
+    // Reuse observations already loaded by Monitor; never request broker quotes.
+    const monitor = state.monitorRows.find(item => item.symbol === row.symbol);
+    const candidates = [
+      {price: boardNumber(row.last_reported_price), at: row.price_as_of, source: 'PC reported'},
+      {price: boardNumber(monitor?.current_price), at: monitor?.quote_as_of,
+        source: 'Yahoo · indicative', stale: Boolean(state.monitorError) || monitor?.quote_status !== 'CURRENT'},
+    ].filter(item => item.price !== null);
+    candidates.sort((a, b) => (Date.parse(b.at || '') || 0) - (Date.parse(a.at || '') || 0));
+    if (!candidates.length) return {price: null, fresh: false, note: 'Price not reported yet'};
+    const quote = candidates[0];
+    const age = (Date.now() - Date.parse(quote.at || '')) / 1000;
+    const fresh = Number.isFinite(age) && age >= -5
+      && age <= state.monitorStaleSeconds && !quote.stale;
+    const elapsed = Number.isFinite(age) && age >= 0
+      ? age < 60 ? `${Math.floor(age)}s ago` : `${Math.floor(age / 60)}m ago`
+      : 'Age unavailable';
+    return {...quote, fresh, note: `${quote.source} · ${boardTime(quote.at)} · ${elapsed}${fresh ? '' : ' · stale'}`};
+  }
+
+  function boardDetails(row) {
+    const price = boardPrice(row);
+    if (row.board_status === 'BUYLIST') {
+      return {price, facts: [['Price', boardMoney(price.price)], ['Breakout', boardMoney(row.breakout_price)],
+        ['Risk budget', boardRiskBudget(row)], ['Planned allocation', 'Not sized']]};
+    }
+    const held = Math.max(0, Number(row.broker_quantity) || 0);
+    const target = boardTarget(row);
+    const position = ['OPEN_POSITION', 'PARTIAL_SELL', 'SELL_ALL'].includes(row.board_status);
+    const stop = boardNumber(row.active_stop_price);
+    const facts = [['Price', boardMoney(price.price)],
+      [position ? 'Held' : 'Target shares', position ? boardShares(held) : boardShares(target, true)],
+      [position ? 'Active stop' : 'Planned stop', position
+        ? stop === null ? 'Not set' : boardMoney(stop)
+        : boardMoney(row.entry_orb_low)]];
+    if (!position) {
+      facts.push(
+        ['Risk budget', boardRiskBudget(row)],
+        ['Breakout', boardMoney(row.breakout_price)],
+        ['Entry plan', boardMoney(row.entry_execution_price || row.entry_trigger)],
+        ['ORB', row.entry_orb_window || row.selected_orb_window || 'Not selected'],
+      );
+      if (row.entry_breakout_trigger) facts.push(['Entry trigger', boardMoney(row.entry_breakout_trigger)]);
+      if (row.board_status === 'ENTRY_PENDING') {
+        facts.push(['Held / target', `${held.toLocaleString()} / ${target > 0 ? target.toLocaleString() : '—'} sh`]);
+        if (held > 0) facts.push(['Average fill', boardMoney(row.average_entry_price)]);
+      }
+      const entry = boardNumber(row.entry_execution_price || row.entry_trigger);
+      const plannedStop = boardNumber(row.entry_orb_low);
+      facts.push(['Planned allocation', boardNavMetric(entry !== null && target > 0 ? entry * target : null)]);
+      if (entry !== null && plannedStop !== null && entry > plannedStop && target > 0) {
+        facts.push(['Planned risk', boardNavMetric((entry - plannedStop) * target)]);
+      }
+      if (held > 0) {
+        const average = boardNumber(row.average_entry_price);
+        facts.push(['Allocated', boardNavMetric(average !== null ? average * held : null)]);
+      }
+      if (row.next_retry_at) facts.push(['Retry after', boardTime(row.next_retry_at)]);
+    } else {
+      facts.push(['Average entry', boardMoney(row.average_entry_price)],
+        ['Sellable', boardShares(row.orderable_quantity)],
+        ['Stop coverage', stop === null ? 'Not active'
+          : `${Math.max(0, Number(row.stop_quantity) || 0).toLocaleString()} / ${held.toLocaleString()} sh`]);
+      const average = boardNumber(row.average_entry_price);
+      facts.push(['Allocated', boardNavMetric(average !== null && held > 0 ? average * held : null)],
+        ['Risk at stop', stop !== null && held > 0
+          && Number(row.stop_quantity || 0) >= held
+          ? average !== null ? boardNavMetric(Math.max(0, average - stop) * held) : 'Unavailable'
+          : 'Not fully covered']);
+      if (price.price !== null && average !== null && held > 0) {
+        const pnl = (price.price - average) * held;
+        const percent = (price.price / average - 1) * 100;
+        facts.push(['Est. P&L', `${pnl >= 0 ? '+' : '−'}$${Math.abs(pnl).toFixed(2)} (${percent >= 0 ? '+' : ''}${percent.toFixed(2)}%)${price.fresh ? '' : ' · stale'}`]);
+      } else {
+        facts.push(['Est. P&L', '—']);
+      }
+      if (price.price !== null && stop !== null) {
+        facts.push(['To stop', `${((price.price - stop) / price.price * 100).toFixed(2)}%${price.fresh ? '' : ' · stale'}`]);
+      }
+      if (row.pending_stop_price) facts.push(['Pending stop',
+        `${boardMoney(row.pending_stop_price)} · ${boardShares(row.pending_stop_quantity)}`]);
+      if (row.board_status === 'PARTIAL_SELL') {
+        facts.push(['Sell requested', boardShares(row.pending_partial_sell_quantity)]);
+      }
+      if (['PARTIAL_SELL', 'SELL_ALL'].includes(row.board_status)) {
+        facts.push(['Working sell', row.exit_order_pending
+          ? row.reserved_sell_quantity > 0 ? boardShares(row.reserved_sell_quantity) : 'Quantity syncing'
+          : 'Not submitted']);
+        if (row.next_exit_retry_at) facts.push(['Retry after', boardTime(row.next_exit_retry_at)]);
+      }
+      if (row.entry_remaining_target_quantity > 0) {
+        facts.push(['Still to buy', boardShares(row.entry_remaining_target_quantity)]);
+      }
+    }
+    return {facts, price};
+  }
+
+  function boardWarning(row) {
+    const reason = ['PARTIAL_SELL', 'SELL_ALL'].includes(row.board_status)
+      ? row.last_exit_error
+      : ['BUY_TODAY', 'ENTRY_PENDING'].includes(row.board_status) ? row.entry_block_reason
+        : row.board_status === 'BUYLIST' ? row.buy_today_note : '';
+    return [reason, ...(row.warnings || [])].find(value => String(value || '').trim()) || '';
+  }
+
   function mobileKanbanCard(row) {
     const button = document.createElement('button');
     button.type = 'button';
@@ -678,8 +878,16 @@
     metric.textContent = boardMetric(row);
     facts.append(status, metric);
     button.append(top, name, facts);
-    const warning = [...(row.warnings || []), row.entry_block_reason, row.last_exit_error]
-      .find(value => String(value || '').trim());
+    const details = boardDetails(row);
+    const grid = document.createElement('span');
+    grid.className = 'mobile-kanban-card-details';
+    grid.append(...details.facts.map(([label, value]) => boardFact(label, value)));
+    const priceNote = document.createElement('span');
+    priceNote.className = 'mobile-kanban-price-note';
+    priceNote.dataset.stale = String(!details.price.fresh);
+    priceNote.textContent = details.price.note;
+    button.append(grid, priceNote);
+    const warning = boardWarning(row);
     if (warning) {
       const alert = document.createElement('span');
       alert.className = 'mobile-kanban-card-warning';
@@ -736,6 +944,15 @@
     byId('buy-board-column-kicker').textContent = column.kicker;
     byId('buy-board-column-title').textContent = column.title;
     byId('buy-board-column-count').textContent = String(rows.length);
+    const position = ['OPEN_POSITION', 'PARTIAL_SELL', 'SELL_ALL'].includes(column.key);
+    const shares = rows.reduce((sum, row) => sum + (position
+      ? Math.max(0, Number(row.broker_quantity) || 0) : boardTarget(row)), 0);
+    const unsized = !position ? rows.filter(row => boardTarget(row) === 0).length : 0;
+    byId('buy-board-column-summary').textContent = `${rows.length} stock${rows.length === 1 ? '' : 's'}${column.key === 'BUYLIST' ? '' : ` · ${shares.toLocaleString()} ${position ? 'held' : 'target'} shares${unsized ? ` · ${unsized} not sized` : ''}`}`;
+    const nav = boardAccountNav();
+    byId('buy-board-nav').textContent = nav === null
+      ? state.buyBoardNavNote || 'Account NAV stale or unavailable'
+      : `Account NAV $${nav.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
     const cards = document.createDocumentFragment();
     rows.forEach(row => cards.appendChild(mobileKanbanCard(row)));
     if (!rows.length) {
@@ -795,6 +1012,9 @@
       if (epoch !== state.buyBoardEpoch) return;
       state.buyBoardRows = mergeBuyBoardOptimistic(result.rows || []);
       state.buyBoardRevision = String(result.revision || '');
+      state.buyBoardNav = boardNumber(result.account_nav_usd);
+      state.buyBoardNavAt = result.account_nav_as_of || null;
+      state.buyBoardNavNote = String(result.account_nav_note || '');
       state.buyBoardError = '';
     } catch (error) {
       if (epoch === state.buyBoardEpoch) {
@@ -879,18 +1099,12 @@
     byId('buy-board-action-symbol').textContent = row.symbol;
     byId('buy-board-action-name').textContent = row.name || row.symbol;
     const facts = byId('buy-board-action-facts');
-    const factRows = [
-      boardFact('Status', boardStatusLabel(row)),
-      boardFact('Breakout', normalizeBreakoutPrice(row.breakout_price)?.toFixed(2) || '—'),
-    ];
-    if (['OPEN_POSITION', 'PARTIAL_SELL', 'SELL_ALL'].includes(row.board_status)) {
-      factRows.push(
-        boardFact('Quantity', String(Number(row.broker_quantity || 0))),
-        boardFact('Average', Number(row.average_entry_price || 0) > 0 ? Number(row.average_entry_price).toFixed(2) : '—'),
-        boardFact('Stop', Number(row.active_stop_price || 0) > 0 ? Number(row.active_stop_price).toFixed(2) : '—'),
-      );
-    }
+    const details = boardDetails(row);
+    const factRows = [boardFact('Status', boardStatusLabel(row)),
+      ...details.facts.map(([label, value]) => boardFact(label, value))];
     facts.replaceChildren(...factRows);
+    byId('buy-board-action-price-note').textContent = details.price.note;
+    byId('buy-board-action-warning').textContent = boardWarning(row);
     const actions = byId('buy-board-action-buttons');
     const fragment = document.createDocumentFragment();
     const pending = state.buyBoardPendingActions.has(row.symbol);
@@ -916,8 +1130,8 @@
     } else if (row.board_status === 'SELL_ALL') {
       fragment.append(boardActionButton('Cancel Sell All', 'cancel_sell_all', {
         secondary: true,
-        disabled: pending || !row.sell_all_at_market_open || row.exit_order_pending,
-        title: row.sell_all_at_market_open ? '' : 'Only a queued, unsubmitted market-open Sell All can be cancelled.',
+        disabled: pending || !row.can_cancel_sell_all || row.exit_order_pending,
+        title: row.can_cancel_sell_all ? '' : 'Only an unsubmitted Sell All can be cancelled. Reconcile any pending SELL first.',
       }));
     }
     if (['OPEN_POSITION', 'PARTIAL_SELL'].includes(row.board_status)) {
@@ -1288,6 +1502,8 @@
     refreshStatusStrip();
     if (state.statusTimer !== null) window.clearInterval(state.statusTimer);
     state.statusTimer = window.setInterval(refreshStatusStrip, 10_000);
+    if (marketClockTimer !== null) window.clearInterval(marketClockTimer);
+    marketClockTimer = window.setInterval(renderMarketCountdown, 1_000);
   }
 
   function createPane(containerId, rsContainerId, overlayId, timeframe) {
@@ -1741,20 +1957,31 @@
   function closeBreakoutPricePopup() {
     const popup = byId('breakout-price-popup');
     if (popup) popup.hidden = true;
+    state.breakoutFollowup = null;
   }
 
-  function openBreakoutPricePopup(price = breakoutVisualPrice()) {
+  function openBreakoutPricePopup(price = breakoutVisualPrice(), followup = null) {
     const normalized = normalizeBreakoutPrice(price);
-    if (!state.breakoutMode || normalized === null || state.breakoutSaving) return;
+    if ((!followup && (!state.breakoutMode || normalized === null)) || state.breakoutSaving) return;
     setBreakoutMode(false, false);
     const popup = byId('breakout-price-popup');
     const input = byId('breakout-price-popup-input');
-    input.value = normalized.toFixed(2);
+    state.breakoutFollowup = followup;
+    byId('breakout-price-title').textContent = followup
+      ? `Set ${followup.symbol} breakout for ${followup.target === 'buy_today' ? 'Buy Today' : 'Buylist'}`
+      : 'Set exact price';
+    input.value = normalized === null ? '' : normalized.toFixed(2);
+    input.setCustomValidity('');
     popup.hidden = false;
     requestAnimationFrame(() => {
       input.focus({preventScroll: true});
       input.select();
     });
+  }
+
+  function requestBreakoutForList(target) {
+    setPanel(`Set a breakout price for ${state.symbol} before adding it to ${target === 'buy_today' ? 'Buy Today' : 'Buylist'}.`, 'error');
+    openBreakoutPricePopup(null, {symbol: state.symbol, target});
   }
 
   function updateBreakoutModeUi() {
@@ -2459,6 +2686,7 @@
     const startedAt = performance.now();
     closeBreakoutPricePopup();
     state.symbol = symbol.toUpperCase();
+    setPanel('');
     const chartCacheHit = state.bundleCache.has(`${state.symbol}:${state.timeframe}`);
     state.planningBusy = planningPending(state.symbol);
     state.selectionToken += 1;
@@ -2619,16 +2847,22 @@
       const age = quote.quote_as_of ? (Date.now() - new Date(quote.quote_as_of).getTime()) / 1000 : Infinity;
       const stale = Boolean(state.monitorError) || quote.quote_status === 'STALE' || (active && age > state.monitorStaleSeconds);
       if (stale) result.quote_status = quote.current_price ? 'STALE' : 'UNAVAILABLE';
-      if (changedLevel || stale) {
+      if (changedLevel) {
         result.breakout_status = normalizeBreakoutPrice(card.breakout_price) === null ? 'NO_LEVEL' : 'UNKNOWN';
         result.broke_out_today = null;
         result.orb = [];
+      } else if (stale) {
+        result.breakout_status = normalizeBreakoutPrice(card.breakout_price) === null ? 'NO_LEVEL' : 'UNKNOWN';
+        result.broke_out_today = null;
+        const sessionDay = new Intl.DateTimeFormat('en-CA', {timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit'}).format(new Date());
+        result.orb = quote.orb_session_date === sessionDay ? (quote.orb || []).map(orb =>
+          orb.price_status === 'PASS' ? {...orb} : {...orb, price_status: 'UNKNOWN', price_reason: 'Quote is stale'}) : [];
       }
       return result;
     }).filter(row => {
       if (state.monitorQuery && !`${row.symbol} ${row.name || ''}`.toLowerCase().includes(state.monitorQuery)) return false;
       if (state.monitorFilter === 'breakouts') return row.broke_out_today === true;
-      if (state.monitorFilter === 'orb') return (row.orb || []).some(orb => orb.price_status === 'PASS' && orb.position_status === 'PASS');
+      if (state.monitorFilter === 'orb') return (row.orb || []).some(orb => orb.price_status === 'PASS');
       if (state.monitorFilter === 'today') return Boolean(row.buy_today_member);
       return true;
     }).sort((a, b) => (
@@ -2687,13 +2921,16 @@
         const line = add(table, 'span', '', 'mobile-monitor-orb-line');
         add(line, 'b', window);
         const cell = (value, reason) => {
-          const names = {PASS: '✓ Passed', FAIL: '✕ Failed', WAITING: 'Waiting', FORMING: 'Forming', UNKNOWN: 'Unavailable'};
+          const names = {PASS: '✓ Passed', FAIL: '✕ Failed', WAITING: 'Await breakout', FORMING: 'Forming', UNKNOWN: 'Unavailable'};
           const node = add(line, 'span', names[value] || 'Unavailable', 'mobile-monitor-result');
           node.dataset.status = value || 'UNKNOWN';
           node.title = reason || '';
         };
         cell(orb.price_status, orb.price_reason);
         cell(orb.position_status, orb.position_reason);
+        if (orb.price_status === 'WAITING') add(table, 'small', `${window}: Range complete · waiting above $${Number(orb.breakout_trigger || Math.max(row.breakout_price || 0, orb.high || 0)).toFixed(2)}`, 'mobile-monitor-reason');
+        if (orb.price_status === 'UNKNOWN' && orb.price_reason) add(table, 'small', `${window}: ${orb.price_reason}`, 'mobile-monitor-reason');
+        if (orb.price_status === 'PASS' && row.quote_status === 'STALE') add(table, 'small', `${window}: Passed earlier · latest quote stale`, 'mobile-monitor-reason');
         if (orb.position_status === 'FAIL' && orb.position_reason) add(table, 'small', `${window}: ${orb.position_reason}`, 'mobile-monitor-reason');
       });
     }
@@ -2728,6 +2965,8 @@
       window.clearTimeout(timeout);
       state.monitorLoading = false;
       if (state.listMode === 'monitor') applyListMode('monitor');
+      renderBuyBoardPage();
+      if (!byId('buy-board-action-sheet').hidden) renderBuyBoardActionSheet();
       // Poll only the shared snapshot while its first quote batch is loading.
       if (!state.monitorAsOf && state.monitorEnabled === true && !state.monitorError) {
         state.monitorRetryTimer = window.setTimeout(loadIntradayMonitor, 5_000);
@@ -3046,7 +3285,12 @@
       state.session?.operator?.delegated
       && operatorOperations.has(canonicalBuyToday ? 'deactivate_buy_today' : 'activate_buy_today')
     );
-    const buyTodayActionEligible = hasBuyToday || buyTodayDraftEligible;
+    const buyTodayActionEligible = hasBuyToday || buyTodayDraftEligible || (
+      !connectedReadOnly && (card?.canonical_stage || card?.stage) === 'WATCHLIST'
+    ) || (
+      (card?.canonical_stage || card?.stage) === 'CLOSED'
+      && Boolean(card?.breakout_price) && operatorBuyTodayEnabled
+    );
     const displayStage = card?.display_stage || card?.canonical_stage || card?.stage || 'NOT PLANNED';
     byId('plan-stage').textContent = displayStage;
     byId('plan-revision').textContent = operatorPending()
@@ -3266,9 +3510,12 @@
       return;
     }
     if (enabled) {
+      const reentry = (previousPlan.canonical_stage || previousPlan.stage) === 'CLOSED';
       const confirmed = await confirmOperatorAction(
-        `Publish ${actionSymbol} to Buy Today?`,
-        'This creates executable intent on the shared Buy Board. It does not place an order now, but the Execution Owner may act later when every runtime, risk, market-data, and broker gate passes.',
+        reentry ? `Re-enter ${actionSymbol} through Buy Today?` : `Publish ${actionSymbol} to Buy Today?`,
+        reentry
+          ? 'This starts a new trade cycle after a fully reconciled exit. The Execution Owner may buy again when current ORB, fresh market data, risk, capital and broker checks pass. It does not automatically repeat after another stop.'
+          : 'This creates executable intent on the shared Buy Board. It does not place an order now, but the Execution Owner may act later when every runtime, risk, market-data, and broker gate passes.',
         'Publish to Buy Today',
       );
       if (!confirmed) return;
@@ -3367,8 +3614,22 @@
 
   async function toggleBuyTodayDraft() {
     if (!state.symbol || planningPending() || operatorPending()) return;
+    const actionSymbol = state.symbol;
     const canonicalActive = canonicalBuyTodayActive();
     const hasDraft = hasCurrentBuyTodayDraft() && !canonicalActive;
+    if ((state.plan?.canonical_stage || state.plan?.stage) === 'CLOSED'
+        && operatorOperationEnabled('activate_buy_today')) {
+      await toggleCanonicalBuyToday();
+      return;
+    }
+    if (!canonicalActive && !hasDraft && !state.plan?.buylist_member) {
+      if (!state.plan?.breakout_price) {
+        requestBreakoutForList('buy_today');
+        return;
+      }
+      const promoted = await moveToList('buylist');
+      if (!promoted || state.symbol !== actionSymbol) return;
+    }
     if (
       canonicalActive
       || (!hasDraft && operatorOperationEnabled('activate_buy_today'))
@@ -3380,7 +3641,6 @@
       await moveToList('buy_today');
       return;
     }
-    const actionSymbol = state.symbol;
     const previousRow = state.buyTodayRows.find(row => row.symbol === actionSymbol);
     const expectedRevision = state.plan.version;
     state.planningPendingSymbols.add(actionSymbol);
@@ -3416,7 +3676,7 @@
   }
 
   async function moveToList(target) {
-    if (!state.symbol || planningPending()) return;
+    if (!state.symbol || planningPending()) return false;
     const actionSymbol = state.symbol;
     const previousPlan = state.plan ? {...state.plan} : null;
     const previousBuyTodayRow = state.buyTodayRows.find(
@@ -3433,8 +3693,8 @@
       && !buylistMember
       && !previousPlan?.breakout_price
     ) {
-      setPanel('Set a breakout price before adding this symbol to Buylist.', 'error');
-      return;
+      requestBreakoutForList(target);
+      return false;
     }
     let optimisticOperation = '';
     if (target === 'watchlist') {
@@ -3516,6 +3776,7 @@
         setPanel(successMessage, 'success');
       }
       void refreshPlanningLists().catch(() => {});
+      return true;
     } catch (error) {
       state.optimisticPlans.delete(actionSymbol);
       state.optimisticBuyToday.delete(actionSymbol);
@@ -3531,6 +3792,7 @@
         setPanel(`UNAVAILABLE - ${error.message}`, 'error');
       }
       void refreshPlanningLists().catch(() => {});
+      return false;
     } finally {
       bumpPlanningEpoch(actionSymbol);
       state.planningPendingSymbols.delete(actionSymbol);
@@ -3864,7 +4126,7 @@
     byId('breakout-input').addEventListener('keydown', event => {
       if (event.key === 'Enter') saveManualBreakout();
     });
-    byId('breakout-price-form').addEventListener('submit', event => {
+    byId('breakout-price-form').addEventListener('submit', async event => {
       event.preventDefault();
       const input = byId('breakout-price-popup-input');
       const value = Number(input.value);
@@ -3874,8 +4136,13 @@
         return;
       }
       input.setCustomValidity('');
+      const actionSymbol = state.symbol;
+      const followup = state.breakoutFollowup;
       closeBreakoutPricePopup();
-      commitBreakoutPrice(value, `Breakout set to ${value.toFixed(2)} — saved locally.`);
+      const saved = await commitBreakoutPrice(value, `Breakout set to ${value.toFixed(2)} — saved.`);
+      if (!saved || state.symbol !== actionSymbol || followup?.symbol !== actionSymbol) return;
+      if (followup.target === 'buy_today') await toggleBuyTodayDraft();
+      else await moveToList('buylist');
     });
     byId('breakout-price-popup-input').addEventListener('input', event => event.target.setCustomValidity(''));
     byId('breakout-price-cancel').addEventListener('click', closeBreakoutPricePopup);

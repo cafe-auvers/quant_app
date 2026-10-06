@@ -565,6 +565,18 @@ class TradeCardOrbEvaluator:
             if candidate.status in _BLOCKED_CANDIDATE_STATUSES
             else ""
         )
+        candidates = dict(execution_queue_item.candidates or {})
+        if (
+            candidate.status in _BLOCKED_CANDIDATE_STATUSES
+            and len(candidates) > 1
+            and not execution_queue_item.manual_window_lock
+            and all(item.status in _BLOCKED_CANDIDATE_STATUSES for item in candidates.values())
+        ):
+            card.entry_block_reason = "; ".join(
+                f"{window}: {candidates[window].reason}"
+                for window in ("1m", "5m", "30m")
+                if window in candidates and candidates[window].reason
+            )
 
     def select_crossed_candidate(
         self,
@@ -1049,6 +1061,16 @@ class TradeCardOrbEvaluator:
             return card
 
         if prior_runtime_status == EntryRuntimeStatus.RETRY_COOLDOWN:
+            card.entry_runtime_status = prior_runtime_status
+            card.entry_block_reason = prior_block_reason
+        elif prior_runtime_status == EntryRuntimeStatus.DATA_UNAVAILABLE and candidate.status in {
+            OrbCandidateStatus.WAITING_BREAKOUT,
+            OrbCandidateStatus.VALID,
+            OrbCandidateStatus.EXECUTE_READY,
+        }:
+            # Only the live feed check may recover a data-blocked entry.
+            # Re-arming from a minute-bar refresh caused a no-op status write
+            # every cycle when the heartbeat immediately blocked it again.
             card.entry_runtime_status = prior_runtime_status
             card.entry_block_reason = prior_block_reason
 

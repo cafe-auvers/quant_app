@@ -758,8 +758,12 @@ class ReadOnlyMirrorMarketDataSource:
         path: str | Path,
         *,
         scanner_setups_path: str | Path | None = None,
+        hourly_reader=None,
     ):
         self.path = Path(path).expanduser().resolve()
+        self.hourly_reader = hourly_reader
+        if hourly_reader is not None:
+            self.source_name = "PC_HOURLY_WITH_LOCAL_CONTEXT"
         if not self.path.is_file():
             raise MarketDataUnavailable(f"SQLite mirror does not exist: {self.path}")
         self.scanner_setups_path = (
@@ -785,6 +789,17 @@ class ReadOnlyMirrorMarketDataSource:
                 continue
             parts.append(f"{candidate.name}:{stat.st_mtime_ns}:{stat.st_size}")
         return "|".join(parts)
+
+    def chart_cache_revision(self, symbol: str, timeframe: str, *, hourly_months: int) -> str:
+        revision = self.cache_revision()
+        if timeframe == "1H" and self.hourly_reader is not None:
+            start = (pd.Timestamp.now(tz="UTC")-pd.DateOffset(months=hourly_months)).tz_localize(None)
+            revision += "|pc-hourly:" + self.hourly_reader.revision(symbol, start.to_pydatetime())
+        return revision
+
+    def close(self):
+        if self.hourly_reader is not None:
+            self.hourly_reader.close()
 
     def _tables(self, connection: sqlite3.Connection) -> set[str]:
         return {
@@ -1214,35 +1229,40 @@ class ReadOnlyMirrorMarketDataSource:
                 ).fetchall()
                 time_column = "date"
                 requested = daily_bars
-                source = self.source_name
+                source = self.source_name + (":LOCAL_SQLITE_MIRROR" if self.hourly_reader is not None else "")
             elif timeframe == "1H":
-                if "hourly_price_history" not in tables:
+                if self.hourly_reader is None and "hourly_price_history" not in tables:
                     raise MarketDataUnavailable(
                         "hourly_price_history is absent from the mirror"
                     )
                 start = (
                     pd.Timestamp.now(tz="UTC") - pd.DateOffset(months=hourly_months)
                 ).tz_localize(None)
-                rows = connection.execute(
-                    """
-                    SELECT timestamp, open, high, low, close, adj_close, volume, source
-                    FROM hourly_price_history
-                    WHERE symbol=? AND timestamp>=?
-                    ORDER BY timestamp
-                    """,
-                    (symbol, start.isoformat(sep=" ")),
-                ).fetchall()
-                benchmark_rows = connection.execute(
-                    """
-                    SELECT timestamp, close FROM hourly_price_history
-                    WHERE symbol='SPY' AND timestamp>=?
-                    ORDER BY timestamp
-                    """,
-                    (start.isoformat(sep=" "),),
-                ).fetchall()
+                if self.hourly_reader is not None:
+                    rows, benchmark_rows = self.hourly_reader.read(symbol, start.to_pydatetime())
+                else:
+                    rows = connection.execute(
+                        """
+                        SELECT timestamp, open, high, low, close, adj_close, volume, source
+                        FROM hourly_price_history
+                        WHERE symbol=? AND timestamp>=?
+                        ORDER BY timestamp
+                        """,
+                        (symbol, start.isoformat(sep=" ")),
+                    ).fetchall()
+                    benchmark_rows = connection.execute(
+                        """
+                        SELECT timestamp, close FROM hourly_price_history
+                        WHERE symbol='SPY' AND timestamp>=?
+                        ORDER BY timestamp
+                        """,
+                        (start.isoformat(sep=" "),),
+                    ).fetchall()
                 time_column = "timestamp"
                 requested = None
                 sources = {str(row["source"]) for row in rows if row["source"]}
+                if self.hourly_reader is not None:
+                    sources.add("PC_MYSQL_READ_ONLY")
                 source = (
                     f"{self.source_name}:{','.join(sorted(sources))}"
                     if sources
@@ -1339,7 +1359,7 @@ class ReadOnlyMirrorMarketDataSource:
                 index=benchmark_index,
                 dtype=float,
             )
-        return _bundle_from_frame(
+        bundle = _bundle_from_frame(
             symbol=symbol,
             timeframe=timeframe,
             frame=frame,
@@ -1351,18 +1371,30 @@ class ReadOnlyMirrorMarketDataSource:
             benchmark_close=benchmark_close,
             market_alignment=market_alignment,
             header_metrics=header_metrics,
-            source_revision=self.cache_revision(),
+            source_revision=self.chart_cache_revision(symbol, timeframe, hourly_months=hourly_months),
         )
+        if timeframe == "1H" and self.hourly_reader is not None:
+            expected = _latest_completed_session_date().isoformat()
+            actual = str(bundle["coverage"]["actual_end"] or "")[:10]
+            fresh = actual >= expected
+            bundle["coverage"].update(
+                bar_source="PC_MYSQL_READ_ONLY", context_source="LOCAL_SQLITE_MIRROR",
+                expected_completed_session_date=expected, freshness="CURRENT" if fresh else "STALE")
+            if not fresh:
+                bundle["coverage"]["completeness"] = "STALE"
+        return bundle
 
 
 def build_market_data_source(
     local_mirror_path: str,
     *,
     scanner_setups_path: str | Path | None = None,
+    hourly_reader=None,
 ) -> MarketDataSource:
     if local_mirror_path:
         return ReadOnlyMirrorMarketDataSource(
             local_mirror_path,
             scanner_setups_path=scanner_setups_path,
+            hourly_reader=hourly_reader,
         )
     return DemoMarketDataSource()

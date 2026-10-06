@@ -158,6 +158,29 @@ def _make_engine(
 # --- Disabled engine is a strict no-op --------------------------------------
 
 
+def test_pre_broker_risk_rejection_is_visible_on_retrying_card(tmp_path):
+    from src.risk.pre_trade import PreTradeRiskRejectedError
+
+    reason = "Existing pending BUY has no active capital reservation"
+
+    def reject(**kwargs):
+        raise PreTradeRiskRejectedError(reason)
+
+    engine = _make_engine(tmp_path, submit_order=reject)
+    engine._market_is_open_fn = lambda: True
+    card = _buy_today_card()
+    engine._market_data.subscribe([card.symbol])
+    engine._market_data.poll_once()
+    changed = engine._evaluate_buy_today([card])
+
+    assert card in changed
+    assert card.board_status == BoardStatus.BUY_TODAY
+    assert card.entry_runtime_status == EntryRuntimeStatus.RETRY_COOLDOWN
+    assert card.entry_block_reason == reason
+    assert card.next_retry_at is not None
+    assert not card.entry_submission_unresolved
+
+
 def test_disabled_engine_ignores_everything(tmp_path, monkeypatch):
     import src.services.trading_engine as trading_engine_module
 
@@ -230,6 +253,17 @@ def test_stale_quote_blocks_entry_and_flags_data_unavailable(tmp_path):
     assert card.entry_runtime_status == EntryRuntimeStatus.DATA_UNAVAILABLE
     assert card.board_status == BoardStatus.BUY_TODAY  # never attempted
     assert "Fresh KIS WebSocket trade and quote events" in card.entry_block_reason
+
+
+def test_entry_guard_displays_specific_feed_reason_and_keeps_order_blocked(tmp_path):
+    engine = _make_engine(tmp_path)
+    engine._market_data.entry_quote_unavailable_reason = lambda symbol, now=None: "PC evaluation delayed: the KIS event exceeded the processing queue limit"
+    card = _buy_today_card()
+    engine.run_heartbeat([card])
+    assert card.entry_runtime_status == EntryRuntimeStatus.DATA_UNAVAILABLE
+    assert "processing queue limit" in card.entry_block_reason
+    assert card.board_status == BoardStatus.BUY_TODAY
+    assert not card.entry_client_order_id
 
 
 def test_fresh_quote_allows_entry_submission_and_moves_to_entry_pending(tmp_path):
