@@ -156,6 +156,19 @@ def _local_write_generation(engine: Engine) -> int:
         return int(_local_write_generations.get(engine, 0))
 
 
+def account_broker_state_generation(engine: Engine) -> tuple:
+    """Invalidate an asynchronous read after local or remote order changes."""
+    from src.services.coordination_change_pulse import coordination_table_change_generation
+
+    return (
+        _local_write_generation(engine),
+        coordination_table_change_generation(
+            engine,
+            {"execution_orders", "capital_reservations", "discovered_external_orders", "execution_commands"},
+        ),
+    )
+
+
 class ReconciliationCategory(str, Enum):
     ENTRY_BUY = "ENTRY_BUY"
     ENTRY_COMPLETION_BUY = "ENTRY_COMPLETION_BUY"
@@ -2250,11 +2263,12 @@ def run_account_reconciliation_pass(
         Callable[[Mapping], Tuple[float, float]]
     ] = None,
     position_snapshot=_POSITION_SNAPSHOT_NOT_PROVIDED,
+    broker_snapshot: Optional[AccountBrokerSnapshot] = None,
     clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     persist: bool = True,
 ) -> AccountReconciliationResult:
     """Fetch broker truth once and retry one local optimistic-write race."""
-    snapshot = fetch_account_broker_snapshot(
+    snapshot = broker_snapshot or fetch_account_broker_snapshot(
         broker=broker,
         environment=environment,
         account_no=account_no,
@@ -2263,6 +2277,8 @@ def run_account_reconciliation_pass(
         position_snapshot=position_snapshot,
         clock=clock,
     )
+    if snapshot.environment != environment or snapshot.account_no != account_no:
+        raise ValueError("Broker snapshot belongs to a different account or environment")
     attempt_cards = cards
     for attempt in range(2):
         local_state = load_account_local_state(

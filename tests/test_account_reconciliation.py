@@ -57,6 +57,16 @@ from src.services import account_reconciliation as reconciliation_module
 NOW = datetime(2026, 8, 15, 14, 0, tzinfo=timezone.utc)
 
 
+def test_prefetched_snapshot_is_account_scoped_and_cannot_be_applied_elsewhere(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'snapshot-account.db'}", future=True)
+    snapshot = AccountBrokerSnapshot(environment="PROD", account_no="other",
+                                     observed_at=NOW, session_date=NOW.date(),
+                                     completeness=SnapshotCompleteness())
+    with pytest.raises(ValueError, match="different account"):
+        run_account_reconciliation_pass(broker=None, engine=engine, environment="PROD",
+                                        account_no="1", cards=(), broker_snapshot=snapshot)
+
+
 def test_unchanged_reconciliation_plan_emits_no_commit(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'no-op-plan.db'}", future=True)
     commits = []

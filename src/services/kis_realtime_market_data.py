@@ -1374,6 +1374,7 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         require_trade: bool = True,
         require_quote: bool = True,
         now: Optional[datetime] = None,
+        entry_max_age_seconds: Optional[float] = None,
     ) -> bool:
         reference = now or self._clock()
         self._expire_ack_timeouts(reference)
@@ -1393,15 +1394,22 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         ):
             return False
         quote = self.latest_quote(symbol)
-        if quote is None or not quote.is_execution_fresh(now=reference):
+        budgets = {} if entry_max_age_seconds is None else {
+            "broker_max_age_seconds": entry_max_age_seconds,
+            "receive_max_age_seconds": entry_max_age_seconds,
+            "queue_max_delay_seconds": entry_max_age_seconds,
+        }
+        if quote is None or not quote.is_execution_fresh(now=reference, **budgets):
             return False
+        age_budget = (execution_config.BROKER_EVENT_STALE_SECONDS
+                      if entry_max_age_seconds is None else entry_max_age_seconds)
         if require_trade and (
-            reference - state.last_trade_event_at
-        ).total_seconds() > execution_config.BROKER_EVENT_STALE_SECONDS:
+            not 0.0 <= (reference - state.last_trade_event_at).total_seconds() <= age_budget
+        ):
             return False
         if require_quote and (
-            reference - state.last_quote_event_at
-        ).total_seconds() > execution_config.BROKER_EVENT_STALE_SECONDS:
+            not 0.0 <= (reference - state.last_quote_event_at).total_seconds() <= age_budget
+        ):
             return False
         return True
 
@@ -1460,7 +1468,8 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         quote = self.latest_quote(symbol)
         ready = bool(
             self.is_symbol_execution_ready(
-                symbol, require_trade=True, require_quote=True, now=now
+                symbol, require_trade=True, require_quote=True, now=now,
+                entry_max_age_seconds=execution_config.ENTRY_MARKET_DATA_MAX_AGE_SECONDS,
             )
             and quote is not None
             and quote.ask is not None
@@ -1471,7 +1480,7 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         return ready
 
     def entry_quote_unavailable_reason(self, symbol: str, *, now: Optional[datetime] = None) -> str:
-        """Explain the exact feed gate without changing its freshness policy."""
+        """Explain the BUY gate; channel ages include worker scheduling time."""
         reference = now or self._clock()
         state = self.symbol_state(symbol)
         if not self.is_connected():
@@ -1483,13 +1492,14 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         quote = self.latest_quote(symbol)
         if quote is None:
             return "Waiting for the first KIS trade and quote events"
-        if quote.queue_delay_seconds() > execution_config.MAX_MARKET_DATA_QUEUE_DELAY_SECONDS:
+        budget = execution_config.ENTRY_MARKET_DATA_MAX_AGE_SECONDS
+        if quote.queue_delay_seconds() > budget:
             return "PC evaluation delayed: the KIS event exceeded the processing queue limit"
-        if state.last_trade_event_at is None or (reference - state.last_trade_event_at).total_seconds() > execution_config.BROKER_EVENT_STALE_SECONDS:
+        if state.last_trade_event_at is None or (reference - state.last_trade_event_at).total_seconds() > budget:
             return "Waiting for a fresh KIS trade event for this symbol"
-        if state.last_quote_event_at is None or (reference - state.last_quote_event_at).total_seconds() > execution_config.BROKER_EVENT_STALE_SECONDS:
+        if state.last_quote_event_at is None or (reference - state.last_quote_event_at).total_seconds() > budget:
             return "Waiting for a fresh KIS bid/ask event for this symbol"
-        if not quote.is_execution_fresh(now=reference):
+        if not quote.is_entry_fresh(now=reference):
             return "KIS event exceeded the broker or local receive freshness limit"
         if quote.ask is None or quote.ask <= 0 or quote.last_price <= 0:
             return "KIS trade price or best ask is unavailable"

@@ -463,13 +463,14 @@ def test_stale_representative_maximum_cannot_trigger_entry_from_fresh_cache(tmp_
         last_price=105.0,
         bid=104.9,
         ask=105.0,
-        broker_event_at=now - dt.timedelta(seconds=2),
-        received_at=now - dt.timedelta(seconds=2),
+        broker_event_at=now - dt.timedelta(seconds=16),
+        received_at=now - dt.timedelta(seconds=16),
         processed_at=now,
     )
 
     assert engine._market_data.entry_quote_ready("AAPL", now=now)
     assert not stale_maximum.is_execution_fresh(now=now)
+    assert not stale_maximum.is_entry_fresh(now=now)
     assert engine.evaluate_entry_quote([card], stale_maximum) == []
     assert submitted == []
     assert card.entry_runtime_status == EntryRuntimeStatus.EXECUTE_READY

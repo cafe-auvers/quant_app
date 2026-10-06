@@ -27,6 +27,7 @@ new engine activity on the next tick without requiring an app restart.
 """
 from __future__ import annotations
 
+import copy
 import logging
 import math
 import platform
@@ -77,8 +78,12 @@ from src.services.account_reconciliation import (
     AccountReconciliationResult,
     ReconciliationAlertSeverity,
     ReconciliationCommandType,
+    account_broker_state_generation,
+    fetch_account_broker_snapshot,
     run_account_reconciliation_pass,
 )
+from src.services.background_account_reader import AccountReadRequest, BackgroundAccountReader
+from src.services.broker import ReadOnlyBroker
 from src.services.controlled_live_policy import (
     controlled_live_symbols,
     live_entry_card_allowed,
@@ -433,6 +438,11 @@ class BuyboardRuntimeWorker(QThread):
         ] = None
         self.execution_gateway: Optional[ExecutionCommandGateway] = None
         self._cached_cards: List[TradeCardState] = []
+        self._durable_card_payloads: Dict[str, tuple[int, dict]] = {}
+        # Started by run after startup recovery. Direct diagnostic cycles can
+        # retain synchronous reads without owning another thread.
+        self._account_reader: Optional[BackgroundAccountReader] = None
+        self._last_account_read_started = ""
         self._card_cache_initialized = False
         self._card_collection_revision = None
         self._last_card_revision_checked_at: Optional[datetime] = None
@@ -1213,6 +1223,7 @@ class BuyboardRuntimeWorker(QThread):
             self.error_occurred.emit(f"Buy Board engine failed to start: {exc}")
             return
 
+        self._account_reader = BackgroundAccountReader()
         try:
             while not self._stop_requested:
                 cycle_started_monotonic = time.monotonic()
@@ -1432,6 +1443,8 @@ class BuyboardRuntimeWorker(QThread):
         """E4: gate commands, flush, reconcile, close feed, then stop."""
 
         self.shutdown_errors = []
+        if self._account_reader is not None:
+            self._account_reader.close()
         try:
             self._set_device_state(RuntimeDeviceState.SHUTTING_DOWN)
         except Exception as exc:
@@ -2027,6 +2040,9 @@ class BuyboardRuntimeWorker(QThread):
             raise_on_error=True,
         )
         self._cached_cards = cards
+        self._durable_card_payloads = {
+            card.card_key: (card.version, self._card_payload(card)) for card in cards
+        }
         self._card_cache_initialized = True
         self._card_collection_revision = revision
         return cards
@@ -2603,6 +2619,26 @@ class BuyboardRuntimeWorker(QThread):
         # correctly treats every holding found there as newly discovered.
         account_numbers = self._distinct_account_numbers(cards)
         self._reconciliation_required_accounts.update(account_numbers)
+        reader = self._account_reader
+        completed = reader.take_completed() if reader is not None else None
+        completed_request = completed[0] if completed is not None else None
+        if completed_request is not None:
+            account = completed_request.account_no
+            self.reconciliation_accounts_in_progress.discard(account)
+            self.routine_reconciliation_accounts_in_progress.discard(account)
+            age = (now - completed_request.started_at).total_seconds()
+            if (
+                self._stop_requested
+                or age < 0
+                or age > execution_config.FULL_RECONCILIATION_SECONDS
+                or completed_request.generation != self._account_read_generation(cards)
+            ):
+                logger.info("Discarding superseded background account read")
+                completed = completed_request = None
+        # Rotate accounts so one repeatedly-due account cannot starve others.
+        if reader is not None and self._last_account_read_started in account_numbers:
+            index = account_numbers.index(self._last_account_read_started) + 1
+            account_numbers = account_numbers[index:] + account_numbers[:index]
         for account_no in account_numbers:
             retry_not_before = self._account_refresh_retry_not_before.get(account_no)
             if retry_not_before is not None and now < retry_not_before:
@@ -2640,13 +2676,47 @@ class BuyboardRuntimeWorker(QThread):
                 reconcile_age is None
                 or reconcile_age >= reconcile_interval
             )
+            ready_read = bool(completed_request and completed_request.account_no == account_no)
+            if ready_read:
+                reconcile_due = completed_request.reconcile
+                balance_due = True
             if not balance_due and not reconcile_due:
+                continue
+
+            if reader is not None and not ready_read:
+                if reader.busy:
+                    continue
+                request = AccountReadRequest(
+                    account_no=account_no,
+                    reconcile=reconcile_due,
+                    started_at=now,
+                    generation=self._account_read_generation(cards),
+                )
+                broker = ReadOnlyBroker(self.runtime.broker)
+                environment = self._environment
+                extractor = type(self)._extract_account_balance
+
+                def read(request=request, broker=broker, environment=environment, extractor=extractor):
+                    if request.reconcile:
+                        return fetch_account_broker_snapshot(
+                            broker=broker, environment=environment,
+                            account_no=request.account_no,
+                            position_balance_extractor=extractor,
+                        )
+                    return broker.get_positions(environment=environment, account_no=request.account_no)
+
+                if reconcile_due:
+                    self.reconciliation_accounts_in_progress.add(account_no)
+                    self.routine_reconciliation_accounts_in_progress.add(account_no)
+                reader.submit(request, read)
+                self._last_account_read_started = account_no
                 continue
 
             if reconcile_due:
                 self.reconciliation_accounts_in_progress.add(account_no)
                 self.routine_reconciliation_accounts_in_progress.add(account_no)
                 try:
+                    snapshot_args = {"broker_snapshot": completed[1].result()} if ready_read else {}
                     result = run_account_reconciliation_pass(
                         broker=self.runtime.broker,
                         engine=self._db_engine,
@@ -2654,6 +2724,7 @@ class BuyboardRuntimeWorker(QThread):
                         account_no=account_no,
                         cards=account_cards,
                         position_balance_extractor=self._extract_account_balance,
+                        **snapshot_args,
                     )
                 except Exception as exc:
                     self._defer_account_refresh(account_no, now)
@@ -2723,8 +2794,9 @@ class BuyboardRuntimeWorker(QThread):
             # reconciliation pass, so it performs the one holdings query
             # it needs and no order discovery.
             try:
-                position_snapshot = self.runtime.broker.get_positions(
-                    environment=self._environment, account_no=account_no
+                position_snapshot = (
+                    completed[1].result() if ready_read
+                    else self.runtime.broker.get_positions(environment=self._environment, account_no=account_no)
                 )
             except Exception as exc:
                 self._defer_account_refresh(account_no, now)
@@ -2742,11 +2814,25 @@ class BuyboardRuntimeWorker(QThread):
                         account_no,
                     )
                 continue
-            self._record_buying_power(account_no, position_snapshot)
-            self._account_balance_refreshed_at[account_no] = now
+            received_at = completed_request.started_at if ready_read else now
+            self._record_buying_power(account_no, position_snapshot, received_at=received_at)
+            self._account_balance_refreshed_at[account_no] = received_at
             self._account_refresh_retry_not_before.pop(account_no, None)
 
         return changed
+
+    def _account_read_generation(self, cards: List[TradeCardState]) -> tuple:
+        return (
+            account_broker_state_generation(self._db_engine),
+            tuple(sorted(
+                (card.card_key, card.board_status.value, card.broker_quantity,
+                 card.orderable_quantity, card.average_entry_price,
+                 card.entry_client_order_id, card.entry_cancel_in_flight,
+                 card.exit_client_order_id, card.exit_cancel_in_flight,
+                 card.exit_submission_unresolved, card.exit_all_required)
+                for card in cards
+            )),
+        )
 
     def _defer_account_refresh(self, account_no: str, now: datetime) -> None:
         self._account_refresh_retry_not_before[account_no] = now + timedelta(
@@ -2759,7 +2845,7 @@ class BuyboardRuntimeWorker(QThread):
             return None
         return (now - then).total_seconds()
 
-    def _record_buying_power(self, account_no: str, position_snapshot: dict) -> None:
+    def _record_buying_power(self, account_no: str, position_snapshot: dict, *, received_at=None) -> None:
         from src.services import buying_power_cache
 
         usable_usd, equity_usd = self._extract_account_balance(position_snapshot)
@@ -2769,6 +2855,7 @@ class BuyboardRuntimeWorker(QThread):
             usable_buying_power_usd=usable_usd,
             total_equity_usd=equity_usd,
             source="buyboard_runtime_periodic_refresh",
+            received_at=received_at,
         )
         from src.services.monitor_equity import queue_monitor_equity
 
@@ -3856,6 +3943,13 @@ class BuyboardRuntimeWorker(QThread):
         for card in cards:
             try:
                 with self._stop_change_coordinator.lock_cards([card.card_key]):
+                    payload = self._card_payload(card)
+                    if self._durable_card_payloads.get(card.card_key) == (card.version, payload):
+                        persisted.append(card)
+                        continue
+                    from src.services.coordination_change_pulse import coordination_table_change_generation
+                    local_before = repo.local_trade_card_change_generation(self._db_engine)
+                    pulse_before = coordination_table_change_generation(self._db_engine, {"trade_cards"})
                     try:
                         repo.update_trade_card(
                             self._db_engine, card, expected_version=card.version
@@ -3868,6 +3962,18 @@ class BuyboardRuntimeWorker(QThread):
                         # been persisted. Create it instead of dropping it.
                         repo.create_trade_card(self._db_engine, card)
                     self._stop_change_coordinator.reconcile_durable(card)
+                    self._durable_card_payloads[card.card_key] = (card.version, self._card_payload(card))
+                    local_after = repo.local_trade_card_change_generation(self._db_engine)
+                    pulse_after = coordination_table_change_generation(self._db_engine, {"trade_cards"})
+                    if (
+                        local_before == self._local_card_change_generation
+                        and local_after == local_before + 1
+                        and pulse_before == self._last_card_change_pulse_generation
+                        and pulse_after[0] == pulse_before[0]
+                        and any(cached is card for cached in self._cached_cards)
+                    ):
+                        self._local_card_change_generation = local_after
+                        self._last_card_change_pulse_generation = pulse_after
                     persisted.append(card)
             except Exception:
                 # A stale version (another device changed this card
@@ -3876,4 +3982,12 @@ class BuyboardRuntimeWorker(QThread):
                 # next cycle re-loads authoritative state and simply tries
                 # again.
                 logger.exception("BuyboardRuntimeWorker failed to persist %s", card.symbol)
+                self._card_cache_initialized = False
         return persisted
+
+    @staticmethod
+    def _card_payload(card: TradeCardState) -> dict:
+        payload = copy.deepcopy(card.to_dict())
+        payload.pop("version", None)
+        payload.pop("updated_at", None)
+        return payload

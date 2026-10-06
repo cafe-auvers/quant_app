@@ -511,6 +511,102 @@ def test_card_cache_downloads_payload_only_when_revision_changes(
     assert len(calls) == 2
 
 
+def test_unchanged_final_card_state_avoids_write_and_own_write_avoids_reload(tmp_path, monkeypatch):
+    worker, engine = _worker(tmp_path)
+    _seed_card(engine)
+    card = worker._load_cards_if_changed()[0]
+    original = card.name
+    card.name = "Transient planning state"
+    card.name = original
+    assert worker._persist_changed([card]) == [card]
+    assert repo.get_trade_card(engine, "PROD", "1", "AAPL").version == 1
+    card.stop_loss_triggered = True
+    worker._persist_changed([card])
+    assert repo.get_trade_card(engine, "PROD", "1", "AAPL").stop_loss_triggered
+    monkeypatch.setattr(repo, "get_trade_card_collection_revision", lambda *a, **k: pytest.fail("Own write caused reload"))
+    assert worker._load_cards_if_changed()[0] is card
+
+
+def test_background_account_read_does_not_block_quote_and_stop_evaluation(tmp_path, monkeypatch):
+    from src.services.background_account_reader import BackgroundAccountReader
+
+    entered, release = threading.Event(), threading.Event()
+    broker = _FakeBroker()
+    original_read = broker.get_positions
+
+    def blocking_read(**kwargs):
+        entered.set()
+        assert release.wait(3)
+        return original_read(**kwargs)
+
+    broker.get_positions = blocking_read
+    worker, engine = _worker(tmp_path, broker=broker)
+    worker.runtime = _build_test_runtime(
+        buying_power_provider=worker._buying_power_provider,
+        card_lookup=worker._card_lookup, broker=broker, market_data=_dummy_market_data(),
+    )
+    _seed_card(engine, board_status=BoardStatus.OPEN_POSITION, broker_quantity=10,
+               orderable_quantity=10, active_stop_price=101.0, stop_quantity=10)
+    worker._account_reader = BackgroundAccountReader()
+    monkeypatch.setattr(execution_config, "is_buyboard_engine_enabled", lambda: True)
+    monkeypatch.setattr("src.services.trading_engine.is_buyboard_engine_enabled", lambda: True)
+    try:
+        worker._run_one_cycle()
+        assert entered.wait(1)
+        assert not release.is_set()
+        assert worker.last_market_data_drain_at is not None
+        assert worker._cached_cards[0].stop_loss_triggered
+        pending = worker._account_reader._pending
+        worker._run_one_cycle()
+        assert worker._account_reader._pending is pending
+    finally:
+        release.set()
+        worker._account_reader.close()
+
+
+def test_background_result_is_discarded_after_order_state_changes(tmp_path, monkeypatch):
+    from src.services.background_account_reader import BackgroundAccountReader
+
+    broker = _FakeBroker()
+    worker, engine = _worker(tmp_path, broker=broker)
+    worker.runtime = SimpleNamespace(broker=broker)
+    _seed_card(engine)
+    cards = worker._load_cards_if_changed()
+    worker._account_reader = BackgroundAccountReader()
+    worker._refresh_account_state_if_due(cards)
+    pending = worker._account_reader._pending
+    pending[1].result(timeout=3)
+    cards[0].exit_client_order_id = "new-sell-after-read-started"
+    monkeypatch.setattr("src.ui.buyboard.runtime_worker.run_account_reconciliation_pass",
+                        lambda **kwargs: pytest.fail("Superseded snapshot was applied"))
+    try:
+        worker._refresh_account_state_if_due(cards)
+        assert worker._latest_reconciliation_snapshots == {}
+        assert worker._account_reader._pending is not pending
+    finally:
+        worker._account_reader.close()
+
+
+def test_background_snapshot_applies_on_owner_thread_without_refetch(tmp_path, monkeypatch):
+    from src.services.background_account_reader import BackgroundAccountReader
+
+    broker = _FakeBroker()
+    worker, engine = _worker(tmp_path, broker=broker)
+    worker.runtime = SimpleNamespace(broker=broker)
+    _seed_card(engine)
+    cards = worker._load_cards_if_changed()
+    worker._account_reader = BackgroundAccountReader()
+    worker._refresh_account_state_if_due(cards)
+    worker._account_reader._pending[1].result(timeout=3)
+    calls = len(broker.get_positions_calls)
+    assert worker._latest_reconciliation_snapshots == {}
+    worker._refresh_account_state_if_due(cards, execute_commands=False)
+    assert len(broker.get_positions_calls) == calls
+    assert "1" in worker._latest_reconciliation_snapshots
+    assert not worker.reconciliation_accounts_in_progress
+    worker._account_reader.close()
+
+
 def test_same_device_mode_disables_elapsed_card_fallback(
     tmp_path, monkeypatch
 ):

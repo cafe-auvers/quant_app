@@ -70,11 +70,13 @@ class SnapshotMarketData(RealtimeMarketDataService):
                     not state.get("quote_rejected_due_to_capacity"))
 
     def is_symbol_execution_ready(self, symbol, *, require_trade=True,
-                                  require_quote=True, now=None):
+                                  require_quote=True, now=None, entry=False):
         from src.core import execution_config
         quote = self.latest_quote(symbol)
         state = self.states.get(symbol.upper(), {})
         reference = now or datetime.now(timezone.utc)
+        budget = (execution_config.ENTRY_MARKET_DATA_MAX_AGE_SECONDS if entry
+                  else execution_config.BROKER_EVENT_STALE_SECONDS)
         if not self.is_symbol_feed_available(symbol, require_trade=require_trade,
                                              require_quote=require_quote):
             return False
@@ -83,13 +85,14 @@ class SnapshotMarketData(RealtimeMarketDataService):
             stamp = state.get(key)
             if needed and (stamp is None or not
                            0 <= (reference - stamp).total_seconds() <=
-                           execution_config.BROKER_EVENT_STALE_SECONDS):
+                           budget):
                 return False
-        return bool(quote and quote.is_execution_fresh(now=reference))
+        return bool(quote and (quote.is_entry_fresh(now=reference) if entry
+                              else quote.is_execution_fresh(now=reference)))
 
     def entry_quote_ready(self, symbol, *, now=None):
         quote = self.latest_quote(symbol)
-        return bool(self.is_symbol_execution_ready(symbol, now=now) and
+        return bool(self.is_symbol_execution_ready(symbol, now=now, entry=True) and
                     quote and quote.ask and quote.ask > 0 and quote.last_price > 0)
 
     def is_symbol_trading_halted(self, symbol):

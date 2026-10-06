@@ -427,7 +427,7 @@ class TradingEngine:
             not self.is_enabled()
             or not quote.regular_session
             or not quote.entry_trigger_eligible
-            or not quote.is_execution_fresh(now=now)
+            or not quote.is_entry_fresh(now=now)
         ):
             return []
         symbol = quote.symbol.upper()
@@ -1190,7 +1190,7 @@ class TradingEngine:
                     quote is None
                     or not quote.regular_session
                     or not quote.entry_trigger_eligible
-                    or not quote.is_execution_fresh(now=now)
+                    or not quote.is_entry_fresh(now=now)
                     or not self._market_data.entry_quote_ready(card.symbol, now=now)
                     or quote.last_price <= execution_price
                     or best_ask is None

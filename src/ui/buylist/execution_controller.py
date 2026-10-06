@@ -447,7 +447,7 @@ class BuylistExecutionController(WindowController):
             market_data is None
             or quote is None
             or not market_data.entry_quote_ready(item.symbol, now=now)
-            or not quote.is_execution_fresh(now=now)
+            or not quote.is_entry_fresh(now=now)
             or not passive_limit_submission_ready(
                 last_trade=quote.last_price,
                 best_ask=quote.ask,

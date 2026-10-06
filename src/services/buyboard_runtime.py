@@ -1276,6 +1276,17 @@ def build_buyboard_runtime(
         # and Kanban use (INV-21). It normalizes the two persistence models
         # into one workflow result while preserving this function's risk
         # revalidation and gate sequence.
+        if guarded_mode and decision is not None and decision.approved:
+            now = trading_engine._clock()
+            quote = resolved_market_data.latest_quote(symbol)
+            if (
+                quote is None
+                or not quote.regular_session
+                or not quote.entry_trigger_eligible
+                or not quote.is_entry_fresh(now=now)
+                or not resolved_market_data.entry_quote_ready(symbol, now=now)
+            ):
+                raise RuntimeError("KIS entry data expired during pre-trade validation")
         try:
             return request_submit(
                 source=ExecutionSource.KANBAN_BOARD,
@@ -1663,7 +1674,7 @@ def build_buyboard_runtime(
                 or not trading_engine._market_is_open()
                 or not quote.regular_session
                 or not quote.entry_trigger_eligible
-                or not quote.is_execution_fresh(now=now)
+                or not quote.is_entry_fresh(now=now)
                 or not market_data_service.entry_quote_ready(card.symbol, now=now)
                 or quote.last_price <= execution_price
                 or quote.ask is None
@@ -1769,7 +1780,7 @@ def build_buyboard_runtime(
                 or not trading_engine._market_is_open()
                 or not quote.regular_session
                 or not quote.entry_trigger_eligible
-                or not quote.is_execution_fresh(now=now)
+                or not quote.is_entry_fresh(now=now)
                 or not market_data_service.entry_quote_ready(card.symbol, now=now)
                 or quote.last_price <= execution_price
                 or quote.ask is None

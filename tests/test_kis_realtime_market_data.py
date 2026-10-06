@@ -628,6 +628,7 @@ def test_qualification_latency_metrics_can_start_a_new_measurement_window():
 
 
 def test_qualification_silent_channel_probe_uses_live_service_freshness(monkeypatch):
+    monkeypatch.setattr("src.core.execution_config.ENTRY_MARKET_DATA_MAX_AGE_SECONDS", 2.0)
     monkeypatch.setattr(
         "src.services.kis_realtime_market_data.execution_config.BROKER_EVENT_STALE_SECONDS",
         2.0,
@@ -999,7 +1000,7 @@ def test_fresh_trade_cannot_hide_stale_quote_channel_and_explains_block():
     assert service.ingest_quote(_event(channel="HDFSASP0", seconds=-2, fingerprint="quote"))
     assert service.ingest_trade(_event(seconds=-0.1, fingerprint="trade"))
     service.poll_once()
-    reference = NOW + dt.timedelta(seconds=1.1)
+    reference = NOW + dt.timedelta(seconds=13.1)
     assert not service.entry_quote_ready("AAPL", now=reference)
     assert "fresh KIS bid/ask" in service.entry_quote_unavailable_reason("AAPL", now=reference)
 
@@ -1011,9 +1012,28 @@ def test_delayed_processing_is_explained_and_still_blocks_entry():
     _ack(service, "AAPL", "HDFSASP0")
     assert service.ingest_quote(_event(channel="HDFSASP0", seconds=-2, fingerprint="quote"))
     assert service.ingest_trade(_event(seconds=-2, fingerprint="trade"))
+    service._clock = lambda: NOW + dt.timedelta(seconds=16)
     service.poll_once()
-    assert not service.entry_quote_ready("AAPL", now=NOW)
-    assert "processing queue limit" in service.entry_quote_unavailable_reason("AAPL", now=NOW)
+    reference = service._clock()
+    assert not service.entry_quote_ready("AAPL", now=reference)
+    assert "processing queue limit" in service.entry_quote_unavailable_reason("AAPL", now=reference)
+
+
+def test_entry_allows_worker_wait_up_to_total_age_limit_but_keeps_exit_freshness():
+    service, _ = _service()
+    service.configure_desired_channels(trade_priorities={"AAPL": 1}, quote_priorities={"AAPL": 1})
+    _ack(service, "AAPL", "HDFSCNT0")
+    _ack(service, "AAPL", "HDFSASP0")
+    assert service.ingest_quote(_event(channel="HDFSASP0", fingerprint="quote"))
+    assert service.ingest_trade(_event(fingerprint="trade"))
+    service._clock = lambda: NOW + dt.timedelta(seconds=10)
+    quotes = service.poll_once()
+    assert quotes
+    assert service.entry_quote_ready("AAPL", now=service._clock())
+    assert all(quote.is_entry_fresh(now=service._clock()) for quote in quotes)
+    assert not service.is_symbol_execution_ready("AAPL", now=service._clock())
+    assert service.entry_quote_ready("AAPL", now=NOW + dt.timedelta(seconds=15))
+    assert not service.entry_quote_ready("AAPL", now=NOW + dt.timedelta(seconds=15.01))
 
 
 def test_trade_channel_for_open_position_outranks_quote_channel_for_buy_today():

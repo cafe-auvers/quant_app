@@ -122,6 +122,14 @@ class QuoteSnapshot:
         )
         return self.age_seconds(now=now) > max_age
 
+    def is_entry_fresh(self, *, now: Optional[datetime] = None) -> bool:
+        """Bound total BUY data age, including time waiting for evaluation."""
+        budget = execution_config.ENTRY_MARKET_DATA_MAX_AGE_SECONDS
+        return self.is_execution_fresh(
+            now=now, broker_max_age_seconds=budget,
+            receive_max_age_seconds=budget, queue_max_delay_seconds=budget,
+        )
+
 
 def is_quote_stale(
     quote: Optional[QuoteSnapshot], *, now: Optional[datetime] = None
