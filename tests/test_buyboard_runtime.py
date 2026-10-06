@@ -207,8 +207,9 @@ def test_build_buyboard_runtime_rejects_enabled_plain_broker(monkeypatch):
         )
 
 
+@pytest.mark.parametrize("expired", [False, True])
 def test_submit_callback_reaches_the_guarded_gateway_not_wrongmode(
-    tmp_path, trading_enabled, monkeypatch, authorize_full_live
+    tmp_path, trading_enabled, monkeypatch, authorize_full_live, expired
 ):
     """The enabled runtime reaches submit_guarded with durable identity."""
     from sqlalchemy import create_engine
@@ -241,6 +242,15 @@ def test_submit_callback_reaches_the_guarded_gateway_not_wrongmode(
 
     card = _card()
     persisted = []
+    from src.services.realtime_market_data import RestPollingMarketDataService
+    observed_at = dt.datetime.now(dt.timezone.utc)
+    market_data = RestPollingMarketDataService(
+        quote_fetcher=lambda symbol: QuoteSnapshot(symbol=symbol, last_price=101.0,
+                                                   bid=100.9, ask=101.1, received_at=observed_at),
+        clock=lambda: observed_at,
+    )
+    market_data.subscribe([card.symbol])
+    market_data.poll_once()
     monkeypatch.setattr(
         runtime_module.execution_config,
         "is_buyboard_engine_enabled",
@@ -254,10 +264,22 @@ def test_submit_callback_reaches_the_guarded_gateway_not_wrongmode(
         strategy_instance_id="orb",
         execution_lease=lease,
         persist_card_before_execution=lambda current: persisted.append(current.to_dict()),
+        market_data=market_data,
     )
+    runtime.trading_engine._clock = lambda: observed_at + dt.timedelta(seconds=16 if expired else 0)
     authorize_full_live()
 
     fake_broker.queue_acceptance(broker_order_id="B-GUARDED-1")
+    if expired:
+        with pytest.raises(RuntimeError, match="expired during pre-trade"):
+            runtime.entry_attempt_manager._submit_order(
+                environment="PROD", account_no="1", symbol="AAPL", side=OrderSide.BUY,
+                intent=OrderIntent.ENTRY, quantity=10, limit_price=100.0, exchange="NASD",
+                attempt_group_id="g1", attempt_number=1, attempt_deadline_at=None,
+                capital_reservation_id="",
+            )
+        assert fake_broker.submit_calls == []
+        return
     result = runtime.entry_attempt_manager._submit_order(
         environment="PROD", account_no="1", symbol="AAPL", side=OrderSide.BUY,
         intent=OrderIntent.ENTRY, quantity=10, limit_price=100.0, exchange="NASD",
