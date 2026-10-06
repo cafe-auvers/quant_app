@@ -960,6 +960,7 @@ class BuyboardMixin:
                 recovery_card.broker_quantity = 0
                 recovery_card.orderable_quantity = 0
                 recovery_card.exit_all_required = False
+                recovery_card.stop_loss_triggered = False
                 recovery_card.reserved_sell_quantity = 0
             if callable(queue_lookup):
                 try:

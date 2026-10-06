@@ -1238,6 +1238,7 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
         card.pending_stop_command_id = ""
         card.pending_stop_requested_at = None
         card.exit_all_required = False
+        card.stop_loss_triggered = False
         card.sell_all_at_market_open = False
         card.pending_partial_sell_quantity = 0
         card.reserved_sell_quantity = 0
@@ -1351,6 +1352,8 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
         return
 
     if isinstance(command, types.RequestPartialSell):
+        if card.stop_loss_triggered:
+            raise BoardCommandRejectedError("A triggered stop loss must liquidate the full position")
         source_status = card.board_status
         if source_status not in {BoardStatus.OPEN_POSITION, BoardStatus.SELL_ALL}:
             raise BoardCommandRejectedError(
@@ -1373,6 +1376,7 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
                 # above prove no working/ambiguous SELL can be orphaned.
                 card.sell_all_at_market_open = False
                 card.exit_all_required = False
+                card.stop_loss_triggered = False
                 card.reserved_sell_quantity = 0
                 card.next_exit_retry_at = None
                 card.exit_attempt_count = 0
@@ -1456,11 +1460,14 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
         return
 
     if isinstance(command, types.CancelQueuedSellAll):
+        if card.stop_loss_triggered:
+            raise BoardCommandRejectedError("A triggered stop loss cannot be withdrawn")
         if card.board_status != BoardStatus.SELL_ALL:
             raise BoardCommandRejectedError("No Sell All objective to withdraw")
         _move_board_card(card, BoardStatus.OPEN_POSITION)
         card.sell_all_at_market_open = False
         card.exit_all_required = False
+        card.stop_loss_triggered = False
         card.pending_partial_sell_quantity = 0
         card.position_runtime_status = PositionRuntimeStatus.OPEN
         card.next_exit_retry_at = None

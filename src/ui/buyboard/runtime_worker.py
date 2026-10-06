@@ -2627,6 +2627,15 @@ class BuyboardRuntimeWorker(QThread):
                 float(execution_config.FULL_RECONCILIATION_SECONDS)
                 - min(10.0, float(execution_config.FULL_RECONCILIATION_SECONDS) / 4),
             )
+            if any(
+                card.board_status == BoardStatus.SELL_ALL
+                or card.exit_cancel_in_flight
+                for card in account_cards
+            ):
+                reconcile_interval = min(
+                    reconcile_interval,
+                    float(execution_config.PENDING_ORDER_RECONCILIATION_SECONDS),
+                )
             reconcile_due = (
                 reconcile_age is None
                 or reconcile_age >= reconcile_interval

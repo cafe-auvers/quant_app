@@ -598,3 +598,24 @@ def test_reorder_card_respects_stale_version(tmp_path):
     apply_board_command(engine, _cmd(ReorderCard, card, target_priority=1))  # bumps version
     with pytest.raises(TradeCardVersionConflictError):
         apply_board_command(engine, _cmd(ReorderCard, card, target_priority=2))  # stale version
+
+
+@pytest.mark.parametrize("command_type", [CancelQueuedSellAll, RequestPartialSell])
+def test_triggered_stop_loss_cannot_be_withdrawn_or_reduced(tmp_path, command_type):
+    engine = _make_engine(tmp_path)
+    card = _seed(
+        engine,
+        board_status=BoardStatus.SELL_ALL,
+        position_runtime_status=PositionRuntimeStatus.QUEUED_FOR_OPEN,
+        sell_all_at_market_open=True,
+        exit_all_required=True,
+        stop_loss_triggered=True,
+        broker_quantity=12,
+        orderable_quantity=12,
+    )
+    kwargs = {"quantity": 4} if command_type is RequestPartialSell else {}
+    with pytest.raises(CommandRejectedError, match="triggered stop loss"):
+        apply_board_command(engine, _cmd(command_type, card, **kwargs))
+    stored = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert stored.exit_all_required is True
+    assert stored.stop_loss_triggered is True

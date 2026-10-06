@@ -317,6 +317,7 @@ class TradeCardState:
 
     # Exit state (sections 17-18)
     exit_all_required: bool = False
+    stop_loss_triggered: bool = False
     sell_all_at_market_open: bool = False
     # User-requested partial-sell quantity (section 15), stashed on the card
     # when a RequestPartialSell command moves it into PARTIAL_SELL so the
@@ -492,6 +493,7 @@ class TradeCardState:
             else None
         )
         self.exit_all_required = bool(self.exit_all_required)
+        self.stop_loss_triggered = bool(self.stop_loss_triggered)
         self.sell_all_at_market_open = bool(self.sell_all_at_market_open)
         self.pending_partial_sell_quantity = int(self.pending_partial_sell_quantity or 0)
         self.reserved_sell_quantity = int(self.reserved_sell_quantity or 0)
@@ -679,6 +681,7 @@ class TradeCardState:
                 else None
             ),
             "exit_all_required": self.exit_all_required,
+            "stop_loss_triggered": self.stop_loss_triggered,
             "sell_all_at_market_open": self.sell_all_at_market_open,
             "pending_partial_sell_quantity": self.pending_partial_sell_quantity,
             "reserved_sell_quantity": self.reserved_sell_quantity,
@@ -804,6 +807,7 @@ class TradeCardState:
             pending_stop_command_id=str(data.get("pending_stop_command_id", "")),
             pending_stop_requested_at=data.get("pending_stop_requested_at"),
             exit_all_required=bool(data.get("exit_all_required", False)),
+            stop_loss_triggered=bool(data.get("stop_loss_triggered", False)),
             sell_all_at_market_open=bool(data.get("sell_all_at_market_open", False)),
             pending_partial_sell_quantity=int(
                 data.get("pending_partial_sell_quantity", 0) or 0

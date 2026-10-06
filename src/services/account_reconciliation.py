@@ -1351,6 +1351,8 @@ def _project_exact_order_to_card(
         ReconciliationCategory.STOP_LOSS_SELL,
         ReconciliationCategory.RESERVED_MOO_SELL,
     ):
+        if operational == ReconciliationCategory.STOP_LOSS_SELL:
+            card.stop_loss_triggered = True
         if open_at_broker:
             card.board_status = BoardStatus.SELL_ALL
             card.exit_all_required = True

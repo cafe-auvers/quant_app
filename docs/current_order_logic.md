@@ -286,7 +286,39 @@ during replacement cannot inherit the proposed later-generation stop.
   remaining quantity, and a valid later broker timestamp on the same date.
   Missing or contradictory evidence remains fenced.
 
-## 9. What must never happen
+## 9. Hard stop-loss exits
+
+A regular-session trade at or below `active_stop_price` latches a mandatory
+full liquidation. A recovery, restart, or executor handoff cannot withdraw
+that objective. The stop is a trigger, not a minimum acceptable sale price;
+gap-down prices below it must still be sold.
+
+The exit uses the current execution-fresh bid, or a fresh trade when only
+the trade channel is available, with an aggressive sell-limit discount.
+Fresh trades take precedence over an old planning price. The accepted
+breach trade and later liquidation trades update the trusted fallback.
+When both live channels are unavailable, a fresh KIS holding price refreshes
+the liquidation reference and also latches a stop breach.
+
+Hard-stop exits run before new-entry work and retain `STOP_LOSS` intent on
+every attempt. Full Sell All requests also keep repricing until
+broker-confirmed flat, without the partial-exit three-attempt or five-percent
+fallback limits. Manual partial-sell
+and queued-exit withdrawal commands cannot cancel a latched hard stop.
+
+An outstanding order remains fenced until KIS confirms terminal status so a
+late fill cannot overlap a replacement sell. While liquidating, account
+reconciliation uses the pending-order cadence instead of the normal minute
+cadence. A pending broker cancellation is adopted without resending it.
+
+KIS's regular U.S. order API documents limit orders and auction-specific
+orders, rather than a continuous-session market order. See the
+[official KIS order sample](https://github.com/koreainvestment/open-trading-api/blob/main/examples_user/overseas_stock/overseas_stock_functions.py).
+The app therefore follows the market with aggressive limits; broker outages,
+trading halts, and absent liquidity can still delay fills. Closure requires
+broker confirmation that no shares remain.
+
+## 10. What must never happen
 
 - Never infer a fill from price crossing or broker acceptance.
 - Never use yfinance or stale/cached display data to authorize a live order.
@@ -300,7 +332,7 @@ during replacement cannot inherit the proposed later-generation stop.
 - Never let `.env` or `.env.pc` contain live symbol lists; active symbols come
   from canonical Trade Cards and their dedicated runtime data.
 
-## 10. Implementation and verification map
+## 11. Implementation and verification map
 
 | Concern | Primary implementation |
 |---|---|

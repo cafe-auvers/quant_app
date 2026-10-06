@@ -207,6 +207,46 @@ def test_quote_tick_triggers_stop_and_starts_sell_all(tmp_path):
     assert changed == [card]
     assert card.exit_all_required is True
     assert card.board_status == BoardStatus.SELL_ALL
+    assert card.stop_loss_triggered is True
+    assert card.market_data_last_trusted_price == 90.0
+
+
+def test_liquidating_position_keeps_latest_trade_after_another_gap_down(tmp_path):
+    engine = _make_engine(tmp_path)
+    card = _open_card()
+    engine.evaluate_quote([card], QuoteSnapshot(symbol="AAPL", last_price=90.0))
+    engine.evaluate_quote([card], QuoteSnapshot(symbol="AAPL", last_price=70.0))
+    assert card.stop_loss_triggered is True
+    assert card.exit_all_required is True
+    assert card.market_data_last_trusted_price == 70.0
+
+
+def test_stop_sell_is_attempted_before_new_entry_work(tmp_path, monkeypatch):
+    engine = _make_engine(tmp_path)
+    card = _open_card(board_status=BoardStatus.SELL_ALL, stop_loss_triggered=True)
+    actions = []
+    engine._position_callbacks.submit_sell_order = lambda **kw: actions.append(kw["reason"])
+    monkeypatch.setattr(engine, "_evaluate_buy_today", lambda cards: actions.append("entry") or [])
+    engine.run_heartbeat([card])
+    assert actions == ["stop_loss", "entry"]
+
+
+def test_pending_broker_cancel_is_adopted_without_resending(tmp_path):
+    engine = _make_engine(tmp_path)
+    order = _working_sell_order()
+    order.status = OrderStatus.CANCEL_REQUESTED
+    submitted = []
+    engine._position_callbacks = PositionActionCallbacks(
+        cancel_order=lambda intent: pytest.fail("broker cancel is already pending"),
+        submit_sell_order=lambda **kw: submitted.append(kw),
+        refresh_orderable_quantity=lambda *a: 12,
+        find_open_sell_order=lambda card: order,
+    )
+    card = _open_card(board_status=BoardStatus.SELL_ALL, stop_loss_triggered=True)
+    engine.run_heartbeat([card])
+    assert card.exit_cancel_in_flight is True
+    assert card.exit_cancel_requested_at is not None
+    assert submitted == []
 
 
 def test_quote_tick_above_stop_does_not_change_card(tmp_path):

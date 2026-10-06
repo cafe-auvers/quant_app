@@ -1400,7 +1400,78 @@ def test_entry_limits_do_not_block_exits_cancellation_reconciliation_or_recovery
 
 
 @pytest.mark.usefixtures("trading_enabled")
-def test_guarded_sell_all_ttl_reprices_use_fresh_ids_and_consume_emergency_cap(
+def test_guarded_hard_stop_exits_gap_with_trade_only_feed_and_retries_until_flat(
+    tmp_path, monkeypatch
+):
+    runtime, broker, _gateway, engine, market_data = _make_runtime(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        broker, "get_positions", lambda **kwargs: {
+            "overseas": {"holdings": [{"symbol": "AAPL", "quantity": 12, "orderable_quantity": 12}]}
+        },
+    )
+    card = _persist_owned_card(engine, _card(
+        board_status=BoardStatus.OPEN_POSITION,
+        position_runtime_status=PositionRuntimeStatus.OPEN,
+        broker_quantity=12, orderable_quantity=12,
+        active_stop_price=301.19, market_data_last_trusted_price=304.52,
+    ))
+    market_data._quote_fetcher = lambda symbol: QuoteSnapshot(symbol=symbol, last_price=299.0)
+    market_data.subscribe([card.symbol])
+    market_data.poll_once()
+    monkeypatch.setattr(
+        market_data, "is_symbol_execution_ready",
+        lambda symbol, *, require_trade=True, require_quote=True, **kwargs: not require_quote,
+    )
+    runtime.trading_engine.evaluate_quote([card], market_data.latest_quote(card.symbol))
+    current_time = [datetime.now(timezone.utc)]
+    runtime.trading_engine._clock = lambda: current_time[0]
+    broker.queue_acceptance(broker_order_id="STOP-1")
+    runtime.trading_engine.run_heartbeat([card])
+    assert broker.submit_calls[0]["limit_price"] == pytest.approx(299.0 * 0.995)
+    assert fetch_execution_order(engine, card.exit_client_order_id).intent == OrderIntent.STOP_LOSS
+    assert trade_card_repository.get_trade_card(engine, "PROD", "1", "AAPL").stop_loss_triggered
+
+    # Feed loss after the breach cannot exhaust the old three-attempt cap.
+    monkeypatch.setattr(market_data, "is_symbol_execution_ready", lambda *args, **kwargs: False)
+    for number in (2, 3, 4, 5):
+        current_time[0] += timedelta(seconds=execution_config.SELL_ALL_ATTEMPT_TTL_SECONDS + 1)
+        broker.queue_cancel_confirmed()
+        broker.queue_acceptance(broker_order_id=f"STOP-{number}")
+        runtime.trading_engine.run_heartbeat([card])
+        assert len(broker.submit_calls) == number
+        assert card.exit_attempt_count == number
+        assert fetch_execution_order(engine, card.exit_client_order_id).intent == OrderIntent.STOP_LOSS
+    prices = [call["limit_price"] for call in broker.submit_calls]
+    assert all(later < earlier for earlier, later in zip(prices, prices[1:]))
+    assert card.exit_all_required is True
+
+    record = fetch_execution_order(engine, card.exit_client_order_id)
+    plan = reduce_account_reconciliation(
+        AccountBrokerSnapshot(
+            environment="PROD", account_no="1",
+            completeness=SnapshotCompleteness(
+                holdings_complete=True, open_orders_complete=True,
+                history_complete=True, reserved_orders_complete=True,
+                account_balance_complete=True,
+            ),
+            holdings=(), orders=(BrokerOrderStatusSnapshot(
+                environment="PROD", account_no="1", symbol="AAPL",
+                broker_order_id=record.broker_order_id, side=OrderSide.SELL,
+                status=OrderStatus.FILLED, quantity_requested=12,
+                filled_quantity=12, remaining_quantity=0, avg_fill_price=prices[-1],
+            ),), observed_at=current_time[0],
+        ),
+        AccountLocalState(cards=(card,), execution_orders=(record,)),
+    )
+    flat = plan.card_updates[0]
+    assert flat.board_status == BoardStatus.CLOSED
+    assert flat.broker_quantity == 0
+    assert flat.stop_loss_triggered is False
+    assert flat.exit_all_required is False
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_guarded_sell_all_ttl_reprices_use_fresh_ids_beyond_emergency_cap(
     tmp_path, monkeypatch
 ):
     monkeypatch.setattr(execution_config, "EMERGENCY_EXIT_MAX_REPRICE_ATTEMPTS", 3)
@@ -1468,23 +1539,54 @@ def test_guarded_sell_all_ttl_reprices_use_fresh_ids_and_consume_emergency_cap(
     assert [record.attempt_number for record in records] == [1, 2, 3]
     assert len({record.attempt_group_id for record in records}) == 1
 
-    # Cancelling attempt 3 leaves shares, but no fourth emergency submission
-    # may cross the broker boundary after the configured cap is consumed.
+    # A full liquidation must continue after the old three-attempt cutoff.
     current_time[0] += timedelta(
         seconds=execution_config.SELL_ALL_ATTEMPT_TTL_SECONDS + 1
     )
     broker.queue_cancel_confirmed()
+    broker.queue_acceptance(broker_order_id="B-EXIT-4")
     runtime.trading_engine.run_heartbeat([card])
 
-    assert len(broker.submit_calls) == 3
-    assert card.exit_attempt_count == 3
-    assert card.exit_client_order_id == ""
-    assert "retry limit reached" in card.last_exit_error
+    assert len(broker.submit_calls) == 4
+    assert card.exit_attempt_count == 4
+    assert card.exit_client_order_id not in submitted_ids
+    assert not card.last_exit_error
 
-    current_time[0] = card.next_exit_retry_at + timedelta(milliseconds=1)
     runtime.trading_engine.run_heartbeat([card])
-    assert len(broker.submit_calls) == 3
-    assert card.exit_attempt_count == 3
+    assert len(broker.submit_calls) == 4
+    assert card.exit_attempt_count == 4
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_guarded_sell_all_uses_fresh_broker_price_after_feed_loss(tmp_path, monkeypatch):
+    runtime, broker, _gateway, engine, market_data = _make_runtime(tmp_path, monkeypatch)
+    monkeypatch.setattr(broker, "get_positions", lambda **kwargs: {
+        "overseas": {"holdings": [{
+            "symbol": "AAPL", "quantity": 16, "available_quantity": 16,
+            "current_price": 198.21,
+        }]},
+    })
+    card = _persist_owned_card(engine, _card(
+        board_status=BoardStatus.SELL_ALL,
+        position_runtime_status=PositionRuntimeStatus.LIQUIDATING,
+        broker_quantity=16, orderable_quantity=16, exit_all_required=True,
+        exit_attempt_count=3, active_stop_price=201.3,
+        market_data_last_trusted_price=212.0,
+    ))
+    market_data.subscribe([card.symbol])
+    market_data.poll_once()
+    market_data._connected = False
+    broker.queue_acceptance(broker_order_id="FRESH-STOP")
+
+    runtime.trading_engine.run_heartbeat([card])
+
+    assert len(broker.submit_calls) == 1
+    assert broker.submit_calls[0]["quantity"] == 16
+    assert broker.submit_calls[0]["limit_price"] == pytest.approx(198.21 * 0.98)
+    assert card.market_data_last_trusted_price == 198.21
+    assert card.stop_loss_triggered is True
+    assert card.exit_attempt_count == 4
+    assert fetch_execution_order(engine, card.exit_client_order_id).intent == OrderIntent.STOP_LOSS
 
 
 @pytest.mark.usefixtures("trading_enabled")

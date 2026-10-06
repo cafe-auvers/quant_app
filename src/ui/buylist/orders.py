@@ -602,6 +602,7 @@ class BuylistOrdersMixin:
             order_price = marketable_exit_limit_price(
                 last_price=market_observation,
                 quote_is_execution_ready=True,
+                hard_stop=intent == OrderIntent.STOP_LOSS,
             )
         if (
             execution_policy != RESERVED_MOO_EXECUTION
