@@ -69,11 +69,9 @@ ALLOWED_BOARD_TRANSITIONS: Dict[BoardStatus, Set[BoardStatus]] = {
         # order, ambiguous submission, or cancellation is still live.
         BoardStatus.PARTIAL_SELL,
         BoardStatus.CLOSED,  # only once broker confirms zero
-        # CancelQueuedSellAll (section 302-304) cancels a premarket queued
-        # sell-at-open instruction before it fires -- the card returns to
-        # Open Positions. This edge must never be taken once the liquidation
-        # is actually working during market hours (the command handler
-        # additionally requires sell_all_at_market_open=True).
+        # Withdraw a Sell All only before its durable SELL lifecycle starts,
+        # in premarket or regular hours. The workflow rejects identities,
+        # reservations, working/ambiguous orders and unresolved cancellation.
         BoardStatus.OPEN_POSITION,
     },
     # Broker-confirmed flat. A card may only leave CLOSED through the

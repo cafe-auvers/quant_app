@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -83,7 +84,7 @@ def test_dashboard_is_a_static_shell_without_hydration_runtime():
     assert "new MutationObserver" not in script_source
     assert "bootApp();" in script_source
     assert 'id="quant-app"' in page_source
-    assert '/live-static/app.js?v=91' in page_source
+    assert re.search(r'<script src="/live-static/app\.js\?v=\d+" defer></script>', page_source)
     assert page_source.index('id="market-summary"') < page_source.index('id="browser-status"')
     assert page_source.index('id="browser-status"') < page_source.index('id="web-status"')
     assert page_source.index('id="web-status"') < page_source.index('id="data-summary"')
