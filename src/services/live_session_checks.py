@@ -112,6 +112,9 @@ class LiveSessionChecks:
         self.regular_quote_count = 0
         self.last_metrics = {}
         self.last_cycle_at = None
+        self.cycle_count = 0
+        self.last_cycle_timings_ms = {}
+        self.cycle_max_ms = {}
         self.started_at = datetime.now(timezone.utc)
         self.market = SnapshotMarketData()
         self.shadow = None
@@ -165,6 +168,10 @@ class LiveSessionChecks:
         from src.core.trade_card_state import TradeCardState
         quotes, snapshots, feed, equity = payload
         self.last_cycle_at = feed["captured_at"]
+        self.cycle_count += 1
+        self.last_cycle_timings_ms = dict(feed.get("cycle_timings_ms", {}))
+        for phase, duration in self.last_cycle_timings_ms.items():
+            self.cycle_max_ms[phase] = max(self.cycle_max_ms.get(phase, 0), duration)
         self.market.connected = feed["connected"]
         self.market.states = feed["states"]
         self.market.quotes = feed["latest_quotes"]
@@ -211,13 +218,17 @@ class LiveSessionChecks:
             "dropped_batches": self.dropped, "collector_errors": dict(self.errors),
             "queue_depth": self.queue.qsize(),
             "last_cycle_at": self.last_cycle_at,
+            "runtime_cycles": {"count": self.cycle_count,
+                               "last_timings_ms": self.last_cycle_timings_ms,
+                               "maximum_timings_ms": self.cycle_max_ms},
             "full_regular_session_observed": bool(
                 ended and self.started_at <= self.session_open and
                 self.last_cycle_at and self.last_cycle_at >= self.session_close and
                 self.regular_quote_count and not self.dropped and not self.errors and
                 self.queue.empty()),
             "gate2": {"feed_samples": self.last_metrics,
-                      "latency_scope": "runtime cumulative; includes premarket",
+                      "latency_scope": "runtime cumulative and broker-event regular session, separately labeled",
+                      "latency": self.last_metrics.get("latency", {}),
                       "accepted_quote_count": self.quote_count,
                       "regular_quote_count": self.regular_quote_count,
                       "missing_qualification": ["read-only full-session run",
@@ -299,7 +310,7 @@ def configured_observer():
         return _observer
 
 
-def observe_cycle(service, quotes, snapshots, equity_provider):
+def observe_cycle(service, quotes, snapshots, equity_provider, *, cycle_timings_ms=None):
     """Nonblocking handoff after production has finished its decision cycle."""
     try:
         observer = configured_observer()
@@ -307,6 +318,7 @@ def observe_cycle(service, quotes, snapshots, equity_provider):
             return
         symbols = {item["symbol"] for item in snapshots}
         feed = {"captured_at": datetime.now(timezone.utc),
+                "cycle_timings_ms": dict(cycle_timings_ms or {}),
                 "connected": service.is_connected(),
                 "states": {symbol: asdict(service.symbol_state(symbol)) for symbol in symbols},
                 "latest_quotes": {symbol: service.latest_quote(symbol) for symbol in symbols}}
@@ -316,6 +328,9 @@ def observe_cycle(service, quotes, snapshots, equity_provider):
                 "health": asdict(service.health_metrics()),
                 "protocol": asdict(service.protocol_metrics_snapshot()),
                 "capacity": asdict(service.subscription_capacity_snapshot())}
+            latency_snapshot = getattr(service, "latency_metrics_snapshot", None)
+            if callable(latency_snapshot):
+                feed["metrics"]["latency"] = latency_snapshot()
             observer._last_sample = time.monotonic()
         accounts = {(item["environment"], item["account_no"]) for item in snapshots}
         equity = min((float(equity_provider(*account)) for account in accounts), default=0)

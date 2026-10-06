@@ -122,3 +122,35 @@ def test_gate4_passive_capture_works_with_formal_collection_disabled(monkeypatch
     monkeypatch.setattr(checks, "observe_execution_event", lambda kind, payload: captured.append((kind, payload)))
     runtime_observer.observe_gate4_event("MUTATION_TERMINAL", status="FILLED")
     assert captured == [("MUTATION_TERMINAL", {"status": "FILLED"})]
+
+
+def test_passive_report_keeps_regular_timing_distinct_from_cumulative(tmp_path):
+    observer = checks.LiveSessionChecks(tmp_path, SHA, DAY, start_thread=False)
+    observer._initialize()
+    observer.last_metrics = {"protocol": {"receive_lag_p99_ms": 4_500},
+                             "latency": {"regular_session": {"session_date": DAY,
+                                         "receive": {"sample_count": 10, "p99_ms": 3_900},
+                                         "engine_queue": {"sample_count": 4, "p99_ms": 8_000}}}}
+    observer._write_report()
+    report = json.loads((tmp_path / "checks_report.json").read_text())
+    assert report["gate2"]["latency"]["regular_session"]["receive"]["p99_ms"] == 3_900
+    assert report["gate2"]["latency"]["regular_session"]["engine_queue"]["p99_ms"] == 8_000
+    assert report["gate2"]["feed_samples"]["protocol"]["receive_lag_p99_ms"] == 4_500
+    assert report["formal_gate_result"] == "NOT_CERTIFIED"
+
+
+def test_cycle_report_exposes_blocking_account_work_without_issuing_requests(tmp_path):
+    observer = checks.LiveSessionChecks(tmp_path, SHA, DAY, start_thread=False)
+    observer._initialize()
+    feed = {"captured_at": datetime.now(timezone.utc), "connected": False,
+            "states": {}, "latest_quotes": {},
+            "cycle_timings_ms": {"account_refresh_and_reconciliation": 8_000, "total": 8_300}}
+    observer._cycle(((), (), feed, 0))
+    feed["cycle_timings_ms"] = {"account_refresh_and_reconciliation": 0, "total": 200}
+    observer._cycle(((), (), feed, 0))
+    observer._write_report()
+    report = json.loads((tmp_path / "checks_report.json").read_text())
+    assert report["runtime_cycles"]["count"] == 2
+    assert report["runtime_cycles"]["last_timings_ms"]["total"] == 200
+    assert report["runtime_cycles"]["maximum_timings_ms"]["account_refresh_and_reconciliation"] == 8_000
+    assert report["formal_gate_result"] == "NOT_CERTIFIED"

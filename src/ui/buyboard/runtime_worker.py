@@ -31,6 +31,7 @@ import logging
 import math
 import platform
 import threading
+import time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, List, Optional, Tuple
@@ -132,6 +133,12 @@ from src.utils.market_calendar import is_regular_session_open
 from src.utils.redaction import scrub_sensitive_text
 
 logger = logging.getLogger(__name__)
+
+
+def _cycle_wait_milliseconds(interval_seconds: float, started_at: float, now: float) -> int:
+    """Wait only the unused cycle budget; blocking work already uses it."""
+    elapsed = max(0.0, now - started_at)
+    return max(1, math.ceil(max(0.0, interval_seconds - elapsed) * 1000))
 
 # Board columns whose cards need a live quote to do anything useful this
 # tick (entries pricing off it, positions/exits evaluating a stop).
@@ -1208,6 +1215,7 @@ class BuyboardRuntimeWorker(QThread):
 
         try:
             while not self._stop_requested:
+                cycle_started_monotonic = time.monotonic()
                 if not is_buyboard_engine_enabled():
                     logger.info("BuyboardRuntimeWorker stopping: engine flag turned off")
                     break
@@ -1297,7 +1305,9 @@ class BuyboardRuntimeWorker(QThread):
                                 "Could not persist standby demotion after cycle failure"
                             )
                     self.error_occurred.emit("Buy Board engine heartbeat failed -- see logs for detail.")
-                self.msleep(max(1, int(self._heartbeat_seconds * 1000)))
+                self.msleep(_cycle_wait_milliseconds(
+                    self._heartbeat_seconds, cycle_started_monotonic, time.monotonic()
+                ))
         finally:
             self._accepting_commands = False
             self._perform_shutdown_sequence()
@@ -2023,6 +2033,14 @@ class BuyboardRuntimeWorker(QThread):
 
     def _run_one_cycle(self, *, allow_mutations: bool = True) -> None:
         assert self.runtime is not None
+        cycle_timings_ms = {}
+        cycle_started = phase_started = time.monotonic()
+
+        def record_phase(name):
+            nonlocal phase_started
+            now = time.monotonic()
+            cycle_timings_ms[name] = max(0.0, (now - phase_started) * 1000)
+            phase_started = now
         canonical_available = bool(
             self._database_writable or not self._database_probe_completed
         )
@@ -2035,6 +2053,7 @@ class BuyboardRuntimeWorker(QThread):
             # protective SELL commands can get through the gateway while
             # offline, and they must first enter the local emergency journal.
             cards = self._cached_cards
+        record_phase("canonical_load_and_ownership")
 
         allow_mutations = bool(allow_mutations and self._accepting_commands)
         operator_commands_changed = False
@@ -2042,6 +2061,7 @@ class BuyboardRuntimeWorker(QThread):
             operator_commands_changed = self._process_operator_commands()
             if operator_commands_changed:
                 cards = self._load_cards_if_changed(force=True)
+        record_phase("operator_commands")
         reconciliation_changed = False
         if canonical_available:
             reconciliation_changed = bool(
@@ -2053,6 +2073,7 @@ class BuyboardRuntimeWorker(QThread):
             # when it actually changed durable state.
             if reconciliation_changed:
                 cards = self._load_cards_if_changed(force=True)
+        record_phase("account_refresh_and_reconciliation")
 
         changed_ids: set = set()
         changed: List[TradeCardState] = []
@@ -2076,6 +2097,7 @@ class BuyboardRuntimeWorker(QThread):
                     ambiguous_orb_keys=ambiguous_orb_keys,
                 )
             )
+        record_phase("orb_planning")
 
         # The periodic refresh runs over every account regardless of
         # readiness. Later work is gated per card/action: an unrelated
@@ -2124,6 +2146,7 @@ class BuyboardRuntimeWorker(QThread):
 
         check_cards = prepare_card_snapshot(observation_cards)
         check_quotes = []
+        record_phase("subscriptions_and_snapshot")
         with self._stop_change_coordinator.lock_cards(stop_card_keys):
             # A stop can commit after this cycle loaded ``cards``. Overlay
             # that exact durable request before rotating/draining so the
@@ -2136,6 +2159,7 @@ class BuyboardRuntimeWorker(QThread):
             )
 
             quotes = self.runtime.market_data.poll_once()
+            record_phase("stop_handoff_and_feed_drain")
             check_quotes.extend(quotes)
             self.last_market_data_drain_at = datetime.now(timezone.utc)
             if allow_mutations:
@@ -2239,10 +2263,13 @@ class BuyboardRuntimeWorker(QThread):
         self._acknowledge_market_breach_candidates(
             breach_ack_candidates, durable_breach_keys
         )
+        record_phase("decisions_heartbeat_and_persistence")
+        cycle_timings_ms["total"] = max(0.0, (time.monotonic() - cycle_started) * 1000)
         if changed or reconciliation_changed or operator_commands_changed:
             self.board_changed.emit()
         observe_cycle(self.runtime.market_data, check_quotes, check_cards,
-                      self._account_equity_provider or self._buying_power_provider)
+                      self._account_equity_provider or self._buying_power_provider,
+                      cycle_timings_ms=cycle_timings_ms)
 
     def _process_operator_commands(self, *, limit: int = 20) -> bool:
         """Apply live human requests only while this runtime owns execution."""

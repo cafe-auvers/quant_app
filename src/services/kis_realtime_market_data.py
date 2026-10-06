@@ -47,6 +47,7 @@ from src.services.realtime_market_data import (
     QuoteSnapshot,
     RealtimeMarketDataService,
 )
+from src.services.market_data_latency import MarketDataLatencyWindows
 from src.utils.market_calendar import is_regular_session_open
 
 logger = logging.getLogger(__name__)
@@ -491,6 +492,11 @@ class MarketDataProtocolMetrics:
     queue_lag_p99_ms: float
     queue_lag_max_ms: float
     queue_lag_sample_count: int
+    parser_lag_sample_count: int = 0
+    parser_lag_p50_ms: float = 0.0
+    parser_lag_p95_ms: float = 0.0
+    parser_lag_p99_ms: float = 0.0
+    parser_lag_max_ms: float = 0.0
 
 
 class _OnlineLatencyHistogram:
@@ -642,6 +648,11 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         self._dedup_order: deque[tuple] = deque(maxlen=4096)
         self._receive_lags_ms = _OnlineLatencyHistogram()
         self._queue_lags_ms = _OnlineLatencyHistogram()
+        self._parser_lags_ms = _OnlineLatencyHistogram()
+        self._latency_windows = MarketDataLatencyWindows(_OnlineLatencyHistogram)
+        self._drain_latency_seen: set[tuple] = set()
+        self._drain_latency_order: deque[tuple] = deque(maxlen=4096)
+        self._qualification_latency_started_at: Optional[datetime] = None
         self._frame_counts: Dict[str, int] = {}
         self._record_counts: Dict[str, int] = {}
         self._schema_fingerprints: Dict[str, str] = {}
@@ -1176,6 +1187,9 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         queue_count, queue_p50, queue_p95, queue_p99, queue_max = (
             self._queue_lags_ms.snapshot()
         )
+        parser_count, parser_p50, parser_p95, parser_p99, parser_max = (
+            self._parser_lags_ms.snapshot()
+        )
         with self._state_lock:
             return MarketDataProtocolMetrics(
                 frame_counts_by_tr_id=tuple(sorted(self._frame_counts.items())),
@@ -1198,7 +1212,16 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
                 queue_lag_p95_ms=queue_p95,
                 queue_lag_p99_ms=queue_p99,
                 queue_lag_max_ms=queue_max,
+                parser_lag_sample_count=parser_count,
+                parser_lag_p50_ms=parser_p50,
+                parser_lag_p95_ms=parser_p95,
+                parser_lag_p99_ms=parser_p99,
+                parser_lag_max_ms=parser_max,
             )
+
+    def latency_metrics_snapshot(self) -> dict:
+        """Separate feed/parse/engine timing and regular-session diagnostics."""
+        return self._latency_windows.snapshot()
 
     def reset_qualification_latency_metrics(self) -> None:
         """Start the regular-session event-quality window for a read-only soak."""
@@ -1206,7 +1229,12 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
             raise RuntimeError("latency reset is restricted to qualification mode")
         self._receive_lags_ms.reset()
         self._queue_lags_ms.reset()
+        self._parser_lags_ms.reset()
+        self._latency_windows.reset()
         with self._state_lock:
+            self._qualification_latency_started_at = self._clock()
+            self._drain_latency_seen.clear()
+            self._drain_latency_order.clear()
             self._rejected_event_counts.clear()
 
     def replace_stop_rules(self, symbol: str, rules: Iterable[StopRule]):
@@ -1254,6 +1282,7 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         """Drain coalesced states; no network polling occurs."""
         processed_at = self._clock()
         ready: list[QuoteSnapshot] = []
+        timing_observations: list[QuoteSnapshot] = []
         for detached in self._accumulator.drain_all():
             pending = detached.pending
             overrides = tuple((rule.card_key, rule.price) for rule in detached.stop_rules)
@@ -1279,6 +1308,8 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
                     ),
                 )
                 ready.append(trade)
+                if not detached.latch_replay:
+                    timing_observations.append(trade)
             # A replay is an engine-delivery guarantee for a previously
             # unacknowledged breach, not a new market observation.  Never let
             # its historical event regress the latest-quote cache or fire a
@@ -1311,9 +1342,30 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
                 self._cache.update(combined)
                 if not ready or ready[-1] != combined:
                     ready.append(combined)
+                timing_observations.append(combined)
                 for callback in list(self._quote_callbacks):
                     callback(combined)
+        self._record_engine_drain_latency(timing_observations)
         return ready
+
+    def _record_engine_drain_latency(self, observations: Sequence[QuoteSnapshot]) -> None:
+        for quote in observations:
+            identity = (quote.symbol, quote.channel, quote.broker_event_at,
+                        quote.received_at, quote.sequence, quote.payload_fingerprint)
+            with self._state_lock:
+                if (self._qualification_latency_started_at is not None
+                        and quote.received_at < self._qualification_latency_started_at):
+                    continue
+                if identity in self._drain_latency_seen:
+                    continue
+                if len(self._drain_latency_order) == self._drain_latency_order.maxlen:
+                    self._drain_latency_seen.discard(self._drain_latency_order[0])
+                self._drain_latency_order.append(identity)
+                self._drain_latency_seen.add(identity)
+            self._queue_lags_ms.add(quote.queue_delay_seconds() * 1000)
+            self._latency_windows.record_drain(
+                quote, regular_session=self._regular_session_filter(quote.broker_event_at)
+            )
 
     def is_symbol_execution_ready(
         self,
@@ -1729,6 +1781,7 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
             payload_fingerprint=hashlib.sha256(
                 "^".join(record.values()).encode("utf-8")
             ).hexdigest(),
+            regular_session=self._regular_session_filter(event_at),
         )
         self.ingest_quote(quote)
 
@@ -1858,7 +1911,10 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         self._receive_lags_ms.add(
             max(0.0, (now - broker_at).total_seconds() * 1000.0)
         )
-        self._queue_lags_ms.add(quote.queue_delay_seconds() * 1000.0)
+        self._parser_lags_ms.add(quote.queue_delay_seconds() * 1000.0)
+        self._latency_windows.record_ingress(
+            quote, regular_session=self._regular_session_filter(quote.broker_event_at)
+        )
         return True
 
     def _reject_event(
