@@ -270,16 +270,24 @@ def test_cancel_order_regular_vs_reserved_routes_to_different_endpoints(monkeypa
 
 
 def test_get_order_regular_vs_reserved_routes_to_different_endpoints(monkeypatch):
-    monkeypatch.setattr(kis_order, "query_overseas_order", lambda **kwargs: ["regular"])
-    monkeypatch.setattr(kis_order, "query_overseas_reserved_order", lambda **kwargs: ["reserved"])
+    regular = BrokerOrderStatusSnapshot(
+        environment="PROD", account_no="12345678-01", symbol="AAPL",
+        status=OrderStatus.WORKING,
+    )
+    reserved = BrokerOrderStatusSnapshot(
+        environment="PROD", account_no="12345678-01", symbol="MSFT",
+        status=OrderStatus.ACCEPTED,
+    )
+    monkeypatch.setattr(kis_order, "query_overseas_order", lambda **kwargs: [regular])
+    monkeypatch.setattr(kis_order, "query_overseas_reserved_order", lambda **kwargs: [reserved])
 
     broker = KisBroker()
     assert broker.get_order(
         environment="PROD", account_no="12345678-01", symbol="AAPL"
-    ) == ["regular"]
+    ) == [regular]
     assert broker.get_order(
         environment="PROD", account_no="12345678-01", is_reserved=True
-    ) == ["reserved"]
+    ) == [reserved]
 
 
 def test_discover_orders_requires_regular_and_reserved_sources(monkeypatch):
