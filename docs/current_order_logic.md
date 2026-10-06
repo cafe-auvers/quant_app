@@ -31,6 +31,10 @@ available liquidity remain broker/exchange concerns.
 
 - Watchlist and Buylist are passive stages. They do not authorize automatic
   entry, create execution subscriptions, or call KIS.
+- A zero-quantity manual stop imported from a legacy Buylist remains passive
+  after planning metadata updates. Removal requires the migration marker and
+  no order history, active capital reservation, broker position, pending stop,
+  or exit state; the general execution-evidence predicate remains strict.
 - An explicitly published/activated `BUY_TODAY` card authorizes monitoring for
   its exact production account and symbol for its scheduled NYSE session.
 - The runtime evaluates finalized 1-minute, 5-minute, and 30-minute opening
@@ -63,7 +67,10 @@ Therefore:
 
 - `orb_high` must be strictly above both the structural breakout price and the
   ORB low; otherwise no passive execution zone exists.
-- The automatic execution price defaults to that candidate's `orb_high`.
+- The automatic BUY execution price is the highest legal tick at or below that
+  candidate's raw `orb_high`. Fractional-cent market highs are rounded down,
+  never above the range. The raw high remains the breakout confirmation trigger.
+  If rounding leaves no price strictly above the floor, the plan is rejected.
 - A manual execution price may be below `orb_high`, but it must remain strictly
   above both `breakout_price` and `orb_low`.
 - A manual price is never silently changed.

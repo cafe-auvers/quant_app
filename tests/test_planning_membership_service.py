@@ -690,6 +690,41 @@ def test_legacy_stop_exception_cannot_hide_unowned_order(engine):
     assert trade_card_repository.get_trade_card(engine, "PROD", "1", "BLKB").version == card.version
 
 
+@pytest.mark.parametrize("status,blocked", [
+    ("RESERVED", True), ("PARTIALLY_CONSUMED", True), ("RELEASED", False),
+])
+def test_revised_legacy_candidate_checks_actual_reservation_without_card_link(engine, status, blocked):
+    from src.core.capital_reservation import CapitalReservation, CapitalReservationStatus
+    from src.services.capital_reservation_repository import save_reservation_strict
+
+    card = trade_card_repository.create_trade_card(engine, TradeCardState(
+        environment="PROD", account_no="1", symbol="BLKB",
+        board_status=BoardStatus.BUYLIST, buylist_member=True,
+        stop_type=StopType.MANUAL_PRICE, active_stop_price=44.54,
+        warnings=["migrated_from_buylist"],
+    ))
+    card.name = "Updated planning label"
+    card = trade_card_repository.update_trade_card(engine, card, expected_version=card.version)
+    assert card.version == 2 and not card.capital_reservation_id
+    save_reservation_strict(engine, CapitalReservation(
+        reservation_id="durable-reservation", environment="PROD", account_no="1",
+        symbol="BLKB", attempt_group_id="attempt", requested_notional=50,
+        remaining_reserved_notional=50 if blocked else 0,
+        status=CapitalReservationStatus(status),
+    ))
+    command = RemoveFromBuylist(environment="PROD", account_no="1", symbol="BLKB",
+                                expected_card_version=card.version)
+    if blocked:
+        with pytest.raises(BoardCommandRejectedError, match="capital remains reserved"):
+            request_board_action(engine, command, context=BoardActionContext())
+        stored = trade_card_repository.get_trade_card(engine, "PROD", "1", "BLKB")
+        assert stored.version == card.version and stored.buylist_member
+        assert stored.active_stop_price == 44.54
+    else:
+        result = request_board_action(engine, command, context=BoardActionContext())
+        assert not result.card.buylist_member and result.card.active_stop_price is None
+
+
 def test_hidden_watchlist_card_never_suppresses_active_order_warning_rows(engine):
     trade_card_repository.create_trade_card(
         engine,

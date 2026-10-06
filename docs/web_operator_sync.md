@@ -5,6 +5,36 @@ with the PC and laptop desktop applications. It covers Watchlist, Buylist,
 breakout, Buy Today, Buy Board, Operator Control, and runtime-readiness
 projection changes. It does not grant execution authority.
 
+The mobile intraday monitor is advisory and uses Yahoo minute bars. Its
+`ORB passed` filter includes any price window that crossed the configured
+breakout and opening-range high after the range ended. Position bounds are
+shown independently; a price pass does not certify position sizing or permit
+a broker order. A completed range without a crossing says `Await breakout`
+and shows the required price. Missing bars remain unavailable with a reason.
+Same-session observed passes survive a stale latest quote and are explicitly
+marked as historical; the next session clears them. Actual entries still
+require fresh KIS trade and quote events and the full execution guards.
+
+Buy Board cards and their detail sheets show stage-specific facts:
+
+| Stage | Details |
+| --- | --- |
+| Today | Target shares, planned ORL stop, breakout, entry plan/trigger, ORB window, planned risk, retry time and block reason |
+| Entry | The entry plan plus held/target shares and average fill price |
+| Open | Held and sellable shares, average entry, active/pending stop and monitored stop shares, estimated P&L and distance to stop |
+| Partial | Position details plus requested sell shares and remaining shares reserved for a working exit |
+| Sell All | Position details, remaining working sell shares, submission/cancel status, retry time and exit error |
+
+Each stage header counts stocks and sums target or held shares; unsized cards
+are identified separately. Price uses the newer of the existing mobile
+Monitor quote and the PC's persisted observation. Yahoo quotes are labelled
+indicative; PC observations are labelled reported. Source, KST observation
+time, age and stale status remain visible. The display freshness threshold is
+the Monitor threshold (180 seconds by default), not execution readiness.
+Estimated P&L and distance to stop are withheld for stale or undated prices.
+These fields reuse existing snapshots and the canonical card projection;
+they add no SQL query, quote polling, broker connection or order mutation.
+
 The six ORB position-bound values are part of the same shared contract. Their
 default profile is capital allocation 10% / 17.5% / 30% and Stop/ADR
 15% / 65% / 66% (lower / ideal / upper). An authenticated browser or desktop
@@ -86,6 +116,11 @@ Synchronization and execution readiness are separate:
 - A permitted Buy Today activation uses the same canonical workflow as the
   desktop and, when eligible, claims `KANBAN` ownership for that symbol. A
   passive card may otherwise continue to display `LEGACY` ownership.
+- Cancel Sell All withdraws an unsubmitted exit directly in canonical state,
+  including during regular hours and with a separate Execution Owner. It
+  preserves the confirmed holding and stop and clears the retired retry state.
+  A SELL identity, reserved shares, working/ambiguous order or unresolved cancel
+  blocks withdrawal. This action never submits or cancels a broker order.
 - Broker mutation still requires a live execution lease, `ACTIVE` runtime,
   writable canonical store, fresh reconciliation, healthy execution-grade
   market data, matching per-symbol ownership, live-trading permission, and all

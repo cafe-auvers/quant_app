@@ -836,6 +836,28 @@ class TradeCardState:
         )
 
 
+def can_withdraw_sell_all_intent(card: TradeCardState) -> bool:
+    """Allow only a held position whose SELL lifecycle has not started.
+
+    A regular-session liquidation objective is not evidence of a broker
+    order. Working orders are checked separately by the workflow service.
+    """
+
+    return bool(
+        card.board_status == BoardStatus.SELL_ALL
+        and card.broker_quantity > 0
+        and not (
+            card.exit_client_order_id
+            or card.exit_pending_attempt_number
+            or card.reserved_sell_quantity
+            or card.exit_submission_unresolved
+            or card.exit_cancel_in_flight
+            or card.exit_cancel_command_id
+            or card.exit_cancel_requested_at is not None
+        )
+    )
+
+
 def has_durable_execution_evidence(card: TradeCardState) -> bool:
     """Return whether a planning card carries live/attempted execution state.
 
@@ -889,7 +911,7 @@ def has_durable_execution_evidence(card: TradeCardState) -> bool:
 
 
 def has_legacy_planning_stop(card: TradeCardState) -> bool:
-    """Identify an untouched flat legacy candidate's incorrectly migrated stop."""
+    """Identify a flat legacy planning stop, independent of metadata revisions."""
 
     try:
         positive_stop = (
@@ -900,8 +922,7 @@ def has_legacy_planning_stop(card: TradeCardState) -> bool:
     except (TypeError, ValueError, OverflowError):
         return False
     if not (
-        card.version == 1
-        and "migrated_from_buylist" in card.warnings
+        "migrated_from_buylist" in card.warnings
         and card.board_status in {BoardStatus.WATCHLIST, BoardStatus.BUYLIST}
         and card.stop_type == StopType.MANUAL_PRICE
         and positive_stop

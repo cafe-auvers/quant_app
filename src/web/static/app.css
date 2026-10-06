@@ -31,7 +31,8 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--green); out
 .status-strip { min-width: 0; display: flex; align-items: center; gap: 18px; padding: 0 18px; border-bottom: 1px solid var(--line-soft); color: var(--muted); background: #091512; font-size: 11px; white-space: nowrap; overflow: hidden; }
 .status-strip span { display: flex; align-items: center; gap: 6px; }
 #market-status-compact { display: none; }
-#global-message { margin-left: auto; color: var(--ink); overflow: hidden; text-overflow: ellipsis; }
+#global-message { min-width: 0; flex: 1 1 0; margin-left: auto; color: var(--ink); overflow: hidden; text-overflow: ellipsis; }
+#market-countdown { flex: 0 0 auto; margin-left: auto; color: var(--ink); font-variant-numeric: tabular-nums; }
 .status-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--faint); box-shadow: 0 0 0 3px rgba(100, 119, 111, .1); }
 .status-dot.good { background: var(--green); box-shadow: 0 0 0 3px rgba(72, 214, 165, .1); }
 .status-dot.stale { background: var(--amber); box-shadow: 0 0 0 3px rgba(245, 201, 106, .1); }
@@ -125,7 +126,7 @@ input::placeholder { color: #65776f; }
 .timeframe-switch { display: flex; padding: 3px; border: 1px solid var(--line); border-radius: 9px; background: #081411; }
 .timeframe-switch button { min-width: 42px; min-height: 32px; color: var(--muted); border-radius: 6px; background: transparent; font-weight: 800; }
 .timeframe-switch button.active { color: #07110f; background: var(--green); }
-.review-actions { min-width: 0; min-height: 44px; display: flex; align-items: center; gap: 6px; padding: 5px 10px; border-bottom: 1px solid var(--line-soft); background: #091512; }
+.review-actions { min-width: 0; min-height: 44px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 5px 10px; border-bottom: 1px solid var(--line-soft); background: #091512; }
 .review-action { min-height: 32px; padding: 0 12px; border: 1px solid #29463b; border-radius: 7px; color: var(--ink); background: #10211d; font-size: 11px; font-weight: 800; }
 .review-action:hover { border-color: var(--green); background: #15342a; }
 .review-action.current { color: #07110f; border-color: var(--green); background: var(--green); }
@@ -136,6 +137,10 @@ input::placeholder { color: #65776f; }
 .review-action.current:disabled { opacity: 1; }
 .quick-stage { min-width: 108px; color: var(--green); font-size: 10px; font-weight: 900; letter-spacing: .05em; }
 .quick-safety { margin-left: auto; color: var(--faint); font-size: 9px; font-weight: 900; letter-spacing: .1em; }
+.quick-plan-message { grid-column: 1 / -1; flex-basis: 100%; min-width: 0; color: var(--muted); font-size: 10px; line-height: 1.4; overflow-wrap: anywhere; }
+.quick-plan-message[hidden] { display: none; }
+.quick-plan-message.error { color: #ff9ba4; }
+.quick-plan-message.success { color: var(--green); }
 .chart-grid { min-height: 0; display: grid; grid-template-columns: 1fr; gap: 1px; background: var(--line); }
 .chart-grid.split { grid-template-columns: 1fr 1fr; }
 .chart-pane { min-width: 0; min-height: 0; position: relative; background: #081310; overflow: hidden; }
@@ -382,8 +387,10 @@ input::placeholder { color: #65776f; }
   .mobile-kanban-heading { min-height: 50px; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 11px; border-bottom: 1px solid var(--line); background: #0e241d; }
   .mobile-kanban-heading strong, .mobile-kanban-heading .mobile-card-label { display: block; }
   .mobile-kanban-heading strong { margin-top: 2px; font-size: 15px; }
+  #buy-board-column-summary { display: block; margin-top: 3px; color: var(--muted); font-size: 10px; }
+  #buy-board-nav { display: block; margin-top: 3px; color: var(--green); font-size: 10px; overflow-wrap: anywhere; }
   .mobile-kanban-heading > span { min-width: 24px; padding: 3px 7px; border-radius: 999px; color: var(--green); background: #16342a; text-align: center; font-size: 9px; font-weight: 900; }
-  .mobile-kanban-cards { min-height: 84px; max-height: calc(100dvh - 395px); overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; touch-action: pan-y; }
+  .mobile-kanban-cards { min-height: 84px; max-height: calc(100dvh - 405px); overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; touch-action: pan-y; }
   .mobile-kanban-card { width: 100%; min-width: 0; min-height: 78px; display: flex; flex-direction: column; align-items: stretch; gap: 3px; padding: 9px 11px; border: 0; border-left: 3px solid #64766f; border-bottom: 1px solid var(--line-soft); border-radius: 0; color: var(--ink); background: transparent; text-align: left; }
   .mobile-kanban-card:last-child { border-bottom: 0; }
   .mobile-kanban-card[data-status="BUY_TODAY"] { border-left-color: #45d5ad; }
@@ -398,7 +405,14 @@ input::placeholder { color: #65776f; }
   .mobile-kanban-card-name { overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; font-size: 9px; }
   .mobile-kanban-card-facts small { overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; font-size: 8px; text-transform: capitalize; }
   .mobile-kanban-card-facts b { flex: 0 0 auto; color: var(--ink); font-size: 9px; font-variant-numeric: tabular-nums; }
-  .mobile-kanban-card-warning { margin-top: 2px; overflow: hidden; color: #ff9ba4; text-overflow: ellipsis; white-space: nowrap; font-size: 8px; }
+  .mobile-kanban-card-details { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px 12px; margin: 7px 0 4px; }
+  .mobile-kanban-card-details > span { min-width: 0; }
+  .mobile-kanban-card-details small, .mobile-kanban-card-details b { display: block; overflow-wrap: anywhere; }
+  .mobile-kanban-card-details small { color: var(--muted); font-size: 9px; }
+  .mobile-kanban-card-details b { margin-top: 2px; font-size: 12px; font-variant-numeric: tabular-nums; }
+  .mobile-kanban-price-note { color: var(--muted); font-size: 9px; line-height: 1.5; overflow-wrap: anywhere; }
+  .mobile-kanban-price-note[data-stale="true"] { color: var(--amber); }
+  .mobile-kanban-card-warning { margin-top: 3px; color: #ff9ba4; overflow-wrap: anywhere; font-size: 10px; line-height: 1.4; }
   .mobile-board-sync-status { min-height: 22px; display: flex; align-items: center; padding: 4px 3px 0; color: var(--green); font-size: 8px; }
   .mobile-board-sync-status.pending { color: var(--amber); }
   .mobile-board-sync-status.error { color: #ff9ba4; }
@@ -410,11 +424,11 @@ input::placeholder { color: #65776f; }
   .mobile-board-action-heading strong { margin-top: 2px; font-size: 22px; }
   .mobile-board-action-heading small { margin-top: 2px; color: var(--muted); font-size: 9px; }
   .mobile-board-action-heading button { width: 38px; height: 38px; border: 1px solid var(--line); border-radius: 9px; color: var(--ink); background: #132820; font-size: 23px; }
-  .mobile-board-action-facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 5px; margin: 9px 0; }
+  .mobile-board-action-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; margin: 9px 0; }
   .mobile-board-action-facts span { min-width: 0; padding: 7px; border: 1px solid var(--line-soft); border-radius: 8px; background: #091713; }
-  .mobile-board-action-facts small, .mobile-board-action-facts b { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mobile-board-action-facts small, .mobile-board-action-facts b { display: block; overflow-wrap: anywhere; }
   .mobile-board-action-facts small { color: var(--faint); font-size: 7px; text-transform: uppercase; }
-  .mobile-board-action-facts b { margin-top: 3px; font-size: 9px; font-variant-numeric: tabular-nums; }
+  .mobile-board-action-facts b { margin-top: 3px; font-size: 12px; font-variant-numeric: tabular-nums; }
   .mobile-board-action-buttons { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
   .mobile-board-action-buttons button { min-width: 0; min-height: 42px; padding: 4px 7px; border: 1px solid var(--green); border-radius: 9px; color: #07110f; background: var(--green); font-size: 9px; font-weight: 900; }
   .mobile-board-action-buttons button.secondary { color: var(--ink); border-color: #315548; background: #132a23; }
@@ -537,6 +551,13 @@ input::placeholder { color: #65776f; }
   .mobile-bottom-nav { padding-left: 2px; padding-right: 2px; }
   .mobile-nav-button { padding-left: 2px; padding-right: 2px; font-size: 8px; }
   .mobile-segment-control { padding-left: 2px; padding-right: 2px; }
+}
+
+@media (max-width: 480px) {
+  .status-strip { gap: 6px; }
+  .status-strip > #market-summary { flex: 0 1 auto; min-width: 0; overflow: hidden; }
+  #market-status-compact { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .status-strip .status-dot { flex-shrink: 0; }
 }
 
 @media (prefers-reduced-motion: reduce) {
