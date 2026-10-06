@@ -374,12 +374,18 @@ class ChartLoadCoordinator:
                     "cache": "HIT",
                 }
                 return artifact, True
-        await self._get_payload(symbol, timeframe, refresh=True)
+        generated = await self._get_payload(symbol, timeframe, refresh=True)
+        expectations = self._cache_expectations()
+        # Publish the snapshot just generated even when the mirror advances
+        # during preparation. The next request still validates the new revision.
+        expectations["expected_source_revision"] = generated.payload.get("coverage", {}).get(
+            "source_revision", ""
+        )
         artifact = await anyio.to_thread.run_sync(
             lambda: self.cache.publication_artifact(
                 symbol,
                 timeframe,
-                **self._cache_expectations(),
+                **expectations,
             )
         )
         if artifact is None:
