@@ -164,8 +164,10 @@ def suppress_stale_signals(row: dict) -> None:
     row["breakout_status"] = "UNKNOWN" if row.get("breakout_price") else "NO_LEVEL"
     row["broke_out_today"] = None
     for window in row.get("orb", []):
-        window.update(price_status="UNKNOWN", position_status="UNKNOWN",
-                      price_reason="Quote is stale", position_reason="Quote is stale")
+        # An observed crossing remains a historical fact for this session.
+        # It does not certify the current quote or authorize an entry.
+        if window.get("price_status") != "PASS":
+            window.update(price_status="UNKNOWN", price_reason="Quote is stale")
 
 
 def evaluate_monitor_row(
@@ -176,7 +178,8 @@ def evaluate_monitor_row(
     breakout = positive(card.get("breakout_price"))
     row = {**card, "breakout_price": breakout, "current_price": None,
            "quote_as_of": None, "quote_status": "UNAVAILABLE", "quote_source": "MINUTE", "distance_percent": None,
-           "breakout_status": "UNKNOWN", "broke_out_today": None, "orb": []}
+           "breakout_status": "UNKNOWN", "broke_out_today": None,
+           "orb_session_date": now.date().isoformat(), "orb": []}
     if not frame.empty and frame.index.tz is not None:
         frame = frame.copy()
         frame.index = frame.index.tz_convert(US_MARKET_ZONE)
@@ -213,7 +216,7 @@ def evaluate_monitor_row(
                   "price_reason": "Current regular-session data unavailable", "position_reason": "",
                   "high": None, "low": None, "risk_percent": None}
         row["orb"].append(result)
-        if stale or session.empty or breakout is None:
+        if session.empty or breakout is None:
             continue
         start = pd.Timestamp(dt.datetime.combine(now.date(), dt.time(9, 30), US_MARKET_ZONE))
         end = start + pd.Timedelta(minutes=minutes)
@@ -233,7 +236,8 @@ def evaluate_monitor_row(
         floor, trigger, execution, reason = passive_entry_prices(
             breakout_price=breakout, orb_high=high, orb_low=low,
         )
-        result.update(high=high, low=low)
+        result.update(high=high, low=low, breakout_trigger=max(breakout, high),
+                      range_closed_at=end.isoformat())
         # Separate the observed price test from the passive entry/position geometry.
         post_range = session[session.index >= end]
         confirmed = bool((pd.to_numeric(post_range.High) > max(breakout, high)).any())
@@ -258,6 +262,8 @@ def evaluate_monitor_row(
                       capital_percent=round(sizing["capital_percent"], 2),
                       stop_adr_percent=round(sizing["sl_adr"], 2) if sizing["sl_adr"] is not None else None,
                       position_reason="Capital and stop/ADR bounds passed" if valid else "; ".join(warnings))
+    if stale:
+        suppress_stale_signals(row)
     return row
 
 

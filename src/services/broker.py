@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Protocol
 
 from src.api import kis_account_snapshot_dual, kis_order
+from src.core.broker_order_history import authoritative_order_history
 from src.core.order_state import (
     REGULAR_LIMIT_EXECUTION,
     RESERVED_MOO_EXECUTION,
@@ -328,7 +329,9 @@ class KisBroker:
             if is_reserved
             else kis_order.query_overseas_order
         )
-        return query_fn(environment=environment, account_no=account_no, **kwargs)
+        return authoritative_order_history(
+            query_fn(environment=environment, account_no=account_no, **kwargs)
+        )
 
     @staticmethod
     def _authoritative_snapshots(
@@ -406,7 +409,7 @@ class KisBroker:
                 snapshot.remaining_quantity,
             )
             by_key[key] = snapshot
-        result.snapshots = list(by_key.values())
+        result.snapshots = authoritative_order_history(list(by_key.values()))
         result.open_orders_complete = regular_complete
         result.history_complete = regular_complete
         result.reserved_orders_complete = reserved_complete

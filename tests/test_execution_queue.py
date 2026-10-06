@@ -208,6 +208,41 @@ def test_snapshot_current_price_does_not_infer_breakout_confirmation():
     assert candidate.source_session_date == "2026-07-01"
 
 
+def test_odd_fractional_range_is_sized_at_legal_limit_without_snapshot_entry():
+    bars = _intraday(minutes=31)
+    bars.loc[:, "High"] = 19.705
+    bars.loc[:, "Low"] = 19.09
+    bars.loc[:, "Open"] = 19.10
+    bars.loc[:, "Close"] = 19.65
+    candidate = build_orb_candidate(
+        symbol="ODD", window="30m", intraday=bars,
+        breakout_price=18.65, current_price=20.33,
+        account_size=14000.0, risk_percent=0.01, adr_percent=8.35,
+    )
+    assert candidate.valid and not candidate.terminal_rejection
+    assert candidate.status == OrbCandidateStatus.WAITING_BREAKOUT
+    assert candidate.orb_high == candidate.breakout_trigger == 19.705
+    assert candidate.execution_price == candidate.entry_trigger == 19.70
+    assert candidate.stop_loss == 19.09
+    assert candidate.shares == 115 and candidate.risk_percent == 0.005
+    assert 10 <= candidate.capital_percent <= 30
+    assert 15 <= candidate.stop_adr <= 66
+
+
+def test_odd_tight_five_minute_range_remains_risk_invalid():
+    bars = _intraday(minutes=6)
+    bars.loc[:, "High"] = 19.29
+    bars.loc[:, "Low"] = 19.09
+    candidate = build_orb_candidate(
+        symbol="ODD", window="5m", intraday=bars,
+        breakout_price=18.65, current_price=20.33,
+        account_size=14000.0, risk_percent=0.01, adr_percent=8.35,
+    )
+    assert not candidate.valid
+    assert candidate.status == OrbCandidateStatus.RISK_INVALID
+    assert "Stop/ADR" in candidate.reason
+
+
 def test_candidate_source_session_date_survives_queue_round_trip():
     manager = ExecutionQueueManager()
     candidate = build_orb_candidate(

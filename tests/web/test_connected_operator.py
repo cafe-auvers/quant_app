@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import platform
 import uuid
+import pytest
 from dataclasses import replace
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 
-from src.core.trade_card_state import BoardStatus, StopType, TradeCardState
+from src.core.trade_card_state import BoardStatus, PositionRuntimeStatus, StopType, TradeCardState
 from src.core.runtime_readiness import RuntimeDeviceState
 from src.core.execution_ownership import ExecutionOwner
 from src.services import trade_card_repository
@@ -95,6 +96,72 @@ def _buylist_card(engine):
             breakout_price=201.25,
         ),
     )
+
+
+@pytest.mark.parametrize("same_executor", [True, False])
+def test_mobile_reactivates_a_fully_closed_stock_with_original_breakout(
+    web_config, tmp_path, monkeypatch, same_executor
+):
+    engine, _role, service = _service(web_config, tmp_path, same_executor=same_executor)
+    monkeypatch.setattr(trade_card_repository, "LOCAL_TRADE_CARDS_FILE", tmp_path / "cards.json")
+    card = _buylist_card(engine)
+    card.board_status = BoardStatus.CLOSED
+    card.position_runtime_status = PositionRuntimeStatus.CLOSED
+    card.average_entry_price = 200.0
+    card = trade_card_repository.update_trade_card(engine, card, expected_version=card.version)
+    service.set_operator_control_target("mobile")
+    result = service.set_buy_today(command_id=str(uuid.uuid4()), symbol="AAPL",
+        expected_revision=card.version, enabled=True)
+    assert result["queued"] is False
+    assert result["card"]["canonical_stage"] == "BUY_TODAY"
+    assert result["card"]["breakout_price"] == 201.25
+    stored = trade_card_repository.get_trade_card(engine, "PROD", "account-a", "AAPL")
+    assert stored.position_runtime_status == PositionRuntimeStatus.NONE
+    assert stored.average_entry_price == 0 and stored.planned_quantity == 0
+
+
+@pytest.mark.parametrize("same_executor", [True, False])
+def test_mobile_withdraws_unsubmitted_regular_exit_directly_and_preserves_stop(
+    web_config, tmp_path, monkeypatch, same_executor
+):
+    engine, _role, service = _service(web_config, tmp_path, same_executor=same_executor)
+    monkeypatch.setattr(trade_card_repository, "LOCAL_TRADE_CARDS_FILE", tmp_path / "cards.json")
+    card = trade_card_repository.create_trade_card(engine, TradeCardState(
+        environment="PROD", account_no="account-a", symbol="SVIA",
+        board_status=BoardStatus.SELL_ALL, position_runtime_status=PositionRuntimeStatus.LIQUIDATING,
+        broker_quantity=643, orderable_quantity=643, average_entry_price=4.35,
+        stop_type=StopType.ORB_LOW, active_stop_price=4.24, stop_quantity=643,
+        exit_all_required=True, exit_attempt_count=3, last_exit_error="retry limit reached",
+    ))
+    before = service.board_snapshot(force=True)["rows"][0]
+    assert before["can_cancel_sell_all"] is True and before["sell_all_at_market_open"] is False
+    result = service.apply_board_action(
+        command_id=str(uuid.uuid4()), action="cancel_sell_all", symbol="SVIA",
+        expected_revision=card.version,
+    )
+    assert result["queued"] is False and result["command_status"] == "COMPLETED"
+    assert result["broker_order_placed"] is False
+    assert result["card"]["board_status"] == "OPEN_POSITION"
+    stored = trade_card_repository.get_trade_card(engine, "PROD", "account-a", "SVIA")
+    assert stored.broker_quantity == stored.stop_quantity == 643 and stored.active_stop_price == 4.24
+    assert stored.exit_attempt_count == 0 and stored.last_exit_error == ""
+
+
+def test_mobile_cannot_withdraw_reserved_sell_all(web_config, tmp_path, monkeypatch):
+    from src.web.store import ConflictError
+
+    engine, _role, service = _service(web_config, tmp_path, same_executor=False)
+    monkeypatch.setattr(trade_card_repository, "LOCAL_TRADE_CARDS_FILE", tmp_path / "cards.json")
+    card = trade_card_repository.create_trade_card(engine, TradeCardState(
+        environment="PROD", account_no="account-a", symbol="SVIA",
+        board_status=BoardStatus.SELL_ALL, broker_quantity=643,
+        exit_all_required=True, reserved_sell_quantity=643,
+    ))
+    assert service.board_snapshot(force=True)["rows"][0]["can_cancel_sell_all"] is False
+    with pytest.raises(ConflictError, match="unsubmitted Sell All"):
+        service.apply_board_action(command_id=str(uuid.uuid4()), action="cancel_sell_all",
+                                   symbol="SVIA", expected_revision=card.version)
+    assert trade_card_repository.get_trade_card(engine, "PROD", "account-a", "SVIA").version == card.version
 
 
 def test_operator_change_pulse_notifies_pc_listener(

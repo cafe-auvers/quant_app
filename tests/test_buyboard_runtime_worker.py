@@ -24,6 +24,13 @@ from PyQt5.QtWidgets import QApplication
 from sqlalchemy import create_engine
 from sqlalchemy.pool import NullPool
 
+
+@pytest.fixture(autouse=True)
+def isolated_monitor_equity_writer(monkeypatch, tmp_path):
+    from src.services import monitor_equity
+
+    monkeypatch.setattr(monitor_equity, "MONITOR_EQUITY_FILE", tmp_path / "monitor_equity.json")
+
 from src.api.kis_account_snapshot_dual import (
     KisRateLimitError,
     KisTransientApiError,
@@ -366,6 +373,73 @@ def _ready_runtime_state(**overrides):
 def test_construction_builds_nothing(tmp_path):
     worker, _ = _worker(tmp_path)
     assert worker.runtime is None
+
+
+@pytest.mark.parametrize("explicit_engine", [False, True])
+def test_production_composition_reads_existing_pending_buy_reservation(
+    tmp_path, monkeypatch, explicit_engine
+):
+    import src.ui.buyboard.runtime_worker as worker_module
+    from src.core.capital_reservation import CapitalReservation
+    from src.services import capital_reservation_repository
+
+    if explicit_engine:
+        (tmp_path / "reservations").mkdir()
+        reservation_engine = _db_engine(tmp_path / "reservations")
+        worker, engine = _worker(tmp_path, capital_reservation_engine=reservation_engine)
+    else:
+        worker, engine = _worker(tmp_path)
+        reservation_engine = engine
+    reservation = CapitalReservation.create(
+        environment="PROD", account_no="1", symbol="SVIA",
+        attempt_group_id="pending-svia", requested_notional=2797.05,
+        projected_open_risk=70.73,
+    )
+    capital_reservation_repository.save_reservation_strict(reservation_engine, reservation)
+    order = ExecutionOrderRecord(
+        environment="PROD", account_no="1", symbol="SVIA",
+        side=OrderSide.BUY, intent=OrderIntent.ENTRY,
+        client_order_id="pending-svia", broker_order_id="broker-svia",
+        broker_identity_status=BrokerIdentityStatus.EXACT,
+        status=ExecutionOrderStatus.WORKING,
+        submitted_quantity=643, remaining_quantity=643, submitted_limit_price=4.35,
+        capital_reservation_id=reservation.reservation_id,
+    )
+    record_execution_order(engine, order)
+    pending_card = _seed_card(engine, symbol="SVIA", entry_orb_low=4.24)
+    captured = {}
+
+    def capture_composition(**kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("composition captured")
+
+    lease = ExecutionLease(device_id="test", lease_token="test", lease_epoch=1)
+    worker._broker = ExecutionCommandGateway(
+        real_broker=FakeExecutionBroker(), engine=engine, mode_override=True,
+        lease_protocol=FakeExecutionLeaseProtocol(current=lease),
+        mutation_budget=AllowAllMutationBudget(), buying_power_provider=lambda *_: 100_000.0,
+    )
+    worker._schema_migration_manager = SimpleNamespace(prepare_cutover=lambda **_: None)
+    monkeypatch.setattr(worker_module, "is_buyboard_engine_enabled", lambda: True)
+    monkeypatch.setattr(execution_config, "KIS_LIVE_EXECUTION_MODE", "DISABLED")
+    monkeypatch.setattr(worker_module, "require_compatible_runtime_schema", lambda *_, **__: None)
+    monkeypatch.setattr(worker, "_set_device_state", lambda *_: None)
+    monkeypatch.setattr(worker, "_perform_shutdown_sequence", lambda: None)
+    monkeypatch.setattr(runtime_module, "build_buyboard_runtime", capture_composition)
+    worker.run()
+    assert captured
+
+    active = captured["portfolio_reservations_provider"]("PROD", "1")
+    orders = captured["portfolio_orders_provider"]("PROD", "1")
+    exposures = runtime_module._portfolio_projected_exposures(
+        cards=(pending_card,), execution_orders=orders, active_reservations=active,
+    )
+    assert len(exposures) == 1
+    assert exposures[0].source == "PENDING_BUY"
+    assert exposures[0].reservation_id == reservation.reservation_id
+    assert exposures[0].gross_notional_usd == pytest.approx(2797.05)
+    assert exposures[0].open_risk_usd == pytest.approx(70.73)
+    assert captured["portfolio_reservations_provider"]("PROD", "other-account") == []
 
 
 def test_unclaimed_new_store_allows_read_only_standby_migration_bootstrap(tmp_path):
@@ -2881,6 +2955,32 @@ def test_account_balance_preserves_explicit_usd_only_snapshot_without_fx(monkeyp
     assert equity == 5000.0
 
 
+def test_worker_balance_refresh_and_reconciliation_publish_real_equity_timestamp(tmp_path, monkeypatch):
+    from src.services import monitor_equity
+
+    published = []
+    monkeypatch.setattr(monitor_equity, "queue_monitor_equity", published.append)
+    worker, _ = _worker(tmp_path)
+    monkeypatch.setattr(worker, "_extract_account_balance", lambda _snapshot: (4000.0, 6000.0))
+    worker._record_buying_power("1", {})
+    assert published[-1].total_equity_usd == 6000.0
+    assert published[-1].source == "buyboard_runtime_periodic_refresh"
+    fetched = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=10)
+    broker_snapshot = AccountBrokerSnapshot(
+        environment="PROD", account_no="1", completeness=SnapshotCompleteness(account_balance_complete=True),
+        account_buying_power=3000.0, account_equity=7000.0, observed_at=fetched,
+    )
+    worker._record_reconciliation_balance("1", SimpleNamespace(snapshot=broker_snapshot))
+    assert published[-1].received_at == fetched
+    assert published[-1].total_equity_usd == 7000.0
+    path = tmp_path / "equity-projection.json"
+    monitor_equity.publish_monitor_equity(path, published[-1])
+    equity, error = monitor_equity.read_monitor_equity(path, "PROD", "1", fetched + dt.timedelta(seconds=5))
+    assert equity == 7000.0 and not error
+    equity, error = monitor_equity.read_monitor_equity(path, "PROD", "1", fetched + dt.timedelta(seconds=901))
+    assert equity is None and "stale" in error
+
+
 def test_periodic_refresh_populates_buying_power_cache_on_first_cycle(tmp_path, monkeypatch):
     from src.core import execution_config
     from src.services import buying_power_cache
@@ -3037,6 +3137,38 @@ def test_periodic_refresh_requeries_once_the_interval_has_elapsed(tmp_path, monk
 
     worker._run_one_cycle()
     assert len(broker.get_positions_calls) == calls_after_first + 1
+
+
+def test_reconciliation_refresh_starts_before_existing_freshness_deadline(tmp_path, monkeypatch):
+    import datetime as dt
+    import src.ui.buyboard.runtime_worker as worker_module
+    from src.services.account_reconciliation import AccountReconciliationResult, ReconciliationPlan
+
+    worker, _ = _worker(tmp_path)
+    worker.runtime = _build_test_runtime(
+        buying_power_provider=worker._buying_power_provider,
+        card_lookup=worker._card_lookup, broker=worker._broker, market_data=_dummy_market_data())
+    now = dt.datetime.now(dt.timezone.utc)
+    completed = now + dt.timedelta(seconds=2)
+    worker._account_reconciled_at["1"] = now-dt.timedelta(seconds=51)
+    worker._account_balance_refreshed_at["1"] = now
+    snapshot = AccountBrokerSnapshot(environment="PROD", account_no="1", observed_at=completed,
+        completeness=SnapshotCompleteness(holdings_complete=True, open_orders_complete=True,
+            history_complete=True, reserved_orders_complete=True, account_balance_complete=True),
+        account_buying_power=100_000, account_equity=100_000)
+    calls = []
+
+    def reconcile(**kwargs):
+        calls.append(kwargs)
+        return AccountReconciliationResult(snapshot=snapshot, plan=ReconciliationPlan(snapshot_id=snapshot.snapshot_id))
+
+    monkeypatch.setattr(worker_module, "run_account_reconciliation_pass", reconcile)
+    worker._refresh_account_state_if_due([], execute_commands=False)
+    assert len(calls) == 1
+    assert worker._account_reconciled_at["1"] == completed
+    assert worker._account_balance_refreshed_at["1"] == completed
+    assert worker._account_reconciliation_is_fresh("1", now=completed+dt.timedelta(seconds=59))
+    assert not worker._account_reconciliation_is_fresh("1", now=completed+dt.timedelta(seconds=61))
 
 
 def test_periodic_reconciliation_discovers_external_position_change(tmp_path, monkeypatch):
@@ -3478,6 +3610,26 @@ def test_sync_orb_plans_blocks_same_symbol_active_in_multiple_accounts(tmp_path)
     assert second.entry_runtime_status == EntryRuntimeStatus.RISK_INVALID
     assert "multiple accounts" in first.entry_block_reason
     assert "multiple accounts" in second.entry_block_reason
+
+
+def test_sync_orb_plans_waits_for_initial_calculation_and_clears_unverified_sizing(tmp_path):
+    worker, engine = _worker(tmp_path)
+    worker._execution_queue_item_lookup = lambda *_args: None
+    card = _seed_card(
+        engine, board_status=BoardStatus.BUY_TODAY,
+        entry_runtime_status=EntryRuntimeStatus.EXECUTE_READY,
+        entry_trigger=19.705, entry_execution_price=19.705,
+        entry_orb_high=19.705, entry_orb_low=19.09,
+        planned_quantity=100, target_position_quantity=100,
+        selected_orb_window="30m",
+    )
+    assert worker._sync_orb_plans([card]) == [card]
+    assert card.entry_runtime_status == EntryRuntimeStatus.DATA_UNAVAILABLE
+    assert card.entry_block_reason == "Waiting for the PC's current-session ORB calculation"
+    assert card.entry_trigger is None and card.entry_execution_price is None
+    assert card.planned_quantity == card.target_position_quantity == 0
+    assert card.selected_orb_window is None
+    assert worker._sync_orb_plans([card]) == []
 
 
 def test_sync_orb_plans_does_not_mark_price_only_movement_for_db_write(tmp_path):
