@@ -45,6 +45,17 @@ in small checkpointed groups. `--priority SYMBOL` moves requested charts to
 the front without excluding other symbols. The source sessions enforce
 MySQL read-only transactions, the Windows worker uses idle CPU priority, and
 the existing SQLite WAL mirror remains readable during each group. This job
+defers during the regular trading session and rolls back an unfinished group
+if the session opens. For immediate mobile access to all available PC hourly
+history, enable `pc_hourly_reads` in the connected web configuration. Hourly
+charts then make bounded, indexed reads from the PC source under enforced
+MySQL read-only transactions; daily charts and chart context retain the local
+mirror. Requested symbols do not need to be in the desktop scanner results.
+The hourly cache includes the symbol's PC data revision and shows stale source
+dates explicitly. Unavailable PC data is reported rather than replaced with
+invented candles or an unverified old mirror.
+
+The backup job
 does not refresh providers, access the broker, publish plans, change risk or
 live controls, or restart the executor. Source data which is itself stale or
 unavailable remains labelled by its real chart dates; the copy cannot create

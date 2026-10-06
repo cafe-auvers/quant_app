@@ -112,15 +112,26 @@ def main(argv=None):
         if completed % 100 < args.group_size or completed == total:
             print(json.dumps(state), flush=True)
     try:
+        from src.web.market_status import nyse_market_status
+        def live_session_open():
+            return nyse_market_status()["state"] == "OPEN"
+        if live_session_open():
+            state.update(status="DEFERRED", reason="Regular trading session is open")
+            report()
+            return 0
         with pc.connect() as conn:
             symbols = list(conn.execute(text("SELECT DISTINCT symbol FROM hourly_price_history ORDER BY symbol")).scalars())
         symbols = ordered_symbols(symbols, args.priority)
         report(total=len(symbols))
         sync_groups(pc, local, symbols, group_size=args.group_size,
-                    pause_seconds=args.pause_seconds, progress=report)
+                    pause_seconds=args.pause_seconds, progress=report, cancelled=live_session_open)
         state["status"] = "COMPLETED"
         state["finished_at"] = datetime.now(timezone.utc).isoformat()
         report(state["completed_symbols"], len(symbols), state["rows_copied"])
+        return 0
+    except InterruptedError:
+        state.update(status="DEFERRED", reason="Regular trading session opened; current group rolled back")
+        report(state.get("completed_symbols", 0), state.get("total_symbols", 0), state.get("rows_copied", 0))
         return 0
     except Exception as exc:
         state.update(status="FAILED", error_type=type(exc).__name__)
