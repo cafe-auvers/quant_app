@@ -7,6 +7,8 @@ pure function over that immutable snapshot and cloned local state.
 """
 from __future__ import annotations
 
+from src.core.broker_order_history import authoritative_order_history
+
 import copy
 import logging
 import threading
@@ -1488,7 +1490,7 @@ def reduce_account_reconciliation(
             )
 
     # C3 primary path: exact broker-order identity.
-    for broker_snapshot in snapshot.orders:
+    for broker_snapshot in authoritative_order_history(snapshot.orders):
         exact = order_by_broker_id.get(broker_snapshot.broker_order_id)
         if exact is None:
             continue

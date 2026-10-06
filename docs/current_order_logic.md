@@ -277,6 +277,14 @@ during replacement cannot inherit the proposed later-generation stop.
   Position, uncertainty stays Entry Pending.
 - Open Position remains open. EOD stops trying to complete any unfilled entry
   remainder and keeps the filled position protected.
+- Outside regular hours, feed unavailability does not create a new automatic
+  Sell All. Existing stop and explicit exit intent remain pending; during
+  regular hours, the normal structural-outage protection still applies.
+- KIS may return both an original zero-fill order and its later cancellation.
+  The original is retired only with unique cancellation proof for the exact
+  environment/account/symbol/side/order ID, matching quantity, zero fills and
+  remaining quantity, and a valid later broker timestamp on the same date.
+  Missing or contradictory evidence remains fenced.
 
 ## 9. What must never happen
 

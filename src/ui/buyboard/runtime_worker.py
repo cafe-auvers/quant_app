@@ -1849,7 +1849,7 @@ class BuyboardRuntimeWorker(QThread):
                     changed.append(card)
             if result.snapshot.completeness.account_balance_complete:
                 self._record_reconciliation_balance(account_no, result)
-                self._account_balance_refreshed_at[account_no] = now
+                self._account_balance_refreshed_at[account_no] = result.snapshot.observed_at
             if not self._reconciliation_snapshot_complete(result):
                 self.startup_reconciliation_errors[account_no] = (
                     "; ".join(result.snapshot.errors)
@@ -1859,7 +1859,7 @@ class BuyboardRuntimeWorker(QThread):
                     account_no, confirm_for_operator=True
                 )
                 continue
-            self._record_account_reconciliation_success(account_no, now)
+            self._record_account_reconciliation_success(account_no, result.snapshot.observed_at)
             self._observe_gate4_reconciliation(result, account_cards)
 
         if changed:
@@ -2620,9 +2620,16 @@ class BuyboardRuntimeWorker(QThread):
             balance_age = self._age_seconds(self._account_balance_refreshed_at.get(account_no), now)
             reconcile_age = self._age_seconds(self._account_reconciled_at.get(account_no), now)
             balance_due = balance_age is None or balance_age >= balance_interval
+            # Start the read before the existing freshness deadline. Never
+            # extend the deadline or treat a failed refresh as fresh evidence.
+            reconcile_interval = max(
+                1.0,
+                float(execution_config.FULL_RECONCILIATION_SECONDS)
+                - min(10.0, float(execution_config.FULL_RECONCILIATION_SECONDS) / 4),
+            )
             reconcile_due = (
                 reconcile_age is None
-                or reconcile_age >= execution_config.FULL_RECONCILIATION_SECONDS
+                or reconcile_age >= reconcile_interval
             )
             if not balance_due and not reconcile_due:
                 continue
@@ -2671,7 +2678,7 @@ class BuyboardRuntimeWorker(QThread):
                 self._handle_reconciliation_result(result)
                 if result.snapshot.completeness.account_balance_complete:
                     self._record_reconciliation_balance(account_no, result)
-                    self._account_balance_refreshed_at[account_no] = now
+                    self._account_balance_refreshed_at[account_no] = result.snapshot.observed_at
                 if not self._reconciliation_snapshot_complete(result):
                     reason = (
                         "; ".join(result.snapshot.errors)
@@ -2680,7 +2687,7 @@ class BuyboardRuntimeWorker(QThread):
                     self._invalidate_account_reconciliation(account_no, reason)
                     self._defer_account_refresh(account_no, now)
                     continue
-                self._record_account_reconciliation_success(account_no, now)
+                self._record_account_reconciliation_success(account_no, result.snapshot.observed_at)
                 self._account_refresh_retry_not_before.pop(account_no, None)
                 # Review finding P0: "unknown accounts can be incorrectly
                 # considered healthy" -- a full position+order

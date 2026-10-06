@@ -2610,7 +2610,7 @@ def test_recovered_trusted_symbol_price_reclassifies_immediately(tmp_path):
     assert card.market_data_outage_risk_tier == "HIGH"
 
 
-def test_high_outage_outside_session_persists_next_session_sell_intent(
+def test_closed_session_feed_loss_does_not_create_next_session_sell_intent(
     tmp_path, monkeypatch
 ):
     monkeypatch.setattr(execution_config, "MARKET_DATA_OUTAGE_GRACE_SECONDS", 1)
@@ -2627,10 +2627,42 @@ def test_high_outage_outside_session_persists_next_session_sell_intent(
     now[0] += dt.timedelta(seconds=2)
     engine.run_heartbeat([card])
 
-    assert card.board_status == BoardStatus.SELL_ALL
-    assert card.sell_all_at_market_open is True
-    assert card.position_runtime_status == PositionRuntimeStatus.QUEUED_FOR_OPEN
+    assert card.board_status == BoardStatus.OPEN_POSITION
+    assert card.exit_all_required is False
+    assert card.sell_all_at_market_open is False
+    assert card.market_data_outage_started_at is None
     assert sells == []
+
+
+def test_closed_session_does_not_cancel_existing_liquidation(tmp_path):
+    engine = _make_engine(tmp_path)
+    engine._market_is_open_fn = lambda: False
+    card = _open_card(board_status=BoardStatus.SELL_ALL, exit_all_required=True,
+                      market_data_outage_started_at=dt.datetime.now(dt.timezone.utc))
+    _seed_then_disconnect(engine)
+    engine._detect_stale_position_quotes([card])
+    assert card.board_status == BoardStatus.SELL_ALL
+    assert card.exit_all_required is True
+    assert card.active_stop_price == 95.0
+
+
+def test_outage_grace_starts_at_open_after_closed_interval(tmp_path, monkeypatch):
+    monkeypatch.setattr(execution_config, "MARKET_DATA_OUTAGE_GRACE_SECONDS", 5)
+    now = [dt.datetime.now(dt.timezone.utc)]
+    opened = [False]
+    engine = _make_engine(tmp_path)
+    engine._clock = lambda: now[0]
+    engine._market_is_open_fn = lambda: opened[0]
+    card = _open_card(active_stop_price=99.5,
+                     market_data_outage_started_at=now[0]-dt.timedelta(hours=6))
+    _seed_then_disconnect(engine)
+    engine._detect_stale_position_quotes([card])
+    opened[0] = True
+    engine._detect_stale_position_quotes([card])
+    assert card.exit_all_required is False
+    now[0] += dt.timedelta(seconds=6)
+    engine._detect_stale_position_quotes([card])
+    assert card.exit_all_required is True
 
 
 def test_verified_trading_halt_retains_exit_intent_and_retries_when_resumed(

@@ -2503,6 +2503,15 @@ class TradingEngine:
         illiquid symbols can be quiet without their feed being unavailable.
         """
         changed: List[TradeCardState] = []
+        if not self._market_is_open():
+            # The regular-session feed is not a protection outage while the
+            # exchange is closed. Existing stop/user liquidation stays sticky;
+            # a new outage timer starts only during the next trading session.
+            for card in cards:
+                if card.market_data_outage_started_at is not None:
+                    card.market_data_outage_started_at = None
+                    changed.append(card)
+            return changed
         now = self._clock()
         for card in cards:
             if card.board_status not in _TICK_REACTIVE_POSITION_STATUSES:

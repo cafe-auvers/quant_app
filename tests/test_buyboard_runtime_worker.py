@@ -3139,6 +3139,38 @@ def test_periodic_refresh_requeries_once_the_interval_has_elapsed(tmp_path, monk
     assert len(broker.get_positions_calls) == calls_after_first + 1
 
 
+def test_reconciliation_refresh_starts_before_existing_freshness_deadline(tmp_path, monkeypatch):
+    import datetime as dt
+    import src.ui.buyboard.runtime_worker as worker_module
+    from src.services.account_reconciliation import AccountReconciliationResult, ReconciliationPlan
+
+    worker, _ = _worker(tmp_path)
+    worker.runtime = _build_test_runtime(
+        buying_power_provider=worker._buying_power_provider,
+        card_lookup=worker._card_lookup, broker=worker._broker, market_data=_dummy_market_data())
+    now = dt.datetime.now(dt.timezone.utc)
+    completed = now + dt.timedelta(seconds=2)
+    worker._account_reconciled_at["1"] = now-dt.timedelta(seconds=51)
+    worker._account_balance_refreshed_at["1"] = now
+    snapshot = AccountBrokerSnapshot(environment="PROD", account_no="1", observed_at=completed,
+        completeness=SnapshotCompleteness(holdings_complete=True, open_orders_complete=True,
+            history_complete=True, reserved_orders_complete=True, account_balance_complete=True),
+        account_buying_power=100_000, account_equity=100_000)
+    calls = []
+
+    def reconcile(**kwargs):
+        calls.append(kwargs)
+        return AccountReconciliationResult(snapshot=snapshot, plan=ReconciliationPlan(snapshot_id=snapshot.snapshot_id))
+
+    monkeypatch.setattr(worker_module, "run_account_reconciliation_pass", reconcile)
+    worker._refresh_account_state_if_due([], execute_commands=False)
+    assert len(calls) == 1
+    assert worker._account_reconciled_at["1"] == completed
+    assert worker._account_balance_refreshed_at["1"] == completed
+    assert worker._account_reconciliation_is_fresh("1", now=completed+dt.timedelta(seconds=59))
+    assert not worker._account_reconciliation_is_fresh("1", now=completed+dt.timedelta(seconds=61))
+
+
 def test_periodic_reconciliation_discovers_external_position_change(tmp_path, monkeypatch):
     """FULL_RECONCILIATION_SECONDS cadence: a manual sale made mid-session
     (broker quantity dropped to zero) must be discovered without waiting
