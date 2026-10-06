@@ -2703,7 +2703,8 @@ class BuyboardRuntimeWorker(QThread):
                             account_no=request.account_no,
                             position_balance_extractor=extractor,
                         )
-                    return broker.get_positions(environment=environment, account_no=request.account_no)
+                    positions = broker.get_positions(environment=environment, account_no=request.account_no)
+                    return positions, datetime.now(timezone.utc)
 
                 if reconcile_due:
                     self.reconciliation_accounts_in_progress.add(account_no)
@@ -2794,10 +2795,11 @@ class BuyboardRuntimeWorker(QThread):
             # reconciliation pass, so it performs the one holdings query
             # it needs and no order discovery.
             try:
-                position_snapshot = (
-                    completed[1].result() if ready_read
-                    else self.runtime.broker.get_positions(environment=self._environment, account_no=account_no)
-                )
+                received_at = now
+                if ready_read:
+                    position_snapshot, received_at = completed[1].result()
+                else:
+                    position_snapshot = self.runtime.broker.get_positions(environment=self._environment, account_no=account_no)
             except Exception as exc:
                 self._defer_account_refresh(account_no, now)
                 if isinstance(exc, (KisRateLimitError, KisTransientApiError)):
@@ -2814,7 +2816,6 @@ class BuyboardRuntimeWorker(QThread):
                         account_no,
                     )
                 continue
-            received_at = completed_request.started_at if ready_read else now
             self._record_buying_power(account_no, position_snapshot, received_at=received_at)
             self._account_balance_refreshed_at[account_no] = received_at
             self._account_refresh_retry_not_before.pop(account_no, None)

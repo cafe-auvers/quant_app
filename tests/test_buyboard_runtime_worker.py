@@ -607,6 +607,39 @@ def test_background_snapshot_applies_on_owner_thread_without_refetch(tmp_path, m
     worker._account_reader.close()
 
 
+def test_background_balance_retains_response_time_instead_of_request_or_apply_time(tmp_path, monkeypatch):
+    from src.services.background_account_reader import BackgroundAccountReader
+    from src.services import buying_power_cache
+
+    broker = _FakeBroker()
+    worker, engine = _worker(tmp_path, broker=broker)
+    worker.runtime = SimpleNamespace(broker=broker)
+    started = dt.datetime.now(dt.timezone.utc)
+    clock = [started]
+
+    class Clock:
+        @staticmethod
+        def now(_zone):
+            return clock[0]
+
+    def read(**kwargs):
+        clock[0] = started + dt.timedelta(seconds=5)
+        return {"overseas": {"holdings": [], "summary_by_exchange": {"NASD": {"cash_balance_usd": 5000.0}}}}
+
+    monkeypatch.setattr("src.ui.buyboard.runtime_worker.datetime", Clock)
+    broker.get_positions = read
+    worker._account_reconciled_at["1"] = started
+    worker._account_reader = BackgroundAccountReader()
+    worker._refresh_account_state_if_due([])
+    worker._account_reader._pending[1].result(timeout=3)
+    clock[0] = started + dt.timedelta(seconds=10)
+    worker._refresh_account_state_if_due([])
+    snapshot = buying_power_cache.get_snapshot("PROD", "1")
+    assert snapshot.received_at == started + dt.timedelta(seconds=5)
+    assert worker._account_balance_refreshed_at["1"] == snapshot.received_at
+    worker._account_reader.close()
+
+
 def test_same_device_mode_disables_elapsed_card_fallback(
     tmp_path, monkeypatch
 ):
