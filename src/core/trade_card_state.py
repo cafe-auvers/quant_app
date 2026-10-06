@@ -911,7 +911,7 @@ def has_durable_execution_evidence(card: TradeCardState) -> bool:
 
 
 def has_legacy_planning_stop(card: TradeCardState) -> bool:
-    """Identify an untouched flat legacy candidate's incorrectly migrated stop."""
+    """Identify a flat legacy planning stop, independent of metadata revisions."""
 
     try:
         positive_stop = (
@@ -922,8 +922,7 @@ def has_legacy_planning_stop(card: TradeCardState) -> bool:
     except (TypeError, ValueError, OverflowError):
         return False
     if not (
-        card.version == 1
-        and "migrated_from_buylist" in card.warnings
+        "migrated_from_buylist" in card.warnings
         and card.board_status in {BoardStatus.WATCHLIST, BoardStatus.BUYLIST}
         and card.stop_type == StopType.MANUAL_PRICE
         and positive_stop

@@ -1046,6 +1046,15 @@ def _require_board_action_not_conflicted(engine, command, card) -> List[Executio
         isinstance(command, types.MoveToBuylist)
         and card.board_status == BoardStatus.WATCHLIST
     )
+    if planning_stage_move:
+        from src.services.capital_reservation_repository import list_active_reservations
+
+        if any(row.symbol == card.symbol for row in list_active_reservations(
+            engine, environment=card.environment, account_no=card.account_no
+        )):
+            raise BoardCommandRejectedError(
+                "Planning membership cannot change while capital remains reserved"
+            )
     legacy_planning_stop = has_legacy_planning_stop(card) and not owned_orders
     if planning_stage_move and (
         active_orders

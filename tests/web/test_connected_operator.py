@@ -393,8 +393,9 @@ def test_mobile_buyboard_remove_buylist_preserves_non_watchlist_state(
     assert stored.breakout_price == 201.25
 
 
-def test_mobile_removes_untouched_flat_legacy_blkb_without_publishing_entry_intent(
-    web_config, tmp_path, monkeypatch
+@pytest.mark.parametrize("metadata_updates", [0, 22])
+def test_mobile_removes_flat_legacy_candidate_without_publishing_entry_intent(
+    web_config, tmp_path, monkeypatch, metadata_updates
 ):
     engine, _role, service = _service(web_config, tmp_path, same_executor=False)
     monkeypatch.setattr(trade_card_repository, "LOCAL_TRADE_CARDS_FILE", tmp_path / "cards.json")
@@ -404,6 +405,12 @@ def test_mobile_removes_untouched_flat_legacy_blkb_without_publishing_entry_inte
         stop_type=StopType.MANUAL_PRICE, active_stop_price=44.54,
         warnings=["migrated_from_buylist"],
     ))
+    for index in range(metadata_updates):
+        card.name = f"Planning label {index}"
+        card = trade_card_repository.update_trade_card(
+            engine, card, expected_version=card.version,
+        )
+    assert card.version == metadata_updates + 1
     result = service.apply_board_action(
         command_id=str(uuid.uuid4()), action="remove_buylist", symbol="BLKB",
         expected_revision=card.version,

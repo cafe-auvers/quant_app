@@ -22,10 +22,12 @@ def _make_card(**overrides) -> TradeCardState:
     return TradeCardState(**fields)
 
 
-def test_legacy_planning_stop_is_narrowly_identified_without_changing_risk_predicate():
+@pytest.mark.parametrize("version", [1, 2, 23, 100])
+def test_legacy_planning_stop_is_narrowly_identified_without_changing_risk_predicate(version):
     card = _make_card(
         board_status=BoardStatus.BUYLIST, warnings=["migrated_from_buylist"],
         stop_type=StopType.MANUAL_PRICE, active_stop_price=44.54,
+        version=version,
     )
     assert has_legacy_planning_stop(card)
     assert has_durable_execution_evidence(card)
@@ -33,7 +35,7 @@ def test_legacy_planning_stop_is_narrowly_identified_without_changing_risk_predi
 
 
 @pytest.mark.parametrize("evidence", [
-    {"version": 2}, {"warnings": []}, {"board_status": BoardStatus.BUY_TODAY},
+    {"warnings": []}, {"board_status": BoardStatus.BUY_TODAY},
     {"stop_quantity": 1}, {"stop_type": StopType.ORB_LOW},
     {"active_stop_price": float("nan")}, {"active_stop_price": float("inf")},
     {"active_stop_price": 0}, {"active_stop_price": None}, {"active_stop_price": "unknown"},

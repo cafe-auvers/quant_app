@@ -5,6 +5,7 @@ from dataclasses import replace
 
 from sqlalchemy import create_engine
 
+from src.core.trade_card_state import BoardStatus, StopType, TradeCardState
 from src.services import trade_card_repository
 from src.services.state_sync import (
     LocalDeviceRole,
@@ -14,6 +15,38 @@ from src.services.state_sync import (
 from src.web.canonical_planning import CanonicalPlanningSource
 from src.web.connected_planning import ConnectedPlanningService
 from src.web.operator_identity import mobile_web_role
+
+
+def test_connected_buylist_removal_accepts_revised_flat_legacy_planning_stop(web_config, tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'legacy-planning.db'}", future=True)
+    config = replace(web_config, mode="CONNECTED", canonical_planning_reads=True,
+                     canonical_planning_writes=True, connected_passive_operations=("remove_buylist",),
+                     canonical_account_no="account-a", pc_repository_path=str(tmp_path))
+    source = CanonicalPlanningSource(enabled=True, environment="PROD", account_no="account-a",
+                                     engine=engine, cache_seconds=0)
+    service = ConnectedPlanningService(config, source, engine=engine, unavailable_reason="")
+    card = trade_card_repository.create_trade_card(engine, TradeCardState(
+        environment="PROD", account_no="account-a", symbol="CDNA",
+        board_status=BoardStatus.BUYLIST, buylist_member=True, watchlist_member=True,
+        breakout_price=64.81, stop_type=StopType.MANUAL_PRICE, active_stop_price=46.85,
+        warnings=["migrated_from_buylist"],
+    ))
+    for index in range(22):
+        card.name = f"Planning update {index}"
+        card = trade_card_repository.update_trade_card(engine, card, expected_version=card.version)
+    assert card.version == 23
+
+    result = service.apply(command_id=str(uuid.uuid4()), operation="remove_buylist",
+                           symbol="CDNA", expected_revision=23, breakout_price=None)
+
+    stored = trade_card_repository.get_trade_card(engine, "PROD", "account-a", "CDNA")
+    assert stored.board_status == BoardStatus.WATCHLIST and stored.watchlist_member
+    assert not stored.buylist_member and stored.version == 24
+    assert stored.breakout_price == 64.81 and stored.active_stop_price is None
+    assert stored.stop_type is None and stored.broker_quantity == stored.stop_quantity == 0
+    assert result["status"] == "SAVED TO CANONICAL STORE"
+    from src.services.execution_order_repository import list_execution_orders_for_card
+    assert list_execution_orders_for_card(engine, environment="PROD", account_no="account-a", symbol="CDNA") == []
 
 
 def test_planning_change_pulse_notifies_pc_listener(
