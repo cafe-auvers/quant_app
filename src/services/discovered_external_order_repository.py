@@ -467,16 +467,7 @@ def list_discovered_external_orders_for_account(
     account_no: str,
 ) -> list[DiscoveredExternalOrder]:
     """Return the permanent A4b audit records for one account."""
-    table = ensure_discovered_external_orders_table(engine)
-    with coordination_read_connection(engine) as conn:
-        rows = conn.execute(
-            select(table)
-            .where(
-                table.c.environment == str(environment or "").upper(),
-                table.c.account_no == str(account_no or ""),
-            )
-            .order_by(table.c.id.asc())
-        ).fetchall()
+    rows = _read_external_order_rows(engine, environment=environment, account_no=account_no)
     return [_row_to_order(row) for row in rows]
 
 
@@ -484,15 +475,26 @@ def list_discovered_external_orders(
     engine: Engine, *, environment: Optional[str] = None
 ) -> list[DiscoveredExternalOrder]:
     """Return external-order audit rows, optionally for one environment."""
-    table = ensure_discovered_external_orders_table(engine)
-    statement = select(table)
-    if environment is not None:
-        statement = statement.where(
-            table.c.environment == str(environment or "").upper()
-        )
-    with coordination_read_connection(engine) as conn:
-        rows = conn.execute(statement.order_by(table.c.id.asc())).fetchall()
+    rows = _read_external_order_rows(engine, environment=environment)
     return [_row_to_order(row) for row in rows]
+
+
+def _read_external_order_rows(engine, *, environment=None, account_no=None):
+    from src.services.coordination_snapshot import read_versioned_rows
+
+    table = ensure_discovered_external_orders_table(engine)
+    environment = str(environment or "").upper() if environment is not None else None
+    account_no = str(account_no or "") if account_no is not None else None
+    conditions = []
+    if environment is not None:
+        conditions.append(table.c.environment == environment)
+    if account_no is not None:
+        conditions.append(table.c.account_no == account_no)
+    rows = read_versioned_rows(
+        engine, table, cache_key=("discovered_external_orders", environment, account_no),
+        key_columns=("external_order_id",), revision_column="version", conditions=conditions,
+    )
+    return sorted(rows, key=lambda row: row.id)
 
 
 # --- atomic adoption (revision 3.2) -------------------------------------

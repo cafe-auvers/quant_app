@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import BigInteger, Column, DateTime, MetaData, String, Table, Text, text
 from sqlalchemy.engine import Engine
 
 from src.core.trade_card_state import BoardStatus, TradeCardState, can_withdraw_sell_all_intent
@@ -256,14 +256,25 @@ class CanonicalPlanningSource:
                         if revision == self._snapshot.revision:
                             self._snapshot = _Snapshot(self._snapshot.cards, revision, now)
                             return self._snapshot
-                    rows = connection.execute(
-                        text(
-                            "SELECT payload, version, updated_at FROM trade_cards "
-                            "WHERE environment=:environment AND account_no=:account_no "
-                            "ORDER BY board_status, symbol"
-                        ),
-                        parameters,
-                    ).all()
+                from src.services.coordination_snapshot import read_versioned_rows
+
+                table = Table(
+                    "trade_cards", MetaData(),
+                    Column("environment", String(10)),
+                    Column("account_no", String(32)),
+                    Column("symbol", String(20)),
+                    Column("board_status", String(32)),
+                    Column("payload", Text),
+                    Column("version", BigInteger),
+                    Column("updated_at", DateTime),
+                )
+                rows = read_versioned_rows(
+                    self.engine, table,
+                    cache_key=("web_trade_cards", self.environment, account_no),
+                    key_columns=("environment", "account_no", "symbol"),
+                    revision_column="version",
+                    conditions=(table.c.environment == self.environment, table.c.account_no == account_no),
+                )
             except CanonicalPlanningUnavailable:
                 raise
             except Exception as exc:
@@ -282,6 +293,11 @@ class CanonicalPlanningSource:
 
     @staticmethod
     def _revision(count, version_sum, newest) -> str:
+        if isinstance(newest, str):
+            try:
+                newest = dt.datetime.fromisoformat(newest)
+            except ValueError:
+                pass
         newest_text = newest.isoformat() if newest is not None and hasattr(newest, "isoformat") else str(newest or "")
         return f"{int(count)}:{int(version_sum)}:{newest_text}"
 

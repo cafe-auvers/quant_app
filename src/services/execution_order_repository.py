@@ -79,6 +79,9 @@ def invalidate_execution_orders_table_cache(engine: Engine) -> None:
 
     with _ensure_lock:
         _ensured_engines.discard(engine)
+    from src.services.coordination_snapshot import invalidate_versioned_rows
+
+    invalidate_versioned_rows(engine)
 
 
 class DuplicateExecutionOrderError(RuntimeError):
@@ -588,17 +591,8 @@ def list_execution_orders_for_card(
     symbol: str,
 ) -> List[ExecutionOrderRecord]:
     """Return durable guarded orders for one card, newest records first."""
-    table = ensure_execution_orders_table(engine)
-    with coordination_read_connection(engine) as conn:
-        rows = conn.execute(
-            select(table)
-            .where(
-                table.c.environment == str(environment or "").upper(),
-                table.c.account_no == str(account_no or ""),
-                table.c.symbol == str(symbol or "").upper(),
-            )
-            .order_by(table.c.id.desc())
-        ).fetchall()
+    rows = _read_order_rows(engine, environment=environment, account_no=account_no, symbol=symbol)
+    rows.reverse()
     return [_row_to_record(row) for row in rows]
 
 
@@ -609,16 +603,7 @@ def list_execution_orders_for_account(
     account_no: str,
 ) -> List[ExecutionOrderRecord]:
     """Return every durable order in one account for a single C1 pass."""
-    table = ensure_execution_orders_table(engine)
-    with coordination_read_connection(engine) as conn:
-        rows = conn.execute(
-            select(table)
-            .where(
-                table.c.environment == str(environment or "").upper(),
-                table.c.account_no == str(account_no or ""),
-            )
-            .order_by(table.c.id.asc())
-        ).fetchall()
+    rows = _read_order_rows(engine, environment=environment, account_no=account_no)
     return [_row_to_record(row) for row in rows]
 
 
@@ -627,12 +612,27 @@ def list_execution_orders(
 ) -> List[ExecutionOrderRecord]:
     """Return all durable orders, optionally scoped to one environment."""
 
-    table = ensure_execution_orders_table(engine)
-    statement = select(table)
-    if environment is not None:
-        statement = statement.where(
-            table.c.environment == str(environment or "").upper()
-        )
-    with coordination_read_connection(engine) as conn:
-        rows = conn.execute(statement.order_by(table.c.id.asc())).fetchall()
+    rows = _read_order_rows(engine, environment=environment)
     return [_row_to_record(row) for row in rows]
+
+
+def _read_order_rows(engine, *, environment=None, account_no=None, symbol=None):
+    from src.services.coordination_snapshot import read_versioned_rows
+
+    table = ensure_execution_orders_table(engine)
+    scope = (environment, account_no, symbol)
+    normalized = (
+        str(environment or "").upper() if environment is not None else None,
+        str(account_no or "") if account_no is not None else None,
+        str(symbol or "").upper() if symbol is not None else None,
+    )
+    conditions = tuple(
+        table.c[name] == value
+        for name, value, supplied in zip(("environment", "account_no", "symbol"), normalized, scope)
+        if supplied is not None
+    )
+    rows = read_versioned_rows(
+        engine, table, cache_key=("execution_orders", *normalized),
+        key_columns=("client_order_id",), revision_column="version", conditions=conditions,
+    )
+    return sorted(rows, key=lambda row: row.id)

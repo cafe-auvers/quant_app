@@ -204,8 +204,29 @@ def test_board_nav_refreshes_without_changing_card_revisions(tmp_path):
     source.close()
 
 
-def test_unchanged_board_checks_revision_without_redownloading_payloads(tmp_path):
+def test_unchanged_board_checks_revision_without_redownloading_payloads(tmp_path, monkeypatch):
+    from src.services import coordination_snapshot as snapshots
+
     source = canonical_source(tmp_path)
+    transfers = []
+    original_connection = snapshots.coordination_read_connection
+
+    class Connection:
+        def __init__(self, engine):
+            self.connection = original_connection(engine)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.connection.close()
+
+        def execute(self, statement):
+            rows = self.connection.execute(statement).fetchall()
+            transfers.append(rows)
+            return SimpleNamespace(fetchall=lambda: rows)
+
+    monkeypatch.setattr(snapshots, "coordination_read_connection", Connection)
     statements = []
     event.listen(source.engine, "before_cursor_execute", lambda _conn, _cursor, statement, *_args: statements.append(statement))
     original = source.list_plans()
@@ -219,10 +240,12 @@ def test_unchanged_board_checks_revision_without_redownloading_payloads(tmp_path
     statements.clear()
     changed = source.list_plans()
     assert changed["revision"] != original["revision"]
-    assert any("SELECT payload" in statement for statement in statements)
+    assert len(transfers[-1]) == 1
+    assert transfers[-1][0].symbol == "AAPL"
     statements.clear()
     source.list_plans(force=True)
-    assert any("SELECT payload" in statement for statement in statements)
+    assert len(statements) == 1  # forced reads still prove canonical freshness
+    assert transfers[-1] == []
     source.close()
 
 

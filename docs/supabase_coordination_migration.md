@@ -78,10 +78,32 @@ changing authority. Never restart the stale source as a second writer.
 
 ## Usage and backup
 
-The board checks a compact revision after its short cache expires and downloads
-card payloads only when that revision changes. Forced reads after a mobile edit
-remain authoritative. Broker gates, leases and execution checks keep their
-existing freshness requirements.
+The October 7 dashboard showed 41.02 GB against the 5 GB Free egress allowance.
+The full TradeCard read had returned about 8.37 million rows; October 5 and 6
+traffic was almost entirely Shared Pooler egress. Whole-collection refreshes
+after individual changes, rather than database size or chart downloads, were
+the main source.
+
+Card, order-history and state readers now keep immutable, process-local raw
+snapshots. Every repository read checks the canonical database in one statement.
+Known identities, versions and timestamps are sent into PostgreSQL as a single
+JSON parameter; only changed payloads and deletion markers are returned. The
+single statement observes committed rows coherently, including late commits;
+it does not use a timestamp watermark. Decoded models are private to each caller.
+Failed reads remain errors, and force-refresh still performs a database check.
+Restore/schema invalidation clears snapshots. CAS writes, row locks, controls,
+leases, broker checks and market-data timing remain authoritative.
+
+The read-only cloud probe measured 744,079 payload bytes for the initial 181
+cards and zero returned card rows on eleven subsequent unchanged reads. A
+300-card budget regression allows three consumers, one changed card per five
+seconds during 22 six-and-a-half-hour sessions, two fresh polls per change,
+2 KiB protocol allowance per poll, daily cold starts, hourly off-hours polls
+and 300 MiB for backups. That modeled workload stays below 4 GB per month.
+This is a workload budget, not an unlimited-use guarantee: additional devices,
+more mutations, cold starts and other Supabase products must be monitored in
+the organization dashboard. Already accumulated usage remains until the next
+billing cycle. No paid plan or resource is enabled by this change.
 
 Once every writer has moved, the app makes no ongoing TiDB coordination calls.
 Monitor Supabase database size and egress in its dashboard. Keep dated verified
