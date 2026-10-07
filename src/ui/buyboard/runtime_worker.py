@@ -83,6 +83,7 @@ from src.services.account_reconciliation import (
     run_account_reconciliation_pass,
 )
 from src.services.background_account_reader import AccountReadRequest, BackgroundAccountReader
+from src.services.background_symbol_executor import BackgroundSymbolExecutor
 from src.services.broker import ReadOnlyBroker
 from src.services.controlled_live_policy import (
     controlled_live_symbols,
@@ -359,6 +360,7 @@ class BuyboardRuntimeWorker(QThread):
         self._account_equity_provider = account_equity_provider
         self._broker = broker
         self.request_scheduler = request_scheduler or KisRequestScheduler(
+            protective_parallelism=8,
             max_confirmed_mutation_attempts=(
                 execution_config.KIS_MUTATION_MAX_CONFIRMED_ATTEMPTS
             ),
@@ -442,6 +444,10 @@ class BuyboardRuntimeWorker(QThread):
         # Started by run after startup recovery. Direct diagnostic cycles can
         # retain synchronous reads without owning another thread.
         self._account_reader: Optional[BackgroundAccountReader] = None
+        self._balance_reader: Optional[BackgroundAccountReader] = None
+        self._symbol_executor: Optional[BackgroundSymbolExecutor] = None
+        self._symbol_context = threading.local()
+        self._balance_refresh_retry_not_before: Dict[str, datetime] = {}
         self._last_account_read_started = ""
         self._card_cache_initialized = False
         self._card_collection_revision = None
@@ -1224,6 +1230,12 @@ class BuyboardRuntimeWorker(QThread):
             return
 
         self._account_reader = BackgroundAccountReader()
+        self._balance_reader = BackgroundAccountReader()
+        if not self._standby_only:
+            self._symbol_executor = BackgroundSymbolExecutor()
+            on_breach = getattr(self.runtime.market_data, "on_stop_breach", None)
+            if callable(on_breach):
+                on_breach(self._dispatch_ingress_stop_breach)
         try:
             while not self._stop_requested:
                 cycle_started_monotonic = time.monotonic()
@@ -1445,6 +1457,10 @@ class BuyboardRuntimeWorker(QThread):
         self.shutdown_errors = []
         if self._account_reader is not None:
             self._account_reader.close()
+        if self._balance_reader is not None:
+            self._balance_reader.close()
+        if self._symbol_executor is not None:
+            self._symbol_executor.close()
         try:
             self._set_device_state(RuntimeDeviceState.SHUTTING_DOWN)
         except Exception as exc:
@@ -1595,6 +1611,9 @@ class BuyboardRuntimeWorker(QThread):
             return False
 
     def _card_lookup(self, environment: str, account_no: str, symbol: str) -> Optional[TradeCardState]:
+        active = getattr(self._symbol_context, "card", None)
+        if active is not None and (active.environment, active.account_no, active.symbol) == (environment, account_no, symbol):
+            return active
         return repo.get_trade_card(
             self._db_engine,
             environment,
@@ -1899,8 +1918,9 @@ class BuyboardRuntimeWorker(QThread):
 
         observe_gate4_event(
             "LIFECYCLE_COMPARISON",
-            agrees=not result.snapshot.errors,
-            snapshot_complete=True,
+            agrees=not result.snapshot.errors and not any(
+                alert.severity == ReconciliationAlertSeverity.CRITICAL for alert in result.plan.alerts),
+            snapshot_complete=all(vars(result.snapshot.completeness).values()),
         )
         terminal_statuses = {
             ExecutionOrderStatus.FILLED,
@@ -1930,7 +1950,9 @@ class BuyboardRuntimeWorker(QThread):
                 identity_ambiguous=False,
                 resolved=True,
             )
-        for card in cards:
+        observed_cards = {card.card_key: card for card in cards}
+        observed_cards.update({card.card_key: card for card in result.plan.changed_cards})
+        for card in observed_cards.values():
             if int(card.broker_quantity or 0) <= 0:
                 continue
             safely_protected = bool(
@@ -1943,6 +1965,21 @@ class BuyboardRuntimeWorker(QThread):
                     symbol=card.symbol,
                     safe_exit_or_protected=True,
                 )
+        from gate2.reporting import _session_bounds
+        try:
+            _session_open, session_close = _session_bounds(result.snapshot.session_date)
+        except ValueError:
+            # Account reads can occur on a market holiday. Diagnostics must
+            # not interrupt reconciliation or protective execution.
+            return
+        if session_close <= result.snapshot.observed_at <= session_close + timedelta(seconds=90):
+            expected = {holding.symbol: holding.quantity for holding in result.snapshot.holdings if holding.quantity > 0}
+            actual = {card.symbol: card.broker_quantity for card in observed_cards.values() if card.broker_quantity > 0}
+            observe_gate4_event("FINAL_RECONCILIATION", matches_broker=bool(
+                expected == actual and all(vars(result.snapshot.completeness).values())
+                and not result.snapshot.errors and not any(
+                    alert.severity == ReconciliationAlertSeverity.CRITICAL for alert in result.plan.alerts)),
+                snapshot_id=result.snapshot.snapshot_id, observed_at=result.snapshot.observed_at.isoformat())
 
     # -- per-cycle heartbeat --------------------------------------------------
 
@@ -2179,6 +2216,9 @@ class BuyboardRuntimeWorker(QThread):
             check_quotes.extend(quotes)
             self.last_market_data_drain_at = datetime.now(timezone.utc)
             if allow_mutations:
+                if self._symbol_executor is not None:
+                    self._dispatch_symbol_cycles(observation_cards, quotes, execution_ready_cards)
+                    quotes = []
                 for quote in quotes:
                     _track(self.runtime.trading_engine.evaluate_quote(observation_cards, quote))
                     pending_handoff = (
@@ -2216,7 +2256,10 @@ class BuyboardRuntimeWorker(QThread):
                         BoardStatus.SELL_ALL,
                     }
                 ]
-            _track(self.runtime.trading_engine.run_heartbeat(heartbeat_cards))
+            if self._symbol_executor is None:
+                _track(self.runtime.trading_engine.run_heartbeat(heartbeat_cards))
+            elif not canonical_available:
+                self._dispatch_symbol_cycles(heartbeat_cards, (), execution_ready_cards)
             if canonical_available:
                 # Buy Today is valid for one regular session only.  Expiry is
                 # a local board transition, not an entry submission, so run it
@@ -2242,6 +2285,9 @@ class BuyboardRuntimeWorker(QThread):
                     rotated_quotes = self.runtime.market_data.poll_once()
                     check_quotes.extend(rotated_quotes)
                     self.last_market_data_drain_at = datetime.now(timezone.utc)
+                    if self._symbol_executor is not None:
+                        self._dispatch_symbol_cycles(observation_cards, rotated_quotes, execution_ready_cards)
+                        rotated_quotes = []
                     for quote in rotated_quotes:
                         _track(self.runtime.trading_engine.evaluate_quote(observation_cards, quote))
                         pending_handoff = (
@@ -2286,6 +2332,94 @@ class BuyboardRuntimeWorker(QThread):
         observe_cycle(self.runtime.market_data, check_quotes, check_cards,
                       self._account_equity_provider or self._buying_power_provider,
                       cycle_timings_ms=cycle_timings_ms)
+
+    def _dispatch_ingress_stop_breach(self, quote, rule) -> None:
+        if self._symbol_executor is None or not self._accepting_commands or self._stop_requested:
+            return
+        if self.device_state != RuntimeDeviceState.ACTIVE or self._standby_only:
+            return
+        card = next((c for c in tuple(self._cached_cards) if c.card_key == rule.card_key), None)
+        if card is None:
+            return
+        latched_quote = replace(quote, stop_price_overrides=((rule.card_key, rule.price),),
+            breached_stop_versions=((rule.card_key, rule.version),), entry_trigger_eligible=False)
+        self._queue_symbol_cycle(card, (latched_quote,), entry_allowed=False, protective=True, critical=True)
+
+    def _dispatch_symbol_cycles(self, cards, quotes, entry_cards) -> None:
+        entry_keys = {card.card_key for card in entry_cards}
+        for card in cards:
+            if not _card_requires_quote_subscription(card) and not card.exit_all_required:
+                continue
+            matching = tuple(quote for quote in quotes if quote.symbol == card.symbol)
+            protective = bool(card.broker_quantity > 0 or card.exit_all_required)
+            self._queue_symbol_cycle(card, matching, entry_allowed=card.card_key in entry_keys,
+                                     protective=protective)
+
+    def _queue_symbol_cycle(self, card, quotes, *, entry_allowed, protective, critical=False) -> None:
+        fallback = copy.deepcopy(card)
+        def run():
+            if not self._accepting_commands or self._stop_requested:
+                return
+            canonical_available = not self._database_probe_completed or self._database_writable
+            if canonical_available:
+                try:
+                    current = repo.get_trade_card(self._db_engine, card.environment, card.account_no,
+                                                  card.symbol, raise_on_error=True)
+                except SQLAlchemyError:
+                    self._set_database_writable(False)
+                    canonical_available = False
+                    current = fallback
+            else:
+                current = fallback
+            if current is None:
+                return
+            allow_entries = bool(entry_allowed and canonical_available
+                                 and self._card_action_ready(current)
+                                 and self._card_in_execution_scope(current)
+                                 and self.device_state == RuntimeDeviceState.ACTIVE)
+            if not canonical_available and not protective:
+                return
+            self._symbol_context.card = current
+            try:
+                self._stop_change_coordinator.overlay_pending([current])
+                changed = []
+                acknowledgements = set()
+                for quote in quotes:
+                    changed.extend(self.runtime.trading_engine.evaluate_quote([current], quote))
+                    pending = self.runtime.trading_engine.evaluate_pending_stop_handoff([current], quote)
+                    changed.extend(pending)
+                    self._latch_pending_stop_breaches(quote, pending, acknowledgements)
+                    self._collect_market_breach_ack_candidates(quote, [current], acknowledgements)
+                    if allow_entries:
+                        changed.extend(self.runtime.trading_engine.evaluate_entry_quote([current], quote,
+                            prepare_entry_plan=self._prepare_crossed_orb_entry_plan))
+                # The heartbeat also performs guarded cancel, fill recovery,
+                # partial sale and latched stop retries on this card alone.
+                changed.extend(self.runtime.trading_engine.run_heartbeat([current], allow_entries=allow_entries))
+                persisted = self._persist_changed([current]) if changed and canonical_available else []
+                if changed and not canonical_available:
+                    # Preserve the latch and emergency identity until the
+                    # canonical database recovers and imports the journal.
+                    for cached in tuple(self._cached_cards):
+                        if cached.card_key == current.card_key:
+                            cached.exit_all_required |= current.exit_all_required
+                            cached.stop_loss_triggered |= current.stop_loss_triggered
+                self._acknowledge_market_breach_candidates(acknowledgements,
+                    {c.card_key for c in persisted if c.exit_all_required})
+                if persisted:
+                    self._card_cache_initialized = False
+                    self.board_changed.emit()
+            finally:
+                self._symbol_context.card = None
+        critical = critical or any(card.card_key in dict(q.breached_stop_versions) for q in quotes)
+        def scoped_run():
+            from src.services.kis_request_boundary import kis_read_priority_scope
+            from src.services.kis_request_scheduler import RequestPriority
+            priority = (RequestPriority.EMERGENCY_EXIT if critical else
+                        RequestPriority.EXIT_CANCEL_OR_RECONCILIATION if protective else RequestPriority.NEW_ENTRY)
+            with kis_read_priority_scope(priority):
+                run()
+        self._symbol_executor.dispatch(card.card_key, scoped_run, protective=protective, critical=critical)
 
     def _process_operator_commands(self, *, limit: int = 20) -> bool:
         """Apply live human requests only while this runtime owns execution."""
@@ -2619,6 +2753,7 @@ class BuyboardRuntimeWorker(QThread):
         # correctly treats every holding found there as newly discovered.
         account_numbers = self._distinct_account_numbers(cards)
         self._reconciliation_required_accounts.update(account_numbers)
+        self._refresh_background_balance(cards, account_numbers, now)
         reader = self._account_reader
         completed = reader.take_completed() if reader is not None else None
         completed_request = completed[0] if completed is not None else None
@@ -2655,13 +2790,12 @@ class BuyboardRuntimeWorker(QThread):
             )
             balance_age = self._age_seconds(self._account_balance_refreshed_at.get(account_no), now)
             reconcile_age = self._age_seconds(self._account_reconciled_at.get(account_no), now)
-            balance_due = balance_age is None or balance_age >= balance_interval
+            balance_due = self._balance_reader is None and (balance_age is None or balance_age >= balance_interval)
             # Start the read before the existing freshness deadline. Never
             # extend the deadline or treat a failed refresh as fresh evidence.
             reconcile_interval = max(
                 1.0,
-                float(execution_config.FULL_RECONCILIATION_SECONDS)
-                - min(10.0, float(execution_config.FULL_RECONCILIATION_SECONDS) / 4),
+                float(execution_config.FULL_RECONCILIATION_SECONDS) / 2,
             )
             if any(
                 card.board_status == BoardStatus.SELL_ALL
@@ -2704,7 +2838,9 @@ class BuyboardRuntimeWorker(QThread):
                             position_balance_extractor=extractor,
                         )
                     positions = broker.get_positions(environment=environment, account_no=request.account_no)
-                    return positions, datetime.now(timezone.utc)
+                    received_at = datetime.now(timezone.utc)
+                    positions["_account_value_usd"] = extractor(positions)
+                    return positions, received_at
 
                 if reconcile_due:
                     self.reconciliation_accounts_in_progress.add(account_no)
@@ -2757,9 +2893,12 @@ class BuyboardRuntimeWorker(QThread):
                 if execute_commands and self._accepting_commands:
                     changed.extend(self._execute_reconciliation_commands(result))
                 self._handle_reconciliation_result(result)
+                self._observe_gate4_reconciliation(result, account_cards)
                 if result.snapshot.completeness.account_balance_complete:
                     self._record_reconciliation_balance(account_no, result)
-                    self._account_balance_refreshed_at[account_no] = result.snapshot.observed_at
+                    stamp = result.snapshot.account_balance_observed_at or result.snapshot.observed_at
+                    self._account_balance_refreshed_at[account_no] = max(
+                        self._account_balance_refreshed_at.get(account_no, stamp), stamp)
                 if not self._reconciliation_snapshot_complete(result):
                     reason = (
                         "; ".join(result.snapshot.errors)
@@ -2822,6 +2961,50 @@ class BuyboardRuntimeWorker(QThread):
 
         return changed
 
+    def _refresh_background_balance(self, cards, accounts, now) -> None:
+        reader = self._balance_reader
+        if reader is None:
+            return
+        completed = reader.take_completed()
+        if completed is not None:
+            request, future = completed
+            try:
+                if not self._stop_requested and request.generation == self._account_read_generation(cards):
+                    positions, received_at = future.result()
+                    self._record_buying_power(request.account_no, positions, received_at=received_at)
+                    self._account_balance_refreshed_at[request.account_no] = max(
+                        self._account_balance_refreshed_at.get(request.account_no, received_at), received_at)
+                    self._balance_refresh_retry_not_before.pop(request.account_no, None)
+            except Exception:
+                logger.exception("Background account-value read failed")
+                self._balance_refresh_retry_not_before[request.account_no] = now + timedelta(seconds=5)
+        if reader.busy or self._stop_requested:
+            return
+        ordered_accounts = list(accounts)
+        last_account = getattr(self, "_last_balance_read_started", None)
+        if last_account in ordered_accounts:
+            split = ordered_accounts.index(last_account) + 1
+            ordered_accounts = ordered_accounts[split:] + ordered_accounts[:split]
+        for account in ordered_accounts:
+            retry = self._balance_refresh_retry_not_before.get(account)
+            if retry is not None and now < retry:
+                continue
+            age = self._age_seconds(self._account_balance_refreshed_at.get(account), now)
+            if age is not None and age < min(float(execution_config.ACTIVE_ACCOUNT_REFRESH_SECONDS), 7.5):
+                continue
+            request = AccountReadRequest(account, False, now, self._account_read_generation(cards))
+            broker = ReadOnlyBroker(self.runtime.broker)
+            environment = self._environment
+            extractor = type(self)._extract_account_balance
+            def read(request=request, broker=broker, environment=environment, extractor=extractor):
+                positions = broker.get_positions(environment=environment, account_no=request.account_no)
+                received_at = datetime.now(timezone.utc)
+                positions["_account_value_usd"] = extractor(positions)
+                return positions, received_at
+            reader.submit(request, read)
+            self._last_balance_read_started = account
+            break
+
     def _account_read_generation(self, cards: List[TradeCardState]) -> tuple:
         return (
             account_broker_state_generation(self._db_engine),
@@ -2874,7 +3057,7 @@ class BuyboardRuntimeWorker(QThread):
             usable_buying_power_usd=float(snapshot.account_buying_power or 0.0),
             total_equity_usd=float(snapshot.account_equity or 0.0),
             source="buyboard_runtime_account_reconciliation",
-            received_at=snapshot.observed_at,
+            received_at=snapshot.account_balance_observed_at or snapshot.observed_at,
         )
         from src.services.monitor_equity import queue_monitor_equity
 
@@ -3473,6 +3656,16 @@ class BuyboardRuntimeWorker(QThread):
             result.snapshot.environment,
             result.snapshot.account_no,
         )
+        previous_incidents = {key for key in self._active_reconciliation_incidents if key[:2] == account_prefix}
+        if self._reconciliation_snapshot_complete(result) and not result.snapshot.errors:
+            for base in previous_incidents - current_incidents:
+                code = str(base[2] or "").upper()
+                alert_type = (CriticalAlertType.UNKNOWN_SUBMISSION_STATE if "UNKNOWN_SUBMISSION" in code
+                              else CriticalAlertType.DISCOVERED_EXTERNAL_ORDER if "EXTERNAL" in code
+                              else CriticalAlertType.ACCOUNT_RECONCILIATION_FAILED)
+                self._resolve_external_alert(alert_type, ":".join(str(item or "-") for item in base))
+        else:
+            current_incidents |= previous_incidents
         self._active_reconciliation_incidents = {
             key
             for key in self._active_reconciliation_incidents
@@ -3541,6 +3734,8 @@ class BuyboardRuntimeWorker(QThread):
         can be resolved, both values remain unavailable (zero) so entry
         sizing fails closed instead of interpreting KRW totals as USD.
         """
+        if "_account_value_usd" in snapshot:
+            return tuple(snapshot["_account_value_usd"])
         from src.ui.mixins.dashboard_mixin import DashboardMixin
 
         requires_fx = cls._account_snapshot_requires_fx(snapshot)
@@ -3556,7 +3751,9 @@ class BuyboardRuntimeWorker(QThread):
         )
         if not breakdown:
             return 0.0, 0.0
-        usable_usd = float(breakdown.get("ovrs_cash_usd", 0.0) or 0.0)
+        summaries = snapshot.get("overseas", {}).get("summary_by_exchange", {})
+        usable_usd = max((float(summary.get("cash_balance_usd", 0.0) or 0.0)
+                          for summary in summaries.values()), default=0.0)
         equity_usd = float(breakdown.get("total_krw", 0.0) or 0.0) / fx_rate
         return usable_usd, equity_usd
 
@@ -3626,6 +3823,15 @@ class BuyboardRuntimeWorker(QThread):
                 str(card.environment or "").strip().upper(),
                 str(card.symbol or "").strip().upper(),
             )
+            state_reader = getattr(getattr(self.runtime, "market_data", None), "symbol_state", None)
+            if callable(state_reader):
+                feed_state = state_reader(card.symbol)
+                configuration_error = str(getattr(feed_state, "trade_configuration_error", "") or
+                                          getattr(feed_state, "quote_configuration_error", ""))
+                if "symbol master" in configuration_error.lower() and "not present" in configuration_error.lower():
+                    block_unverified_plan(card, "KIS does not recognize this ticker in its US symbol master. "
+                        "Verify the current ticker and activate it with a new trade plan.")
+                    continue
             if symbol_key in ambiguous:
                 reason = (
                     "ORB execution blocked: the same symbol is active in "
@@ -3872,6 +4078,12 @@ class BuyboardRuntimeWorker(QThread):
         for card in cards:
             if not card.pending_stop_command_id or card.pending_stop_price is None:
                 continue
+            if card.exit_all_required and card.board_status == BoardStatus.SELL_ALL:
+                # Liquidation already owns all shares. Retire the stop edit
+                # while preserving its requested price in canonical state.
+                if card.acknowledge_pending_stop_change():
+                    changed.append(card)
+                continue
             signature = (
                 card.pending_stop_type.value
                 if card.pending_stop_type is not None
@@ -3976,6 +4188,26 @@ class BuyboardRuntimeWorker(QThread):
                         self._local_card_change_generation = local_after
                         self._last_card_change_pulse_generation = pulse_after
                     persisted.append(card)
+            except repo.TradeCardVersionConflictError:
+                if card.exit_all_required:
+                    latest = repo.get_trade_card(self._db_engine, card.environment, card.account_no,
+                                                 card.symbol, raise_on_error=True)
+                    if latest is not None and latest.broker_quantity > 0:
+                        latest.exit_all_required = True
+                        latest.stop_loss_triggered = bool(latest.stop_loss_triggered or card.stop_loss_triggered)
+                        latest.board_status = BoardStatus.SELL_ALL
+                        latest.position_runtime_status = card.position_runtime_status
+                        if latest.pending_stop_price is not None:
+                            latest.active_stop_price = latest.pending_stop_price
+                            latest.stop_type = latest.pending_stop_type or latest.stop_type
+                            latest.stop_quantity = latest.broker_quantity
+                        try:
+                            repo.update_trade_card(self._db_engine, latest, expected_version=latest.version)
+                            persisted.append(latest)
+                        except repo.TradeCardVersionConflictError:
+                            pass  # Keep the accumulator breach unacknowledged for replay.
+                logger.info("Card %s changed concurrently; reloading authoritative state", card.symbol)
+                self._card_cache_initialized = False
             except Exception:
                 # A stale version (another device changed this card
                 # concurrently) or a transient DB error must not stop the

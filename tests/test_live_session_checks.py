@@ -12,6 +12,38 @@ SHA = "a" * 40
 DAY = "2026-10-05"
 
 
+def test_automatic_capture_rotates_finished_sessions_and_isolates_release_paths(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from datetime import date
+    import src.utils.market_calendar as calendar
+    selected_day = [date(2026, 10, 5)]
+    monkeypatch.setattr(calendar, "current_or_next_nyse_session_date", lambda: selected_day[0])
+    monkeypatch.setattr(checks, "checks_enabled", lambda: True)
+    monkeypatch.setattr(checks, "get_env_value", lambda key, default="": {
+        "LIVE_SESSION_DATE": "auto", "LIVE_SESSION_EVIDENCE_DIR": str(tmp_path), "KIS_RUNTIME_COMMIT_SHA": SHA,
+    }.get(key, default))
+    monkeypatch.setattr(checks, "_observer", None)
+    monkeypatch.setattr(checks, "LiveSessionChecks", lambda output, commit, day:
+        SimpleNamespace(output_dir=output, commit_sha=commit, session_date=day, finished=False))
+    first = checks.configured_observer()
+    assert first.output_dir.name == DAY + "_" + SHA[:12]
+    first.finished = True
+    selected_day[0] = date(2026, 10, 6)
+    second = checks.configured_observer()
+    assert second is not first and second.session_date == "2026-10-06"
+    assert second.output_dir != first.output_dir
+
+
+def test_read_only_audit_does_not_create_missing_evidence_or_report_success(tmp_path):
+    from scripts.audit_passive_trading_session import audit_session
+    (tmp_path / "checks_report.json").write_text(json.dumps({"session_date": DAY, "commit_sha": SHA}))
+    result = audit_session(tmp_path, session_date=DAY, commit_sha=SHA)
+    assert result["collection_status"] == "COLLECTION_MISSING_OR_INVALID"
+    assert result["formal_gate_result"] == "NOT_CERTIFIED"
+    assert result["broker_calls"] == result["canonical_writes"] == 0
+    assert not (tmp_path / "live_checks.evidence.jsonl").exists()
+
+
 def test_evidence_path_cannot_touch_repository():
     with pytest.raises(ValueError, match="outside the repository"):
         checks.LiveSessionChecks(checks.ROOT_DIR / "data", SHA, DAY, start_thread=False)
@@ -154,3 +186,36 @@ def test_cycle_report_exposes_blocking_account_work_without_issuing_requests(tmp
     assert report["runtime_cycles"]["last_timings_ms"]["total"] == 200
     assert report["runtime_cycles"]["maximum_timings_ms"]["account_refresh_and_reconciliation"] == 8_000
     assert report["formal_gate_result"] == "NOT_CERTIFIED"
+
+
+def test_automatic_collector_rolls_finished_session_into_separate_evidence(tmp_path, monkeypatch):
+    from datetime import date
+    from types import SimpleNamespace
+    from src.utils import market_calendar
+    created = []
+
+    def collector(output, commit, day):
+        item = SimpleNamespace(output_dir=output, commit_sha=commit, session_date=day, finished=False)
+        created.append(item)
+        return item
+
+    settings = {"LIVE_SESSION_DATE": "auto", "LIVE_SESSION_EVIDENCE_DIR": str(tmp_path),
+                "KIS_RUNTIME_COMMIT_SHA": SHA}
+    monkeypatch.setattr(checks, "checks_enabled", lambda: True)
+    monkeypatch.setattr(checks, "get_env_value", lambda key, default="": settings.get(key, default))
+    monkeypatch.setattr(checks, "LiveSessionChecks", collector)
+    monkeypatch.setattr(checks, "_observer", SimpleNamespace(session_date="2026-10-06", finished=True))
+    monkeypatch.setattr(market_calendar, "current_or_next_nyse_session_date", lambda: date(2026, 10, 7))
+    current = checks.configured_observer()
+    assert current.output_dir == tmp_path / ("2026-10-07_" + SHA[:12])
+    assert checks.configured_observer() is current
+    assert len(created) == 1
+
+
+def test_missing_passive_evidence_never_creates_an_empty_journal_or_passes(tmp_path):
+    from scripts.audit_passive_trading_session import audit_session
+    (tmp_path / "checks_report.json").write_text(json.dumps({"session_date": DAY, "commit_sha": SHA}))
+    result = audit_session(tmp_path, session_date=DAY, commit_sha=SHA)
+    assert result["collection_status"] == "COLLECTION_MISSING_OR_INVALID"
+    assert result["formal_gate_result"] == "NOT_CERTIFIED"
+    assert not (tmp_path / "live_checks.evidence.jsonl").exists()

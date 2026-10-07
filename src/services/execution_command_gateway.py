@@ -50,6 +50,7 @@ import hashlib
 import math
 import threading
 import time
+from datetime import datetime, timezone
 import weakref
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
@@ -90,6 +91,7 @@ from src.core.order_state import (
 from src.infrastructure.database.coordination_engine import coordination_read_connection
 from src.services import trading_state
 from src.services.capital_reservation_repository import (
+    InsufficientAvailableCapitalError,
     activate_prepared_replacement_reservation,
     ensure_capital_reservations_table,
     fetch_reservation,
@@ -137,6 +139,8 @@ from src.risk.portfolio import (
     require_portfolio_risk_reservation_spec,
 )
 from src.services.kis_request_boundary import (
+    PreBrokerDispatchAbortedError,
+    effective_kis_read_priority,
     install_process_kis_request_scheduler,
     kis_request_scope,
 )
@@ -640,6 +644,10 @@ class ExecutionCommandGateway:
             priority=RequestPriority.ACCOUNT_RECONCILIATION,
         )
 
+    def get_buying_power(self, **kwargs: Any):
+        reader = getattr(self._real_broker, "get_buying_power", None)
+        return reader(**kwargs) if callable(reader) else None
+
     # --- GUARDED_ENGINE only ----------------------------------------------------
 
     def _canonical_database_is_writable(self) -> bool:
@@ -934,6 +942,14 @@ class ExecutionCommandGateway:
                         )
                         or 0.0
                     )
+                    funding_reader = getattr(self._real_broker, "get_buying_power", None)
+                    if callable(funding_reader):
+                        funding = funding_reader(environment=original.environment, account_no=original.account_no,
+                            symbol=original.symbol, exchange=original.exchange, limit_price=new_limit_price)
+                        amount = float(funding["available_usd"])
+                        if not math.isfinite(amount) or amount < 0 or funding["currency"] != "USD":
+                            raise InsufficientAvailableCapitalError("KIS replacement orderability is unavailable")
+                        replacement_buying_power = amount + float(original_reservation.remaining_reserved_notional)
 
             # 2. verify replace ownership/permission.
             self._require_ownership(
@@ -1183,6 +1199,7 @@ class ExecutionCommandGateway:
                 pre_trade_risk_decision=request.pre_trade_risk_decision,
                 risk_strategy_id=request.risk_strategy_id,
                 risk_plan_id=request.risk_plan_id,
+                entry_freshness_validator=request.entry_freshness_validator,
             )
             try:
                 result = self._do_submit(submit_request)
@@ -1371,6 +1388,7 @@ class ExecutionCommandGateway:
                     pre_trade_risk_decision=request.pre_trade_risk_decision,
                     risk_strategy_id=request.risk_strategy_id,
                     risk_plan_id=request.risk_plan_id,
+                    entry_freshness_validator=request.entry_freshness_validator,
                 )
                 try:
                     result = self._do_submit(submit_request)
@@ -1571,6 +1589,7 @@ class ExecutionCommandGateway:
         endpoint: str,
         priority: RequestPriority,
     ) -> Any:
+        priority = effective_kis_read_priority(priority)
         scheduler = self._mutation_budget
         if getattr(self._real_broker, "schedules_at_request_boundary", False):
             with kis_request_scope(
@@ -1600,6 +1619,7 @@ class ExecutionCommandGateway:
         priority: RequestPriority,
         is_new_entry: bool,
         qualification_context: Optional[Mapping[str, Any]] = None,
+        pre_dispatch_check: Optional[Callable[[], None]] = None,
     ) -> Any:
         context = dict(qualification_context or {})
         observer = self._qualification_observer
@@ -1646,6 +1666,11 @@ class ExecutionCommandGateway:
 
         def observed_operation() -> Any:
             nonlocal dispatched
+            if not getattr(self._real_broker, "schedules_at_request_boundary", False) and pre_dispatch_check is not None:
+                try:
+                    pre_dispatch_check()
+                except Exception as exc:
+                    raise PreBrokerDispatchAbortedError(str(exc)) from exc
             dispatched = True
             observer("MUTATION_DISPATCHED", common_observation)
             return operation()
@@ -1663,6 +1688,7 @@ class ExecutionCommandGateway:
                     mutation_classifier=(
                         classifier if callable(classifier) else None
                     ),
+                    pre_dispatch_check=pre_dispatch_check,
                 ):
                     result = observed_operation()
             else:
@@ -1685,10 +1711,14 @@ class ExecutionCommandGateway:
         except Exception as exc:
             if not dispatched:
                 raise
+            if isinstance(exc, PreBrokerDispatchAbortedError):
+                observer("MUTATION_TERMINAL", {**common_observation, "result": "PRE_BROKER_ABORTED",
+                    "identity_ambiguous": False, "resolved": True, "broker_confirmed_terminal": False})
+                raise
             try:
-                ambiguous = not (
-                    callable(classifier) and classifier(exc) is True
-                )
+                classify = getattr(self._real_broker, "is_ambiguous_cancellation_error", None) if command_type == CommandType.CANCEL else None
+                classify = classify or self._real_broker.is_ambiguous_submission_error
+                ambiguous = bool(classify(exc))
             except Exception:
                 ambiguous = True
             observer(
@@ -1715,6 +1745,25 @@ class ExecutionCommandGateway:
             },
         )
         return result
+
+    @staticmethod
+    def _validate_entry_funding(evidence, request) -> None:
+        try:
+            age = (datetime.now(timezone.utc) - datetime.fromisoformat(evidence["observed_at"])).total_seconds()
+            amount = float(evidence["available_usd"])
+            quantity = int(evidence["orderable_quantity"])
+            valid = (0 <= age <= 15 and math.isfinite(amount) and amount >= 0
+                and evidence["currency"] == "USD" and evidence["symbol"] == request.symbol
+                and evidence["exchange"] == request.exchange
+                and math.isclose(float(evidence["limit_price"]), float(request.limit_price), rel_tol=0, abs_tol=1e-8)
+                and int(request.quantity) <= quantity
+                and float(request.quantity) * float(request.limit_price) <= amount)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            valid = False
+        if not valid:
+            raise InsufficientAvailableCapitalError(
+                "Waiting for fresh KIS orderable funds for the exact symbol, exchange, price and quantity; no order sent"
+            )
 
     @staticmethod
     def _priority_for_submit(request: SubmitExecutionRequest) -> RequestPriority:
@@ -2386,11 +2435,17 @@ class ExecutionCommandGateway:
         # creates a (zero-notional) reservation row so the record's
         # capital_reservation_id/audit trail stays uniform across sides.
         requested_notional = quantity * limit_price if request.side == OrderSide.BUY else 0.0
-        buying_power = (
-            float(self._require_buying_power_provider()(environment, account_no) or 0.0)
-            if requested_notional > 0
-            else 0.0
-        )
+        funding_evidence = None
+        buying_power = 0.0
+        if requested_notional > 0:
+            read_funding = getattr(self._real_broker, "get_buying_power", None)
+            if callable(read_funding):
+                funding_evidence = read_funding(environment=environment, account_no=account_no,
+                    symbol=symbol, exchange=request.exchange, limit_price=limit_price)
+                self._validate_entry_funding(funding_evidence, request)
+                buying_power = float(funding_evidence["available_usd"])
+            else:
+                buying_power = float(self._require_buying_power_provider()(environment, account_no) or 0.0)
 
         projected_open_risk = (
             portfolio_risk_spec.proposed_open_risk_usd
@@ -2500,6 +2555,8 @@ class ExecutionCommandGateway:
                     reservation,
                     buying_power=buying_power,
                     portfolio_risk_spec=portfolio_risk_spec,
+                    broker_observed_at=(datetime.fromisoformat(funding_evidence["request_started_at"]).astimezone(timezone.utc).replace(tzinfo=None)
+                        if funding_evidence is not None and funding_evidence.get("request_started_at") else None),
                 )
             insert_execution_order(conn, record)
 
@@ -2532,6 +2589,8 @@ class ExecutionCommandGateway:
             # Recheck at the last possible moment because lease/database work
             # above may consume most of the approval's short TTL.
             final_portfolio_risk_spec = require_current_entry_risk_approval()
+            if funding_evidence is not None:
+                self._validate_entry_funding(funding_evidence, request)
             effective_entry_notional_cap = require_live_entry_allowed(
                 environment=environment,
                 account_no=account_no,
@@ -2554,6 +2613,7 @@ class ExecutionCommandGateway:
             ActiveExternalOrderFenceError,
             PreTradeRiskRejectedError,
             LiveExecutionEnvelopeError,
+            InsufficientAvailableCapitalError,
         ) as gate_error:
             # The broker boundary has definitely not been entered. Retire
             # every A1 artifact atomically so a final-gate race cannot look
@@ -2575,6 +2635,14 @@ class ExecutionCommandGateway:
                 )
             raise GuardedSubmissionPreBrokerAbortedError(str(gate_error)) from gate_error
 
+        def validate_at_http_dispatch():
+            if is_new_entry:
+                require_current_entry_risk_approval()
+                if funding_evidence is not None:
+                    self._validate_entry_funding(funding_evidence, request)
+                if request.entry_freshness_validator is not None:
+                    request.entry_freshness_validator()
+
         # 9. only now call the broker.
         try:
             submission = self._execute_scheduled_mutation(
@@ -2595,6 +2663,7 @@ class ExecutionCommandGateway:
                 endpoint="submit_order",
                 priority=submit_priority,
                 is_new_entry=is_new_entry,
+                pre_dispatch_check=validate_at_http_dispatch,
                 qualification_context={
                     "symbol": symbol,
                     "client_order_id": request.client_order_id,
@@ -2608,10 +2677,20 @@ class ExecutionCommandGateway:
                         is_new_entry and final_portfolio_risk_spec is not None
                     ),
                     "effective_entry_notional_cap": effective_entry_notional_cap,
+                    "funding_evidence": funding_evidence,
                 },
             )
         except Exception as exc:
             error_message = str(exc)
+            if isinstance(exc, PreBrokerDispatchAbortedError):
+                apply_status_transition(record, ExecutionOrderStatus.CANCELLED_LOCALLY)
+                reservation.release()
+                with engine.begin() as conn:
+                    update_execution_order(conn, record, expected_version=record.version)
+                    update_command_response(conn, idempotency_key, status="PRE_BROKER_ABORTED",
+                                            broker_response={"error": error_message, "funding_evidence": funding_evidence})
+                    update_reservation(conn, reservation, expected_version=reservation.version)
+                raise GuardedSubmissionPreBrokerAbortedError(error_message) from exc
             try:
                 ambiguous = self._real_broker.is_ambiguous_submission_error(exc)
             except Exception:
@@ -2626,12 +2705,12 @@ class ExecutionCommandGateway:
                     update_execution_order(conn, record, expected_version=record.version)
                     update_command_response(
                         conn, idempotency_key, status="AMBIGUOUS" if ambiguous else "FAILED",
-                        broker_response={"error": error_message},
+                        broker_response={"error": error_message, "funding_evidence": funding_evidence},
                     )
                     if not ambiguous:
-                        # 11: never automatically retry -- a clean rejection
-                        # gives the reservation back; an ambiguous one does
-                        # not (the order may yet turn out to exist).
+                        # A definitive rejection releases this consumed
+                        # identity. Any later attempt needs fresh evidence.
+                        # Ambiguous outcomes retain the hold and identity.
                         reservation.release()
                         update_reservation(
                             conn,
@@ -2762,6 +2841,7 @@ class ExecutionCommandGateway:
             LeaseNotVerifiedError,
             ActiveExternalOrderFenceError,
             LiveExecutionEnvelopeError,
+            InsufficientAvailableCapitalError,
         ) as gate_error:
             # No cancel reached the broker. Restore the exact live status
             # captured before CANCEL_PENDING and retire this caller-owned

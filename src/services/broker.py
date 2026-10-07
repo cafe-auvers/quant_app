@@ -199,6 +199,9 @@ class ReadOnlyBroker:
     def get_positions(self, **kwargs):
         return self._delegate.get_positions(**kwargs)
 
+    def get_buying_power(self, **kwargs):
+        return self._delegate.get_buying_power(**kwargs)
+
 
 class KisBroker:
     """``Broker`` implementation backed by the real KIS overseas order API."""
@@ -414,6 +417,12 @@ class KisBroker:
         result.history_complete = regular_complete
         result.reserved_orders_complete = reserved_complete
         return result
+
+    def get_buying_power(self, *, environment: str, account_no: str, symbol: str,
+                         exchange: str, limit_price: float) -> Dict[str, Any]:
+        config = kis_account_snapshot_dual.load_config(kis_account_snapshot_dual.KisEnvironment(environment), account_no_override=account_no)
+        client = kis_account_snapshot_dual.KisAccountClient(config)
+        return client.get_overseas_buying_power(symbol=symbol, exchange=exchange, limit_price=limit_price)
 
     def get_positions(
         self,

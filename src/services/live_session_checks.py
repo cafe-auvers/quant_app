@@ -271,7 +271,7 @@ class LiveSessionChecks:
                 if time.monotonic() - self._last_report >= 10:
                     self._write_report()
                     self._last_report = time.monotonic()
-                if datetime.now(timezone.utc) >= self.session_close + timedelta(seconds=10):
+                if datetime.now(timezone.utc) >= self.session_close + timedelta(seconds=90):
                     break
             self.finished = True
             while not self.queue.empty():
@@ -304,12 +304,20 @@ def configured_observer():
     global _observer
     if not checks_enabled():
         return None
+    from src.utils.market_calendar import current_or_next_nyse_session_date
+    configured_date = str(get_env_value("LIVE_SESSION_DATE", "auto")).strip()
+    automatic = not configured_date or configured_date.lower() == "auto"
+    session_date = current_or_next_nyse_session_date().isoformat() if automatic else configured_date
     with _lock:
+        if automatic and _observer is not None and _observer.finished and _observer.session_date != session_date:
+            _observer = None
         if _observer is None:
+            output = Path(get_env_value("LIVE_SESSION_EVIDENCE_DIR", ""))
+            commit = str(get_env_value("KIS_RUNTIME_COMMIT_SHA", ""))
+            if automatic:
+                output = output / (session_date + "_" + commit[:12])
             _observer = LiveSessionChecks(
-                Path(get_env_value("LIVE_SESSION_EVIDENCE_DIR", "")),
-                str(get_env_value("KIS_RUNTIME_COMMIT_SHA", "")),
-                str(get_env_value("LIVE_SESSION_DATE", "")))
+                output, commit, session_date)
         return _observer
 
 

@@ -244,6 +244,7 @@ class PendingMarketStateAccumulator:
         self._buckets_lock = threading.Lock()
         self._detached: deque[DetachedMarketState] = deque()
         self._detached_lock = threading.Lock()
+        self.breach_callbacks = []
 
     def _bucket(self, symbol: str) -> _Bucket:
         key = str(symbol or "").upper()
@@ -252,6 +253,7 @@ class PendingMarketStateAccumulator:
 
     def publish_trade(self, quote: QuoteSnapshot) -> None:
         bucket = self._bucket(quote.symbol)
+        notifications = []
         with bucket.lock:
             before = set(bucket.pending.breached_stop_versions)
             bucket.pending.add_trade(quote, bucket.stop_rules)
@@ -260,6 +262,13 @@ class PendingMarketStateAccumulator:
                 rule = bucket.stop_rules.get(card_key)
                 if rule is not None and rule.version == version:
                     bucket.pending_breaches.setdefault(identity, (quote, rule))
+                    notifications.append((quote, rule))
+        for quote, rule in notifications:
+            for callback in tuple(self.breach_callbacks):
+                try:
+                    callback(quote, rule)
+                except Exception:
+                    logger.exception("Protective dispatch failed; breach remains latched for replay")
 
     def publish_quote(self, quote: QuoteSnapshot) -> None:
         bucket = self._bucket(quote.symbol)
@@ -1240,6 +1249,10 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
     def replace_stop_rules(self, symbol: str, rules: Iterable[StopRule]):
         return self._accumulator.replace_stop_rules(symbol, rules)
 
+    def on_stop_breach(self, callback) -> None:
+        """Nonblocking notification after a validated trade latches a stop."""
+        self._accumulator.breach_callbacks.append(callback)
+
     def acknowledge_stop_breach(self, symbol: str, card_key: str, version: str) -> bool:
         return self._accumulator.acknowledge_breach(symbol, card_key, version)
 
@@ -1339,7 +1352,7 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
                     ),
                     processed_at=processed_at,
                 )
-                self._cache.update(combined)
+                self._cache.update(combined, only_if_newer=True)
                 if not ready or ready[-1] != combined:
                     ready.append(combined)
                 timing_observations.append(combined)
@@ -1810,12 +1823,15 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
     def ingest_trade(self, quote: QuoteSnapshot) -> bool:
         if not self._accept_event(quote, FeedChannel.TRADE):
             return False
-        self._accumulator.publish_trade(quote)
         with self._state_lock:
             state = self._states.setdefault(quote.symbol, SymbolFeedState(symbol=quote.symbol))
             state.last_trade_event_at = quote.broker_event_at
             state.last_trade_received_at = quote.received_at
             self._record_valid_channel_event_locked(state, FeedChannel.TRADE)
+            current = self._cache.get(quote.symbol)
+            self._cache.update(replace(quote, bid=current.bid if current else None,
+                                       ask=current.ask if current else None), only_if_newer=True)
+        self._accumulator.publish_trade(quote)
         return True
 
     def ingest_quote(self, quote: QuoteSnapshot) -> bool:
@@ -1827,6 +1843,8 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
             state.last_quote_event_at = quote.broker_event_at
             state.last_quote_received_at = quote.received_at
             self._record_valid_channel_event_locked(state, FeedChannel.QUOTE)
+            current = self._cache.get(quote.symbol)
+            self._cache.update(replace(quote, last_price=current.last_price if current else 0.0), only_if_newer=True)
         return True
 
     @staticmethod
@@ -1889,8 +1907,9 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         skew = abs((now - broker_at).total_seconds())
         if future > execution_config.MAX_FUTURE_BROKER_EVENT_SECONDS:
             return self._reject_event(quote.symbol, channel, ClockHealth.FUTURE_TIMESTAMP)
-        if skew > execution_config.MAX_BROKER_CLOCK_SKEW_SECONDS:
-            return self._reject_event(quote.symbol, channel, ClockHealth.EXCESSIVE_SKEW)
+        if skew > max(execution_config.MAX_BROKER_CLOCK_SKEW_SECONDS,
+                      execution_config.ENTRY_MARKET_DATA_MAX_AGE_SECONDS):
+            return self._reject_event(quote.symbol, channel, ClockHealth.EXCESSIVE_SKEW, quote=quote)
         previous_at = self._last_timestamp.get(key)
         if previous_at is not None and broker_at < previous_at:
             return self._reject_event(quote.symbol, channel, ClockHealth.NON_MONOTONIC)
@@ -1928,7 +1947,7 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
         return True
 
     def _reject_event(
-        self, symbol: str, channel: FeedChannel, health: ClockHealth
+        self, symbol: str, channel: FeedChannel, health: ClockHealth, *, quote=None
     ) -> bool:
         changed = False
         with self._state_lock:
@@ -1954,10 +1973,15 @@ class KisRealtimeMarketDataService(RealtimeMarketDataService):
                 state.quote_error = message
         if changed:
             logger.warning(
-                "KIS realtime rejected %s %s event: %s",
+                "KIS realtime rejected %s %s event: %s; timing=%s",
                 symbol,
                 channel.value,
                 health.value,
+                ({"broker_event_at": quote.broker_event_at.isoformat(),
+                  "received_at": quote.received_at.isoformat(),
+                  "processed_at": quote.processed_at.isoformat(),
+                  "receive_age_seconds": (quote.received_at - quote.broker_event_at).total_seconds(),
+                  "queue_delay_seconds": quote.queue_delay_seconds()} if quote else {}),
             )
         return False
 

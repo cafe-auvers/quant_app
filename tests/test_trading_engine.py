@@ -583,7 +583,11 @@ def test_passive_submission_blocks_when_trade_or_ask_reaches_execution_limit(
     engine.evaluate_entry_quote([card], quote)
 
     assert submitted == []
-    assert card.entry_block_reason == "EXECUTION_LEVEL_ALREADY_REACHED"
+    assert card.entry_block_reason == (
+        "Waiting for a trade above the ORB execution level"
+        if last_price <= 100.0
+        else "Waiting for a valid ask above the ORB execution level"
+    )
 
 
 def test_waiting_orb_does_not_submit_before_confirmed_breakout(tmp_path):

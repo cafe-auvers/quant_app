@@ -561,7 +561,7 @@ class TradingEngine:
         # Keep the latest accepted trade through liquidation. A stop breach
         # must never be priced from an earlier entry-planning observation.
         if (
-            quote.channel in {"", "TRADE"}
+            quote.channel in {"", "TRADE", "HDFSCNT0"}
             and math.isfinite(quote.last_price)
             and quote.last_price > 0
             and (
@@ -677,7 +677,7 @@ class TradingEngine:
 
     # --- Heartbeat (section 789-799) -----------------------------------
 
-    def run_heartbeat(self, cards: List[TradeCardState]) -> List[TradeCardState]:
+    def run_heartbeat(self, cards: List[TradeCardState], *, allow_entries: bool = True) -> List[TradeCardState]:
         if not self.is_enabled():
             return []
         changed: List[TradeCardState] = []
@@ -701,6 +701,8 @@ class TradingEngine:
             self._detect_stale_position_quotes,
             self._run_eod_cleanup_if_due,
         ):
+            if not allow_entries and stage in (self._evaluate_buy_today, self._process_entry_completion):
+                continue
             try:
                 changed.extend(stage(cards))
             except Exception:
@@ -944,7 +946,11 @@ class TradingEngine:
                     or float(best_ask) <= price
                 ):
                     card.entry_runtime_status = EntryRuntimeStatus.ARMED
-                    card.entry_block_reason = "EXECUTION_LEVEL_ALREADY_REACHED"
+                    card.entry_block_reason = (
+                        "Waiting for a trade above the ORB execution level"
+                        if quote is None or quote.last_price <= price
+                        else "Waiting for a valid ask above the ORB execution level"
+                    )
                     changed.append(card)
                     continue
                 planned_quantity = self._target_plan_quantity(
@@ -1039,6 +1045,7 @@ class TradingEngine:
                     if result.outcome in {
                         AttemptOutcome.REJECTED,
                         AttemptOutcome.BROKER_ROUTING_REJECTED,
+                        AttemptOutcome.WAITING_FOR_CAPITAL,
                     }:
                         card.entry_client_order_id = ""
                         card.entry_pending_attempt_number = 0
@@ -1197,7 +1204,7 @@ class TradingEngine:
                     or float(best_ask) <= execution_price
                 ):
                     pending["state"] = "UPGRADE_REJECTED"
-                    pending["reason"] = "EXECUTION_LEVEL_ALREADY_REACHED"
+                    pending["reason"] = "Waiting for current trade and ask above the ORB execution level"
                     card.pending_entry_replacement = pending
                     self._append_replacement_audit(
                         card,
@@ -1994,9 +2001,12 @@ class TradingEngine:
                         )
                         card.buy_today_note = card.entry_block_reason
                     card.next_retry_at = result.retry_at
+                    card.entry_attempt_group_id = result.attempt_group_id
+                    card.entry_attempt_count = result.attempt_count
                     if result.outcome in {
                         AttemptOutcome.REJECTED,
                         AttemptOutcome.BROKER_ROUTING_REJECTED,
+                        AttemptOutcome.WAITING_FOR_CAPITAL,
                     }:
                         card.entry_client_order_id = ""
                         card.entry_pending_attempt_number = 0

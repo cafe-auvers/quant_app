@@ -564,6 +564,44 @@ def test_background_account_read_does_not_block_quote_and_stop_evaluation(tmp_pa
         worker._account_reader.close()
 
 
+def test_async_symbol_cycle_handles_gap_stop_while_another_card_is_blocked(tmp_path, monkeypatch):
+    from src.services.background_symbol_executor import BackgroundSymbolExecutor
+
+    worker, engine, service, now = _stale_snapshot_stop_worker(tmp_path, monkeypatch, stop_price=100.0)
+    other = _seed_card(engine, symbol="OTHER", board_status=BoardStatus.BUY_TODAY)
+    worker._cached_cards = repo.list_trade_cards(engine)
+    held = next(c for c in worker._cached_cards if c.symbol == "AAPL")
+    worker.device_state = RuntimeDeviceState.ACTIVE
+    worker._symbol_executor = BackgroundSymbolExecutor(ordinary_workers=1, protective_workers=1)
+    started, release, stopped = (threading.Event() for _ in range(3))
+    def heartbeat(cards, *, allow_entries=True):
+        assert worker._card_lookup("PROD", "1", cards[0].symbol) is cards[0]
+        if cards[0].symbol == "OTHER":
+            started.set()
+            assert release.wait(3)
+        else:
+            assert not allow_entries
+            assert cards[0].exit_all_required
+            stopped.set()
+        return []
+    worker.runtime.trading_engine.run_heartbeat = heartbeat
+    try:
+        worker._queue_symbol_cycle(other, (), entry_allowed=False, protective=False)
+        assert started.wait(1)
+        quote = QuoteSnapshot(symbol="AAPL", last_price=95.0, broker_event_at=now,
+            received_at=now, channel="HDFSCNT0")
+        worker._queue_symbol_cycle(held, (quote,), entry_allowed=False, protective=True, critical=True)
+        assert stopped.wait(1)
+        assert not release.is_set()
+    finally:
+        release.set()
+        worker._symbol_executor.close()
+    durable = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert durable.stop_loss_triggered and durable.exit_all_required
+    assert durable.board_status == BoardStatus.SELL_ALL
+    assert durable.market_data_last_trusted_price == 95.0
+
+
 def test_background_result_is_discarded_after_order_state_changes(tmp_path, monkeypatch):
     from src.services.background_account_reader import BackgroundAccountReader
 
@@ -1073,8 +1111,8 @@ def test_ui_stop_commit_reaches_feed_when_worker_card_snapshot_is_stale(
 
     after_conflict = repo.get_trade_card(engine, "PROD", "1", "AAPL")
     assert after_conflict.pending_stop_command_id
-    assert after_conflict.exit_all_required is False
-    assert any(quote.breached_stop_versions for quote in service.poll_once())
+    assert after_conflict.exit_all_required is True
+    assert not any(quote.breached_stop_versions for quote in service.poll_once())
 
     worker._run_one_cycle()
 
@@ -1208,8 +1246,8 @@ def test_stop_breach_ack_waits_for_successful_card_cas(tmp_path, monkeypatch):
 
     after_conflict = repo.get_trade_card(engine, "PROD", "1", "AAPL")
     assert after_conflict.kanban_priority == 7
-    assert after_conflict.exit_all_required is False
-    assert any(quote.breached_stop_versions for quote in service.poll_once())
+    assert after_conflict.exit_all_required is True
+    assert not any(quote.breached_stop_versions for quote in service.poll_once())
 
     worker._run_one_cycle()
 
@@ -2904,18 +2942,20 @@ def test_due_reconciliation_failure_invalidates_cached_action_readiness(
 
 
 def test_reconciliation_alert_incidents_are_account_scoped_and_rearm_after_resolution(
-    tmp_path,
+    tmp_path, monkeypatch,
 ):
     worker, _ = _worker(tmp_path)
     messages = []
     worker.alert.connect(messages.append)
+    resolved = []
+    monkeypatch.setattr(worker, "_resolve_external_alert", lambda kind, key: resolved.append((kind, key)))
 
     def result(account_no, alerts):
         return AccountReconciliationResult(
             snapshot=AccountBrokerSnapshot(
                 environment="PROD",
                 account_no=account_no,
-                completeness=SnapshotCompleteness(),
+                completeness=SnapshotCompleteness(True, True, True, True, True),
                 snapshot_id=f"snapshot-{account_no}",
             ),
             plan=ReconciliationPlan(
@@ -2937,6 +2977,21 @@ def test_reconciliation_alert_incidents_are_account_scoped_and_rearm_after_resol
 
     assert len(messages) == 3
     assert "incident 2" in messages[-1]
+    assert len(resolved) == 1
+    assert resolved[0][1].startswith("PROD:1:")
+
+
+def test_incomplete_reconciliation_keeps_existing_critical_incident(tmp_path, monkeypatch):
+    worker, _ = _worker(tmp_path)
+    incident = ("PROD", "1", "UNKNOWN_SUBMISSION", "AAPL", "order-1")
+    worker._active_reconciliation_incidents.add(incident)
+    resolved = []
+    monkeypatch.setattr(worker, "_resolve_external_alert", lambda *args: resolved.append(args))
+    result = AccountReconciliationResult(snapshot=AccountBrokerSnapshot(environment="PROD", account_no="1", completeness=SnapshotCompleteness()),
+        plan=ReconciliationPlan(snapshot_id="incomplete"))
+    worker._handle_reconciliation_result(result)
+    assert incident in worker._active_reconciliation_incidents
+    assert not resolved
 
 
 def test_startup_reconciliation_complete_when_every_account_succeeds(tmp_path):
@@ -3055,7 +3110,7 @@ def test_account_balance_converts_krw_totals_with_fallback_fx(monkeypatch):
 
     usable, equity = BuyboardRuntimeWorker._extract_account_balance(snapshot)
 
-    assert usable == pytest.approx(7_811_119.0 / 1342.51)
+    assert usable == 0.0  # Foreign account valuation is not orderable cash.
     assert equity == pytest.approx(18_995_455.0 / 1342.51)
 
 
@@ -3100,13 +3155,14 @@ def test_worker_balance_refresh_and_reconciliation_publish_real_equity_timestamp
         account_buying_power=3000.0, account_equity=7000.0, observed_at=fetched,
     )
     worker._record_reconciliation_balance("1", SimpleNamespace(snapshot=broker_snapshot))
-    assert published[-1].received_at == fetched
-    assert published[-1].total_equity_usd == 7000.0
+    assert published[-1].received_at > fetched
+    assert published[-1].total_equity_usd == 6000.0
+    latest = published[-1].received_at
     path = tmp_path / "equity-projection.json"
     monitor_equity.publish_monitor_equity(path, published[-1])
-    equity, error = monitor_equity.read_monitor_equity(path, "PROD", "1", fetched + dt.timedelta(seconds=5))
-    assert equity == 7000.0 and not error
-    equity, error = monitor_equity.read_monitor_equity(path, "PROD", "1", fetched + dt.timedelta(seconds=901))
+    equity, error = monitor_equity.read_monitor_equity(path, "PROD", "1", latest + dt.timedelta(seconds=5))
+    assert equity == 6000.0 and not error
+    equity, error = monitor_equity.read_monitor_equity(path, "PROD", "1", latest + dt.timedelta(seconds=901))
     assert equity is None and "stale" in error
 
 

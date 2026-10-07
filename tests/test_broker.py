@@ -32,6 +32,26 @@ from src.services.broker import (
 from src.services.trading_state import TradingDisabledError
 
 
+def test_kis_buying_power_queries_exact_symbol_exchange_and_price():
+    client = kis_account_snapshot_dual.KisAccountClient.__new__(kis_account_snapshot_dual.KisAccountClient)
+    client.config = SimpleNamespace(environment=kis_account_snapshot_dual.KisEnvironment.PROD,
+        cano="12345678", account_product_code="01", overseas_currency="USD")
+    calls = []
+    def read(endpoint, **kwargs):
+        calls.append((endpoint, kwargs))
+        return {"output": {"ovrs_ord_psbl_amt": "915.31", "ord_psbl_qty": "4", "tr_crcy_cd": "USD"}}
+    client._get = read
+    evidence = client.get_overseas_buying_power(symbol="ZS", exchange="NASD", limit_price=211.85)
+    assert evidence["available_usd"] == 915.31
+    assert evidence["orderable_quantity"] == 4
+    assert calls[0][0].endswith("/inquire-psamount")
+    assert calls[0][1]["tr_id"] == "TTTS3007R"
+    assert calls[0][1]["params"]["ITEM_CD"] == "ZS"
+    assert float(calls[0][1]["params"]["OVRS_ORD_UNPR"]) == 211.85
+    with pytest.raises(ValueError):
+        client.get_overseas_buying_power(symbol="ZS", exchange="NASD", limit_price=float("nan"))
+
+
 def test_real_broker_submission_is_disarmed_by_default(monkeypatch):
     monkeypatch.setattr(
         kis_order,

@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import platform
 import stat
@@ -490,6 +491,31 @@ class KisAccountClient:
             f"KIS balance pagination was incomplete for {endpoint}"
         )
 
+    def get_overseas_buying_power(self, *, symbol: str, exchange: str, limit_price: float) -> Dict[str, Any]:
+        """Read KIS orderability for the exact proposed US stock order."""
+        if exchange not in {"NASD", "NYSE", "AMEX"} or not symbol or not math.isfinite(limit_price) or limit_price <= 0:
+            raise ValueError("A US symbol, exchange and positive order price are required")
+        started_at = datetime.now(timezone.utc)
+        data = self._get(
+            "/uapi/overseas-stock/v1/trading/inquire-psamount",
+            tr_id="TTTS3007R" if self.config.environment.is_prod else "VTTS3007R",
+            params={"CANO": self.config.cano, "ACNT_PRDT_CD": self.config.account_product_code,
+                    "OVRS_EXCG_CD": exchange, "OVRS_ORD_UNPR": format(limit_price, ".8f"),
+                    "ITEM_CD": symbol},
+        )
+        row = first_dict(data.get("output"))
+        amount = row.get("ovrs_ord_psbl_amt", row.get("ord_psbl_frcr_amt"))
+        quantity = row.get("ord_psbl_qty", row.get("max_ord_psbl_qty"))
+        if amount is None or quantity is None:
+            raise ValueError("KIS orderability response is missing amount or quantity")
+        currency = str(row.get("tr_crcy_cd") or self.config.overseas_currency).upper()
+        if currency != "USD":
+            raise ValueError("US stock orderability response is not USD")
+        return {"available_usd": float(amount), "orderable_quantity": int(float(quantity)),
+                "currency": currency, "symbol": symbol, "exchange": exchange,
+                "limit_price": float(limit_price), "request_started_at": started_at.isoformat(),
+                "observed_at": datetime.now(timezone.utc).isoformat(), "source": "KIS_INQUIRE_PSAMOUNT"}
+
     def get_domestic_balance(self) -> Dict[str, Any]:
         """Fetch all domestic stock holdings and the account summary."""
         params = {
@@ -720,6 +746,7 @@ class KisAccountClient:
                         "error": str(exc),
                     }
             snapshot["overseas"] = overseas
+        snapshot["received_at"] = datetime.now(timezone.utc).isoformat()
         return snapshot
 
     def _headers(self, tr_id: str, tr_cont: str = "") -> Dict[str, str]:

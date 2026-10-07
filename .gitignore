@@ -63,6 +63,7 @@ config/web.publisher.local.json
 data/*.csv
 data/*.json
 data/*.json.bak
+data/.*.json.*.tmp
 data/*.jsonl
 data/*.lock
 data/cache/

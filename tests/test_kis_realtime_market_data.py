@@ -648,7 +648,7 @@ def test_qualification_silent_channel_probe_uses_live_service_freshness(monkeypa
     assert service.ingest_quote(
         _event(channel="HDFSASP0", fingerprint="quote-before-suppression")
     )
-    assert not service.entry_quote_ready("AAPL", now=NOW)
+    assert service.entry_quote_ready("AAPL", now=NOW)
     service.poll_once()
     assert service.entry_quote_ready("AAPL", now=NOW)
 
@@ -768,7 +768,7 @@ def test_structural_feed_continuity_ignores_rejected_event_but_execution_does_no
     service.poll_once()
 
     delayed_trade = replace(
-        _event(seconds=10, fingerprint="delayed-trade"),
+        _event(seconds=16, fingerprint="delayed-trade"),
         broker_event_at=NOW,
     )
     assert not service.ingest_trade(delayed_trade)
@@ -1034,6 +1034,30 @@ def test_entry_allows_worker_wait_up_to_total_age_limit_but_keeps_exit_freshness
     assert not service.is_symbol_execution_ready("AAPL", now=service._clock())
     assert service.entry_quote_ready("AAPL", now=NOW + dt.timedelta(seconds=15))
     assert not service.entry_quote_ready("AAPL", now=NOW + dt.timedelta(seconds=15.01))
+
+
+def test_entry_ingress_accepts_source_delay_inside_approved_total_age():
+    service, _ = _service()
+    service.configure_desired_channels(trade_priorities={"AAPL": 1}, quote_priorities={"AAPL": 1})
+    _ack(service, "AAPL", "HDFSCNT0")
+    _ack(service, "AAPL", "HDFSASP0")
+    for channel in ("HDFSCNT0", "HDFSASP0"):
+        event = replace(_event(channel=channel, seconds=10, fingerprint=channel), broker_event_at=NOW)
+        assert (service.ingest_trade if channel == "HDFSCNT0" else service.ingest_quote)(event)
+    assert service.entry_quote_ready("AAPL", now=NOW + dt.timedelta(seconds=10))
+    assert not service.entry_quote_ready("AAPL", now=NOW + dt.timedelta(seconds=15.01))
+
+
+def test_stop_breach_notifies_before_the_owner_drains_and_latest_price_is_current():
+    service, _ = _service()
+    seen = []
+    service.on_stop_breach(lambda quote, rule: seen.append((quote, rule, service.latest_quote("AAPL"))))
+    service.replace_stop_rules("AAPL", [StopRule("held", 100.0, "v1")])
+    assert service.ingest_trade(replace(_event(fingerprint="gap"), last_price=95.0))
+    assert seen and seen[0][0].last_price == 95.0
+    assert seen[0][2].last_price == 95.0
+    assert service.ingest_trade(replace(_event(seconds=1, fingerprint="rebound"), last_price=105.0))
+    assert any(quote.last_price == 95.0 and quote.breached_stop_versions for quote in service.poll_once())
 
 
 def test_trade_channel_for_open_position_outranks_quote_channel_for_buy_today():

@@ -218,6 +218,7 @@ def request_submit(
             pre_trade_risk_decision=pre_trade_risk_decision,
             risk_strategy_id=risk_strategy_id,
             risk_plan_id=risk_plan_id,
+            entry_freshness_validator=legacy_kwargs.pop("entry_freshness_validator", None),
         )
         return ExecutionSubmissionResult.from_execution_order(
             resolved_gateway.submit_guarded(request)
@@ -372,6 +373,7 @@ def request_replace(
     risk_strategy_id: str = "",
     risk_plan_id: str = "",
     post_cancel_revalidate: Optional[Callable[[], None]] = None,
+    entry_freshness_validator=None,
 ) -> ExecutionOrderRecord:
     """``GUARDED_ENGINE`` only -- no legacy or Kanban call site performs a
     broker-level replace today (confirmed by codebase survey); raises
@@ -399,6 +401,7 @@ def request_replace(
         pre_trade_risk_decision=pre_trade_risk_decision,
         risk_strategy_id=risk_strategy_id,
         risk_plan_id=risk_plan_id,
+        entry_freshness_validator=entry_freshness_validator,
     )
     return resolved_gateway.replace_guarded(
         request,
@@ -423,6 +426,7 @@ def resume_replace(
     pre_trade_risk_decision: Any = None,
     risk_strategy_id: str = "",
     risk_plan_id: str = "",
+    entry_freshness_validator=None,
 ) -> ExecutionOrderRecord:
     """Resume a persisted replacement after authoritative cancellation.
 
@@ -445,6 +449,7 @@ def resume_replace(
         pre_trade_risk_decision=pre_trade_risk_decision,
         risk_strategy_id=risk_strategy_id,
         risk_plan_id=risk_plan_id,
+        entry_freshness_validator=entry_freshness_validator,
     )
     return gateway.resume_replace_guarded(
         request,
