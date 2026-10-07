@@ -943,6 +943,7 @@ class ExecutionCommandGateway:
                         or 0.0
                     )
                     funding_reader = getattr(self._real_broker, "get_buying_power", None)
+                    replacement_funding_started_at = None
                     if callable(funding_reader):
                         funding = funding_reader(environment=original.environment, account_no=original.account_no,
                             symbol=original.symbol, exchange=original.exchange, limit_price=new_limit_price)
@@ -950,6 +951,8 @@ class ExecutionCommandGateway:
                         if not math.isfinite(amount) or amount < 0 or funding["currency"] != "USD":
                             raise InsufficientAvailableCapitalError("KIS replacement orderability is unavailable")
                         replacement_buying_power = amount + float(original_reservation.remaining_reserved_notional)
+                        if funding.get("request_started_at"):
+                            replacement_funding_started_at = datetime.fromisoformat(funding["request_started_at"]).astimezone(timezone.utc).replace(tzinfo=None)
 
             # 2. verify replace ownership/permission.
             self._require_ownership(
@@ -1039,6 +1042,7 @@ class ExecutionCommandGateway:
                             replacement_open_risk=replacement_open_risk,
                             buying_power=replacement_buying_power,
                             portfolio_risk_spec=replacement_portfolio_spec,
+                            broker_observed_at=replacement_funding_started_at,
                         )
                     )
                 insert_command(conn, replace_command)

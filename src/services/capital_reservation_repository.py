@@ -364,6 +364,24 @@ def insert_reservation(conn: Connection, reservation: CapitalReservation) -> Cap
     return reservation
 
 
+def _broker_reflected_reservations(conn, *, environment, account_no, observed_at):
+    if observed_at is None:
+        return set()
+    from src.services.execution_order_repository import _get_execution_orders_table
+    orders = _get_execution_orders_table(MetaData())
+    payloads = conn.execute(select(orders.c.payload).where(
+        orders.c.environment == environment, orders.c.account_no == account_no,
+        orders.c.status.in_(("ACKNOWLEDGED", "WORKING", "PARTIALLY_FILLED")),
+        orders.c.broker_identity_status == "EXACT", orders.c.updated_at <= observed_at,
+    )).scalars()
+    reflected = set()
+    for payload in payloads:
+        order = json.loads(payload)
+        if order.get("side") == "BUY" and order.get("capital_reservation_id"):
+            reflected.add(order["capital_reservation_id"])
+    return reflected
+
+
 def insert_reservation_if_available(
     conn: Connection,
     reservation: CapitalReservation,
@@ -390,22 +408,10 @@ def insert_reservation_if_available(
             )
             .with_for_update()
         ).fetchall()
-        reflected = set()
-        if broker_observed_at is not None:
-            # KIS orderability already deducts previously acknowledged orders.
-            # Newer and unresolved local holds still fence concurrent buys.
-            from src.services.execution_order_repository import _get_execution_orders_table
-            orders = _get_execution_orders_table(MetaData())
-            reflected_orders = conn.execute(select(orders.c.payload).where(
-                orders.c.environment == reservation.environment,
-                orders.c.account_no == reservation.account_no,
-                orders.c.status.in_(("ACKNOWLEDGED", "WORKING", "PARTIALLY_FILLED")),
-                orders.c.broker_identity_status == "EXACT", orders.c.updated_at <= broker_observed_at,
-            )).scalars()
-            for payload in reflected_orders:
-                order = json.loads(payload)
-                if order.get("side") == "BUY" and order.get("capital_reservation_id"):
-                    reflected.add(order["capital_reservation_id"])
+        # KIS orderability deducts older acknowledged orders. Newer and
+        # unresolved holds still fence concurrent buys.
+        reflected = _broker_reflected_reservations(conn, environment=reservation.environment,
+            account_no=reservation.account_no, observed_at=broker_observed_at)
         reserved = sum(float(row.remaining_reserved_notional or 0.0) for row in rows
                        if row.reservation_id not in reflected)
         available = float(buying_power or 0.0) - reserved
@@ -435,6 +441,7 @@ def prepare_reservation_for_replacement(
     replacement_open_risk: float,
     buying_power: float,
     portfolio_risk_spec,
+    broker_observed_at=None,
 ) -> tuple[CapitalReservation, CapitalReservation]:
     """Atomically validate net replacement capacity and hold the larger leg.
 
@@ -516,8 +523,11 @@ def prepare_reservation_for_replacement(
         for row in rows
         if str(row.reservation_id) != str(original_reservation_id)
     )
+    reflected = _broker_reflected_reservations(conn, environment=scope[0],
+        account_no=scope[1], observed_at=broker_observed_at)
     reserved_elsewhere = sum(
         float(row.remaining_reserved_notional or 0.0) for row in other_rows
+        if row.reservation_id not in reflected
     )
     available = buying_power - reserved_elsewhere
     if available + 1e-6 < replacement_notional:

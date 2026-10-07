@@ -3328,6 +3328,8 @@ class BuyboardRuntimeWorker(QThread):
                 symbol_ready = getattr(
                     market_data, "is_symbol_execution_ready", None
                 )
+                if str(action).upper() == "NEW_ENTRY":
+                    symbol_ready = getattr(market_data, "entry_quote_ready", symbol_ready)
                 quotes_fresh = bool(
                     callable(symbol_ready)
                     and symbol_ready(str(symbol).upper(), now=reference)

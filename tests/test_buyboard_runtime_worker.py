@@ -1465,6 +1465,33 @@ def test_action_readiness_uses_exact_symbol_not_another_quiet_symbol(tmp_path):
     assert stale_symbol_readiness.critical_quotes_fresh is False
 
 
+def test_entry_action_readiness_uses_approved_total_age_not_default_execution_age(tmp_path, monkeypatch):
+    monkeypatch.setattr(execution_config, "ENTRY_MARKET_DATA_MAX_AGE_SECONDS", 15)
+    now = dt.datetime.now(dt.timezone.utc)
+    transport = SimpleNamespace(on_data=lambda _: None, on_ack=lambda _: None,
+        on_connection=lambda _: None, subscribe=lambda _: None, unsubscribe=lambda _: None,
+        is_connected=lambda: True, reconnect_count=0, malformed_frame_count=0)
+    service = KisRealtimeMarketDataService(transport=transport, symbol_key_resolver=lambda symbol, channel: symbol,
+        trade_capacity=10, quote_capacity=10, clock=lambda: now, regular_session_filter=lambda _: True)
+    service._on_connection(True, "", 1)
+    event_at = now - dt.timedelta(seconds=13)
+    service.ingest_quote(QuoteSnapshot(symbol="AAPL", last_price=101.0, bid=100.9, ask=101.1,
+        broker_event_at=event_at, received_at=event_at, channel="HDFSASP0"))
+    service.ingest_trade(QuoteSnapshot(symbol="AAPL", last_price=101.0,
+        broker_event_at=event_at, received_at=event_at, channel="HDFSCNT0"))
+    service._states["AAPL"].trade_acked = True
+    service._states["AAPL"].quote_acked = True
+    assert not service.is_symbol_execution_ready("AAPL", now=now)
+    worker, _ = _worker(tmp_path)
+    worker.runtime = SimpleNamespace(market_data=service)
+    worker.startup_reconciliation_ran = worker.startup_reconciliation_complete = True
+    worker._database_writable = True
+    worker.last_market_data_drain_at = now
+    worker.device_state = RuntimeDeviceState.ACTIVE
+    assert worker.engine_readiness(symbol="AAPL", action="NEW_ENTRY", now=now).critical_quotes_fresh
+    assert not worker.engine_readiness(symbol="AAPL", action="NEW_ENTRY", now=now + dt.timedelta(seconds=3)).critical_quotes_fresh
+
+
 def test_database_probe_logs_one_concise_warning_for_an_outage(
     tmp_path, caplog
 ):
