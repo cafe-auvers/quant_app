@@ -329,6 +329,24 @@ class CanonicalPlanningSource:
             }
         )
         buy_today_member = card.board_status == BoardStatus.BUY_TODAY
+        quantity = max(0, int(card.broker_quantity or 0))
+        remaining = max(0, int(card.entry_remaining_target_quantity or 0))
+        purchase_status = (
+            "PARTIALLY_BOUGHT"
+            if quantity and remaining
+            else "BOUGHT"
+            if quantity
+            else "SOLD"
+            if card.board_status == BoardStatus.CLOSED
+            and card.session_date == active_session and card.average_entry_price > 0
+            else "ENTRY_PENDING"
+            if card.board_status == BoardStatus.ENTRY_PENDING
+            else ""
+        )
+        # Display completed entries without restoring executable Buy Today intent.
+        buy_today_display_member = buy_today_member or bool(
+            card.session_date == active_session and purchase_status
+        )
         breakout_price = self._positive_number(card.breakout_price)
         stage = (
             "BUYLIST"
@@ -352,6 +370,11 @@ class CanonicalPlanningSource:
             "watchlist_member": watchlist_member,
             "buylist_member": buylist_member,
             "buy_today_member": buy_today_member,
+            "buy_today_display_member": buy_today_display_member,
+            "purchase_status": purchase_status,
+            "broker_quantity": quantity,
+            "entry_remaining_target_quantity": remaining,
+            "average_entry_price": self._positive_number(card.average_entry_price),
             "breakout_price": breakout_price,
             "version": int(card.version),
             "card_version": int(card.version),
@@ -376,6 +399,7 @@ class CanonicalPlanningSource:
             if row["watchlist_member"]
             or row["buylist_member"]
             or row["buy_today_member"]
+            or row["buy_today_display_member"]
         ]
         if stage:
             stage_key = str(stage).strip().upper()
@@ -389,8 +413,11 @@ class CanonicalPlanningSource:
         return {"rows": rows, "revision": snapshot.revision}
 
     def list_buy_today(self) -> dict[str, Any]:
-        result = self.list_plans("BUY_TODAY")
-        return {"rows": result["rows"], "revision": result["revision"]}
+        snapshot = self._load_snapshot()
+        rows = [self._project(card) for card in snapshot.cards]
+        rows = [row for row in rows if row["buy_today_display_member"]]
+        rows.sort(key=lambda row: row["symbol"])
+        return {"rows": rows, "revision": snapshot.revision}
 
     def orb_monitor_inputs(self) -> dict[str, Any]:
         """Read account scope and shared settings without write authority or bootstrap."""
@@ -549,7 +576,7 @@ class CanonicalPlanningSource:
         if projected is not None and not include_inactive and not (
             any(
                 projected[key]
-                for key in ("watchlist_member", "buylist_member", "buy_today_member")
+                for key in ("watchlist_member", "buylist_member", "buy_today_display_member")
             )
             or projected["breakout_price"] is not None
         ):

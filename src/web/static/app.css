@@ -110,6 +110,12 @@ input::placeholder { color: #65776f; }
 .active-symbol-search-trigger:hover, .active-symbol-search-trigger:focus-visible { color: var(--green); }
 .symbol-line strong { font-size: 22px; letter-spacing: -.025em; }
 .symbol-line span { min-width: 0; max-width: 330px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.symbol-line .purchase-status { flex: 0 0 auto; display: inline-flex; align-items: center; max-width: none; padding: 3px 6px; border: 1px solid #2c785d; border-radius: 5px; background: #123e2e; color: #8af0bd; font-size: 10px; font-weight: 800; line-height: 1.2; }
+.symbol-line .purchase-status[data-status="PARTIALLY_BOUGHT"], .symbol-line .purchase-status[data-status="ENTRY_PENDING"] { border-color: #79602c; background: #352b16; color: #ffdb81; }
+.symbol-line .purchase-status[data-status="SOLD"] { border-color: #52615d; background: #24312d; color: #c3d2cc; }
+.symbol-line .purchase-status[hidden] { display: none; }
+.stock-metric[data-purchase-status], .mobile-list-metric[data-purchase-status] { font-weight: 800; }
+.stock-metric[data-purchase-status="PARTIALLY_BOUGHT"], .mobile-list-metric[data-purchase-status="PARTIALLY_BOUGHT"] { color: #ffdb81; }
 .mobile-symbol-search-button, .mobile-symbol-search-dialog { display: none; }
 .company-context { color: var(--faint); font-size: 11px; margin-top: 3px; }
 .chart-metrics { display: flex; align-items: center; gap: 5px; margin-top: 5px; }

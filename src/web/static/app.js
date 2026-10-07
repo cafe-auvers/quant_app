@@ -2693,6 +2693,7 @@
     rememberListCursor();
     state.plan = state.optimisticPlans.get(state.symbol)
       || state.planningRows.find(row => row.symbol === state.symbol)
+      || state.buyTodayRows.find(row => row.symbol === state.symbol)
       || null;
     setPanel('');
     const chartCacheHit = state.bundleCache.has(`${state.symbol}:${state.timeframe}`);
@@ -2756,6 +2757,45 @@
     }, 650);
   }
 
+  function purchaseDisplay(row) {
+    if (!row) return null;
+    const quantity = Math.max(0, Number(row.broker_quantity) || 0);
+    const remaining = Math.max(0, Number(row.entry_remaining_target_quantity) || 0);
+    const status = quantity > 0 ? (remaining > 0 ? 'PARTIALLY_BOUGHT' : 'BOUGHT')
+      : row.purchase_status === 'SOLD' ? 'SOLD'
+      : (row.canonical_stage || row.board_status) === 'ENTRY_PENDING' ? 'ENTRY_PENDING' : '';
+    const labels = {BOUGHT: 'Bought', PARTIALLY_BOUGHT: 'Partially bought', SOLD: 'Bought · sold', ENTRY_PENDING: 'Entry pending'};
+    if (!labels[status]) return null;
+    const average = Number(row.average_entry_price);
+    const title = quantity > 0
+      ? `${labels[status]} · ${quantity} ${quantity === 1 ? 'share' : 'shares'}${average > 0 ? ` at $${average.toFixed(average < 1 ? 4 : 2)} average` : ''}`
+      : status === 'SOLD' ? 'Bought earlier this session; position is now closed' : 'Entry submitted; no confirmed shares bought yet';
+    return {status, label: labels[status], title};
+  }
+
+  function renderPurchaseStatus() {
+    const badge = byId('chart-purchase-status');
+    const row = state.plan?.symbol === state.symbol ? state.plan
+      : state.buyTodayRows.find(item => item.symbol === state.symbol);
+    const purchase = purchaseDisplay(row);
+    badge.hidden = !purchase;
+    badge.textContent = purchase
+      ? compactLayout.matches && purchase.status === 'PARTIALLY_BOUGHT' ? 'Part bought' : purchase.label
+      : '';
+    badge.dataset.status = purchase?.status || '';
+    badge.title = purchase?.title || '';
+    badge.setAttribute('aria-label', purchase?.title || '');
+  }
+
+  function renderListMetric(metric, row) {
+    const purchase = PLANNING_LIST_MODES.has(state.listMode) && purchaseDisplay(row);
+    metric.textContent = purchase?.label || (Number.isFinite(row.score) ? row.score.toFixed(1) : (row.stage || ''));
+    if (purchase) {
+      metric.dataset.purchaseStatus = purchase.status;
+      metric.title = purchase.title;
+    }
+  }
+
   function stockRow(row, index) {
     const button = document.createElement('button');
     button.className = `stock-row${row.symbol === state.symbol ? ' active' : ''}`;
@@ -2775,7 +2815,7 @@
     identity.append(symbol, name);
     const metric = document.createElement('span');
     metric.className = 'stock-metric';
-    metric.textContent = Number.isFinite(row.score) ? row.score.toFixed(1) : (row.stage || '');
+    renderListMetric(metric, row);
     button.append(rank, identity, metric);
     button.addEventListener('click', () => selectSymbol(row.symbol));
     return button;
@@ -2875,7 +2915,7 @@
     identity.append(symbol, name);
     const metric = document.createElement('span');
     metric.className = 'mobile-list-metric';
-    metric.textContent = Number.isFinite(row.score) ? row.score.toFixed(1) : (row.stage || '');
+    renderListMetric(metric, row);
     button.append(rank, identity, metric);
     button.addEventListener('click', () => {
       byId('mobile-list-popover').hidden = true;
@@ -3101,6 +3141,10 @@
     const revision = planningResult.revision || buyTodayResult.revision;
     if (revision) state.planningRevision = String(revision);
     if (buyTodayResult.draft_revision) state.buyTodayDraftRevision = String(buyTodayResult.draft_revision);
+    const selected = state.planningRows.find(row => row.symbol === state.symbol)
+      || state.buyTodayRows.find(row => row.symbol === state.symbol);
+    if (selected && !planningPending() && !operatorPending()
+      && Number(selected.version || 0) >= Number(state.plan?.version || 0)) state.plan = selected;
     if (state.listMode !== 'scanner') applyListMode(state.listMode);
     renderPlan();
     renderMobileWorkspace();
@@ -3231,6 +3275,7 @@
   function hasCurrentBuyTodayDraft() {
     return state.buyTodayRows.some(row => (
       row.symbol === state.symbol && row.card_version === state.plan?.version
+      && !row.buy_today_display_member && !row.purchase_status
     ));
   }
 
@@ -3335,6 +3380,7 @@
   }
 
   function renderPlan(fast = false) {
+    renderPurchaseStatus();
     const card = state.plan;
     const busy = planningPending() || operatorPending();
     const hasBuyTodayDraft = hasCurrentBuyTodayDraft();

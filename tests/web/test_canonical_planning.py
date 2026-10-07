@@ -200,6 +200,67 @@ def test_board_details_project_only_public_card_facts(tmp_path):
     source.close()
 
 
+@pytest.mark.parametrize("stage,quantity,remaining,average,status", [
+    (BoardStatus.BUY_TODAY, 0, 10, 0, ""),
+    (BoardStatus.ENTRY_PENDING, 0, 10, 0, "ENTRY_PENDING"),
+    (BoardStatus.OPEN_POSITION, 3, 7, 12.5, "PARTIALLY_BOUGHT"),
+    (BoardStatus.OPEN_POSITION, 10, 0, 12.5, "BOUGHT"),
+    (BoardStatus.SELL_ALL, 10, 0, 12.5, "BOUGHT"),
+    (BoardStatus.CLOSED, 0, 0, 12.5, "SOLD"),
+    (BoardStatus.CLOSED, 0, 0, 0, ""),
+])
+def test_planning_purchase_status_requires_confirmed_shares(
+    tmp_path, stage, quantity, remaining, average, status
+):
+    source = canonical_source(tmp_path)
+    card = TradeCardState(
+        environment="PROD", account_no="private-account", symbol="FILL",
+        board_status=stage, session_date=current_or_next_nyse_session_date(),
+        broker_quantity=quantity, entry_remaining_target_quantity=remaining,
+        average_entry_price=average,
+    )
+    before = card.to_dict()
+    row = source._project(card)
+    assert row["purchase_status"] == status
+    assert row["broker_quantity"] == quantity
+    assert row["average_entry_price"] == (average or None)
+    assert row["buy_today_member"] == (stage == BoardStatus.BUY_TODAY)
+    assert "account_no" not in row and "environment" not in row
+    assert card.to_dict() == before
+    source.close()
+
+
+def test_buy_today_display_keeps_current_session_entries_without_execution_intent(tmp_path, monkeypatch):
+    source = canonical_source(tmp_path)
+    current = current_or_next_nyse_session_date()
+    cards = [
+        TradeCardState(
+            environment="PROD", account_no="a", symbol=symbol,
+            board_status=stage, session_date=session,
+            broker_quantity=quantity, average_entry_price=average,
+            entry_remaining_target_quantity=remaining,
+        )
+        for symbol, stage, session, quantity, remaining, average in (
+            ("WAIT", BoardStatus.BUY_TODAY, current, 0, 10, 0),
+            ("ENTRY", BoardStatus.ENTRY_PENDING, current, 0, 10, 0),
+            ("PART", BoardStatus.OPEN_POSITION, current, 3, 7, 12.5),
+            ("FILL", BoardStatus.OPEN_POSITION, current, 10, 0, 12.5),
+            ("SOLD", BoardStatus.CLOSED, current, 0, 0, 12.5),
+            ("OLDER", BoardStatus.OPEN_POSITION, current-dt.timedelta(days=1), 10, 0, 12.5),
+            ("NEVER", BoardStatus.CLOSED, current, 0, 0, 0),
+        )
+    ]
+    before = [card.to_dict() for card in cards]
+    monkeypatch.setattr(source, "_load_snapshot", lambda **_kwargs: SimpleNamespace(cards=cards, revision="test"))
+    rows = source.list_buy_today()["rows"]
+    assert [row["symbol"] for row in rows] == ["ENTRY", "FILL", "PART", "SOLD", "WAIT"]
+    assert [row["symbol"] for row in rows if row["buy_today_member"]] == ["WAIT"]
+    assert [row["symbol"] for row in source.list_plans("BUY_TODAY")["rows"]] == ["WAIT"]
+    assert source.get_plan("SOLD")["card"]["purchase_status"] == "SOLD"
+    assert [card.to_dict() for card in cards] == before
+    source.close()
+
+
 @pytest.mark.parametrize("case", ["fresh", "stale", "future", "wrong_account", "zero", "missing"])
 def test_board_nav_uses_only_the_matching_fresh_account_snapshot(case, tmp_path):
     source = canonical_source(tmp_path)
@@ -333,6 +394,33 @@ def test_connected_api_returns_canonical_rows_and_never_local_sandbox_rows(
     assert [row["symbol"] for row in buy_today["rows"]] == ["NVDA"]
     assert current["card"]["breakout_price"] == 520.0
     assert current["card"]["source"] == "CANONICAL_LOCAL"
+
+
+def test_connected_buy_today_api_retains_bought_card_as_read_only_display(
+    web_config, tmp_path, monkeypatch
+):
+    connected = replace(web_config, mode="CONNECTED")
+    services = build_services(connected)
+    source = canonical_source(tmp_path)
+    services.canonical_planning = source
+    card = TradeCardState(
+        environment="PROD", account_no="private-account", symbol="FILL",
+        board_status=BoardStatus.OPEN_POSITION,
+        session_date=current_or_next_nyse_session_date(),
+        broker_quantity=10, average_entry_price=12.5,
+    )
+    monkeypatch.setattr(source, "_load_snapshot", lambda **_kwargs: SimpleNamespace(cards=[card], revision="test"))
+    services.auth.bootstrap_user("owner", "correct horse battery staple")
+    before = card.to_dict()
+    with TestClient(create_api_app(connected, services=services), base_url="http://localhost:8080") as client:
+        login(client)
+        rows = client.get("/api/v1/buy-today-drafts").json()["rows"]
+        selected = client.get("/api/v1/planning/FILL").json()["card"]
+    assert len(rows) == 1 and rows[0]["symbol"] == "FILL"
+    assert rows[0]["purchase_status"] == selected["purchase_status"] == "BOUGHT"
+    assert rows[0]["broker_quantity"] == 10 and rows[0]["average_entry_price"] == 12.5
+    assert rows[0]["buy_today_member"] is False and rows[0]["buy_today_display_member"] is True
+    assert "account_no" not in rows[0] and card.to_dict() == before
 
 
 def test_connected_buy_today_preview_is_shared_but_never_published(
