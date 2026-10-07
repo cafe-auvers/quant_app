@@ -153,3 +153,67 @@ isolated shadow active. Actual Gate 4 counts were 266 lifecycle comparisons,
 manual-arm observation. These are recorded observations, not fabricated
 trades or a certificate. The passive audit remained Ready for October 8
 at 07:05:05 KST. Both active repositories and the prepared checkout were clean.
+
+## Approved deployment and verification, 16:43–16:52 KST
+
+The operator answered "yes ok to restart" to the exact `639cc74` deployment
+and supervised open-position restart question. The private approval record
+binds that instruction to the complete commit and the five reviewed position
+limits. Unchanged protocol capability evidence was carried forward under
+procedural operator approval; independent technical review and formal Gates
+2–4 certification are not claimed.
+
+Fresh checks at 16:43 and again just before maintenance confirmed the same
+five quantities, matching KIS and canonical state, with no working orders or
+unsettled broker commands. A coherent canonical backup was saved before the
+lease release. The approved staged preflight passed with no failures.
+
+Both PC and web deployed `639cc747d0298dcabd1f26390abb7930d4f3e5fc` at
+16:45:37. Credentials and all existing risk settings were preserved. Executor
+activation waited for the normal readiness fence; the guarded transfer
+succeeded at 16:47:13. Before restart, the operator's switch was already
+armed for October 7 at revision 61 (this changed after the earlier afternoon
+check). The restore helper restored that existing session for the new exact
+release at 16:47:47, revision 63. It did not authorize a different session.
+No broker order or cancellation was sent by this maintenance.
+
+The 16:49 read-only post-restart audit passed:
+
+- PC runtime ACTIVE on the exact release, with all ten readiness checks true,
+  including market data, reconciliation and execution readiness.
+- PC owns the execution lease; October 7 is armed for this release.
+- KIS holdings match ALAB 8, BE 10, CYPH 897, SIMO 10 and VNCE 184, with no
+  working orders. All five active stop prices match the fresh backup.
+- Buy Today remains empty; no stock was added by maintenance.
+- Both deployed repositories are clean. Web responds HTTP 200. The scheduled
+  morning guard selects `639cc74`, preserving the approved release.
+
+The new evidence directory is
+`C:\Users\tonyh\quant_evidence\tonight_preparation_20261007\session\2026-10-07_639cc747d029`.
+At 16:50 its collector was RUNNING, with an active isolated shadow, zero
+errors, zero dropped batches and zero queue depth. Both append-only journals
+passed integrity audit. Gate 4 had recorded ten lifecycle comparisons and
+50 position-protection observations. The old release's evidence remains
+preserved. The post-session task reads the current configuration and release,
+so it will audit this directory without arming or promoting a gate.
+
+An approximately 111-second post-deployment production sample measured
+546 fresh single-card checks, **zero returned card payload rows**, and 22
+collection checks with zero card payload rows. The old repeated single-card
+payload download statement had no further calls in this window. CPU busy
+averaged 4.53%, memory used excluding available memory was 53.6%, and the
+last observation showed 16 connections against 60, zero blocked locks,
+zero queries/idle transactions older than 15 seconds and zero deadlocks.
+The correction is now active and measurable in the running process.
+
+These measurements cover ordinary pre-session operation. The collector will
+capture live-session behavior; neither live peaks nor the current billing
+allowance are established by this sample. Previously accumulated excess
+egress is not reset, and current plan/usage/grace status still requires access
+to the trading project's dashboard. The exposed pooler send counter remains
+unchanged and is not used as proof of zero billed egress.
+
+Private evidence includes `deployment.json`, `supervised_release.json`,
+`owner_activation.json`, `live_session_restored.json`, `post_restart_health.json`,
+`collection_readiness.json` and `supabase_post_deploy_comparison.json` under
+`artifacts/tonight_preparation_20261007/`.

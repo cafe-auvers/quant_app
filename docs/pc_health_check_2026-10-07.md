@@ -197,3 +197,21 @@ changes, shutdowns, wake commands, or PC executor restarts. It updated the web
 service, disabled the redundant cache-copy task, and guarded the scheduled
 morning source selection. Original task configuration and copy-helper evidence
 were saved before changes.
+
+## Approved 16:45 deployment follow-up
+
+The operator subsequently approved the supervised PC restart for exact release
+`639cc747d0298dcabd1f26390abb7930d4f3e5fc`. PC and web now run that clean
+release. The PC resumed ACTIVE readiness, and the already armed October 7
+session was restored after readiness passed. KIS/canonical quantities and all
+five active stop prices match the fresh pre-restart backup; maintenance sent
+no broker order or cancellation. Buy Today remains empty.
+
+The formerly repeated single-card downloads are now corrected in production:
+546 fresh checks returned zero card payload rows over approximately 111
+seconds. CPU averaged 4.53%, with 16 of 60 connections and no lock or long-query
+pressure. Both new passive evidence journals pass integrity checks, with zero
+collector errors or dropped batches. Previously accumulated egress and current
+billing/quota verification remain separate outstanding items. Full deployment,
+approval, collection and measurement evidence is recorded in
+`docs/tonight_preparation_2026-10-07.md`.
