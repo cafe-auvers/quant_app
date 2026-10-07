@@ -154,10 +154,15 @@ invocation of the unwrapped repository script.
   its DNS address in the account, then repeat DNS and router-link checks.
 - **Supabase monthly traffic:** current plan, current billed traffic, and free
   allowance compliance remain unverified because management billing access
-  was denied. The differential-read fix is deployed, but a 196-second SQL
-  sample still returned 2,829 card payload rows, approximately 11.6 MB before
-  protocol overhead. This is an estimate from SQL reads, not a billing
-  measurement. Some full-card and fresh single-card reads remain.
+  was denied. The differential collection-read fix is deployed; repeated
+  single-card downloads remain in the running release. The earlier 196-second
+  estimate of 2,829 rows / 11.6 MB is superseded: its comparison matched only
+  `queryid` and confused identical statement IDs recorded under different
+  database users. The corrected October 7 preparation sample aggregates those
+  counters and finds 688 actual single-card payload downloads in approximately
+  140 seconds, with no recurring full-collection payload downloads in that
+  interval. SQL row counts are not billing measurements. See
+  `docs/tonight_preparation_2026-10-07.md` for the new correction and validation.
 - **Source coverage:** morning refresh reported 31 unavailable/stale hourly
   symbols. Reference and sampled current symbols passed; universal freshness
   for every symbol is not claimed. BRR remains an identified stale source.

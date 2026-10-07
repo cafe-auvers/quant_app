@@ -58,6 +58,27 @@ reported egress already above the Free allowance; reducing future traffic
 does not reset billing-cycle usage. No paid plan is enabled by this work.
 Current billed usage and plan have not yet been reverified.
 
+A read-only production probe of the new code made 60 canonical reads across
+the five holdings: five initial payload rows, followed by zero payload rows
+over the remaining 55 fresh checks. No broker calls or canonical writes were
+made. This verifies the new read path before deployment.
+
+Fresh SQL/metrics observations around 14:09–14:13 KST show 15–16 connections
+against `max_connections=60`, no blocked locks, no active queries or idle
+transactions older than 15 seconds, and zero database deadlocks. CPU busy
+averaged approximately 3.7% and then 1.1% over two samples; memory used after
+subtracting available memory was approximately 53–58%. These observations
+show no current compute/connection saturation; they do not establish live
+session peaks or remaining billing allowance.
+
+The earlier health report's full-query/11.6 MB estimate was incorrect: its
+delta comparison keyed only on statement ID while PostgreSQL records
+separate counters for different database users. Aggregating identical IDs
+correctly eliminates the apparent repeated full-collection downloads. The
+actual repeated single-card downloads remain measurable and are the issue
+addressed here. The exposed pooler network counter did not advance during
+the sampled interval, so it is not treated as proof of zero egress.
+
 Free uncached egress is 5 GB and is separate from cached egress; pooler traffic
 is counted as Shared Pooler Egress. See the
 [official usage documentation](https://supabase.com/docs/guides/platform/manage-your-usage/egress).
@@ -71,4 +92,15 @@ SQL row counts estimate payload traffic; they do not replace billing metrics.
 - Four JavaScript backup tests passed, including access rejection, compression,
   stored readback/hash verification and oversized-backup rejection.
 - Staged secret scan passed; generated runtime and credential files are excluded.
-- Full exact-release hosted CI and deployment verification are pending.
+- Initial hosted CI on `ef4be9f` passed 3,551 tests per Python version and
+  found one outdated credential-schema assertion: it omitted the new
+  server-only `SUPABASE_SERVICE_ROLE_KEY`. The assertion is corrected; the
+  template remains credential-only. Full final-release CI and deployment
+  verification are pending.
+
+At approximately 14:12 KST, both active append-only evidence journals passed
+integrity audit. The report correctly remains INCOMPLETE_PASSIVE_COLLECTION
+while the collector is RUNNING before the session; this is not a collection
+failure. The only enabled gate-related task with a future run is the passive
+post-session audit. No competing gate soak or shadow WebSocket runner is
+scheduled for tonight.
