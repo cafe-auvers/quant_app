@@ -810,6 +810,9 @@ class SchemaMigrationManager:
                                 ):
                                     row[column.name] = datetime.fromisoformat(value)
                     conn.execute(reflected.insert(), decoded_rows)
+        from src.services.coordination_snapshot import invalidate_versioned_rows
+
+        invalidate_versioned_rows(self.engine)
         for raw_path, encoded in payload.get("files", {}).items():
             path = Path(raw_path)
             path.parent.mkdir(parents=True, exist_ok=True)
