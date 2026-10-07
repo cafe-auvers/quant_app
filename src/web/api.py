@@ -35,6 +35,7 @@ from .connected_operator import (
     ConnectedOperatorUnavailable,
 )
 from .market_data import MarketDataUnavailable, MarketDataSource, build_market_data_source
+from .hourly_source import build_pc_hourly_reader
 from .market_status import nyse_market_status
 from .live_updates import LiveUpdateHub
 from .intraday_monitor import IntradayMonitor
@@ -145,6 +146,10 @@ def build_services(config: WebConfig) -> WebServices:
     market = build_market_data_source(
         config.resolved_local_mirror_path,
         scanner_setups_path=scanner_setups_path,
+        hourly_reader=(
+            build_pc_hourly_reader(config.resolved_pc_repository)
+            if config.pc_hourly_reads else None
+        ),
     )
     cache = ChartBundleCache(
         config.cache_dir, max_symbols=config.chart_cache_max_symbols
@@ -1240,6 +1245,8 @@ async def web_services_lifespan(app: FastAPI):
         services.monitor.close()
         services.connected_planning.close()
         services.canonical_planning.close()
+        if callable(getattr(services.market, "close", None)):
+            services.market.close()
 
 
 def create_api_app(
