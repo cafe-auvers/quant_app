@@ -8,6 +8,7 @@
   const standaloneLayout = window.matchMedia('(display-mode: standalone)');
   const DEFAULT_VISIBLE_BARS = 63;
   const BUY_BOARD_FALLBACK_MS = 15_000;
+  const PLANNING_LIST_MODES = new Set(['watchlist', 'buylist', 'buy_today']);
   const KANBAN_COLUMNS = Object.freeze([
     {key: 'BUYLIST', title: 'Buylist', short: 'Buylist', kicker: 'Planning'},
     {key: 'BUY_TODAY', title: 'Buy Today', short: 'Today', kicker: 'Monitoring'},
@@ -89,6 +90,9 @@
     historyError: '',
     historyRequestToken: 0,
     visibleRows: [],
+    listOrders: new Map(),
+    listCursor: null,
+    listScrollPositions: new Map(),
     manualRows: [],
     listMode: 'monitor',
     symbol: null,
@@ -2686,6 +2690,10 @@
     const startedAt = performance.now();
     closeBreakoutPricePopup();
     state.symbol = symbol.toUpperCase();
+    rememberListCursor();
+    state.plan = state.optimisticPlans.get(state.symbol)
+      || state.planningRows.find(row => row.symbol === state.symbol)
+      || null;
     setPanel('');
     const chartCacheHit = state.bundleCache.has(`${state.symbol}:${state.timeframe}`);
     state.planningBusy = planningPending(state.symbol);
@@ -2717,6 +2725,7 @@
     Object.values(state.panes).forEach(pane => pane?.breakoutHandle.classList.remove('dragging'));
     updateBreakoutModeUi();
     updateActiveStockRow();
+    renderPlan(true);
     const chartRequest = loadCharts(state.symbol, token);
     const contextRequest = fetchPlanAndDrawings(state.symbol, token);
     const [chartOutcome] = await Promise.allSettled([chartRequest]);
@@ -2792,8 +2801,52 @@
       empty.textContent = listEmptyMessage();
       fragment.appendChild(empty);
     }
-    list.replaceChildren(fragment);
+    replaceStockListRows(list, fragment);
     renderMobileStockList();
+  }
+
+  function replaceStockListRows(list, fragment) {
+    const key = `${state.listMode}:${list.id}`;
+    const scrollTop = state.listScrollPositions.get(key) || 0;
+    list.replaceChildren(fragment);
+    list.scrollTop = scrollTop;
+  }
+
+  function rememberListCursor() {
+    const index = state.visibleRows.findIndex(row => row.symbol === state.symbol);
+    state.listCursor = index < 0 || !PLANNING_LIST_MODES.has(state.listMode) ? null : {
+      mode: state.listMode,
+      symbol: state.symbol,
+      index,
+      symbols: state.visibleRows.map(row => row.symbol),
+    };
+  }
+
+  function listContinuationSymbol(direction) {
+    const cursor = state.listCursor;
+    if (!cursor || cursor.mode !== state.listMode || cursor.symbol !== state.symbol) return null;
+    const available = new Set(state.visibleRows.map(row => row.symbol));
+    const after = cursor.symbols.slice(cursor.index + 1);
+    const before = cursor.symbols.slice(0, cursor.index).reverse();
+    const neighbors = direction < 0 ? [...before, ...after] : [...after, ...before];
+    return neighbors.find(symbol => available.has(symbol))
+      || state.visibleRows[Math.min(cursor.index, state.visibleRows.length - 1)]?.symbol;
+  }
+
+  function preservePlanningListOrder(mode, rows) {
+    const order = state.listOrders.get(mode) || [];
+    const known = new Set(order);
+    rows.forEach(row => {
+      if (!known.has(row.symbol)) {
+        order.push(row.symbol);
+        known.add(row.symbol);
+      }
+    });
+    // Keep removed symbols' slots so a rejected optimistic edit restores its order.
+    state.listOrders.set(mode, order);
+    const current = new Map(rows.map(row => [row.symbol, row]));
+    return order.filter(symbol => current.has(symbol))
+      .map((symbol, index) => ({...current.get(symbol), rank: index + 1}));
   }
 
   function listEmptyMessage() {
@@ -2996,7 +3049,7 @@
       empty.textContent = listEmptyMessage();
       fragment.appendChild(empty);
     }
-    list.replaceChildren(fragment);
+    replaceStockListRows(list, fragment);
     byId('mobile-list-count').textContent = String(state.visibleRows.length);
     const monitor = state.listMode === 'monitor';
     byId('mobile-monitor-controls').hidden = !monitor;
@@ -3055,6 +3108,7 @@
   }
 
   function applyListMode(mode, render = true) {
+    if (state.listMode !== mode) state.listCursor = null;
     state.listMode = mode;
     document.querySelectorAll('.list-tab').forEach(button => button.classList.toggle('active', button.dataset.list === mode));
     const listLabels = {monitor: 'Intraday watch', scanner: 'Scanner', history: 'History', watchlist: 'Watchlist', buylist: 'Buylist', buy_today: 'Buy Today'};
@@ -3094,7 +3148,21 @@
     } else {
       state.visibleRows = state.planningRows.filter(row => row.buylist_member === true || row.stage === 'BUYLIST').map((row, index) => ({...row, rank: index + 1, name: row.name || row.stage}));
     }
+    if (PLANNING_LIST_MODES.has(mode)) {
+      state.visibleRows = preservePlanningListOrder(mode, state.visibleRows);
+    }
     if (render) renderStockList();
+    if (state.visibleRows.some(row => row.symbol === state.symbol)) {
+      rememberListCursor();
+    } else if (!planningPending() && !operatorPending()) {
+      const nextSymbol = listContinuationSymbol(1);
+      if (nextSymbol) void selectSymbol(nextSymbol, 'list-continuation');
+      else state.listCursor = null;
+    }
+  }
+
+  function refreshActivePlanningList() {
+    if (PLANNING_LIST_MODES.has(state.listMode)) applyListMode(state.listMode);
   }
 
   async function loadWatchlistHistory(startDate, endDate) {
@@ -3416,6 +3484,7 @@
       bumpPlanningEpoch(actionSymbol);
       state.planningPendingSymbols.delete(actionSymbol);
       state.planningBusy = planningPending();
+      refreshActivePlanningList();
       if (state.symbol === actionSymbol) renderPlan();
     }
   }
@@ -3503,6 +3572,7 @@
     if (!state.symbol || planningPending() || operatorPending() || !state.plan) return;
     const actionSymbol = state.symbol;
     const previousPlan = {...state.plan};
+    const previousBuyTodayRow = state.buyTodayRows.find(row => row.symbol === actionSymbol);
     const enabled = !canonicalBuyTodayActive(previousPlan);
     const operation = enabled ? 'activate_buy_today' : 'deactivate_buy_today';
     if (!operatorOperationEnabled(operation)) {
@@ -3559,6 +3629,9 @@
       state.optimisticPlans.delete(actionSymbol);
       state.optimisticBuyToday.delete(actionSymbol);
       syncOptimisticPlanningRow(previousPlan, actionSymbol);
+      state.buyTodayRows = state.buyTodayRows.filter(row => row.symbol !== actionSymbol);
+      if (previousBuyTodayRow) state.buyTodayRows.push(previousBuyTodayRow);
+      if (state.listMode === 'buy_today') applyListMode('buy_today');
       if (state.symbol === actionSymbol) {
         state.plan = error.status === 409 && error.current
           ? (Object.keys(error.current).length ? error.current : null)
@@ -3569,6 +3642,7 @@
       bumpPlanningEpoch(actionSymbol);
       state.planningPendingSymbols.delete(actionSymbol);
       state.planningBusy = planningPending();
+      refreshActivePlanningList();
       if (state.symbol === actionSymbol) renderPlan();
       if (!queued) renderMobileWorkspace();
     }
@@ -3661,6 +3735,7 @@
       state.optimisticBuyToday.delete(actionSymbol);
       state.buyTodayRows = state.buyTodayRows.filter(row => row.symbol !== actionSymbol);
       if (previousRow) state.buyTodayRows.unshift(previousRow);
+      if (state.listMode === 'buy_today') applyListMode('buy_today');
       if (state.symbol === actionSymbol) {
         if (error.status === 409 && error.current) {
           state.plan = Object.keys(error.current).length ? error.current : null;
@@ -3671,6 +3746,7 @@
       bumpPlanningEpoch(actionSymbol);
       state.planningPendingSymbols.delete(actionSymbol);
       state.planningBusy = planningPending();
+      refreshActivePlanningList();
       if (state.symbol === actionSymbol) renderPlan();
     }
   }
@@ -3797,6 +3873,7 @@
       bumpPlanningEpoch(actionSymbol);
       state.planningPendingSymbols.delete(actionSymbol);
       state.planningBusy = planningPending();
+      refreshActivePlanningList();
       if (state.symbol === actionSymbol) renderPlan();
     }
   }
@@ -3880,6 +3957,13 @@
   function stepSymbol(direction) {
     if (!state.visibleRows.length) return;
     const current = state.visibleRows.findIndex(row => row.symbol === state.symbol);
+    if (current < 0) {
+      const continuation = listContinuationSymbol(direction);
+      if (continuation) {
+        void selectSymbol(continuation, direction < 0 ? 'previous-stock' : 'next-stock');
+        return;
+      }
+    }
     const next = current < 0
       ? (direction < 0 ? state.visibleRows.length - 1 : 0)
       : (current + direction + state.visibleRows.length) % state.visibleRows.length;
@@ -3933,6 +4017,14 @@
   }
 
   function wireEvents() {
+    ['stock-list', 'mobile-list-items'].forEach(id => {
+      const list = byId(id);
+      list.addEventListener('scroll', () => {
+        if (list.clientHeight) {
+          state.listScrollPositions.set(`${state.listMode}:${id}`, list.scrollTop);
+        }
+      }, {passive: true});
+    });
     document.addEventListener('click', cancelDrawingModeForOtherControl, true);
     document.querySelectorAll('.list-tab').forEach(button => button.addEventListener('click', () => activateListMode(button.dataset.list)));
     const mobileListMenu = byId('mobile-list-menu');
@@ -4008,8 +4100,8 @@
       mobileListPopover.hidden = !opening;
       mobileListMenu.setAttribute('aria-expanded', String(opening));
       if (opening) {
-        applyListMode('monitor');
-        void loadIntradayMonitor();
+        applyListMode(state.listMode);
+        if (state.listMode === 'monitor') void loadIntradayMonitor();
         renderMobileStockList();
         requestAnimationFrame(() => {
           const selected = mobileListPopover.querySelector('.mobile-list-row.active');
