@@ -58,6 +58,14 @@ reported egress already above the Free allowance; reducing future traffic
 does not reset billing-cycle usage. No paid plan is enabled by this work.
 Current billed usage and plan have not yet been reverified.
 
+The authenticated Supabase CLI lists two other projects, but does not list
+the trading project. Its management login therefore cannot verify this
+project's current plan, billed egress or any quota/grace-period notice.
+The trading project's actual database and documented metrics endpoint are
+reachable. Current resource health and billing allowance are separate checks;
+an account with access to the trading project's dashboard is still needed
+for the latter.
+
 A read-only production probe of the new code made 60 canonical reads across
 the five holdings: five initial payload rows, followed by zero payload rows
 over the remaining 55 fresh checks. No broker calls or canonical writes were
@@ -95,8 +103,41 @@ SQL row counts estimate payload traffic; they do not replace billing metrics.
 - Initial hosted CI on `ef4be9f` passed 3,551 tests per Python version and
   found one outdated credential-schema assertion: it omitted the new
   server-only `SUPABASE_SERVICE_ROLE_KEY`. The assertion is corrected; the
-  template remains credential-only. Full final-release CI and deployment
-  verification are pending.
+  template remains credential-only.
+- Final exact-release CI on `639cc747d0298dcabd1f26390abb7930d4f3e5fc`
+  passed all five jobs: repository hygiene/secret scan, dependency audit,
+  Python 3.11 and 3.12 suites (3,552 passed and 29 skipped each), and Gate 1
+  deterministic simulation. See the
+  [CI run](https://github.com/cafe-auvers/quant_app/actions/runs/37575642531).
+- The actual PC's staged checkout is clean. Its readiness check passed 19
+  checks; two remaining failures both require actual exact-release approval
+  of the capability manifest. It made no broker mutation or KIS connection.
+- Twenty-three staged web planning/hourly-chart tests passed in the actual
+  web Python environment. Fifty-six credential/configuration checks passed
+  after the schema assertion correction.
+
+The reviewed deployment candidate remains the exact code commit `639cc747`.
+This report's later documentation-only commit does not change that candidate.
+The immutable bundle, exact CI/Gate 1 evidence, staged checkout and supervised
+rollback/restart scripts are prepared locally and on the PC. The capability
+manifest is still AWAITING_OPERATOR_ACCEPTANCE; no approval, independent
+review or formal Gates 2–4 certification has been manufactured.
+
+The 14:23 KST read-only KIS/canonical recheck found ALAB 8, BE 10, CYPH 897,
+SIMO 10 and VNCE 184, matching the canonical quantities, with no working
+orders or unsettled broker commands. It did not disarm, release the lease or
+send a broker order. The repository's E4 shutdown fence requires explicit
+acceptance of the brief unprotected exposure during a supervised restart
+(`src/core/runtime_readiness.py`); exact-release review is also required
+(`src/core/release_identity.py` and `gate2/capabilities.py`). Existing earlier
+release approvals do not approve this new code commit.
+
+Until that approval and supervised deployment, the PC remains on `12dcd792`
+and the web on `3f602ca`; the new single-card correction is not active in
+production. After deployment, remeasure payload traffic and resource health
+during ordinary live trading. The earlier excess billed egress still needs
+dashboard verification. The October 7 session also needs operator arming;
+the deployment restore helper only restores the previously armed date.
 
 At approximately 14:12 KST, both active append-only evidence journals passed
 integrity audit. The report correctly remains INCOMPLETE_PASSIVE_COLLECTION
@@ -104,3 +145,11 @@ while the collector is RUNNING before the session; this is not a collection
 failure. The only enabled gate-related task with a future run is the passive
 post-session audit. No competing gate soak or shadow WebSocket runner is
 scheduled for tonight.
+
+The final collection recheck at 14:38 KST still showed RUNNING, 10,006 cycles,
+zero collector errors, zero dropped batches and an empty queue, with the
+isolated shadow active. Actual Gate 4 counts were 266 lifecycle comparisons,
+1,330 position-protection observations, one runtime activation and one
+manual-arm observation. These are recorded observations, not fabricated
+trades or a certificate. The passive audit remained Ready for October 8
+at 07:05:05 KST. Both active repositories and the prepared checkout were clean.
