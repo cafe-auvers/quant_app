@@ -22,12 +22,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, default=ROOT / "data" / "coordination_backups")
     args = parser.parse_args()
-    config = get_coordination_database_config()
-    if config["backend"] != "postgresql":
-        print("Automatic coordination backup requires PostgreSQL; TiDB is not queried", file=sys.stderr)
-        return 1
-    engine = create_coordination_connection_engine(config, read_only=False)
+    engine = None
     try:
+        config = get_coordination_database_config()
+        engine = create_coordination_connection_engine(config, read_only=False)
         snapshot = backup_coordination_snapshot(engine)
         name = datetime.now(timezone.utc).strftime("coordination_%Y%m%dT%H%M%S_%fZ.json")
         path = args.output_dir / name
@@ -38,7 +36,8 @@ def main() -> int:
         print(f"Coordination backup failed ({type(exc).__name__})", file=sys.stderr)
         return 1
     finally:
-        engine.dispose()
+        if engine is not None:
+            engine.dispose()
 
 
 if __name__ == "__main__":

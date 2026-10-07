@@ -386,7 +386,8 @@ class TradingEngine:
         matching = [
             card
             for card in cards
-            if card.symbol == symbol and card.board_status in _TICK_REACTIVE_POSITION_STATUSES
+            if card.symbol == symbol
+            and card.board_status in _TICK_REACTIVE_POSITION_STATUSES | {BoardStatus.SELL_ALL}
         ]
         changed: List[TradeCardState] = []
         for card in matching:
@@ -553,9 +554,23 @@ class TradingEngine:
 
     def _evaluate_quote_for_card(self, card: TradeCardState, quote: QuoteSnapshot) -> bool:
         was_exit_required = card.exit_all_required
+        was_stop_triggered = card.stop_loss_triggered
         was_board_status = card.board_status
         was_warnings = list(card.warnings)
 
+        # Keep the latest accepted trade through liquidation. A stop breach
+        # must never be priced from an earlier entry-planning observation.
+        if (
+            quote.channel in {"", "TRADE"}
+            and math.isfinite(quote.last_price)
+            and quote.last_price > 0
+            and (
+                card.market_data_last_trusted_at is None
+                or quote.broker_event_at >= card.market_data_last_trusted_at
+            )
+        ):
+            card.market_data_last_trusted_price = quote.last_price
+            card.market_data_last_trusted_at = quote.broker_event_at
         self._clear_stale_warning(card)
         stop_override = dict(quote.stop_price_overrides).get(card.card_key)
         if stop_override is None:
@@ -587,6 +602,7 @@ class TradingEngine:
 
         return (
             card.exit_all_required != was_exit_required
+            or card.stop_loss_triggered != was_stop_triggered
             or card.board_status != was_board_status
             or card.warnings != was_warnings
         )
@@ -673,15 +689,15 @@ class TradingEngine:
         # later stage -- EOD cleanup, stale-quote flagging, Sell All
         # retries -- for every other card too.
         for stage in (
-            self._recover_retryable_cards,
-            self._evaluate_buy_today,
             self._reconcile_entry_orders,
-            self._process_entry_completion,
-            self._process_partial_sell_requests,
-            self._reconcile_partial_sell_fills,
             self._process_queued_market_open_sells,
             self._reconcile_sell_all_orders,
             self._retry_incomplete_sell_alls,
+            self._recover_retryable_cards,
+            self._evaluate_buy_today,
+            self._process_entry_completion,
+            self._process_partial_sell_requests,
+            self._reconcile_partial_sell_fills,
             self._detect_stale_position_quotes,
             self._run_eod_cleanup_if_due,
         ):
@@ -2216,6 +2232,13 @@ class TradingEngine:
         the broker still hasn't confirmed the cancel by then, so a stalled
         liquidation is visible rather than silently waiting forever.
         """
+        changed = False
+        if order.status == OrderStatus.CANCEL_REQUESTED and not card.exit_cancel_in_flight:
+            # The broker command can outlive a failed card-state write.
+            # Adopt its pending state instead of issuing a second cancel.
+            card.exit_cancel_in_flight = True
+            card.exit_cancel_requested_at = card.exit_cancel_requested_at or now
+            changed = True
         if card.exit_cancel_in_flight:
             requested_at = card.exit_cancel_requested_at
             if requested_at is not None:
@@ -2230,7 +2253,7 @@ class TradingEngine:
                     if _EXIT_CANCEL_STALLED_WARNING not in card.warnings:
                         card.warnings = [*card.warnings, _EXIT_CANCEL_STALLED_WARNING]
                         return True
-            return False
+            return changed
         if not force and not self._attempt_deadline_passed(order, now):
             return False
         self._position_callbacks.request_cancel(card, order.client_order_id, scope="EXIT")
@@ -2367,7 +2390,9 @@ class TradingEngine:
                     symbol=card.symbol,
                     quantity=remaining,
                     reason=(
-                        "sell_all"
+                        "stop_loss"
+                        if card.stop_loss_triggered
+                        else "sell_all"
                         if card.sell_all_at_market_open
                         else "sell_all_retry"
                     ),

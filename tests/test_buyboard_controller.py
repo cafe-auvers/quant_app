@@ -508,6 +508,27 @@ def test_cancel_queued_sell_all_returns_to_open_position(tmp_path):
     assert result.exit_all_required is False
 
 
+@pytest.mark.parametrize("command_type", [CancelQueuedSellAll, RequestPartialSell])
+def test_triggered_stop_loss_cannot_be_withdrawn_or_reduced(tmp_path, command_type):
+    engine = _make_engine(tmp_path)
+    card = _seed(
+        engine,
+        board_status=BoardStatus.SELL_ALL,
+        position_runtime_status=PositionRuntimeStatus.QUEUED_FOR_OPEN,
+        sell_all_at_market_open=True,
+        exit_all_required=True,
+        stop_loss_triggered=True,
+        broker_quantity=12,
+        orderable_quantity=12,
+    )
+    kwargs = {"quantity": 4} if command_type is RequestPartialSell else {}
+    with pytest.raises(CommandRejectedError, match="triggered stop loss"):
+        apply_board_command(engine, _cmd(command_type, card, **kwargs))
+    stored = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert stored.exit_all_required is True
+    assert stored.stop_loss_triggered is True
+
+
 def test_cancel_queued_sell_all_refuses_when_actively_working(tmp_path):
     """A Sell All that is not premarket-queued is actively working at the
     broker -- cancelling that path is a different, engine-owned flow, not a

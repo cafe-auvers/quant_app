@@ -684,7 +684,7 @@ def require_compatible_runtime_schema(
                 "Coordination RU profile mismatch: device "
                 f"{conflicting.device_id} is a {authority} without "
                 f"{required_coordination_profile!r}. Stop it, deploy the same "
-                "version to both devices, and restart before using TiDB."
+                "version to both devices, and restart before using shared coordination."
             )
         if required_release_id and str(
             conflicting.details.get("release_id") or ""

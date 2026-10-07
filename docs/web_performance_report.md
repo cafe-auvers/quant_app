@@ -61,9 +61,9 @@ the user's real browser and iPhone remains part of UAT.
 ## Interpretation and limits
 
 - DEMO measures deterministic local generation and is not a prediction of
-  LAN, TiDB, Supabase, Tailscale, or phone-network latency.
+  LAN, Supabase, Tailscale, or phone-network latency.
 - PC-mirror values measure a local read-only SQLite mirror, not provider or
-  TiDB planning-write latency.
+  Supabase planning-write latency.
 - HTTP values use an authenticated in-process ASGI transport, so they include
   routing/auth/serialization but not TCP, TLS, browser parsing, or paint.
 - Nearby prefetch remains bounded to the other current timeframe plus one

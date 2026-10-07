@@ -53,13 +53,13 @@ Expected configuration concepts, with exact names supplied by Codex:
 | `SUPABASE_SECRET_KEY` | Privileged publisher/server credential only |
 | `WEB_CANONICAL_PLANNING_WRITES` | Remains false until a separate explicit integration test |
 
-The Postgres database password is not an API key. Existing TiDB/MySQL credentials stay separate; do not replace them with Supabase values.
+The Postgres database password is not an API key. Keep PC MySQL history credentials separate from COORD_DB_USER/COORD_DB_PASSWORD for the private Supabase coordination schema. Browser API keys are separate from both SQL logins.
 
 ### Database and chart storage
 
 - [ ] Review and apply the migrations produced by Codex to the dedicated development project. Do not manually invent tables in advance: table names, policies, and application code must match.
 - [ ] Create or verify a PRIVATE bucket named `chart-cache`. Apply generated Storage policies and table Row Level Security policies; do not temporarily make the bucket public to fix access errors.
-- [ ] Enable Realtime only for the tables/channels the implementation actually uses. It does not automatically subscribe to TiDB changes.
+- [ ] Enable Realtime only for the tables/channels the implementation actually uses. The private coordination schema uses the existing authenticated change-pulse bridge; do not expose it through public browser APIs.
 - [ ] Run the provided integration/readiness tests: permitted user succeeds; signed-out and wrong-user requests fail; upload/read/overwrite/delete behave correctly; no secret appears in the browser.
 - [ ] Upload a small selection of symbols first, verify actual chart dates/indicators/checksums, then publish the relevant scanner/planning universe. Review measured storage and transfer in the dashboard rather than relying on earlier estimates.
 

@@ -91,6 +91,7 @@ logs/
 .coverage
 htmlcov/
 /artifacts/
+/supabase/.temp/
 
 # Application specific
 *.db

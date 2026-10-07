@@ -245,9 +245,9 @@ COORDINATION_LEASE_POLL_SECONDS = max(
     20.0,
     _env_float("COORDINATION_LEASE_POLL_SECONDS", 20.0, minimum=20.0),
 )
-# Runtime liveness is the one routine TiDB write that remains while a device
+# Runtime liveness is the one routine database write while a device
 # is otherwise idle. Local/Tailscale change pulses handle five-second peer
-# synchronization, so TiDB only needs a coarse four-minute publication.
+# synchronization, so the database needs only a four-minute publication.
 # Every safety-critical mutation still proves its database/lease state at the
 # action boundary and publishes immediately when runtime details change.
 COORDINATION_DEVICE_HEARTBEAT_SECONDS = max(
@@ -275,16 +275,16 @@ COORDINATION_ALERT_POLL_SECONDS = max(
 )
 # Liveness monitoring belongs to the external watchdog, not the SQL
 # coordination store.  The runtime checks this cadence from its local
-# one-second loop and publishes without waiting for the TiDB alert poll.
+# one-second loop and publishes without waiting for the database alert poll.
 # Successful webhook traffic is cheap enough to be frequent; only compact
-# audit evidence is written to TiDB, once per hour or on a status transition.
+# audit evidence is written once per hour or on a status transition.
 EXTERNAL_WATCHDOG_HEARTBEAT_SECONDS = max(
     1.0,
     _env_float("EXTERNAL_WATCHDOG_HEARTBEAT_SECONDS", 5.0, minimum=1.0),
 )
-EXTERNAL_WATCHDOG_TIDB_AUDIT_SECONDS = max(
+EXTERNAL_WATCHDOG_COORDINATION_AUDIT_SECONDS = max(
     3600.0,
-    _env_float("EXTERNAL_WATCHDOG_TIDB_AUDIT_SECONDS", 3600.0, minimum=3600.0),
+    _env_float("EXTERNAL_WATCHDOG_COORDINATION_AUDIT_SECONDS", 3600.0, minimum=3600.0),
 )
 # Once a critical alert has been delivered successfully, the durable incident
 # remains open until an operator acknowledges it. Re-sending the same alert
@@ -296,12 +296,9 @@ EXTERNAL_ALERT_ACK_REMINDER_SECONDS = max(
     _env_float("EXTERNAL_ALERT_ACK_REMINDER_SECONDS", 21600.0, minimum=3600.0),
 )
 # Operator commands are the hottest remaining coordination read while the US
-# regular session is open.  Production measurements near 20 RU/s were
-# consistent with the remaining empty-queue lookup's one-second cadence. A
-# later production sample still measured 17--18 RU/s with the three-second
-# floor. Twenty seconds is now the non-overridable minimum required by the
-# 7--9 RU/s cluster budget. Local controls are immediate; only a command
-# created on the other device waits for this fallback poll.
+# regular session is open. Keep a twenty-second minimum to bound empty-queue
+# reads. Local controls and peer change pulses apply immediately; missed
+# notifications are recovered through the fallback poll.
 # The local market/stop loop and broker-boundary lease proof are independent.
 COORDINATION_OPERATOR_COMMAND_POLL_SECONDS = max(
     20.0,
@@ -349,7 +346,7 @@ ACTIVE_ACCOUNT_REFRESH_SECONDS = _env_int(
 IDLE_ACCOUNT_REFRESH_SECONDS = _env_int("IDLE_ACCOUNT_REFRESH_SECONDS", 20, minimum=1)
 FULL_RECONCILIATION_SECONDS = _env_int("FULL_RECONCILIATION_SECONDS", 60, minimum=1)
 # Broker truth still refreshes every minute. The relational comparison side
-# is process-local between canonical writes and is force-refreshed from TiDB
+# is process-local between canonical writes and refreshed from the database
 # periodically, avoiding the same three unchanged table reads every minute.
 COORDINATION_RECONCILIATION_CACHE_SECONDS = max(
     300.0,

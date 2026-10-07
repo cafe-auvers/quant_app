@@ -1,12 +1,12 @@
 # Database Tables and DB-Only Architecture
 
-Last verified: **2026-10-02**
+Coordination routing verified: **2026-10-06**; detailed legacy table inventory: **2026-10-02**
 
 This document describes only the SQL databases used by the project:
 
 - MySQL on the always-on PC;
 - SQLite on the laptop/workspace device;
-- TiDB Cloud;
+- Supabase Cloud;
 - the direction and timing of database updates and communication.
 
 JSON state, log files, broker/provider internals, Git synchronization, and UI
@@ -19,9 +19,10 @@ not itself authorize a broker mutation. See
 [Current Order Logic](current_order_logic.md).
 
 The inventory below was checked against both the current table definitions and
-a read-only inspection of the configured PC MySQL database, the configured TiDB
-database, and the two SQLite files in `data/`. No schema or row was changed by
-that inspection.
+the earlier read-only PC/SQLite inventory. A 2026-10-06 read-only check found
+33 PC MySQL tables and 20 tables in the Supabase coordination schema; the PC
+executor publishes its active, ready heartbeat to Supabase. The detailed table
+matrices below retain the earlier inventory and are not a current table count.
 
 The 2026-10-02 web validation additionally proved that the 1.397 GB PC SQLite
 market mirror retained identical size and nanosecond mtime across scanner,
@@ -29,7 +30,7 @@ search, metadata, earnings, and representative 1D/1H reads. Isolated canonical
 SQL instrumentation observed 5 statements for Watchlist, 14 for breakout, 7
 for Buylist, and 29 for Buy Today, including authority/revision/ownership and
 read-back checks. These are bounded request-path counts, not polling cadences or
-TiDB latency claims; see [web_final_validation.md](web_final_validation.md).
+Supabase latency claims; see [web_final_validation.md](web_final_validation.md).
 
 ## 1. Database roles and authority
 
@@ -38,15 +39,18 @@ TiDB latency claims; see [web_final_validation.md](web_final_validation.md).
 | PC MySQL | `MYSQL_*`; normally database `quant_app` on port `3306` | Shared daily/hourly/intraday history and derived market-data cache | Canonical **market-data** store |
 | Laptop market mirror | `data/local_mirror.db` | Offline SQLite copy of selected PC market tables; can also receive laptop-only intraday/fallback refreshes | Read fallback, not a peer market-data authority |
 | Local operational SQLite | `data/kanban_operational.sqlite3`, overridable with `OPERATIONAL_DB_PATH` | Per-device recovery/compatibility store for Kanban data | Not the shared authority in a real application window |
-| TiDB Cloud | `COORD_DB_*`; normally database `quant_coordination` on port `4000` | Small shared execution, ownership, command, order, readiness, and alert store | Canonical **coordination/execution** store when configured |
+| Supabase Cloud | `COORD_DB_*`; database `postgres`, private schema `quant_coordination`, session pooler port `5432` | Small shared execution, ownership, command, order, readiness, and alert store | Canonical **coordination/execution** store when configured |
 
 Two routing decisions are deliberately independent:
 
 1. **Market-data route:** use PC MySQL when reachable; otherwise use the
    laptop market mirror; otherwise market-cache features have no database.
-2. **Coordination route:** use TiDB whenever `COORD_DB_*` is configured. If it
-   is configured but unreachable, coordination fails closed. If TiDB is not
-   configured, PC MySQL is the legacy shared coordination fallback.
+2. **Coordination route:** use Supabase whenever `COORD_DB_*` is configured. If it
+   is configured but unreachable or invalid, coordination fails closed.
+   PostgreSQL is the only supported shared-cloud backend; stale MySQL/TiDB
+   coordination settings cannot reconnect or select a fallback authority.
+   Without any shared-cloud configuration, PC MySQL is the legacy local
+   coordination route.
 
 The local operational SQLite database is not silently selected as shared
 authority by a normal PC or laptop application window. That prevents two
@@ -70,47 +74,48 @@ flowchart LR
         LAPAPP -.->|"recovery/compatibility only"| LOCALOPS
     end
 
-    TIDB[("TiDB Cloud\nquant_coordination")]
+    SUPABASE[("Supabase Cloud\nquant_coordination")]
     WEB["Authenticated web/PWA service"]
 
     LAPAPP <-->|"MySQL protocol over LAN/Tailscale :3306"| MYSQL
     MYSQL -->|"application-level checkpointed copy\nstartup + every 15 minutes"| MIRROR
-    LAPAPP <-->|"TLS MySQL protocol :4000"| TIDB
-    PCAPP <-->|"TLS MySQL protocol :4000"| TIDB
-    WEB <-->|"allowlisted canonical reads/writes"| TIDB
+    LAPAPP <-->|"TLS PostgreSQL session pooler :5432"| SUPABASE
+    PCAPP <-->|"TLS PostgreSQL session pooler :5432"| SUPABASE
+    WEB <-->|"allowlisted canonical reads/writes"| SUPABASE
 
 ```
 
 Important boundaries:
 
-- There is **no database replication link** between PC MySQL and TiDB.
-- There is **no market-data copy into TiDB**.
+- There is **no database replication link** between PC MySQL and Supabase.
+- There is **no market-data copy into Supabase**.
 - The PC-to-laptop mirror is implemented by application SQL reads and SQLite
   upserts, not by MySQL replication.
 - One-second quote, ORB, and stop calculations remain local and do not write to
-  TiDB every second. Only durable state changes are persisted.
+  Supabase every second. Only durable state changes are persisted.
 - WebSocket invalidations and inbound/outbound desktop change pulses are
   non-authoritative notification paths. They cause scoped canonical reads and
   are not database replication or a second state store.
 
 ## 3. Read-only deployed-schema snapshot
 
-The current inspection found:
+The 2026-10-06 inspection found 33 PC MySQL tables and 20 Supabase coordination
+tables. The following PC/SQLite matrix preserves the 2026-10-02 inventory:
 
-| Database | Tables currently present | Notes |
+| Database | Tables present at verification | Notes |
 | --- | ---: | --- |
 | PC MySQL | 28 | 11 market-data tables plus 17 legacy/shared coordination tables |
 | Laptop market mirror | 13 | 11 market-data tables plus 2 mirror-control tables |
 | Laptop local operational SQLite | 15 | Local copies of 15 coordination table types; not current shared authority |
-| TiDB Cloud | 18 | Complete current coordination schema |
+| Supabase PostgreSQL | 20 | Current private coordination schema (2026-10-06) |
 
 Table presence does not decide authority. In particular, the coordination
-tables still present in PC MySQL are legacy/deployment history while TiDB is
+tables still present in PC MySQL are legacy/deployment history while Supabase is
 configured.
 
-### 3.1 Market and mirror tables currently present
+### 3.1 Market and mirror table inventory (2026-10-02)
 
-| Table | PC MySQL | Laptop market mirror | TiDB | Local operational SQLite |
+| Table | PC MySQL | Laptop market mirror | Supabase | Local operational SQLite |
 | --- | :---: | :---: | :---: | :---: |
 | `price_history` | Yes | Yes | No | No |
 | `hourly_price_history` | Yes | Yes | No | No |
@@ -131,9 +136,9 @@ The current code also defines `market_pulse_instruments` and
 initialization, but neither was present in the inspected PC database nor the
 laptop mirror at the time of verification.
 
-### 3.2 Coordination tables currently present
+### 3.2 Coordination table inventory
 
-| Table | PC MySQL | Laptop market mirror | TiDB | Local operational SQLite |
+| Table | PC MySQL | Laptop market mirror | Supabase | Local operational SQLite |
 | --- | :---: | :---: | :---: | :---: |
 | `app_state_sync` | Yes | No | Yes | Yes |
 | `operator_control_audit` | Yes | No | Yes | No |
@@ -146,6 +151,8 @@ laptop mirror at the time of verification.
 | `execution_commands` | Yes | No | Yes | Yes |
 | `execution_orders` | Yes | No | Yes | Yes |
 | `capital_reservations` | Yes | No | Yes | Yes |
+| `capital_reservation_accounts` | Not rechecked | No | Yes (2026-10-06) | Not rechecked |
+| `daily_trading_events` | Not rechecked | No | Yes (2026-10-06) | Not rechecked |
 | `discovered_external_orders` | Yes | No | Yes | Yes |
 | `emergency_journal_reconciliation` | Yes | No | Yes | Yes |
 | `external_alert_incidents` | Yes | No | Yes | Yes |
@@ -201,8 +208,11 @@ The Market Pulse tables are also outside the normal mirror set.
 
 ## 5. Coordination/execution table catalog
 
-The same SQLAlchemy definitions work on TiDB/MySQL and SQLite. TiDB startup
-provisions all 18 tables through `ensure_coordination_schema()`.
+The SQLAlchemy definitions support PostgreSQL and local MySQL/SQLite fixtures.
+Supabase uses 20 tables in a private schema. Provision schema changes with the
+administrator migration tool before rollout; the application role has DML
+permissions and cannot create new tables. `ensure_coordination_schema()`
+checks the schema on application startup.
 
 | Table | Primary/unique key | What it stores | When it changes |
 | --- | --- | --- | --- |
@@ -250,8 +260,8 @@ Intraday rows are updated on demand by intraday workers and pruned to seven
 days. Market Pulse tables update only when the user requests a Market Pulse
 refresh.
 
-When TiDB is not configured, the application also creates/uses coordination
-tables in PC MySQL as the legacy shared execution store. When TiDB is
+When Supabase is not configured, the application also creates/uses coordination
+tables in PC MySQL as the legacy shared execution store. When Supabase is
 configured, those physically present PC tables are not the selected authority.
 
 ### 6.2 Laptop market mirror
@@ -279,9 +289,9 @@ or hourly keys into PC MySQL; it never overwrites an existing PC key, never
 promotes derived tables, then rebuilds PC-derived data and exact-copies the PC
 result back to the laptop.
 
-### 6.3 TiDB Cloud
+### 6.3 Supabase Cloud
 
-Both running devices connect directly to the same TiDB SQL database over TLS.
+Both running devices connect directly to the same Supabase SQL database over TLS.
 There is no PC relay. The principal steady-state database cadences are:
 
 | Coordination activity | Database cadence |
@@ -291,7 +301,7 @@ There is no PC relay. The principal steady-state database cadences are:
 | Protective ownership proof | 30 seconds while positions exist; one bulk read |
 | Runtime-readiness heartbeat | 240 seconds per running device; stale after 300 seconds by default |
 | `main.py` process heartbeat | Folded into runtime readiness; `app_runtime_status` is a legacy fallback |
-| External watchdog pulse | 5 seconds over HTTPS; no TiDB request per pulse |
+| External watchdog pulse | 5 seconds over HTTPS; no Supabase request per pulse |
 | Alert queue check | 90 seconds; successful external heartbeat audit compacted to about 1 hour |
 | Active/standby card revision check | Typed `trade_cards` token; 180/300-second legacy or 3600-second pulse fallback |
 | Buy Board and planning/control display synchronization | Matching typed token; 3600-second pulse fallback |
@@ -305,7 +315,7 @@ changes, owner activation/handoff, command insertion/claim, order status/fill
 changes, reservations, reconciliation evidence, and alerts are committed when
 the event happens.
 
-The local one-second trading loop performs no unconditional one-second TiDB
+The local one-second trading loop performs no unconditional one-second Supabase
 write. A TradeCard is persisted only when a durable decision changes.
 Listener protocol v3 attaches affected table names to its non-secret event ID,
 so unrelated consumers remain asleep. A protocol-v2 event remains supported
@@ -316,7 +326,7 @@ existing typed inbound and outbound pulse files in the configured PC
 repository. The PC desktop consumes the inbound event on a one-second local
 timer and its listener exposes the outbound event to the laptop. The same web
 process invalidates its open authenticated clients in memory. These operations
-add no unconditional one-second TiDB query; receiving clients fetch canonical
+add no unconditional one-second Supabase query; receiving clients fetch canonical
 state only after an event, with revision checks as recovery.
 
 ### 6.4 Local operational SQLite
@@ -324,7 +334,7 @@ state only after an event, with revision checks as recovery.
 The file is opened on each device and can seed `trade_cards` from recovery
 material. Repository table definitions are SQLite-compatible, which is useful
 for recovery, migrations, and tests. In a normal real application window,
-however, shared ownership and execution state route to TiDB or the legacy PC
+however, shared ownership and execution state route to Supabase or the legacy PC
 MySQL store, not to this private file. It is therefore not synchronized between
 the PC and laptop and must not be treated as a third coordination authority.
 
@@ -332,27 +342,27 @@ the PC and laptop and must not be treated as a third coordination authority.
 
 | From | To | Transport | Direction and data | Timing |
 | --- | --- | --- | --- | --- |
-| Laptop application | PC MySQL | MySQL/PyMySQL over TCP `3306`, normally through LAN or Tailscale | Shared market reads; legacy coordination reads/writes only if TiDB is not configured | On demand plus connection/status probes |
+| Laptop application | PC MySQL | MySQL/PyMySQL over TCP `3306`, normally through LAN or Tailscale | Shared market reads; legacy coordination reads/writes only if Supabase is not configured | On demand plus connection/status probes |
 | PC refresh/application processes | PC MySQL | Local/host MySQL connection | Market-data batch upserts and reads | Scheduled morning refresh plus manual/event-driven work |
 | PC MySQL | Laptop market mirror | Application SQL reads followed by SQLite transactions | Selected market tables, PC-authoritative | Startup/recovery and every 15 minutes |
 | Laptop application | Laptop SQLite files | Local SQLite connection with WAL | Offline market reads/writes; private operational recovery access | On demand |
-| Laptop application | TiDB Cloud | TLS-authenticated MySQL/PyMySQL, normally port `4000` | Shared coordination reads/writes | Immediate events plus bounded polling/heartbeats |
-| PC application | TiDB Cloud | Same TLS SQL connection | Same coordination authority as laptop | Immediate events plus bounded polling/heartbeats |
-| Web/PWA service | TiDB Cloud | Server-side TLS SQL connection; credentials never enter the browser | Allowlisted canonical planning/operator requests and projections | Immediate request/response plus bounded revision recovery |
-| Web/PWA service | PC/laptop applications | Authenticated browser invalidation plus typed local/listener change pulse | Non-authoritative scope/revision hint; receiver refetches TiDB | After successful canonical mutation |
+| Laptop application | Supabase Cloud | TLS-authenticated PostgreSQL/psycopg session pooler, port `5432` | Shared coordination reads/writes | Immediate events plus bounded polling/heartbeats |
+| PC application | Supabase Cloud | Same TLS SQL connection | Same coordination authority as laptop | Immediate events plus bounded polling/heartbeats |
+| Web/PWA service | Supabase Cloud | Server-side TLS SQL connection; credentials never enter the browser | Allowlisted canonical planning/operator requests and projections | Immediate request/response plus bounded revision recovery |
+| Web/PWA service | PC/laptop applications | Authenticated browser invalidation plus typed local/listener change pulse | Non-authoritative scope/revision hint; receiver refetches Supabase | After successful canonical mutation |
 
-There is no SQL communication path from TiDB to the laptop mirror and no SQL
-communication path from TiDB to the PC market-data tables.
+There is no SQL communication path from Supabase to the laptop mirror and no SQL
+communication path from Supabase to the PC market-data tables.
 
 ## 8. Failure and recovery behavior
 
 | Failure | Market-data behavior | Coordination behavior |
 | --- | --- | --- |
-| PC MySQL offline; TiDB online | Laptop switches to `local_mirror.db`; PC market history is unavailable until reconnect | TiDB ownership, commands, cards, orders, and ordinary execution remain available |
-| TiDB offline while configured; PC MySQL online | PC market data remains usable | No fallback to PC coordination tables or private SQLite; ordinary coordination/execution mutations fail closed |
-| PC MySQL and TiDB both offline | Laptop can still display/use its market mirror | Ordinary shared mutations remain closed |
-| PC MySQL recovers | Application switches market reads to PC after a successful connection check and updates the laptop mirror in the background | No change when TiDB is the coordination authority |
-| TiDB recovers | No market-data change | Emergency/reconciliation evidence is folded into canonical tables and full broker reconciliation is required before ordinary execution reopens |
+| PC MySQL offline; Supabase online | Laptop switches to `local_mirror.db`; PC market history is unavailable until reconnect | Supabase ownership, commands, cards, orders, and ordinary execution remain available |
+| Supabase offline while configured; PC MySQL online | PC market data remains usable | No fallback to PC coordination tables or private SQLite; ordinary coordination/execution mutations fail closed |
+| PC MySQL and Supabase both offline | Laptop can still display/use its market mirror | Ordinary shared mutations remain closed |
+| PC MySQL recovers | Application switches market reads to PC after a successful connection check and updates the laptop mirror in the background | No change when Supabase is the coordination authority |
+| Supabase recovers | No market-data change | Emergency/reconciliation evidence is folded into canonical tables and full broker reconciliation is required before ordinary execution reopens |
 
 ## 9. Schema ownership in the code
 
@@ -363,8 +373,8 @@ communication path from TiDB to the PC market-data tables.
 | Laptop mirror engine, table set, and routing | `src/infrastructure/database/mirror_engine.py` |
 | PC-to-laptop mirror copy/checkpoints | `src/infrastructure/database/mirror_copy.py` |
 | Explicit guarded reconciliation | `src/infrastructure/database/mirror_reconciliation.py` |
-| TiDB TLS engine | `src/infrastructure/database/coordination_engine.py` |
-| TiDB coordination schema provisioning | `src/services/coordination_schema.py` |
+| Supabase TLS engine | `src/infrastructure/database/coordination_engine.py` |
+| Supabase coordination schema provisioning | `src/services/coordination_schema.py` |
 | Local operational SQLite engine | `src/infrastructure/database/operational_engine.py` |
 | Individual coordination table definitions | Repository modules under `src/services/` |
 | Scheduled historical refresh | `scripts/run_daily_refresh.py` and `historical.py` |

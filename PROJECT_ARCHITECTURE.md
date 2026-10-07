@@ -42,7 +42,7 @@ browser / installed PWA
        -> isolated sandbox planning/drawing store (data/web/web_state.db)
        -> one-current gzip chart cache (data/web/chart_cache)
        -> optional read-only SQLite market mirror
-       -> optional read-only canonical TiDB TradeCard projection
+       -> optional read-only canonical Supabase PostgreSQL TradeCard projection
        -> optional Supabase identity/chart/drawing projection
 
 PyQt main.py / canonical SQL state / executor / KIS

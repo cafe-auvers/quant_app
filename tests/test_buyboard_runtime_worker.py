@@ -3039,6 +3039,36 @@ def test_periodic_refresh_requeries_once_the_interval_has_elapsed(tmp_path, monk
     assert len(broker.get_positions_calls) == calls_after_first + 1
 
 
+@pytest.mark.parametrize("board_status", [BoardStatus.OPEN_POSITION, BoardStatus.SELL_ALL])
+def test_pending_exit_uses_fast_broker_reconciliation(tmp_path, board_status):
+    from src.core import execution_config
+
+    broker = _FakeBroker()
+    broker.positions = {"overseas": {"holdings": []}}
+    worker, engine = _worker(tmp_path, broker=broker)
+    worker.runtime = _build_test_runtime(
+        buying_power_provider=worker._buying_power_provider,
+        card_lookup=worker._card_lookup,
+        broker=worker._broker,
+        market_data=_dummy_market_data(),
+    )
+    _seed_card(engine, board_status=board_status, broker_quantity=10, orderable_quantity=10)
+    cards = repo.list_trade_cards(engine, environment="PROD", account_no="1")
+    now = dt.datetime.now(dt.timezone.utc)
+    worker._account_balance_refreshed_at["1"] = now
+    worker._account_reconciled_at["1"] = now - dt.timedelta(
+        seconds=execution_config.PENDING_ORDER_RECONCILIATION_SECONDS + 1
+    )
+    worker._refresh_account_state_if_due(cards)
+    stored = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    if board_status == BoardStatus.SELL_ALL:
+        assert stored.board_status == BoardStatus.CLOSED
+        assert stored.broker_quantity == 0
+    else:
+        assert stored.broker_quantity == 10
+        assert broker.get_positions_calls == []
+
+
 def test_periodic_reconciliation_discovers_external_position_change(tmp_path, monkeypatch):
     """FULL_RECONCILIATION_SECONDS cadence: a manual sale made mid-session
     (broker quantity dropped to zero) must be discovered without waiting

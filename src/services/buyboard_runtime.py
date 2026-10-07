@@ -295,8 +295,10 @@ def _marketable_sell_limit_price(
     quote: Optional[QuoteSnapshot],
     *,
     quote_is_execution_ready: bool = True,
+    trade_is_execution_ready: Optional[bool] = None,
     last_trusted_price: Optional[float] = None,
     emergency_reprice_attempt: int = 0,
+    hard_stop: bool = False,
 ) -> Optional[float]:
     """Compatibility wrapper around the shared frontend-neutral policy."""
 
@@ -305,7 +307,9 @@ def _marketable_sell_limit_price(
         last_price=quote.last_price if quote is not None else None,
         last_trusted_price=last_trusted_price,
         quote_is_execution_ready=quote_is_execution_ready,
+        trade_is_execution_ready=trade_is_execution_ready,
         emergency_reprice_attempt=emergency_reprice_attempt,
+        hard_stop=hard_stop,
     )
 
 
@@ -1845,6 +1849,12 @@ def build_buyboard_runtime(
             submit_kwargs.get("account_no", ""),
             symbol,
         )
+        if card is not None and card.stop_loss_triggered:
+            intent = OrderIntent.STOP_LOSS
+        mandatory_liquidation = intent == OrderIntent.STOP_LOSS or bool(
+            card is not None
+            and (card.exit_all_required or card.board_status == BoardStatus.SELL_ALL)
+        )
         exchange = _execution_exchange_for_card(
             card,
             resolved_market_data,
@@ -1863,9 +1873,36 @@ def build_buyboard_runtime(
             quote_ready = resolved_market_data.is_symbol_execution_ready(
                 symbol, require_trade=False, require_quote=True
             )
+            trade_ready = resolved_market_data.is_symbol_execution_ready(
+                symbol, require_trade=True, require_quote=False
+            )
+            if mandatory_liquidation and not quote_ready and not trade_ready:
+                # A disconnected feed must not leave exits priced from an
+                # old entry observation when fresh KIS holdings are available.
+                try:
+                    positions = resolved_broker.get_positions(
+                        environment=submit_kwargs["environment"],
+                        account_no=submit_kwargs["account_no"],
+                    )
+                    holdings = (positions.get("overseas") or {}).get("holdings") or []
+                    for holding in holdings:
+                        if str(holding.get("symbol") or "").upper() != symbol.upper():
+                            continue
+                        current_price = float(holding.get("current_price") or 0.0)
+                        if math.isfinite(current_price) and current_price > 0 and card is not None:
+                            card.market_data_last_trusted_price = current_price
+                            card.market_data_last_trusted_at = datetime.now(timezone.utc)
+                            if card.active_stop_price and current_price <= card.active_stop_price:
+                                card.stop_loss_triggered = True
+                                intent = OrderIntent.STOP_LOSS
+                        break
+                except Exception:
+                    logger.warning("Fresh broker exit price unavailable for %s", symbol)
             emergency_attempt = int(card.exit_attempt_count if card is not None else 0)
             if (
                 not quote_ready
+                and not trade_ready
+                and not mandatory_liquidation
                 and emergency_attempt
                 >= execution_config.EMERGENCY_EXIT_MAX_REPRICE_ATTEMPTS
             ):
@@ -1875,10 +1912,12 @@ def build_buyboard_runtime(
             limit_price = _marketable_sell_limit_price(
                 quote,
                 quote_is_execution_ready=quote_ready,
+                trade_is_execution_ready=trade_ready,
                 last_trusted_price=(
                     card.market_data_last_trusted_price if card is not None else None
                 ),
                 emergency_reprice_attempt=emergency_attempt,
+                hard_stop=mandatory_liquidation,
             )
             if limit_price is None:
                 raise ExecutionGradeDataUnavailableError(

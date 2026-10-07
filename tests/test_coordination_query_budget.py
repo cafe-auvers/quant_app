@@ -1,6 +1,6 @@
 """Regression limits for routine shared-coordination reads.
 
-TiDB bills transaction work.  Read-only polling helpers must therefore use a
+Read-only polling helpers avoid transaction overhead by using a
 connection scope, not a committing transaction scope.  The safety-critical
 write paths keep their explicit transactions in their own repository tests.
 """
@@ -43,14 +43,14 @@ def test_cloud_coordination_poll_floors_preserve_monthly_budget():
     assert execution_config.COORDINATION_REMOTE_FALLBACK_SECONDS >= 3600.0
     assert execution_config.COORDINATION_RECONCILIATION_CACHE_SECONDS >= 900.0
     assert execution_config.EXTERNAL_WATCHDOG_HEARTBEAT_SECONDS <= 5.0
-    assert execution_config.EXTERNAL_WATCHDOG_TIDB_AUDIT_SECONDS >= 3600.0
+    assert execution_config.EXTERNAL_WATCHDOG_COORDINATION_AUDIT_SECONDS >= 3600.0
     assert execution_config.EXTERNAL_ALERT_ACK_REMINDER_SECONDS >= 3600.0
     assert execution_config.PENDING_ORDER_RECONCILIATION_SECONDS >= 2
     assert execution_config.UNKNOWN_ORDER_RECONCILIATION_SECONDS >= 1
     assert execution_config.DURABLE_ORDER_OBSERVATION_SECONDS >= 3600
 
 
-def test_typed_change_pulse_profile_has_large_headroom_below_nine_ru_per_second():
+def test_typed_change_pulse_profile_preserves_scheduled_request_envelope():
     """Lock the documented two-device scheduled-request envelope."""
 
     month_seconds = 30 * 24 * 60 * 60
@@ -70,13 +70,13 @@ def test_typed_change_pulse_profile_has_large_headroom_below_nine_ru_per_second(
             / execution_config.COORDINATION_REMOTE_FALLBACK_SECONDS,
             month_seconds
             / execution_config.COORDINATION_OWNERSHIP_PROOF_SECONDS,
-            # Two alert consumers plus hourly TiDB evidence for the fast
+            # Two alert consumers plus hourly audit evidence for the fast
             # external-webhook pulses.
             2 * month_seconds
             / execution_config.COORDINATION_ALERT_POLL_SECONDS,
             2
             * month_seconds
-            / execution_config.EXTERNAL_WATCHDOG_TIDB_AUDIT_SECONDS,
+            / execution_config.EXTERNAL_WATCHDOG_COORDINATION_AUDIT_SECONDS,
             # Two board projections plus five compact state-sync request
             # slots use the same missed-notification recovery fallback.
             7
@@ -86,12 +86,7 @@ def test_typed_change_pulse_profile_has_large_headroom_below_nine_ru_per_second(
             # remain in process until an actual local/remote DML pulse.
         )
     )
-    conservative_ru_per_second = (
-        scheduled_requests * 1.25 * 8.0 / month_seconds
-    )
-
     assert scheduled_requests <= 300_000
-    assert conservative_ru_per_second <= 1.2
 
 
 def test_idle_operator_command_poll_uses_covering_index_without_commit(tmp_path):

@@ -109,6 +109,9 @@ def invalidate_trade_cards_table_cache(engine: Engine) -> None:
 
     with _ensure_lock:
         _ensured_engines.discard(engine)
+    from src.services.coordination_snapshot import invalidate_versioned_rows
+
+    invalidate_versioned_rows(engine)
 
 
 class TradeCardVersionConflictError(RuntimeError):
@@ -270,13 +273,20 @@ def list_trade_cards(
         return []
     try:
         table = _ensure_trade_cards_table(engine)
-        statement = select(table)
+        conditions = []
         if environment:
-            statement = statement.where(table.c.environment == str(environment).upper())
+            conditions.append(table.c.environment == str(environment).upper())
         if account_no:
-            statement = statement.where(table.c.account_no == str(account_no))
-        with coordination_read_connection(engine) as conn:
-            rows = conn.execute(statement).fetchall()
+            conditions.append(table.c.account_no == str(account_no))
+        from src.services.coordination_snapshot import read_versioned_rows
+
+        rows = read_versioned_rows(
+            engine, table,
+            cache_key=("trade_cards", str(environment or "").upper(), str(account_no or "")),
+            key_columns=("environment", "account_no", "symbol"),
+            revision_column="version",
+            conditions=conditions,
+        )
         return [_row_to_card(row) for row in rows]
     except SQLAlchemyError as exc:
         if raise_on_error:

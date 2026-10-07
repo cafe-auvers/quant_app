@@ -317,7 +317,7 @@ navigation against the validated gzip cache.
 
 - DEMO results measure deterministic local generation, normalization,
   compression, checksum, and disk cache behavior; they do not predict provider,
-  LAN, TiDB, Supabase, or phone-network latency.
+  LAN, Supabase, or phone-network latency.
 - Browser layout/paint is measured separately through the bounded
   `window.__quantWebMetrics` samples; a physical iPhone remains a manual check.
 - The benchmark intentionally uses a temporary cache and performs no planning,

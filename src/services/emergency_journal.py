@@ -669,6 +669,8 @@ class EmergencyJournal:
                             (outcome or {}).get("status") or "AMBIGUOUS"
                         ).upper()
                         card.exit_all_required = True
+                        if order_payload.get("intent") == OrderIntent.STOP_LOSS.value:
+                            card.stop_loss_triggered = True
                         card.board_status = BoardStatus.SELL_ALL
                         card.position_runtime_status = (
                             PositionRuntimeStatus.LIQUIDATING

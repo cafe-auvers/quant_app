@@ -93,7 +93,7 @@ The **Buy Board** is the operator surface for planning and execution. Its cards 
 3. Run the app: `python main.py`
 4. Run the supported full suite: `python -m pytest tests -q`
 
-The app can run without MySQL. Database-backed scanning and cache freshness features require valid `MYSQL_*` settings. For PC-independent execution coordination, configure the separate TLS-only `COORD_DB_*` SQL connection described in [TiDB Cloud Coordination Store](docs/tidb_coordination_store.md); historical prices are never uploaded there.
+The app can run without MySQL. Database-backed scanning and cache freshness features require valid `MYSQL_*` settings. For PC-independent execution coordination, configure the separate TLS-only `COORD_DB_*` SQL connection described in [Supabase Coordination Store](docs/supabase_coordination_migration.md); historical prices are never uploaded there.
 
 `requirements.txt` contains the intentionally supported direct dependency ranges.
 `requirements.lock` pins the full Python 3.11/3.12 dependency graph and package
@@ -134,7 +134,7 @@ Today preview. Sandbox mode explicitly denies execution, order, ownership,
 risk, power, and real Buy Today activation endpoints.
 
 `CONNECTED` mode can point at the PC repository to show its read-only market
-mirror and canonical TiDB Watchlist, breakout, Buylist, and Buy Today state on
+mirror and canonical Supabase Watchlist, breakout, Buylist, and Buy Today state on
 the phone/PWA. Allowed actions update the initiating browser optimistically,
 then reconcile with canonical state. Authenticated WebSocket invalidations
 refresh other open browser/PWA sessions; typed coordination pulses refresh the

@@ -94,7 +94,7 @@ server re-verifies the current shared Operator Control owner at request time.
 An empty `canonical_account_no` is accepted only when exactly one production
 account exists. The server reads the PC mirror with SQLite read-only mode and
 loads only the PC repository's `COORD_DB_*` credentials into a dedicated
-SELECT-only TiDB adapter. It never copies those credentials to the browser or
+SELECT-only Supabase adapter. It never copies those credentials to the browser or
 the web database, and it never runs schema creation during adapter startup.
 
 In this mode the phone receives current Scanner/search/chart data and

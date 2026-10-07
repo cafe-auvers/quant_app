@@ -628,7 +628,7 @@ def _stamp_exact_order_observation_if_due(
 
     ``last_broker_seen_at`` and ``last_reconciled_at`` are not authorization
     or freshness inputs anywhere in the execution path.  Rewriting an
-    otherwise identical row on every broker poll consumed TiDB writes and
+    otherwise identical row on every broker poll consumed coordination database writes and
     invalidated the full Buy Board projection.  Active orders retain a
     hourly durable audit trail; terminal rows remain stable after their
     terminal evidence was first committed.
@@ -1349,6 +1349,8 @@ def _project_exact_order_to_card(
         ReconciliationCategory.STOP_LOSS_SELL,
         ReconciliationCategory.RESERVED_MOO_SELL,
     ):
+        if operational == ReconciliationCategory.STOP_LOSS_SELL:
+            card.stop_loss_triggered = True
         if open_at_broker:
             card.board_status = BoardStatus.SELL_ALL
             card.exit_all_required = True

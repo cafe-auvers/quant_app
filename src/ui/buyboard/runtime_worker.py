@@ -1922,7 +1922,7 @@ class BuyboardRuntimeWorker(QThread):
     def _process_due_external_alerts(
         self, *, now: Optional[datetime] = None
     ) -> bool:
-        """Poll durable alerts without keeping an idle TiDB instance awake.
+        """Poll durable alerts with bounded requests to the shared database.
 
         When the Tailscale status probe confirms the other device is off,
         there is no remote alert producer to observe.  Align the remaining
@@ -2580,10 +2580,20 @@ class BuyboardRuntimeWorker(QThread):
             )
             balance_age = self._age_seconds(self._account_balance_refreshed_at.get(account_no), now)
             reconcile_age = self._age_seconds(self._account_reconciled_at.get(account_no), now)
+            exit_pending = any(
+                card.board_status == BoardStatus.SELL_ALL
+                or card.exit_cancel_in_flight
+                for card in account_cards
+            )
+            reconciliation_interval = (
+                execution_config.PENDING_ORDER_RECONCILIATION_SECONDS
+                if exit_pending
+                else execution_config.FULL_RECONCILIATION_SECONDS
+            )
             balance_due = balance_age is None or balance_age >= balance_interval
             reconcile_due = (
                 reconcile_age is None
-                or reconcile_age >= execution_config.FULL_RECONCILIATION_SECONDS
+                or reconcile_age >= reconciliation_interval
             )
             if not balance_due and not reconcile_due:
                 continue

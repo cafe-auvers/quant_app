@@ -1550,7 +1550,7 @@ def publish_trading_plan(
     # The local metadata records the last remote revision absorbed from the
     # previously active coordination store.  It can legitimately outlive the
     # remote rows themselves -- for example when moving coordination to a new
-    # TiDB database or restoring an empty branch.  Ordinary background saves
+    # coordination database or restoring an empty branch. Ordinary background saves
     # must continue treating that as a conflict, but an explicit, market-closed
     # full-plan publish by the Operator Control owner is the recovery boundary.
     # Read the current compact revision projection so missing rows use an

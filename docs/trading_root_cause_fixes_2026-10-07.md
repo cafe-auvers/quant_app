@@ -1,0 +1,57 @@
+# Trading root cause fixes — 7 October 2026 (Korea time)
+
+## Verified deployment status — 7 October 2026, 09:56 KST
+
+Deployed release **`58c797c04ca3aa5d8423ee81174fb8f366d81737`** to the PC. The runtime is **ACTIVE**, its execution/reconciliation/market-data readiness checks pass, and only the previously enabled **US 6 October session** was restored. No future session was armed and no broker order was submitted by maintenance.
+
+Hosted CI passed all five jobs, including Gate 1 and the full suites on Python 3.11 and 3.12: **3,507 passed and 29 skipped per version**. Skips include optional browser/live dependencies; the preliminary local browser failures were Windows socket setup errors. [Exact release CI](https://github.com/cafe-auvers/quant_app/actions/runs/37552952180).
+
+Post-deployment KIS quantities match the five open canonical positions, and a separate canonical read confirms full stop coverage: ALAB 8 at 374.635, BE 10 at 285.64, CYPH 897 at 3.09, SIMO 10 at 281.51 and VNCE 184 at 11.88. TWLO, MRNA, SVIA and BAND remain closed. There are no working broker orders. Existing credentials and risk settings were preserved. Windows shows one venv launcher and its one application child, rather than two independent application instances.
+
+The passive collector is running for the **US 7 October session** on this release, with **zero errors and zero dropped batches** at verification. The existing audit task now uses the current repository/date/release, runs without a visible console daily around **07:05 KST**, and returns exit code 2 for incomplete evidence. **Gates 2, 3 and 4 remain NOT_CERTIFIED** pending the required real-session evidence and review. BRR still requires a current ticker and current plan; old closed SVIA state is not silently reused.
+
+Review and operational proof: `artifacts/trading_root_causes_20261007/verification.json`, `post_deployment_verification.json`, `post_deployment_stop_coverage.json`, `exact_orderability_probe.json` and `review_58c797c0/`.
+
+
+## Required behavior
+
+Monitor the current session's Buy Today cards. Submit a buy when the existing breakout and ORB rules qualify. When an owned position trades at or below its active stop, latch Sell All and keep liquidating the remaining broker-confirmed shares. Execute a requested partial sale while retaining stop coverage on the remainder.
+
+The approved entry market-data age is **15 seconds total**, including source delay, receive delay and time waiting for processing. Trade and bid/ask inputs remain required. Stops do not wait for an exact-price match, a recovery to the stop, a new ORB calculation or an entry-funds refresh. A broker acceptance is not a fill; a gap can execute below the stop price.
+
+## Root causes and changes
+
+| Root cause | Correction | Verification |
+| --- | --- | --- |
+| Decision processing still performed broker work in a shared loop; seven symbols could wait behind a slow account or order call. | Bounded per-card workers, coalesced pending work, a separate protective pool and immediate stop-breach dispatch from validated KIS ingestion. Same-card broker identities remain serialized. | A real trading-engine test gaps below the stop while another card is blocked; the stopped card independently becomes durably latched Sell All. |
+| The shared HTTP scheduler serialized the whole network round trip. | Reserve protective request capacity while preserving shared request spacing, mutation budgets, throttle handling and priority. Account, quantity and status reads inherit protective priority during an exit. | A protective mutation starts while an ordinary HTTP read is blocked; pacing and same-card serialization tests remain enforced. |
+| Ingestion rejected events older than five seconds even after entry readiness was changed to the approved 15 seconds; scoped action readiness still used the general two-second execution check. | Align past-event acceptance and new-entry action readiness with the configured total entry age. Reject future timestamps, invalid sessions and events beyond the age limit. Log broker, receive and processing times for clock-skew rejection. | Accept delayed source data and a 13-second-old trade/book for entry readiness; reject them after the total age exceeds 15 seconds. |
+| Newest KIS trades were only useful after a loop drain; the native `HDFSCNT0` channel was excluded from an exit-price lookup. | Publish validated trade/book state and the current quote cache immediately; accept the native trade channel for protective pricing. | The gap-stop test uses the current native KIS trade below the stop. |
+| A quote could expire after initial validation while waiting for the scheduler. | Revalidate entry quote and book freshness, risk authorization and exact funds at the actual HTTP dispatch boundary. Abort locally and release the reservation before any HTTP mutation if a check fails. | A scheduler-wait test expires the quote and proves no HTTP call; guarded gateway tests verify the durable local abort and released hold. |
+| Estimated foreign asset values could be treated as available cash; slow full reconciliation aged the balance cache. | Use KIS `inquire-psamount` for the exact symbol, exchange, limit and quantity. Refresh cash/equity independently in the background and preserve the response's actual balance timestamp. | Broker response parsing, exact-funds rejection, stale balance and out-of-order snapshot tests. |
+| A live read-only orderability probe rejected a price padded to eight decimals with OPSQ2002 (`OVRS_ORD_UNPR` field size). | Strip unnecessary trailing zeros from the decimal price sent to the orderability endpoint. Preserve the proposed numerical limit. | Verify the corrected parser and parameter against the actual KIS response before deploying. |
+| A prior acknowledged buy could be deducted twice from KIS's already-net orderability, including an ORB replacement. | Exclude only exact acknowledged working buys that preceded the KIS request from the cash subtraction for both new buys and replacements. Keep newer and uncertain holds, and retain all reservations in portfolio-risk calculations. | Tests cover acknowledgement before and after the request, an ambiguous prior submission and an ORB replacement alongside another acknowledged buy. |
+| A definite insufficient-funds rejection permanently retired Buy Today. | APBK0952 moves to Waiting for Capital with a cooldown. Any subsequent attempt consumes a new identity and must pass the current quote, ORB, risk and orderability checks. Ambiguous submissions retain their identity and hold. | Rejection/cooldown/retry test verifies separate consumed attempt numbers and no immediate duplicate submission. |
+| UI and runtime persistence could conflict while a stop was latching. | Reapply a proven stop latch to the current card on a version conflict. Acknowledge a feed breach only after durable liquidation state exists. Use the same mutable card within one execution callback chain. | Version-conflict and durable-breach acknowledgement tests. |
+| A late cancel rejection remained marked ambiguous after a complete exact terminal broker proof. | Reconcile only the exact account, symbol, side, broker order identity, quantity and session with a complete snapshot. Preserve the original response with the resolution proof. | Negative cases cover incomplete snapshots, wrong scope/quantity and nonterminal broker state. |
+| Card refreshes rebuilt every widget and wrote a recovery backup on the UI thread; `pythonw` has no stderr. | Update changed widgets in place when layout is stable; write canonical recovery backups in the projection worker. Send Qt/startup messages through logging and give the native fault handler its own log file. | Widget reuse, UI thread and stderr-absent tests. |
+| Obsolete symbols appeared to wait indefinitely for ORB/feed data. | Expose a KIS symbol-master configuration failure as Data Unavailable with an actionable current-ticker message. Do not silently reuse another ticker's old trade plan. | Existing ORB/session and market-data configuration tests. BRR requires the operator to select the issuer's current ticker and create a current plan. |
+| Daily evidence and its scheduled audit were fixed to an earlier date, directory and release; an incomplete audit exited successfully. | Automatic per-session/per-release evidence directories; lifecycle/final reconciliation observations; a repository-owned audit that rejects missing, incomplete or corrupt evidence and exits nonzero. Resolve a prior reconciliation incident only after a complete successful account snapshot. | Collector rollover, missing-evidence and account-scoped incident-resolution tests. |
+
+## Yesterday's orders and remaining evidence
+
+The audited US session was **6 October 2026**, 09:30–16:00 New York time (22:30 on 6 October to 05:00 on 7 October Korea time). TWLO, MRNA, SVIA and BAND were confirmed flat after their sells. MRNA's zero-fill entry cancellation and replacement were the configured one-minute to five-minute ORB sequence; an automatic replacement remains subject to current conditions, and a later user re-add is a separate entry.
+
+ZS and AVAT had definite KIS APBK0952 insufficient-funds rejections. For ZS, KIS reported $915.31 and four shares orderable at $211.85 while the application's prior derived cash estimate was $1,409.85. The exact orderability query replaces that estimate for entry authorization.
+
+The read-only maintenance inventory at 00:12 UTC on 7 October confirmed five open positions: ALAB 8, BE 10, CYPH 897, SIMO 10 and VNCE 184. Canonical quantities matched KIS, stops covered the full remaining quantities, and there were no nonterminal local orders or active reservations. This is a dated observation, not a promise about later market state.
+
+Formal Gates **2, 3 and 4 remain NOT_CERTIFIED**. The existing timestamp, sequence and notice-encryption capability files retain their original empirical provenance. This release changes processing, scheduling, ingress-age policy and funding checks; it does not create new empirical qualification or an independent review. Full regular-session collection, required lifecycle/probe evidence and reviewed chains across the required dates still need to be observed. A complete passive collection is distinct from formal gate certification.
+
+## Release validation and operational record
+
+The release is built in an isolated worktree from deployed commit `32866eae800168b794811220b50ef84a457d1a26`; unrelated edits in the original development checkout are excluded. Deployment is authorized by the user's continuing fix/deploy instructions. Credentials, existing stops, quantities and risk limits must be preserved.
+
+Exact release SHA, regression counts, hosted CI/Gate 1 results, supervised maintenance inventory, credential/config preservation, owner activation and post-deployment broker reconciliation are recorded in the `artifacts/trading_root_causes_20261007` review bundle. The initial broad local run produced 3,507 passes, seven skips and five failures: two obsolete assertions, one composition failure that passed in isolation, and two Windows socket errors in browser setup. Follow-up regression and exact-release hosted results supersede that preliminary run.
+
+Live latency under the new architecture and formal gate closure require subsequent real-session evidence. No artificial buy, sell or future-session arming is part of validation or deployment.

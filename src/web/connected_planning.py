@@ -48,7 +48,7 @@ class ConnectedPlanningUnavailable(RuntimeError):
 
 
 class _MemoryWatchlist:
-    """Small compatibility adapter; canonical TiDB remains the authority."""
+    """Small compatibility adapter; canonical coordination remains the authority."""
 
     def __init__(self, card=None) -> None:
         self.active_session_date = current_or_next_nyse_session_date()

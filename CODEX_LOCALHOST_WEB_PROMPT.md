@@ -29,7 +29,7 @@ Read `AGENTS.md` wherever applicable, `README.md`, `PROJECT_ARCHITECTURE.md`, an
 - `docs/current_order_logic.md`
 - `docs/orb_buyboard_planning.md`
 - `docs/execution_operator_control.md`
-- `docs/tidb_coordination_store.md`
+- `docs/supabase_coordination_migration.md`
 - `docs/kanban_architecture.md`
 - `docs/activation_gate_specification.md`
 - `docs/web_operator_sync.md`
@@ -69,7 +69,7 @@ SANDBOX, default:
 
 CONNECTED:
 - Read real market data through existing local repositories or configured Supabase adapters.
-- TiDB reads are allowed only with explicit configuration; shared planning writes default OFF.
+- coordination database reads are allowed only with explicit configuration; shared planning writes default OFF.
 - Implement an independently enabled allowlist of passive canonical planning commands through the existing services. Require authenticated operator identity, explicit account/environment, valid current Operator Control where required, expected revisions, and existing lifecycle fences.
 - Keep a separate operator allowlist for guarded Buy Today activation/removal and closed-session plan publication. Revalidate that either the stable Mobile Web identity or the exact hosting-desktop identity owns Operator Control for every request; never grant the browser Execution Owner authority.
 - Do not impersonate the PC's operator identity. Unsupported authority combinations must remain read-only with a clear reason.
@@ -91,10 +91,10 @@ Do not modify `.env`, `.env.pc`, live runtime configuration, live database schem
 Keep each authoritative store unambiguous:
 - PC MySQL: existing full market history, indicators, and scanner calculations.
 - Laptop SQLite mirror: existing read-only market-data fallback, with its actual coverage limits.
-- TiDB: canonical TradeCards, Watchlist/Buylist/Buy Today, breakout targets, orders, reservations, ownership, and execution state.
-- Supabase: optional Auth, mobile scanner/metadata projections, chart object storage, and ordinary visual drawings.
+- Supabase private PostgreSQL coordination schema: canonical TradeCards, Watchlist/Buylist/Buy Today, breakout targets, orders, reservations, ownership, and execution state.
+- Optional Supabase API features: Auth, mobile scanner/metadata projections, chart object storage, and ordinary visual drawings; these are separate from private execution coordination.
 
-Do not migrate TiDB to PostgreSQL. Do not create a second production Watchlist/Buylist in Supabase. Do not sync full production ledgers or secrets into Supabase.
+The canonical coordination store already uses Supabase PostgreSQL. Do not create a second production Watchlist/Buylist in a public projection schema. Do not expose private production ledgers or secrets through browser APIs.
 
 Provide clean interfaces for market/scanner reads, current chart-bundle storage, drawings, identity, and planning commands. Supply working local implementations and optional Supabase implementations. Core localhost acceptance must not require a Supabase account, Docker, public hosting, or a domain. Missing optional credentials must not prevent sandbox startup.
 
@@ -174,7 +174,7 @@ Same command ID plus same payload must not reapply. Same ID plus changed payload
 
 Respect session restrictions, immutable active targets, existing orders/positions/reservations, and the separate Operator Control rules. Display position-size calculations as estimates unless fresh exact-account inputs meet current requirements. Never equate a draft with executable authorization.
 
-After commit, reuse/bridge existing typed change notifications. Other clients reload canonical state. Supabase Realtime does not automatically observe TiDB; implement the bridge explicitly and add bounded revision-based recovery. Do not introduce one-second TiDB polling or per-card query fan-out.
+After commit, reuse/bridge existing typed change notifications. Other clients reload canonical state. Supabase Realtime is not enabled for the private coordination schema; preserve the existing authenticated bridge and add bounded revision-based recovery. Do not introduce one-second coordination database polling or per-card query fan-out.
 
 Render permitted planning and Buy Today actions optimistically on the
 initiating browser before waiting for persistence. Replace the pending state
@@ -212,7 +212,7 @@ Add the PWA manifest, icons, install metadata, and a deliberately limited servic
 
 NiceGUI's server-driven interface is not a fully offline application: provide a clear disconnected/read-only/offline view, not a false promise of offline editing. Browser closure must not affect the separately running executor.
 
-Document desktop localhost separately from phone access. On the phone, localhost means the phone, not the PC. Keep the server loopback-bound and document optional private HTTPS access through existing Tailscale Serve; do not configure public Funnel, port forwarding, or expose MySQL/TiDB SQL ports. Phone PWA testing requires a trusted HTTPS origin. The local web host must remain running; Supabase storage does not host this Python application.
+Document desktop localhost separately from phone access. On the phone, localhost means the phone, not the PC. Keep the server loopback-bound and document optional private HTTPS access through existing Tailscale Serve; do not configure public Funnel, port forwarding, or expose MySQL/PostgreSQL SQL ports. Phone PWA testing requires a trusted HTTPS origin. The local web host must remain running; Supabase storage does not host this Python application.
 
 ## 11. Monitoring and out-of-scope operations
 

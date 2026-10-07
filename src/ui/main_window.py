@@ -532,7 +532,7 @@ class MainWindow(
         must never block execution, but losing the *shared coordination*
         channel must, or two disconnected devices can both believe they are
         Main at once. The local Kanban SQLite store is therefore recovery
-        material only in a real application window. Loss of shared MySQL
+        material only in a real application window. Loss of the shared store
         makes execution coordination fail closed.
 
         Lightweight unit-test windows created without a ``pc_db_engine``
@@ -658,7 +658,7 @@ class MainWindow(
                 "is independent of whether the PC historical database is online."
             )
         self.append_log(
-            "TiDB RU profile active: "
+            "Coordination profile active: "
             f"{execution_config.COORDINATION_RU_PROFILE} "
             "(local changes are dirty-event driven; "
             f"remote fallback {execution_config.COORDINATION_REMOTE_FALLBACK_SECONDS:g}s; "
@@ -697,7 +697,7 @@ class MainWindow(
         ):
             # runtime_device_state is the canonical cross-device liveness row.
             # Keep app_runtime_status only as a compatibility fallback when
-            # the guarded runtime is not running; do not pay for two TiDB
+            # the guarded runtime is not running; avoid two database
             # heartbeat UPDATEs from the same process.
             return
         worker = self.__dict__.get("_coordination_runtime_heartbeat_worker")
@@ -4045,7 +4045,7 @@ class MainWindow(
         self.state_sync_timer.start()
 
         # This is the hot pulse requested by the operator. It reads only
-        # process memory and two tiny local files; it never polls TiDB.
+        # process memory and two tiny local files; it never polls the database.
         self.coordination_change_timer = QTimer(self)
         self.coordination_change_timer.setInterval(1_000)
         self.coordination_change_timer.timeout.connect(
@@ -4176,8 +4176,8 @@ class MainWindow(
                 self,
                 "Shared control unavailable",
                 "The shared coordination database is unavailable. Ownership "
-                "cannot be changed, and execution remains fail-closed. If TiDB "
-                "is configured, verify its SQL endpoint, TLS, and Internet connection.",
+                "cannot be changed, and execution remains fail-closed. Verify the "
+                "configured PostgreSQL endpoint, TLS, and Internet connection.",
             )
             return
         target = self._control_target_role(target_label)
@@ -4449,7 +4449,7 @@ class MainWindow(
         return self._operator_executor_sync_mode() == "split"
 
     def _apply_operator_executor_sync_cadence(self) -> None:
-        """Apply the ownership-driven TiDB planning/command poll policy."""
+        """Apply the ownership-driven coordination poll policy."""
 
         mode = self._operator_executor_sync_mode()
         if mode == "unknown":
@@ -5071,7 +5071,7 @@ class MainWindow(
         *,
         peer_confirmed_off: bool = False,
     ) -> None:
-        """Back off or pause TiDB display polls based on peer reachability."""
+        """Back off or pause shared display polls based on peer reachability."""
 
         # Known Operator/Executor ownership is authoritative for planning and
         # live-command synchronization.  Split control always gets the fixed
@@ -5127,7 +5127,7 @@ class MainWindow(
 
     @staticmethod
     def _coordination_remote_poll_backoff_safe(status) -> bool:
-        """Return whether routine TiDB fallback reads can use the long cadence.
+        """Return whether shared fallback reads can use the long cadence.
 
         A reachable v2/v3 listener supplies change notifications.  A peer
         whose listener *and* database are both off cannot make remote changes,
@@ -5461,7 +5461,7 @@ class MainWindow(
         status_timer = self.__dict__.get("pc_status_timer")
         if status_timer is not None:
             # This is a local/Tailscale status and change-token pulse, not a
-            # TiDB poll. Keep it at five seconds in both offline and online
+            # database poll. Keep it at five seconds in both offline and online
             # modes so a returning peer or a remote change is noticed fast.
             status_timer.setInterval(5_000)
         self._last_pc_main_app_active = status.main_app_active

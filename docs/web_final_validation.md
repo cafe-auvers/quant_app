@@ -56,7 +56,7 @@ Browser / installed PWA
   -> FastAPI static-client and typed command boundary
   -> market source / canonical services / repositories
        -> read-only PC SQLite market mirror
-       -> canonical TiDB planning and operator intent
+       -> canonical Supabase planning and operator intent
   -> desktop Execution Owner
   -> existing guarded execution gateway
   -> KIS
@@ -188,7 +188,7 @@ the isolated clean environment proved bootstrap/login/startup separately.
 Measured canonical SQL executions on an isolated repository-backed SQLite
 engine were bounded per action: Watchlist 5, breakout 14, Buylist 7, and Buy
 Today 29. Counts include authority, revision, ownership, transaction, and
-read-back checks; they are not TiDB latency measurements. No one-second SQL
+read-back checks; they are not Supabase latency measurements. No one-second SQL
 poll, per-card fanout, duplicate board refresh loop, or self-trigger loop was
 introduced.
 

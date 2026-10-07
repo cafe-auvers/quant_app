@@ -161,7 +161,7 @@ If one required check is missing, the correct outcome is no order.
 - [Current Order Logic](current_order_logic.md)
 - [Leadership and Market Context](market_alignment.md)
 - [Supervised Controlled-Live Pilot](controlled_live_pilot_runbook.md)
-- [TiDB Cloud Coordination Store](tidb_coordination_store.md)
+- [Supabase Coordination Store](supabase_coordination_migration.md)
 - [Database Architecture](database_architecture.md)
 - [Web/PWA Operator Synchronization](web_operator_sync.md)
 - [Main README](../README.md)

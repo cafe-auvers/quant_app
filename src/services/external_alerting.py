@@ -428,7 +428,7 @@ class ExternalAlertingService:
         self._last_heartbeat_attempt_at: Optional[datetime] = None
         self._last_heartbeat_published_at: Optional[datetime] = None
         # The external watchdog is the live authority.  Delay the first
-        # centralized sample so startup does not open a TiDB transaction just
+        # centralized sample so startup does not open a coordination database transaction just
         # to duplicate a webhook that the provider already received.
         self._last_heartbeat_audited_at: Optional[datetime] = _as_utc(self._clock())
         self._last_heartbeat_audit_status = ""
@@ -1162,8 +1162,7 @@ class ExternalAlertingService:
             table = _heartbeat_table(MetaData())
             try:
                 # One deferred INSERT on the dedicated AUTOCOMMIT pool avoids
-                # the separate COMMIT that dominated the observed TiDB RU
-                # spikes during transient webhook failures.
+                # a separate COMMIT during transient webhook failures.
                 with coordination_autocommit_connection(self.engine) as conn:
                     conn.execute(
                         table.insert().values(
@@ -1185,7 +1184,7 @@ class ExternalAlertingService:
     def publish_heartbeat_if_due(self) -> bool:
         now = _as_utc(self._clock())
         # The webhook is the heartbeat authority.  A process restart should
-        # publish immediately instead of spending a TiDB read to discover the
+        # publish immediately instead of spending a coordination database read to discover the
         # previous process's last audit row.
         with self._heartbeat_lock:
             last = self._last_heartbeat_published_at
@@ -1290,7 +1289,7 @@ def build_external_alerting_service(
             execution_config.EXTERNAL_WATCHDOG_HEARTBEAT_SECONDS
         ),
         heartbeat_audit_interval_seconds=(
-            execution_config.EXTERNAL_WATCHDOG_TIDB_AUDIT_SECONDS
+            execution_config.EXTERNAL_WATCHDOG_COORDINATION_AUDIT_SECONDS
         ),
         qualification_observer=qualification_observer,
     )

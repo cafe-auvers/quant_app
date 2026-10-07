@@ -54,6 +54,31 @@ def test_export_requires_source_writers_to_be_stopped(tmp_path):
         export_coordination_snapshot(create_engine("sqlite://"), writers_stopped=False)
 
 
+def test_restore_clears_cached_payloads_when_versions_and_timestamps_are_reused(tmp_path):
+    from src.services.coordination_snapshot import read_versioned_rows
+
+    engine = _populated_store(tmp_path)
+    metadata = coordination_metadata()
+    table = metadata.tables["app_state_sync"]
+
+    def read():
+        return read_versioned_rows(
+            engine, table, cache_key=("restore-test",),
+            key_columns=("state_key",), revision_column="revision",
+        )[0].payload
+
+    assert read() == "x"
+    with engine.begin() as connection:
+        connection.execute(table.update().values(payload='{"restored":true}'))
+    backup = export_coordination_snapshot(engine, writers_stopped=True)
+    with engine.begin() as connection:
+        for item in metadata.tables.values():
+            connection.execute(item.delete())
+    restore_coordination_snapshot(engine, backup)
+    assert read() == '{"restored":true}'
+    engine.dispose()
+
+
 def test_backup_rejects_tampering_before_restoration(tmp_path):
     snapshot = export_coordination_snapshot(_populated_store(tmp_path), writers_stopped=True)
     snapshot["payload"]["tables"]["trade_cards"][0]["version"] += 1

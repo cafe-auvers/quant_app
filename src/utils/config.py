@@ -14,6 +14,18 @@ DATA_DIR = ROOT_DIR / "data"
 RULEBOOK_DIR = ROOT_DIR / "rulebooks"
 DEFAULT_KIS_TOKEN_CACHE = ROOT_DIR / ".kis_token_cache_prod.json"
 _CONFIG_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+RUNTIME_KEY_ALIASES = {
+    "EXTERNAL_WATCHDOG_TIDB_AUDIT_SECONDS": "EXTERNAL_WATCHDOG_COORDINATION_AUDIT_SECONDS",
+}
+
+
+def normalize_runtime_key_aliases(values: Dict[str, Any]) -> Dict[str, Any]:
+    """Preserve renamed runtime overrides; explicit current names win."""
+    normalized = dict(values)
+    for old_key, new_key in RUNTIME_KEY_ALIASES.items():
+        if old_key in normalized:
+            normalized.setdefault(new_key, normalized.pop(old_key))
+    return normalized
 
 
 def resolve_repo_path(path: str | Path) -> Path:
@@ -38,7 +50,7 @@ def load_env_file() -> Dict[str, str]:
         value = value.strip().strip('"').strip("'")
         values[key] = value
 
-    return values
+    return normalize_runtime_key_aliases(values)
 
 
 def _runtime_value_text(value: Any) -> str:
@@ -63,7 +75,7 @@ def _load_runtime_mapping(path: Path) -> Dict[str, str]:
         if not _CONFIG_KEY_RE.fullmatch(key):
             raise ValueError(f"Invalid runtime configuration key {key!r} in {path}")
         values[key] = _runtime_value_text(value)
-    return values
+    return normalize_runtime_key_aliases(values)
 
 
 def load_runtime_config(
@@ -101,6 +113,9 @@ def repository_configuration_values() -> Dict[str, str]:
 def install_repository_configuration() -> None:
     """Fill missing process variables for modules that resolve at import time."""
 
+    for key, value in normalize_runtime_key_aliases(dict(os.environ)).items():
+        if key in RUNTIME_KEY_ALIASES.values():
+            os.environ.setdefault(key, value)
     for key, value in repository_configuration_values().items():
         os.environ.setdefault(key, value)
 
@@ -109,6 +124,10 @@ def get_env_value(key: str, default: Optional[str] = None) -> Optional[str]:
     value = os.environ.get(key)
     if value is not None:
         return value
+
+    for old_key, new_key in RUNTIME_KEY_ALIASES.items():
+        if key == new_key and old_key in os.environ:
+            return os.environ[old_key]
 
     file_values = load_env_file()
     if key in file_values:

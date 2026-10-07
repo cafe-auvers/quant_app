@@ -124,7 +124,7 @@ def check_pc_listener(timeout: float = CONNECT_TIMEOUT_SECONDS) -> PcListenerSta
         return PcListenerStatus(PcStatus.OFF)
     if reply == "PONG":
         # Backward-compatible response from a listener that predates change
-        # pulses. Callers retain their TiDB fallback polling in this case.
+        # pulses. Callers retain their shared-database fallback polling in this case.
         return PcListenerStatus(PcStatus.ON)
     if reply.startswith("PONG v3"):
         parts = reply.split(" ", 3)
@@ -245,7 +245,7 @@ def notify_pc_coordination_change(
     protocol_version: int = 2,
     timeout: float = CONNECT_TIMEOUT_SECONDS,
 ) -> bool:
-    """Tell the PC listener that TiDB state has already changed.
+    """Tell the PC listener that canonical state has already changed.
 
     This request writes only a local JSON token on the PC. The PC's internal
     Python pulse notices it and performs the one canonical reconciliation.
