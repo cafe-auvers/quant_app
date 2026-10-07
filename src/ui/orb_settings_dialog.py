@@ -32,10 +32,17 @@ class OrbSettingsDialog(QDialog):
             100.0,
         ),
         (
-            "Stop / ADR (%)",
+            "Normal Stop / ADR (%)",
             "stop_adr_min_percent",
             "stop_adr_ideal_percent",
             "stop_adr_max_percent",
+            1000.0,
+        ),
+        (
+            "EP Stop / ADR (%)",
+            "ep_stop_adr_min_percent",
+            "ep_stop_adr_ideal_percent",
+            "ep_stop_adr_max_percent",
             1000.0,
         ),
     )

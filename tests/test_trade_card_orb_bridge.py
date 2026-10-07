@@ -81,6 +81,16 @@ def test_execute_ready_candidate_populates_entry_plan_fields():
     assert card.entry_block_reason == ""
 
 
+def test_ep_card_waits_for_queue_built_with_matching_profile():
+    card = _card(is_ep=True)
+    item = _queue_item(_candidate())
+    TradeCardOrbEvaluator().update_card(card, item)
+    assert card.board_status == BoardStatus.BUY_TODAY
+    assert card.entry_runtime_status == EntryRuntimeStatus.DATA_UNAVAILABLE
+    assert "stop/ADR profile" in card.entry_block_reason
+    assert card.entry_trigger is None
+
+
 def test_forming_candidate_status_maps_to_orb_forming():
     card = _card()
     item = _queue_item(

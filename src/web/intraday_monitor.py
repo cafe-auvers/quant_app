@@ -258,11 +258,11 @@ def evaluate_monitor_row(
         candidates = []
         for risk in RISK_CASES:
             sizing = calculate_orb_position_values(context.equity, risk, float(execution), low, adr)
-            valid = is_orb_position_plan_valid(sizing, adr, context.settings)
-            score = score_orb_position_recommendation(sizing, risk, context.settings)
+            valid = is_orb_position_plan_valid(sizing, adr, context.settings, is_ep=card.get("is_ep") is True)
+            score = score_orb_position_recommendation(sizing, risk, context.settings, is_ep=card.get("is_ep") is True)
             candidates.append((valid, score, risk, sizing))
         valid, _score, risk, sizing = max(candidates, key=lambda item: (item[0], item[1]))
-        warnings = validate_orb_position_values(sizing, adr, context.settings)
+        warnings = validate_orb_position_values(sizing, adr, context.settings, is_ep=card.get("is_ep") is True)
         result.update(position_status="PASS" if valid else "FAIL", risk_percent=risk * 100,
                       capital_percent=round(sizing["capital_percent"], 2),
                       stop_adr_percent=round(sizing["sl_adr"], 2) if sizing["sl_adr"] is not None else None,

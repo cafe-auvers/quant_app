@@ -84,6 +84,7 @@ class MoveToBuylist(BoardCommand):
 
 @dataclass(frozen=True)
 class ActivateForToday(BoardCommand):
+    is_ep: bool = False
     # The KIS realtime key is operational symbol metadata, not a credential.
     # Carrying the verified value with the durable activation lets a split
     # Operator/Execution topology subscribe on the executor without copying a
@@ -92,6 +93,8 @@ class ActivateForToday(BoardCommand):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        if not isinstance(self.is_ep, bool):
+            raise ValueError("EP selection must be a boolean")
         object.__setattr__(
             self,
             "kis_ws_symbol_key",

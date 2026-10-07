@@ -19,7 +19,7 @@
         <div class="brand-mark">Q</div>
         <div><div class="brand-name">Quant Web</div><div class="brand-sub">Review workspace</div></div>
       </div>
-      <button id="logout-button" class="ghost-button">Sign out</button>
+      <div class="topbar-actions"><button id="desktop-orb-settings" class="ghost-button" type="button">ORB settings</button><button id="logout-button" class="ghost-button">Sign out</button></div>
     </header>
     <section class="status-strip" aria-live="polite">
       <span id="market-summary" title="Checking NYSE market status"><i id="market-dot" class="status-dot"></i><b id="market-status-long">Market Status: Checking</b><b id="market-status-compact">Market Checking</b></span>
@@ -86,7 +86,7 @@
             <button id="summary-open-settings" class="mobile-secondary-action" type="button">Open chart settings</button>
           </article>
           <article class="mobile-page-section mobile-orb-settings">
-            <div class="mobile-section-heading"><div><span class="mobile-card-label">Shared risk settings</span><strong>ORB position bounds</strong></div><span id="orb-settings-revision">Loading</span></div>
+            <div class="mobile-section-heading"><div><span class="mobile-card-label">Shared risk settings</span><strong>ORB position bounds</strong></div><span id="orb-settings-revision">Loading</span><button id="desktop-orb-settings-close" type="button" class="ghost-button">Close</button></div>
             <p>These are the same ORB bounds used by the PC and laptop. Saving creates one shared revision for every device.</p>
             <form id="mobile-orb-settings-form">
               <fieldset>
@@ -98,11 +98,19 @@
                 </div>
               </fieldset>
               <fieldset>
-                <legend>Stop / ADR (%)</legend>
+                <legend>Normal Stop / ADR (%)</legend>
                 <div class="mobile-orb-inputs">
                   <label><span>Lower</span><input id="orb-stop-adr-min" type="number" min="0" max="1000" step="0.5" inputmode="decimal" required></label>
                   <label><span>Ideal</span><input id="orb-stop-adr-ideal" type="number" min="0" max="1000" step="0.5" inputmode="decimal" required></label>
                   <label><span>Upper</span><input id="orb-stop-adr-max" type="number" min="0" max="1000" step="0.5" inputmode="decimal" required></label>
+                </div>
+              </fieldset>
+              <fieldset>
+                <legend>EP Stop / ADR (%)</legend>
+                <div class="mobile-orb-inputs">
+                  <label><span>Lower</span><input id="orb-ep-stop-adr-min" type="number" min="0" max="1000" step="0.5" inputmode="decimal" required></label>
+                  <label><span>Ideal</span><input id="orb-ep-stop-adr-ideal" type="number" min="0" max="1000" step="0.5" inputmode="decimal" required></label>
+                  <label><span>Upper</span><input id="orb-ep-stop-adr-max" type="number" min="0" max="1000" step="0.5" inputmode="decimal" required></label>
                 </div>
               </fieldset>
               <div class="mobile-orb-actions"><button id="orb-settings-defaults" type="button">Restore defaults</button><button id="orb-settings-save" type="submit">Save shared settings</button></div>
@@ -151,6 +159,7 @@
                 <strong id="active-symbol">—</strong><span id="company-name">Select a symbol</span>
               </button>
               <span id="chart-purchase-status" class="purchase-status" role="status" aria-live="polite" hidden></span>
+              <span id="chart-entry-profile" class="purchase-status" hidden>EP</span>
             </div>
             <div id="company-context" class="company-context">Sector and industry unavailable</div>
             <div class="chart-metrics"><span id="adr-chip" class="metric-chip">ADR</span><span id="growth-1m-chip" class="metric-chip performance-chip">1M</span><span id="growth-3m-chip" class="metric-chip performance-chip">3M</span><span id="earnings-chip" class="metric-chip">Earnings</span></div>
@@ -233,7 +242,7 @@
             <span class="eyebrow">OPERATOR ACTION</span>
             <h2 id="operator-confirm-title">Confirm action</h2>
             <p id="operator-confirm-copy"></p>
-            <div class="operator-confirm-actions"><button id="operator-confirm-cancel" type="button">Cancel</button><button id="operator-confirm-submit" type="button">Confirm</button></div>
+            <div class="operator-confirm-actions"><button id="operator-confirm-cancel" type="button">Cancel</button><button id="operator-confirm-submit" type="button">Confirm</button><button id="operator-confirm-ep" type="button" hidden>Publish as EP</button></div>
           </div>
         </div>
         <button id="mobile-draw-line" class="mobile-floating-draw" type="button" aria-label="Line Tool" aria-pressed="false" title="Draw and edit chart lines">

@@ -99,6 +99,69 @@ def _buylist_card(engine):
 
 
 @pytest.mark.parametrize("same_executor", [True, False])
+@pytest.mark.parametrize("endpoint", ["planning", "board"])
+def test_ep_publication_api_persists_on_shared_card_and_replay_checks_profile(
+    web_config, services, tmp_path, monkeypatch, same_executor, endpoint
+):
+    engine, _role, operator = _service(web_config, tmp_path, same_executor=same_executor)
+    monkeypatch.setattr(trade_card_repository, "LOCAL_TRADE_CARDS_FILE", tmp_path / "cards.json")
+    card = _buylist_card(engine)
+    services.config = operator.config
+    services.canonical_planning = operator.source
+    services.connected_planning = operator.planning
+    services.connected_operator = operator
+    with TestClient(create_api_app(operator.config, services=services), base_url="http://localhost:8080") as phone:
+        session = login(phone)
+        phone.headers.update({"Origin": "http://localhost:8080", "X-CSRF-Token": session["csrf_token"]})
+        assert phone.post("/api/v1/operator/control", json={"target": "mobile"}).status_code == 200
+        payload = {"command_id": str(uuid.uuid4()), "expected_revision": card.version, "is_ep": True}
+        if endpoint == "planning":
+            path = "/api/v1/planning/AAPL/activate-buy-today"
+            payload["enabled"] = True
+        else:
+            path = "/api/v1/operator/board-actions"
+            payload.update(action="activate_buy_today", symbol="AAPL")
+        response = phone.post(path, json=payload)
+        assert response.status_code == 200, response.text
+        assert response.json()["card"]["is_ep"] is True
+        assert response.json()["broker_order_placed"] is False
+        stored = trade_card_repository.get_trade_card(engine, "PROD", "account-a", "AAPL")
+        assert stored.is_ep and stored.board_status == BoardStatus.BUY_TODAY
+        assert phone.get("/api/v1/planning/AAPL").json()["card"]["is_ep"]
+        board = phone.get("/api/v1/buyboard").json()
+        assert board["rows"][0]["is_ep"] and "EP" not in board["columns"]
+        assert phone.post(path, json=payload).status_code == 200
+        assert phone.post(path, json={**payload, "is_ep": False}).status_code == 409
+
+
+def test_custom_ep_settings_survive_old_client_normal_settings_save(web_config, services, tmp_path):
+    engine, _role, operator = _service(web_config, tmp_path)
+    services.config = operator.config
+    services.canonical_planning = operator.source
+    services.connected_planning = operator.planning
+    services.connected_operator = operator
+    with TestClient(create_api_app(operator.config, services=services), base_url="http://localhost:8080") as phone:
+        session = login(phone)
+        phone.headers.update({"Origin": "http://localhost:8080", "X-CSRF-Token": session["csrf_token"]})
+        phone.post("/api/v1/operator/control", json={"target": "mobile"})
+        initial = phone.get("/api/v1/operator/orb-settings").json()
+        payload = {**initial["settings"], "command_id": str(uuid.uuid4()), "expected_revision": initial["revision"],
+            "ep_stop_adr_min_percent": 40, "ep_stop_adr_ideal_percent": 90, "ep_stop_adr_max_percent": 140}
+        response = phone.put("/api/v1/operator/orb-settings", json=payload)
+        assert response.status_code == 200, response.text
+        legacy_payload = {key: value for key, value in response.json()["settings"].items() if not key.startswith("ep_")}
+        legacy_payload.update(command_id=str(uuid.uuid4()), expected_revision=response.json()["revision"], stop_adr_max_percent=90)
+        saved = phone.put("/api/v1/operator/orb-settings", json=legacy_payload)
+        assert saved.status_code == 200, saved.text
+        assert saved.json()["settings"]["ep_stop_adr_max_percent"] == 140
+        assert saved.json()["settings"]["ep_stop_adr_ideal_percent"] == 90
+        assert saved.json()["settings"]["ep_stop_adr_min_percent"] == 40
+        assert saved.json()["settings"]["stop_adr_max_percent"] == 90
+        invalid = {**payload, "command_id": str(uuid.uuid4()), "expected_revision": saved.json()["revision"], "ep_stop_adr_ideal_percent": 160}
+        assert phone.put("/api/v1/operator/orb-settings", json=invalid).status_code == 422
+
+
+@pytest.mark.parametrize("same_executor", [True, False])
 def test_mobile_reactivates_a_fully_closed_stock_with_original_breakout(
     web_config, tmp_path, monkeypatch, same_executor
 ):

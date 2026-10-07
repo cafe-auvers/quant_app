@@ -994,6 +994,7 @@ def test_dragging_partial_sell_to_open_dispatches_partial_withdrawal(tmp_path, m
 
 
 def test_drop_uses_rendered_projection_without_database_read(monkeypatch):
+    monkeypatch.setattr(board_module.dialogs, "prompt_buy_today_profile", lambda *_args: False)
     card = _card(board_status=BoardStatus.BUYLIST, version=4)
     projection = BoardCardProjection(card=card)
     window = _FakeMainWindow(engine=object(), cards=[card])

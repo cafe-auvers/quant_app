@@ -452,6 +452,7 @@ class ConnectedOperatorService:
         quantity: int | None = None,
         price: float | None = None,
         target_priority: int | None = None,
+        is_ep: bool = False,
     ) -> dict[str, Any]:
         from src.services.trade_card_repository import TradeCardVersionConflictError
 
@@ -463,7 +464,7 @@ class ConnectedOperatorService:
                 return self._apply_board_action_once(
                     command_id=command_id, action=action, symbol=symbol,
                     expected_revision=expected_revision, quantity=quantity,
-                    price=price, target_priority=target_priority,
+                    price=price, target_priority=target_priority, is_ep=is_ep,
                 )
             except TradeCardVersionConflictError as exc:
                 if not withdrawal or attempt == 3:
@@ -483,6 +484,7 @@ class ConnectedOperatorService:
         quantity: int | None = None,
         price: float | None = None,
         target_priority: int | None = None,
+        is_ep: bool = False,
     ) -> dict[str, Any]:
         """Apply one desktop-equivalent typed Kanban command.
 
@@ -571,7 +573,7 @@ class ConnectedOperatorService:
             "move_watchlist": lambda: MoveToWatchlist(**common),
             "remove_buylist": lambda: RemoveFromBuylist(**common),
             "move_buylist": lambda: MoveToBuylist(**common),
-            "activate_buy_today": lambda: ActivateForToday(**common),
+            "activate_buy_today": lambda: ActivateForToday(is_ep=is_ep, **common),
             "deactivate_buy_today": lambda: CancelEntry(**common),
             "cancel_entry": lambda: CancelEntry(**common),
             "request_partial_sell": lambda: RequestPartialSell(
@@ -694,12 +696,14 @@ class ConnectedOperatorService:
         symbol: str,
         expected_revision: int,
         enabled: bool,
+        is_ep: bool = False,
     ) -> dict[str, Any]:
         result = self.apply_board_action(
             command_id=command_id,
             action="activate_buy_today" if enabled else "deactivate_buy_today",
             symbol=symbol,
             expected_revision=expected_revision,
+            is_ep=is_ep,
         )
         # Keep the chart-planning endpoint's established public card shape;
         # the dedicated Buy Board endpoint uses the richer Kanban projection.

@@ -901,7 +901,12 @@ class BuylistActionsMixin:
             return
 
         payload = card_drag_payload(projection)
-        command = ActivateForToday(**_command_kwargs(payload))
+        from src.ui.buyboard.dialogs import prompt_buy_today_profile
+
+        is_ep = prompt_buy_today_profile(self, card.symbol)
+        if is_ep is None:
+            return
+        command = ActivateForToday(is_ep=is_ep, **_command_kwargs(payload))
         if not self._buyboard_dispatch_command(
             command,
             interaction_fingerprint=payload["state_fingerprint"],

@@ -252,6 +252,7 @@ class OrbCandidate:
     terminal_rejection: bool = False
     warnings: List[str] = field(default_factory=list)
     reason: str = ""
+    is_ep: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -298,6 +299,7 @@ class ExecutionQueueItem:
     order_id: Optional[str] = None
     last_updated: datetime = field(default_factory=_utc_now)
     warnings: List[str] = field(default_factory=list)
+    is_ep: bool = False
 
     def __post_init__(self) -> None:
         self.environment = _require_production_environment(self.environment)
@@ -307,6 +309,7 @@ class ExecutionQueueItem:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "symbol": self.symbol,
+            "is_ep": self.is_ep,
             "environment": self.environment,
             "account_no": self.account_no,
             "name": self.name,
@@ -352,6 +355,7 @@ class ExecutionQueueItem:
             last_updated = _utc_now()
         return cls(
             symbol=str(data.get("symbol", "")).upper(),
+            is_ep=data.get("is_ep") is True,
             environment=str(data.get("environment") or PRODUCTION_ENVIRONMENT).upper(),
             account_no=str(data.get("account_no") or "").strip(),
             name=str(data.get("name", "")),
@@ -570,10 +574,12 @@ def _candidate_unavailable(
     reason: str,
     *,
     source_session_date: Optional[str] = None,
+    is_ep: bool = False,
 ) -> OrbCandidate:
     return OrbCandidate(
         symbol=symbol.upper(),
         window=window,
+        is_ep=is_ep,
         source_session_date=source_session_date,
         status=status,
         valid=False,
@@ -700,13 +706,13 @@ def calculate_position_values(
 
 
 def validate_position_values(
-    sizing: Dict[str, Any], adr_percent: Optional[float]
+    sizing: Dict[str, Any], adr_percent: Optional[float], *, is_ep: bool = False
 ) -> List[str]:
-    return validate_orb_position_values(sizing, adr_percent)
+    return validate_orb_position_values(sizing, adr_percent, is_ep=is_ep)
 
 
-def score_orb_candidate(sizing: Dict[str, Any], risk_percent: float) -> float:
-    return score_orb_position_recommendation(sizing, risk_percent)
+def score_orb_candidate(sizing: Dict[str, Any], risk_percent: float, *, is_ep: bool = False) -> float:
+    return score_orb_position_recommendation(sizing, risk_percent, is_ep=is_ep)
 
 
 def build_orb_candidate(
@@ -725,6 +731,7 @@ def build_orb_candidate(
     lock_risk_percent: bool = False,
     execution_price: Optional[float] = None,
     execution_price_manual: bool = False,
+    is_ep: bool = False,
 ) -> OrbCandidate:
     symbol = str(symbol or "").upper()
     has_sizing_equity = _has_known_positive_sizing_equity(account_size)
@@ -734,10 +741,11 @@ def build_orb_candidate(
             window,
             OrbCandidateStatus.NOT_AVAILABLE,
             f"unsupported ORB window {window}",
+            is_ep=is_ep,
         )
     if intraday is None or intraday.empty:
         return _candidate_unavailable(
-            symbol, window, OrbCandidateStatus.NOT_AVAILABLE, "intraday data missing"
+            symbol, window, OrbCandidateStatus.NOT_AVAILABLE, "intraday data missing", is_ep=is_ep
         )
 
     source_session_date = _intraday_source_session_date(intraday)
@@ -767,6 +775,7 @@ def build_orb_candidate(
             status,
             reason,
             source_session_date=source_session_date,
+            is_ep=is_ep,
         )
 
     orb_high = float(orb_range.high)
@@ -780,6 +789,7 @@ def build_orb_candidate(
         return OrbCandidate(
             symbol=symbol,
             window=window,
+            is_ep=is_ep,
             orb_high=orb_high,
             orb_low=orb_low,
             breakout_price=breakout,
@@ -823,6 +833,7 @@ def build_orb_candidate(
         return OrbCandidate(
             symbol=symbol,
             window=window,
+            is_ep=is_ep,
             orb_high=orb_high,
             orb_low=orb_low,
             breakout_price=breakout,
@@ -879,8 +890,8 @@ def build_orb_candidate(
                 stop_price=candidate_stop,
                 adr_percent=adr_percent,
             )
-            if is_orb_position_plan_valid(_s, adr_percent):
-                _sc = score_orb_candidate(_s, _rc)
+            if is_orb_position_plan_valid(_s, adr_percent, is_ep=is_ep):
+                _sc = score_orb_candidate(_s, _rc, is_ep=is_ep)
                 if _sc > _best_score:
                     _best_score = _sc
                     _best_sizing = _s
@@ -898,8 +909,8 @@ def build_orb_candidate(
         )
     )
     risk_percent = _best_risk
-    warnings.extend(validate_position_values(sizing, adr_percent))
-    score = score_orb_candidate(sizing, risk_percent)
+    warnings.extend(validate_position_values(sizing, adr_percent, is_ep=is_ep))
+    score = score_orb_candidate(sizing, risk_percent, is_ep=is_ep)
 
     if warnings:
         terminal_rejection = (
@@ -908,6 +919,7 @@ def build_orb_candidate(
         return OrbCandidate(
             symbol=symbol,
             window=window,
+            is_ep=is_ep,
             orb_high=orb_high,
             orb_low=orb_low,
             breakout_price=breakout,
@@ -936,6 +948,7 @@ def build_orb_candidate(
     return OrbCandidate(
         symbol=symbol,
         window=window,
+        is_ep=is_ep,
         orb_high=orb_high,
         orb_low=orb_low,
         breakout_price=breakout,
@@ -1134,6 +1147,7 @@ class ExecutionQueueManager:
         current_price: Optional[float] = None,
         candidates: Optional[Dict[str, OrbCandidate]] = None,
         warnings: Optional[Iterable[str]] = None,
+        is_ep: bool = False,
     ) -> ExecutionQueueItem:
         symbol_key = str(symbol or "").upper()
         environment_key = _require_production_environment(environment)
@@ -1164,6 +1178,7 @@ class ExecutionQueueManager:
                 self._reset_for_account_reassignment(existing)
                 existing.account_no = requested_account
         existing.name = name or existing.name
+        existing.is_ep = is_ep
         existing.breakout_price = breakout_price
         existing.current_price = current_price
         if candidates is not None:
@@ -1186,6 +1201,7 @@ class ExecutionQueueManager:
                         "breakout_price",
                         "execution_price",
                         "score_version",
+                        "is_ep",
                     )
                 )
                 if not same_generation:
@@ -1241,6 +1257,7 @@ class ExecutionQueueManager:
         buffer_pct: float = DEFAULT_ORB_BUFFER_PCT,
         duplicate_pending_order: bool = False,
         force_buffer_pct: bool = False,
+        is_ep: bool = False,
     ) -> ExecutionQueueItem:
         symbol = str(getattr(item, "symbol", "")).upper()
         previous = self.get_item(symbol, environment)
@@ -1291,6 +1308,7 @@ class ExecutionQueueManager:
                 lock_risk_percent=(
                     use_saved_selection and selected_risk_percent is not None
                 ),
+                is_ep=is_ep,
             )
         queue_item = self.upsert_item(
             symbol=symbol,
@@ -1300,6 +1318,7 @@ class ExecutionQueueManager:
             breakout_price=breakout_price,
             current_price=current_price,
             candidates=candidates,
+            is_ep=is_ep,
         )
         if selected_window:
             selected_candidate = queue_item.candidates.get(selected_window)

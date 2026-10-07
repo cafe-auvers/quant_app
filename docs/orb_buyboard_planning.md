@@ -1,5 +1,13 @@
 # Buy Board ORB Planning
 
+Buy Today publication offers **Cancel**, **Publish to Buy Today**, and
+**Publish as EP**. Both publication choices use the same card and workflow.
+The EP label selects only the stop/ADR validity bounds and scoring ideal:
+normal defaults are 15% / 65% / 90%, and EP defaults are 50% / 100% / 150%.
+Both profiles can be edited in shared ORB settings on desktop and web/mobile.
+The ADR measurement, stop placement, position-sizing formula, and other entry
+and exit checks are unchanged. Previously saved cards use the normal profile.
+
 Buy Board prices are indicative observations, labelled with their source, timestamp,
 and age. When Yahoo is delayed or a refresh fails, the last available price remains
 visible. Estimated P&L and distance to the active stop also remain visible, marked

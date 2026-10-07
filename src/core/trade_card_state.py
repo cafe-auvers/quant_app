@@ -232,6 +232,7 @@ class TradeCardState:
     # allows the execution owner to materialize a missing local key safely.
     kis_ws_symbol_key: str = ""
     breakout_price: Optional[float] = None
+    is_ep: bool = False
     selected_orb_window: Optional[str] = None
     buffer_pct: float = 0.001
     # Canonical account-risk *fraction*: 0.01 means 1%.  The historical name
@@ -606,6 +607,7 @@ class TradeCardState:
             "rejected_orb_snapshot": self.rejected_orb_snapshot,
             "kis_ws_symbol_key": self.kis_ws_symbol_key,
             "breakout_price": self.breakout_price,
+            "is_ep": self.is_ep,
             "selected_orb_window": self.selected_orb_window,
             "buffer_pct": self.buffer_pct,
             "risk_percent": self.risk_percent,
@@ -741,6 +743,7 @@ class TradeCardState:
             rejected_orb_snapshot=dict(data.get("rejected_orb_snapshot") or {}),
             kis_ws_symbol_key=str(data.get("kis_ws_symbol_key", "")),
             breakout_price=data.get("breakout_price"),
+            is_ep=data.get("is_ep") is True,
             selected_orb_window=data.get("selected_orb_window"),
             buffer_pct=data.get("buffer_pct", 0.001),
             risk_percent=_persisted_risk_fraction(data),

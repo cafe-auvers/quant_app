@@ -485,7 +485,7 @@ def _revalidate_and_approve(
         ),
         "sl_adr": card.stop_adr,
     }
-    if not reasons and not is_orb_position_plan_valid(sizing, adr_percent=None):
+    if not reasons and not is_orb_position_plan_valid(sizing, adr_percent=None, is_ep=card.is_ep):
         reasons.append(
             f"Order fingerprint fails ORB position bounds: "
             f"capital_percent={sizing['capital_percent']:.1f}%, sl_adr={card.stop_adr}"

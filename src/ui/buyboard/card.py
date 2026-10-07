@@ -504,7 +504,8 @@ class TradeCardWidget(QFrame):
 
         header = QLabel(
             f"<b>{html.escape(card.symbol)}</b>  "
-            f"<span style='color:#888;'>{html.escape(card.name)}</span>"
+            + ("<b style='color:#b8860b;'>EP</b>  " if card.is_ep else "")
+            + f"<span style='color:#888;'>{html.escape(card.name)}</span>"
         )
         layout.addWidget(header)
 

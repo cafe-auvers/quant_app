@@ -202,6 +202,14 @@ class BuylistExecutionController(WindowController):
                 duplicate_order = bool(
                     broker_has_open_order and not queue_has_working_order
                 )
+                is_ep = False
+                if request.trade_card_engine is not None:
+                    from src.services.trade_card_repository import get_trade_card
+
+                    canonical = get_trade_card(
+                        request.trade_card_engine, request.env, item_account_no, symbol
+                    )
+                    is_ep = canonical is not None and canonical.is_ep
                 queue_item = request.manager.build_or_update_from_watchlist_item(
                     planning_item,
                     {"1m": one_minute, "5m": five_minute, "30m": five_minute},
@@ -217,6 +225,7 @@ class BuylistExecutionController(WindowController):
                     # per-symbol buffer. Legacy imported plan data may keep
                     # its risk/window lock but cannot override this value.
                     force_buffer_pct=True,
+                    is_ep=is_ep,
                 )
                 sync = self.apply_execution_queue_item_to_buylist(
                     queue_item,

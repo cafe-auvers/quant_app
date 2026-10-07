@@ -161,6 +161,29 @@ def test_empty_target_items_returns_zero_and_preserves_missing_symbols():
     assert result.failures == []
 
 
+def test_queue_refresh_reads_ep_choice_from_canonical_card(tmp_path, monkeypatch):
+    engine = create_engine(f"sqlite:///{tmp_path / 'ep-profile.db'}")
+    monkeypatch.setattr(trade_card_repository, "LOCAL_TRADE_CARDS_FILE", tmp_path / "cards.json")
+    trade_card_repository.create_trade_card(engine, TradeCardState(
+        environment="PROD", account_no="12345678", symbol="AAPL", is_ep=True,
+        board_status=BoardStatus.BUY_TODAY, buylist_member=True, breakout_price=100,
+    ))
+    manager = FakeQueueManager()
+    captured = []
+    original = manager.build_or_update_from_watchlist_item
+
+    def build(*args, **kwargs):
+        captured.append(kwargs["is_ep"])
+        return original(*args, **kwargs)
+
+    manager.build_or_update_from_watchlist_item = build
+    result = BuylistExecutionController(SimpleNamespace()).refresh_execution_queue(
+        _request(manager=manager, trade_card_engine=engine)
+    )
+    assert result.refreshed == 1 and result.failures == []
+    assert captured == [True]
+
+
 @pytest.mark.parametrize("fence", ["none", "current_identity", "broker_order", "owned_order"])
 def test_queue_refresh_retires_only_a_completed_previous_cycle(tmp_path, monkeypatch, fence):
     from src.core.execution_queue import ExecutionQueueManager

@@ -228,6 +228,8 @@ def orb_candidate_plan_id(candidate: Any) -> str:
         "stop_adr": _finite_float(getattr(candidate, "stop_adr", None)),
         "risk_percent": _finite_float(getattr(candidate, "risk_percent", None)),
     }
+    if getattr(candidate, "is_ep", False) is True:
+        payload["is_ep"] = True
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return f"ORB:{hashlib.sha256(encoded.encode('utf-8')).hexdigest()}"
 
@@ -322,6 +324,7 @@ def assess_orb_entry_candidate(
                         "sl_adr": stop_adr,
                     },
                     adr_percent=None,
+                    is_ep=getattr(candidate, "is_ep", False) is True,
                 )
             )
         reasons.extend(

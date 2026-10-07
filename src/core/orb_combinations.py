@@ -347,14 +347,14 @@ def build_orb_position_combinations(
             ):
                 invalid_reasons.append("Execution/stop geometry is invalid")
             invalid_reasons.extend(
-                validate_orb_position_values(sizing, adr_percent)
+                validate_orb_position_values(sizing, adr_percent, is_ep=queue_item.is_ep)
             )
             # Preserve order while removing duplicate explanations.
             invalid_reasons = list(dict.fromkeys(invalid_reasons))
             valid = not invalid_reasons and is_orb_position_plan_valid(
-                sizing, adr_percent
+                sizing, adr_percent, is_ep=queue_item.is_ep
             )
-            score = score_orb_position_recommendation(sizing, risk_percent)
+            score = score_orb_position_recommendation(sizing, risk_percent, is_ep=queue_item.is_ep)
             reason = (
                 "; ".join(invalid_reasons)
                 if invalid_reasons

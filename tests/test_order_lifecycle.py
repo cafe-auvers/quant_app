@@ -2094,6 +2094,7 @@ def test_buylist_activate_explicitly_retires_legacy_entry(monkeypatch):
 
 
 def test_buylist_activation_dispatches_buy_today_kanban_command(monkeypatch):
+    monkeypatch.setattr("src.ui.buyboard.dialogs.prompt_buy_today_profile", lambda *_args: False)
     from src.core.board_workflow import BoardCardProjection
     from src.core.trade_card_state import BoardStatus, TradeCardState
     from src.ui.buyboard.drag_commands import ActivateForToday

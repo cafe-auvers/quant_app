@@ -284,7 +284,7 @@ def test_orb_position_validity_requires_capital_percent_between_10_and_30():
     assert MainWindow._orb_position_plan_is_valid(too_large, adr_percent=10.0) is False
 
 
-def test_orb_position_validity_requires_sl_adr_between_15_and_66():
+def test_orb_position_validity_requires_sl_adr_between_15_and_90():
     too_low = {
         "shares": 2.0,
         "capital_percent": 20.0,
@@ -300,8 +300,8 @@ def test_orb_position_validity_requires_sl_adr_between_15_and_66():
     too_high = {
         "shares": 2.0,
         "capital_percent": 20.0,
-        "stop_loss_percent": 6.7,
-        "sl_adr": 67.0,
+        "stop_loss_percent": 9.01,
+        "sl_adr": 90.1,
     }
 
     assert MainWindow._orb_position_plan_is_valid(too_low, adr_percent=10.0) is False
@@ -1941,7 +1941,8 @@ def test_tradingview_navigation_load_discards_stale_symbol(monkeypatch):
     assert loads == [{"force": True}]
 
 
-def test_tradingview_activate_dispatches_buyboard_command_without_legacy_monitor():
+def test_tradingview_activate_dispatches_buyboard_command_without_legacy_monitor(monkeypatch):
+    monkeypatch.setattr("src.ui.buyboard.dialogs.prompt_buy_today_profile", lambda *_args: False)
     from src.core.board_workflow import BoardCardProjection
     from src.core.trade_card_state import BoardStatus, TradeCardState
     from src.ui.buyboard.drag_commands import ActivateForToday

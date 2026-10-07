@@ -175,7 +175,8 @@ def test_queue_toggle_promotes_a_standalone_breakout_to_buylist():
 
 
 @pytest.mark.parametrize("status", [BoardStatus.BUYLIST, BoardStatus.CLOSED])
-def test_activate_toggle_uses_only_canonical_card_and_exact_fences(status):
+def test_activate_toggle_uses_only_canonical_card_and_exact_fences(status, monkeypatch):
+    monkeypatch.setattr("src.ui.buyboard.dialogs.prompt_buy_today_profile", lambda *_args: False)
     window = _Window([_projection(status=status)])
 
     window._chart_activate_toggle("WEX")

@@ -705,7 +705,11 @@ def _handle_card_dropped(main_window, payload: dict, target_status: BoardStatus)
         else:
             command = MoveToBuylist(**common)
     elif target_status == BoardStatus.BUY_TODAY:
+        is_ep = dialogs.prompt_buy_today_profile(main_window, card.symbol)
+        if is_ep is None:
+            return
         command = ActivateForToday(
+            is_ep=is_ep,
             **common
         )
     elif target_status == BoardStatus.OPEN_POSITION:
@@ -1221,7 +1225,10 @@ def _handle_card_context_menu(main_window, payload: dict, global_pos) -> None:
         return
 
     if chosen is actions.get("activate"):
-        command = ActivateForToday(**common)
+        is_ep = dialogs.prompt_buy_today_profile(main_window, card.symbol)
+        if is_ep is None:
+            return
+        command = ActivateForToday(is_ep=is_ep, **common)
         main_window._buyboard_dispatch_command(
             command, interaction_fingerprint=interaction_fingerprint
         )

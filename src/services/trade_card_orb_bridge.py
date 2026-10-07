@@ -112,6 +112,8 @@ def _complete_candidate_for_card(
     candidate,
 ) -> bool:
     """Validate one persisted candidate before a live event can select it."""
+    if card.is_ep != execution_queue_item.is_ep or card.is_ep != getattr(candidate, "is_ep", False):
+        return False
 
     window = str(getattr(candidate, "window", "") or "").strip()
     execution_price = _positive_float(
@@ -918,6 +920,11 @@ class TradeCardOrbEvaluator:
 
         if execution_queue_item.name and not card.name:
             card.name = execution_queue_item.name
+        if card.is_ep != execution_queue_item.is_ep:
+            _clear_entry_plan(card)
+            card.entry_runtime_status = EntryRuntimeStatus.DATA_UNAVAILABLE
+            card.entry_block_reason = "ORB execution blocked: waiting for the published stop/ADR profile"
+            return card
         canonical_breakout = _positive_float(card.breakout_price)
         queue_breakout = _positive_float(execution_queue_item.breakout_price)
         if (

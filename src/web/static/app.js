@@ -35,7 +35,10 @@
     capital_max_percent: 30,
     stop_adr_min_percent: 15,
     stop_adr_ideal_percent: 65,
-    stop_adr_max_percent: 66,
+    stop_adr_max_percent: 90,
+    ep_stop_adr_min_percent: 50,
+    ep_stop_adr_ideal_percent: 100,
+    ep_stop_adr_max_percent: 150,
   });
 
   function loadDisplayPreferences() {
@@ -469,6 +472,9 @@
     stop_adr_min_percent: 'orb-stop-adr-min',
     stop_adr_ideal_percent: 'orb-stop-adr-ideal',
     stop_adr_max_percent: 'orb-stop-adr-max',
+    ep_stop_adr_min_percent: 'orb-ep-stop-adr-min',
+    ep_stop_adr_ideal_percent: 'orb-ep-stop-adr-ideal',
+    ep_stop_adr_max_percent: 'orb-ep-stop-adr-max',
   });
 
   function canEditOrbSettings() {
@@ -513,11 +519,13 @@
       || values.capital_min_percent === values.capital_max_percent) {
       throw new Error('Capital ideal must be between distinct lower and upper bounds.');
     }
-    if (values.stop_adr_min_percent < 0
-      || !(values.stop_adr_min_percent <= values.stop_adr_ideal_percent
-        && values.stop_adr_ideal_percent <= values.stop_adr_max_percent)
-      || values.stop_adr_min_percent === values.stop_adr_max_percent) {
-      throw new Error('Stop / ADR ideal must be between distinct non-negative bounds.');
+    for (const prefix of ['', 'ep_']) {
+      const lower = values[`${prefix}stop_adr_min_percent`];
+      const ideal = values[`${prefix}stop_adr_ideal_percent`];
+      const upper = values[`${prefix}stop_adr_max_percent`];
+      if (lower < 0 || !(lower <= ideal && ideal <= upper) || lower === upper) {
+        throw new Error(`${prefix ? 'EP' : 'Normal'} Stop / ADR ideal must be between distinct non-negative bounds.`);
+      }
     }
     return values;
   }
@@ -536,7 +544,7 @@
     renderOrbSettingsAccess();
     try {
       const result = await api('/api/v1/operator/orb-settings');
-      state.orbSettings = {...result.settings};
+      state.orbSettings = {...ORB_SETTINGS_DEFAULTS, ...result.settings};
       state.orbSettingsRevision = Number(result.revision || 0);
       setOrbSettingsInputs(state.orbSettings);
       status.textContent = canEditOrbSettings()
@@ -868,6 +876,7 @@
     top.className = 'mobile-kanban-card-top';
     const symbol = document.createElement('strong');
     symbol.textContent = row.symbol;
+    if (row.is_ep) symbol.textContent += ' · EP';
     const priority = document.createElement('small');
     priority.textContent = row._pendingAction ? 'SYNCING' : `P${Number(row.kanban_priority || 0)}`;
     top.append(symbol, priority);
@@ -1183,6 +1192,7 @@
 
   function optimisticBoardAction(row, action, payload) {
     const next = {...row, _pendingAction: action};
+    if (action === 'activate_buy_today') next.is_ep = Boolean(payload.is_ep);
     const target = {
       activate_buy_today: 'BUY_TODAY',
       deactivate_buy_today: 'BUYLIST',
@@ -1255,7 +1265,11 @@
       request_partial_sell: [`Request a partial sell for ${symbol}?`, `Request ${payload.quantity} share${Number(payload.quantity) === 1 ? '' : 's'} as durable exit intent.`, 'Request partial sell'],
       request_sell_all: [`Sell all of ${symbol}?`, 'This records durable liquidation intent. The Execution Owner may submit it only after the workflow gates pass.', 'Request Sell All'],
     };
-    if (confirmations[action]) {
+    if (action === 'activate_buy_today') {
+      const choice = await confirmBuyTodayPublication(symbol, confirmations[action][1]);
+      if (!choice) return;
+      payload = {...payload, is_ep: choice === 'ep'};
+    } else if (confirmations[action]) {
       const accepted = await confirmOperatorAction(...confirmations[action]);
       if (!accepted) return;
     }
@@ -1356,16 +1370,29 @@
     byId('operator-confirm-dialog').hidden = true;
     const resolve = operatorConfirmResolve;
     operatorConfirmResolve = null;
-    if (resolve) resolve(Boolean(accepted));
+    if (resolve) resolve(accepted);
   }
 
-  function confirmOperatorAction(title, copy, confirmLabel = 'Confirm') {
+  function confirmOperatorAction(title, copy, confirmLabel = 'Confirm', epChoice = false) {
     if (operatorConfirmResolve) closeOperatorConfirm(false);
     byId('operator-confirm-title').textContent = title;
     byId('operator-confirm-copy').textContent = copy;
     byId('operator-confirm-submit').textContent = confirmLabel;
+    byId('operator-confirm-ep').hidden = !epChoice;
+    byId('operator-confirm-ep').parentElement.classList.toggle('has-ep-choice', epChoice);
     byId('operator-confirm-dialog').hidden = false;
     return new Promise(resolve => { operatorConfirmResolve = resolve; });
+  }
+
+  function confirmBuyTodayPublication(symbol, copy) {
+    const settings = {...ORB_SETTINGS_DEFAULTS, ...state.orbSettings};
+    const bounds = prefix => ['min', 'ideal', 'max']
+      .map(bound => `${Number(settings[`${prefix}stop_adr_${bound}_percent`])}%`).join(' / ');
+    return confirmOperatorAction(
+      `Publish ${symbol} to Buy Today?`,
+      `${copy}\n\nStop/ADR lower / ideal / upper\nNormal: ${bounds('')}\nEP: ${bounds('ep_')}`,
+      'Publish to Buy Today', true,
+    );
   }
 
   async function refreshStatusStrip() {
@@ -3410,7 +3437,8 @@
       && Boolean(card?.breakout_price) && operatorBuyTodayEnabled
     );
     const displayStage = card?.display_stage || card?.canonical_stage || card?.stage || 'NOT PLANNED';
-    byId('plan-stage').textContent = displayStage;
+    byId('plan-stage').textContent = `${displayStage}${card?.is_ep ? ' · EP' : ''}`;
+    byId('chart-entry-profile').hidden = !card?.is_ep;
     byId('plan-revision').textContent = operatorPending()
       ? `Revision ${card?.version || 0} · Queued`
       : busy || state.breakoutSaving
@@ -3641,6 +3669,7 @@
     const previousPlan = {...state.plan};
     const previousBuyTodayRow = state.buyTodayRows.find(row => row.symbol === actionSymbol);
     const enabled = !canonicalBuyTodayActive(previousPlan);
+    let isEp = false;
     const operation = enabled ? 'activate_buy_today' : 'deactivate_buy_today';
     if (!operatorOperationEnabled(operation)) {
       setPanel('Mobile operator control is not available for this action.', 'error');
@@ -3648,16 +3677,17 @@
     }
     if (enabled) {
       const reentry = (previousPlan.canonical_stage || previousPlan.stage) === 'CLOSED';
-      const confirmed = await confirmOperatorAction(
-        reentry ? `Re-enter ${actionSymbol} through Buy Today?` : `Publish ${actionSymbol} to Buy Today?`,
+      const confirmed = await confirmBuyTodayPublication(
+        actionSymbol,
         reentry
-          ? 'This starts a new trade cycle after a fully reconciled exit. The Execution Owner may buy again when current ORB, fresh market data, risk, capital and broker checks pass. It does not automatically repeat after another stop.'
+          ? `Re-enter ${actionSymbol}: This starts a new trade cycle after a fully reconciled exit. The Execution Owner may buy again when current ORB, fresh market data, risk, capital and broker checks pass. It does not automatically repeat after another stop.`
           : 'This creates executable intent on the shared Buy Board. It does not place an order now, but the Execution Owner may act later when every runtime, risk, market-data, and broker gate passes.',
-        'Publish to Buy Today',
       );
       if (!confirmed) return;
+      isEp = confirmed === 'ep';
     }
     const optimistic = optimisticBuyTodayPlan(previousPlan, enabled, actionSymbol);
+    if (enabled) optimistic.is_ep = isEp;
     const requestId = commandId();
     state.planningPendingSymbols.add(actionSymbol);
     bumpPlanningEpoch(actionSymbol);
@@ -3675,6 +3705,7 @@
           command_id: requestId,
           expected_revision: previousPlan.version,
           enabled,
+          is_ep: isEp,
         }),
       });
       queued = Boolean(result.queued);
@@ -4156,7 +4187,13 @@
     });
     byId('buy-board-action-value').addEventListener('input', event => event.target.setCustomValidity(''));
     byId('operator-confirm-cancel').addEventListener('click', () => closeOperatorConfirm(false));
+    byId('desktop-orb-settings').addEventListener('click', () => {
+      setMobilePage('summary');
+      void loadOrbSettings();
+    });
+    byId('desktop-orb-settings-close').addEventListener('click', () => setMobilePage('chart'));
     byId('operator-confirm-submit').addEventListener('click', () => closeOperatorConfirm(true));
+    byId('operator-confirm-ep').addEventListener('click', () => closeOperatorConfirm('ep'));
     byId('operator-confirm-dialog').addEventListener('pointerdown', event => {
       if (event.target === byId('operator-confirm-dialog')) closeOperatorConfirm(false);
     });

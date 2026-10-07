@@ -1535,6 +1535,9 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
             card.entry_attempt_group_id = ""
             card.entry_attempt_count = 0
     elif isinstance(command, types.ActivateForToday):
+        if card.is_ep != command.is_ep:
+            clear_executable_entry_plan()
+        card.is_ep = command.is_ep
         card.board_status_updated_at = command.requested_at
         card.buy_today_note = ""
         card.last_buy_today_session_date = None

@@ -23,7 +23,10 @@ class OrbSettings:
     capital_max_percent: float = DEFAULT_MAX_CAPITAL_PERCENT
     stop_adr_min_percent: float = 15.0
     stop_adr_ideal_percent: float = 65.0
-    stop_adr_max_percent: float = 66.0
+    stop_adr_max_percent: float = 90.0
+    ep_stop_adr_min_percent: float = 50.0
+    ep_stop_adr_ideal_percent: float = 100.0
+    ep_stop_adr_max_percent: float = 150.0
 
     def __post_init__(self) -> None:
         values = tuple(asdict(self).values())
@@ -49,6 +52,21 @@ class OrbSettings:
             raise ValueError("Capital lower bound must be below its upper bound")
         if self.stop_adr_min_percent >= self.stop_adr_max_percent:
             raise ValueError("Stop/ADR lower bound must be below its upper bound")
+        if not (
+            0 <= self.ep_stop_adr_min_percent
+            <= self.ep_stop_adr_ideal_percent
+            <= self.ep_stop_adr_max_percent
+        ):
+            raise ValueError("EP Stop/ADR ideal must be between non-negative bounds")
+        if self.ep_stop_adr_min_percent >= self.ep_stop_adr_max_percent:
+            raise ValueError("EP Stop/ADR lower bound must be below its upper bound")
+
+    def stop_adr_bounds(self, is_ep: bool = False) -> tuple[float, float, float]:
+        prefix = "ep_" if is_ep else ""
+        return tuple(
+            getattr(self, f"{prefix}stop_adr_{bound}_percent")
+            for bound in ("min", "ideal", "max")
+        )
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any] | None) -> "OrbSettings":
@@ -77,6 +95,15 @@ class OrbSettings:
                 ),
                 stop_adr_max_percent=float(
                     values.get("stop_adr_max_percent", defaults.stop_adr_max_percent)
+                ),
+                ep_stop_adr_min_percent=float(
+                    values.get("ep_stop_adr_min_percent", defaults.ep_stop_adr_min_percent)
+                ),
+                ep_stop_adr_ideal_percent=float(
+                    values.get("ep_stop_adr_ideal_percent", defaults.ep_stop_adr_ideal_percent)
+                ),
+                ep_stop_adr_max_percent=float(
+                    values.get("ep_stop_adr_max_percent", defaults.ep_stop_adr_max_percent)
                 ),
             )
         except (TypeError, ValueError, OverflowError):
@@ -195,9 +222,12 @@ def is_orb_position_plan_valid(
     sizing: Dict[str, Any],
     adr_percent: Optional[float],
     settings: Mapping[str, Any] | OrbSettings | None = None,
+    *,
+    is_ep: bool = False,
 ) -> bool:
     """Apply the configured ORB validity bounds."""
     orb_settings = _resolve_orb_settings(settings)
+    lower, _ideal, upper = orb_settings.stop_adr_bounds(is_ep)
     if sizing.get("shares", 0.0) < 1.0:
         return False
     capital_percent = sizing.get("capital_percent", 0.0)
@@ -208,15 +238,16 @@ def is_orb_position_plan_valid(
         return False
     stop_loss_percent = sizing.get("stop_loss_percent", 0.0)
     if (
-        adr_percent is not None
+        not is_ep
+        and adr_percent is not None
         and adr_percent > 0
         and stop_loss_percent >= adr_percent
     ):
         return False
     sl_adr = sizing.get("sl_adr")
     if sl_adr is not None and (
-        sl_adr < orb_settings.stop_adr_min_percent
-        or sl_adr > orb_settings.stop_adr_max_percent
+        sl_adr < lower
+        or sl_adr > upper
     ):
         return False
     return True
@@ -226,9 +257,12 @@ def validate_orb_position_values(
     sizing: Dict[str, Any],
     adr_percent: Optional[float],
     settings: Mapping[str, Any] | OrbSettings | None = None,
+    *,
+    is_ep: bool = False,
 ) -> List[str]:
     """Return human-readable warnings for the configured ORB bounds."""
     orb_settings = _resolve_orb_settings(settings)
+    lower, _ideal, upper = orb_settings.stop_adr_bounds(is_ep)
     warnings: List[str] = []
     shares = int(sizing.get("shares", 0) or 0)
     capital_percent = float(sizing.get("capital_percent", 0.0) or 0.0)
@@ -247,22 +281,22 @@ def validate_orb_position_values(
             f"Capital allocation ({capital_percent:.2f}%) exceeds "
             f"{orb_settings.capital_max_percent:g}%"
         )
-    if adr_percent is not None and adr_percent > 0 and stop_loss_percent >= adr_percent:
+    if not is_ep and adr_percent is not None and adr_percent > 0 and stop_loss_percent >= adr_percent:
         warnings.append(
             f"Stop loss % ({stop_loss_percent:.2f}%) is wider than ADR "
             f"({adr_percent:.2f}%)"
         )
     if stop_adr is not None:
         stop_adr_value = float(stop_adr)
-        if stop_adr_value < orb_settings.stop_adr_min_percent:
+        if stop_adr_value < lower:
             warnings.append(
                 f"Stop/ADR ({stop_adr_value:.2f}%) is below "
-                f"{orb_settings.stop_adr_min_percent:g}%"
+                f"{lower:g}%"
             )
-        elif stop_adr_value > orb_settings.stop_adr_max_percent:
+        elif stop_adr_value > upper:
             warnings.append(
                 f"Stop/ADR ({stop_adr_value:.2f}%) exceeds "
-                f"{orb_settings.stop_adr_max_percent:g}%"
+                f"{upper:g}%"
             )
     return warnings
 
@@ -271,9 +305,12 @@ def score_orb_position_recommendation(
     sizing: Dict[str, Any],
     risk_percent: float,
     settings: Mapping[str, Any] | OrbSettings | None = None,
+    *,
+    is_ep: bool = False,
 ) -> float:
     """Score an ORB plan using the configured ideal values."""
     orb_settings = _resolve_orb_settings(settings)
+    _lower, ideal, _upper = orb_settings.stop_adr_bounds(is_ep)
     sl_adr = sizing.get("sl_adr")
     capital_percent = sizing.get("capital_percent", 0.0)
     if sl_adr is None:
@@ -281,7 +318,7 @@ def score_orb_position_recommendation(
     sl_adr_score = max(
         0.0,
         100.0
-        - abs(float(sl_adr) - orb_settings.stop_adr_ideal_percent) * 3.0,
+        - abs(float(sl_adr) - ideal) * 3.0,
     )
     capital_score = max(
         0.0,
