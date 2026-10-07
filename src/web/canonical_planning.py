@@ -371,6 +371,10 @@ class CanonicalPlanningSource:
             "buylist_member": buylist_member,
             "buy_today_member": buy_today_member,
             "buy_today_display_member": buy_today_display_member,
+            "entry_cancellation_pending": bool(
+                card.entry_block_reason == "cancel_requested"
+                or card.entry_cancel_in_flight
+            ),
             "purchase_status": purchase_status,
             "broker_quantity": quantity,
             "entry_remaining_target_quantity": remaining,
@@ -488,6 +492,7 @@ class CanonicalPlanningSource:
                 or card.entry_submission_unresolved
             ),
             "entry_cancel_in_flight": bool(card.entry_cancel_in_flight),
+            "entry_remaining_target_quantity": max(0, int(card.entry_remaining_target_quantity or 0)),
             "planned_quantity": max(0, int(card.planned_quantity or 0)),
             "target_position_quantity": max(
                 0, int(card.target_position_quantity or 0)

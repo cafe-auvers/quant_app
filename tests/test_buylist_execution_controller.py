@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 import src.ui.controllers.buylist_execution_controller as controller_module
 from sqlalchemy import create_engine
 from sqlalchemy.pool import NullPool
@@ -157,6 +159,35 @@ def test_empty_target_items_returns_zero_and_preserves_missing_symbols():
     assert result.target_count == 0
     assert result.missing_symbols == ["ZZZ"]
     assert result.failures == []
+
+
+@pytest.mark.parametrize("fence", ["none", "current_identity", "broker_order", "owned_order"])
+def test_queue_refresh_retires_only_a_completed_previous_cycle(tmp_path, monkeypatch, fence):
+    from src.core.execution_queue import ExecutionQueueManager
+    from src.core.execution_order_record import ExecutionOrderStatus
+    from src.services import execution_order_repository
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'fresh-cycle.db'}", future=True)
+    trade_card_repository.ensure_trade_cards_table(engine)
+    monkeypatch.setattr(trade_card_repository, "LOCAL_TRADE_CARDS_FILE", tmp_path / "cards.json")
+    trade_card_repository.create_trade_card(engine, TradeCardState(
+        environment="PROD", account_no="12345678", symbol="AAPL",
+        board_status=BoardStatus.BUY_TODAY, buylist_member=True, breakout_price=100,
+        entry_client_order_id="current-buy" if fence == "current_identity" else "",
+    ))
+    orders = [SimpleNamespace(status=ExecutionOrderStatus.WORKING)] if fence == "owned_order" else []
+    monkeypatch.setattr(execution_order_repository, "list_execution_orders_for_card", lambda *args, **kwargs: orders)
+    queue = ExecutionQueueManager()
+    item = queue.upsert_item(symbol="AAPL", account_no="12345678")
+    queue.mark_order_filled("AAPL")
+    result = BuylistExecutionController(SimpleNamespace()).refresh_execution_queue(_request(
+        manager=queue, trade_card_engine=engine,
+        has_duplicate_open_order=lambda *args: fence == "broker_order",
+        load_intraday_interval=lambda *args: None,
+    ))
+    assert result.failures == [] and result.refreshed == 1
+    assert item.locked == (fence != "none")
+    assert item.order_status == (None if fence == "none" else "FILLED")
 
 
 def test_missing_manager_with_targets_returns_failure():

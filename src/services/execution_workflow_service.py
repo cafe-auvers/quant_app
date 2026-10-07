@@ -1348,6 +1348,16 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
             card.entry_client_order_id = ""
             card.entry_pending_attempt_number = 0
             card.entry_submission_unresolved = False
+        elif card.board_status == BoardStatus.OPEN_POSITION and card.entry_remaining_target_quantity > 0:
+            if card.entry_client_order_id:
+                card.entry_block_reason = "cancel_requested"
+            else:
+                card.entry_remaining_target_quantity = 0
+                card.position_runtime_status = PositionRuntimeStatus.OPEN
+                card.entry_runtime_status = None
+                card.entry_block_reason = ""
+                card.next_retry_at = None
+                card.entry_attempt_group_id = ""
         elif card.board_status in (BoardStatus.BUY_TODAY, BoardStatus.ENTRY_PENDING):
             card.entry_block_reason = "cancel_requested"
         else:

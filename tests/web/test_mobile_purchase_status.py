@@ -80,7 +80,7 @@ def select_purchase(page, symbol):
 
 
 @pytest.mark.parametrize("width", [320, 390, 1400])
-def test_purchase_badge_visible_on_chart_and_list_without_enabling_cancel(width, tmp_path, browser_event_loop):
+def test_purchase_badge_visible_and_cancel_targets_only_remaining_entry(width, tmp_path, browser_event_loop):
     playwright = pytest.importorskip("playwright.sync_api")
     with playwright.sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
@@ -94,8 +94,12 @@ def test_purchase_badge_visible_on_chart_and_list_without_enabling_cancel(width,
             page.wait_for_function("status => document.querySelector('#chart-purchase-status').dataset.status === status", arg=status)
             assert badge.is_visible()
             assert "Bought" in badge.inner_text() or "bought" in badge.inner_text() or status == "ENTRY_PENDING"
-            assert "Cancel Today" not in page.locator("#quick-buy-today").inner_text()
-            if status != "SOLD":
+            if status in {"ENTRY_PENDING", "PARTIALLY_BOUGHT"}:
+                assert page.locator("#quick-buy-today").inner_text() == "Cancel Today"
+                assert page.locator("#quick-buy-today").is_enabled()
+            else:
+                assert "Cancel Today" not in page.locator("#quick-buy-today").inner_text()
+            if status == "BOUGHT":
                 assert page.locator("#quick-buy-today").is_disabled()
             if symbol in {"FILL", "PART"}:
                 assert "shares at $12.50 average" in badge.get_attribute("aria-label")
@@ -132,7 +136,7 @@ def test_live_fill_refresh_keeps_selected_buy_today_chart_and_marks_partial_then
             page.wait_for_function("status => document.querySelector('#chart-purchase-status').dataset.status === status", arg=status)
             assert page.locator("#active-symbol").inner_text() == "WAIT"
             assert page.locator('[data-mobile-list="buy_today"]').get_attribute("aria-selected") == "true"
-            assert page.locator("#quick-buy-today").is_disabled()
+            assert page.locator("#quick-buy-today").is_disabled() == (remaining == 0)
         page.locator("#mobile-list-menu").click()
         assert page.locator('[data-mobile-symbol="WAIT"] [data-purchase-status="BOUGHT"]').is_visible()
         assert state["errors"] == [] and state["mutations"] == []

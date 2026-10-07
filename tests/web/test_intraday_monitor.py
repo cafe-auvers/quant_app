@@ -126,6 +126,22 @@ def test_breakout_equal_to_orh_fails_passive_position_geometry_only():
     assert "execution zone" in row["orb"][0]["position_reason"]
 
 
+def test_be_breakout_edit_recalculates_zone_using_the_same_observed_range():
+    frame = bars(high=290.241, low=284.775, close=291.85)
+    card = {"symbol": "BE", "breakout_price": 293.19, "buylist_member": True}
+    rejected = evaluate(frame, card=card, adr=6)
+    first = rejected["orb"][0]
+    assert first["position_status"] == "FAIL"
+    assert "breakout $293.19, range high $290.241" in first["position_reason"]
+    card["breakout_price"] = 289
+    rebuilt = evaluate(frame, card=card, adr=6)["orb"][0]
+    assert rebuilt["high"] == first["high"] == 290.241
+    assert rebuilt["low"] == first["low"] == 284.775
+    assert rebuilt["breakout_trigger"] == 290.241
+    assert "execution zone" not in rebuilt["position_reason"]
+    assert rebuilt["position_status"] == "PASS"
+
+
 def test_premarket_does_not_confirm_regular_session_breakouts():
     frame = bars(until="09:30")
     frame.index = pd.date_range(moment("08:00"), periods=len(frame), freq="min")

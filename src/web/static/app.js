@@ -1112,16 +1112,22 @@
     const actions = byId('buy-board-action-buttons');
     const fragment = document.createDocumentFragment();
     const pending = state.buyBoardPendingActions.has(row.symbol);
+    const cancellingEntry = row.entry_block_reason === 'cancel_requested' || row.entry_cancel_in_flight;
     if (row.board_status === 'BUYLIST') {
       fragment.append(
         boardActionButton('Activate Buy Today', 'activate_buy_today', {disabled: pending || !row.breakout_price}),
         boardActionButton('Remove from Buylist', 'remove_buylist', {secondary: true, disabled: pending}),
       );
     } else if (row.board_status === 'BUY_TODAY') {
-      fragment.append(boardActionButton('Return to Buylist', 'deactivate_buy_today', {secondary: true, disabled: pending}));
+      fragment.append(boardActionButton(cancellingEntry ? 'Cancelling…' : 'Return to Buylist', 'deactivate_buy_today', {secondary: true, disabled: pending || cancellingEntry}));
     } else if (row.board_status === 'ENTRY_PENDING') {
-      fragment.append(boardActionButton('Cancel Entry', 'cancel_entry', {danger: true, disabled: pending}));
+      fragment.append(boardActionButton(cancellingEntry ? 'Cancelling…' : 'Cancel Entry', 'cancel_entry', {danger: true, disabled: pending || cancellingEntry}));
     } else if (row.board_status === 'OPEN_POSITION') {
+      if (Number(row.entry_remaining_target_quantity) > 0) {
+        fragment.append(boardActionButton(cancellingEntry ? 'Cancelling…' : 'Cancel remaining buy', 'cancel_entry', {
+          secondary: true, disabled: pending || cancellingEntry,
+        }));
+      }
       fragment.append(
         boardActionButton('Partial Sell', 'request_partial_sell', {
           disabled: pending,
@@ -3384,9 +3390,7 @@
     const card = state.plan;
     const busy = planningPending() || operatorPending();
     const hasBuyTodayDraft = hasCurrentBuyTodayDraft();
-    const canonicalBuyToday = Boolean(
-      card?.buy_today_member || (card?.canonical_stage || card?.stage) === 'BUY_TODAY'
-    );
+    const canonicalBuyToday = canonicalBuyTodayActive(card);
     const hasBuyToday = canonicalBuyToday || hasBuyTodayDraft;
     const connectedReadOnly = state.session?.mode === 'CONNECTED' && !state.session?.planning_writable;
     const watchlistMember = card?.watchlist_member ?? (card?.stage === 'WATCHLIST' || card?.stage === 'BUYLIST');
@@ -3422,7 +3426,7 @@
     byId('clear-breakout').disabled = connectedReadOnly || !card || !card.breakout_price || busy || state.breakoutSaving;
     byId('place-breakout').disabled = connectedReadOnly || !state.symbol || busy || state.breakoutSaving;
     const previewButton = byId('buy-today-preview');
-    previewButton.disabled = busy || !card || !buyTodayActionEligible;
+    previewButton.disabled = busy || !card || !buyTodayActionEligible || Boolean(card?.entry_cancellation_pending);
     previewButton.textContent = hasBuyToday
       ? 'Remove from Buy Today'
       : operatorBuyTodayEnabled ? 'Publish to Buy Today' : 'Create Buy Today draft';
@@ -3443,10 +3447,11 @@
       ? 'Add to Buylist'
       : 'Set a breakout price before adding to Buylist';
     const quickBuyToday = byId('quick-buy-today');
-    quickBuyToday.disabled = busy || !buyTodayActionEligible;
-    quickBuyToday.textContent = hasBuyToday ? 'Cancel Today' : 'Buy Today';
+    quickBuyToday.disabled = busy || !buyTodayActionEligible || Boolean(card?.entry_cancellation_pending);
+    quickBuyToday.textContent = card?.entry_cancellation_pending
+      ? 'Cancelling…' : hasBuyToday ? 'Cancel Today' : 'Buy Today';
     quickBuyToday.title = hasBuyToday
-      ? canonicalBuyToday ? 'Remove this unsubmitted card from Buy Today' : 'Cancel the shared Buy Today draft'
+      ? canonicalBuyToday ? 'Cancel the remaining buy intent; confirmed fills are preserved' : 'Cancel the shared Buy Today draft'
       : operatorBuyTodayEnabled ? 'Publish executable Buy Today intent after confirmation' : 'Create a shared, non-executable Buy Today draft';
     byId('buy-today-safety').textContent = operatorBuyTodayEnabled
       ? 'Confirmed Buy Today intent is written through verified Operator Control. The browser never places an order.'
@@ -3471,15 +3476,29 @@
     return crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-0000-4000-8000-${Math.random().toString(16).slice(2).padEnd(12, '0').slice(0, 12)}`;
   }
 
-  async function sendPlanningCommand(symbol, operation, breakoutPrice, expectedRevision) {
-    return api(`/api/v1/planning/${encodeURIComponent(symbol)}/commands`, {
-      method: 'POST',
-      body: JSON.stringify({
-        command_id: commandId(), operation,
-        expected_revision: expectedRevision,
-        breakout_price: breakoutPrice,
-      }),
-    });
+  async function sendPlanningCommand(symbol, operation, breakoutPrice, expectedRevision, previousPlan = null) {
+    let revision = expectedRevision;
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      try {
+        return await api(`/api/v1/planning/${encodeURIComponent(symbol)}/commands`, {
+          method: 'POST',
+          body: JSON.stringify({
+            command_id: commandId(), operation,
+            expected_revision: revision,
+            breakout_price: breakoutPrice,
+          }),
+        });
+      } catch (error) {
+        const current = error.current;
+        const observationConflict = operation === 'set_breakout'
+          && error.status === 409 && error.message.includes('Stale planning revision')
+          && current?.symbol === symbol && Number(current.version) > Number(revision)
+          && current.breakout_price === previousPlan?.breakout_price
+          && (current.canonical_stage || current.stage) === (previousPlan?.canonical_stage || previousPlan?.stage);
+        if (!observationConflict || attempt === 3) throw error;
+        revision = current.version;
+      }
+    }
   }
 
   async function planningCommand(operation, breakoutPrice = null, successMessage = '') {
@@ -3500,7 +3519,7 @@
     setPanel('Saving to canonical store…');
     try {
       const result = await sendPlanningCommand(
-        actionSymbol, operation, breakoutPrice, expectedRevision
+        actionSymbol, operation, breakoutPrice, expectedRevision, previousPlan
       );
       state.optimisticPlans.delete(actionSymbol);
       syncOptimisticPlanningRow(result.card, actionSymbol);
@@ -3549,7 +3568,9 @@
 
   function canonicalBuyTodayActive(card = state.plan) {
     return Boolean(
-      card?.buy_today_member || (card?.canonical_stage || card?.stage) === 'BUY_TODAY'
+      card?.buy_today_member
+      || ['BUY_TODAY', 'ENTRY_PENDING'].includes(card?.canonical_stage || card?.stage)
+      || ((card?.canonical_stage || card?.stage) === 'OPEN_POSITION' && Number(card?.entry_remaining_target_quantity) > 0)
     );
   }
 

@@ -253,6 +253,113 @@ def test_mobile_operator_commits_buy_today_intent_with_a_separate_execution_owne
     assert stored.board_status == BoardStatus.BUY_TODAY
 
 
+@pytest.mark.parametrize("action", ["deactivate_buy_today", "cancel_entry"])
+def test_entry_cancellation_uses_current_revision_and_retries_runtime_race(
+    web_config, tmp_path, monkeypatch, action
+):
+    from src.services import execution_workflow_service
+
+    engine, _role, service = _service(web_config, tmp_path, same_executor=False)
+    monkeypatch.setattr(trade_card_repository, "LOCAL_TRADE_CARDS_FILE", tmp_path / "cards.json")
+    original = _buylist_card(engine)
+    card = replace(original, board_status=BoardStatus.BUY_TODAY)
+    card = trade_card_repository.update_trade_card(engine, card, expected_version=card.version)
+    request = execution_workflow_service.request_board_action
+    attempts = []
+
+    def racing_request(engine, command, **kwargs):
+        attempts.append(command.expected_card_version)
+        if len(attempts) == 1:
+            live = trade_card_repository.get_trade_card(engine, "PROD", "account-a", "AAPL")
+            live.entry_block_reason = "live ORB observation"
+            trade_card_repository.update_trade_card(engine, live, expected_version=live.version)
+        return request(engine, command, **kwargs)
+
+    monkeypatch.setattr(execution_workflow_service, "request_board_action", racing_request)
+    result = service.apply_board_action(command_id=str(uuid.uuid4()), action=action,
+        symbol="AAPL", expected_revision=original.version)
+    assert attempts == [card.version, card.version + 1]
+    assert result["queued"] is False and result["broker_order_placed"] is False
+    stored = trade_card_repository.get_trade_card(engine, "PROD", "account-a", "AAPL")
+    assert stored.board_status == BoardStatus.BUYLIST
+    assert stored.breakout_price == original.breakout_price
+
+
+@pytest.mark.parametrize("stage,filled_quantity", [
+    (BoardStatus.ENTRY_PENDING, 0), (BoardStatus.ENTRY_PENDING, 3), (BoardStatus.OPEN_POSITION, 3),
+])
+def test_mobile_cancels_remaining_entry_and_preserves_confirmed_fills(
+    web_config, tmp_path, monkeypatch, filled_quantity, stage
+):
+    engine, _role, service = _service(web_config, tmp_path, same_executor=False)
+    monkeypatch.setattr(trade_card_repository, "LOCAL_TRADE_CARDS_FILE", tmp_path / "cards.json")
+    card = trade_card_repository.create_trade_card(engine, TradeCardState(
+        environment="PROD", account_no="account-a", symbol="AAPL", buylist_member=True,
+        board_status=stage, breakout_price=201.25,
+        entry_client_order_id="working-buy", entry_remaining_target_quantity=7,
+        broker_quantity=filled_quantity, orderable_quantity=filled_quantity,
+        average_entry_price=202 if filled_quantity else 0,
+        stop_quantity=filled_quantity, active_stop_price=199, stop_type=StopType.ORB_LOW,
+    ))
+    result = service.set_buy_today(command_id=str(uuid.uuid4()), symbol="AAPL",
+        expected_revision=card.version - 1, enabled=False)
+    assert result["queued"] is False and result["broker_order_placed"] is False
+    assert result["status"] == "ENTRY CANCELLATION REQUESTED"
+    assert result["card"]["entry_cancellation_pending"] is True
+    stored = trade_card_repository.get_trade_card(engine, "PROD", "account-a", "AAPL")
+    assert stored.board_status == stage
+    assert stored.entry_block_reason == "cancel_requested"
+    assert stored.broker_quantity == stored.stop_quantity == filled_quantity
+    assert stored.active_stop_price == 199 and stored.entry_client_order_id == "working-buy"
+    again = service.set_buy_today(command_id=str(uuid.uuid4()), symbol="AAPL",
+        expected_revision=card.version, enabled=False)
+    assert again["status"] == "ENTRY CANCELLATION REQUESTED"
+    assert trade_card_repository.get_trade_card(engine, "PROD", "account-a", "AAPL").version == stored.version
+
+
+def test_mobile_cancels_unsubmitted_completion_without_removing_position_protection(
+    web_config, tmp_path, monkeypatch
+):
+    engine, _role, service = _service(web_config, tmp_path)
+    monkeypatch.setattr(trade_card_repository, "LOCAL_TRADE_CARDS_FILE", tmp_path / "cards.json")
+    card = trade_card_repository.create_trade_card(engine, TradeCardState(
+        environment="PROD", account_no="account-a", symbol="AAPL", buylist_member=True,
+        board_status=BoardStatus.OPEN_POSITION, position_runtime_status=PositionRuntimeStatus.ENTRY_COMPLETING,
+        breakout_price=201.25, entry_remaining_target_quantity=7,
+        broker_quantity=3, orderable_quantity=3, average_entry_price=202,
+        stop_quantity=3, active_stop_price=199, stop_type=StopType.ORB_LOW,
+    ))
+    result = service.set_buy_today(command_id=str(uuid.uuid4()), symbol="AAPL",
+        expected_revision=0, enabled=False)
+    assert result["card"]["entry_cancellation_pending"] is False
+    stored = trade_card_repository.get_trade_card(engine, "PROD", "account-a", "AAPL")
+    assert stored.board_status == BoardStatus.OPEN_POSITION and stored.entry_remaining_target_quantity == 0
+    assert stored.position_runtime_status == PositionRuntimeStatus.OPEN
+    assert stored.broker_quantity == stored.stop_quantity == 3 and stored.active_stop_price == 199
+
+
+def test_mobile_cancellation_is_idempotent_and_does_not_sell_a_completed_entry(
+    web_config, tmp_path, monkeypatch
+):
+    from src.web.store import ConflictError
+
+    engine, _role, service = _service(web_config, tmp_path)
+    monkeypatch.setattr(trade_card_repository, "LOCAL_TRADE_CARDS_FILE", tmp_path / "cards.json")
+    card = _buylist_card(engine)
+    result = service.set_buy_today(command_id=str(uuid.uuid4()), symbol="AAPL",
+        expected_revision=0, enabled=False)
+    assert result["status"] == "REMOVED FROM TODAY"
+    assert trade_card_repository.get_trade_card(engine, "PROD", "account-a", "AAPL").version == card.version
+    card.board_status = BoardStatus.OPEN_POSITION
+    card.broker_quantity = card.stop_quantity = 10
+    card.active_stop_price = 199
+    card = trade_card_repository.update_trade_card(engine, card, expected_version=card.version)
+    with pytest.raises(ConflictError, match="confirmed holdings are preserved"):
+        service.set_buy_today(command_id=str(uuid.uuid4()), symbol="AAPL",
+            expected_revision=0, enabled=False)
+    assert trade_card_repository.get_trade_card(engine, "PROD", "account-a", "AAPL").version == card.version
+
+
 def test_mobile_can_select_mobile_pc_and_laptop_operator_control(
     web_config, tmp_path
 ):

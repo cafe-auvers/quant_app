@@ -245,6 +245,11 @@ def evaluate_monitor_row(
                       price_reason="Post-range price exceeded breakout and ORH" if confirmed
                       else "Waiting for price above breakout and ORH")
         if reason:
+            if reason == "No valid passive-pullback execution zone":
+                reason += (
+                    f": breakout ${breakout:g}, range high ${high:g}, range low ${low:g}; "
+                    "entry must be above breakout and range low, and at or below range high"
+                )
             result.update(position_status="FAIL", position_reason=reason)
             continue
         if context.settings is None or context.equity is None or adr is None:

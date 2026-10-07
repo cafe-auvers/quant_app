@@ -453,6 +453,37 @@ class ConnectedOperatorService:
         price: float | None = None,
         target_priority: int | None = None,
     ) -> dict[str, Any]:
+        from src.services.trade_card_repository import TradeCardVersionConflictError
+
+        withdrawal = str(action or "").strip().lower() in {
+            "deactivate_buy_today", "cancel_entry"
+        }
+        for attempt in range(4):
+            try:
+                return self._apply_board_action_once(
+                    command_id=command_id, action=action, symbol=symbol,
+                    expected_revision=expected_revision, quantity=quantity,
+                    price=price, target_priority=target_priority,
+                )
+            except TradeCardVersionConflictError as exc:
+                if not withdrawal or attempt == 3:
+                    current = self.source.get_plan(
+                        symbol, force=True, include_inactive=True
+                    ).get("card")
+                    raise ConflictError(str(exc), current) from exc
+        raise AssertionError("Unreachable cancellation retry")
+
+    def _apply_board_action_once(
+        self,
+        *,
+        command_id: str,
+        action: str,
+        symbol: str,
+        expected_revision: int,
+        quantity: int | None = None,
+        price: float | None = None,
+        target_priority: int | None = None,
+    ) -> dict[str, Any]:
         """Apply one desktop-equivalent typed Kanban command.
 
         Presentation moves, Buy Today intent, and withdrawal of an unsubmitted
@@ -491,7 +522,14 @@ class ConnectedOperatorService:
         symbol = normalize_symbol(symbol)
         account_no = self.planning._account_no()
         card = self.planning._current_card(account_no, symbol)
-        self.planning._check_revision(card, expected_revision)
+        withdrawal = action in {"deactivate_buy_today", "cancel_entry"}
+        # A cancellation withdraws the current symbol's entry intent. Live
+        # ORB/status observations must not make the user's cancel button stale.
+        # The workflow still locks and checks this exact fresh revision.
+        if withdrawal and card is not None:
+            expected_revision = int(card.version)
+        else:
+            self.planning._check_revision(card, expected_revision)
         if card is None:
             raise ConflictError("No canonical Buy Board card exists")
         if action == "activate_buy_today":
@@ -502,8 +540,25 @@ class ConnectedOperatorService:
             breakout = self.source._positive_number(card.breakout_price)
             if breakout is None:
                 raise ConflictError("Set a breakout price before Buy Today activation")
-        if action == "deactivate_buy_today" and card.board_status != BoardStatus.BUY_TODAY:
-            raise ConflictError("Buy Today cancellation requires a Buy Today card")
+        cancellation_pending = bool(
+            card.board_status in {BoardStatus.BUY_TODAY, BoardStatus.ENTRY_PENDING, BoardStatus.OPEN_POSITION}
+            and (card.entry_block_reason == "cancel_requested" or card.entry_cancel_in_flight)
+        )
+        if withdrawal and (card.board_status == BoardStatus.BUYLIST or cancellation_pending):
+            board = self.board_snapshot(force=True)
+            return {
+                "status": "ENTRY CANCELLATION REQUESTED" if cancellation_pending else "ENTRY ALREADY CANCELLED",
+                "card": next((row for row in board["rows"] if row["symbol"] == symbol), None),
+                "board_revision": board["revision"], "command_id": command_id,
+                "published": False, "executable_intent": True,
+                "broker_order_placed": False, "queued": False,
+                "command_status": "COMPLETED", "canonical_version": int(card.version),
+            }
+        cancellable_entry = card.board_status in {BoardStatus.BUY_TODAY, BoardStatus.ENTRY_PENDING} or (
+            card.board_status == BoardStatus.OPEN_POSITION and card.entry_remaining_target_quantity > 0
+        )
+        if withdrawal and not cancellable_entry:
+            raise ConflictError("No pending entry remains to cancel; confirmed holdings are preserved")
 
         common = {
             "environment": self.config.canonical_environment,
@@ -558,7 +613,7 @@ class ConnectedOperatorService:
         # The workflow rejects every durable SELL lifecycle; no broker cancel
         # is requested and a separate executor need not consume a command.
         direct_intent_actions = {
-            "activate_buy_today", "deactivate_buy_today", "cancel_sell_all"
+            "activate_buy_today", "deactivate_buy_today", "cancel_entry", "cancel_sell_all"
         }
         queued = (
             not bool(authority.get("same_device"))
@@ -594,11 +649,17 @@ class ConnectedOperatorService:
                 )
                 canonical_version = int(result.card.version) if result.card else 0
                 command_status = "COMPLETED"
+        except TradeCardVersionConflictError:
+            if withdrawal:
+                raise
+            current = self.source.get_plan(
+                symbol, force=True, include_inactive=True
+            ).get("card")
+            raise ConflictError("Stale planning revision", current)
         except (
             execution_workflow_service.BoardCommandRejectedError,
             execution_workflow_service.BoardRuntimeFenceError,
             TradeCardNotFoundError,
-            TradeCardVersionConflictError,
             OperatorCommandError,
         ) as exc:
             current = self.source.get_plan(
@@ -652,6 +713,8 @@ class ConnectedOperatorService:
             if result["queued"]
             else "BUY TODAY ACTIVATED"
             if enabled
+            else "ENTRY CANCELLATION REQUESTED"
+            if (result.get("card") or {}).get("entry_cancellation_pending")
             else "REMOVED FROM TODAY"
         )
         return result

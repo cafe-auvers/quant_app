@@ -325,7 +325,12 @@ class ConnectedPlanningService:
                 )
         except ConflictError:
             raise
-        except (TradeCardVersionConflictError, TradeCardNotFoundError) as exc:
+        except TradeCardVersionConflictError as exc:
+            current = self.source.get_plan(
+                symbol, force=True, include_inactive=True
+            ).get("card")
+            raise ConflictError("Stale planning revision", current) from exc
+        except TradeCardNotFoundError as exc:
             current = self.source.get_plan(
                 symbol, force=True, include_inactive=True
             ).get("card")

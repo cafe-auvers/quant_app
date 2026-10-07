@@ -270,6 +270,23 @@ canonical database query for NAV.
 
 ## Explicit re-entry after a completed exit
 
+Mobile Cancel Today withdraws the latest entry intent for the selected symbol.
+Runtime observation revisions do not invalidate cancellation; each attempt still
+locks and validates the current canonical card. Repeated cancellation is harmless.
+An unsubmitted entry returns to Buylist immediately. A working or partially filled
+entry remains pending until the executor confirms cancellation; filled shares and
+their protective stops remain in Open Positions. The chart shows Cancelling while
+broker reconciliation is pending, and a partially completed position exposes
+Cancel remaining buy.
+
+Editing an unsubmitted breakout rebuilds its entry qualification, sizing and
+breakout confirmation from the revised target. Opening-range high and low remain
+the observed first 1, 5 or 30 minutes. Passive execution still requires an entry
+above both the breakout and opening-range low, and at or below the opening-range
+high; a breakout above that high has no execution zone. Mobile rejection feedback
+includes these prices. An unrelated observation revision can be retried, while a
+concurrent change to the breakout or lifecycle requires reviewing the current card.
+
 A stop hit starts liquidation. A new entry cannot start while the stock remains
 held or its exit is pending. Once broker reconciliation confirms zero shares and
 the completed cycle is Closed, select the stock and confirm Buy Today again on
@@ -285,6 +302,13 @@ stop. Repeated same-day attempts still require a new user activation each time,
 current ORB qualification, fresh KIS trade/quote data, account equity/buying power,
 portfolio risk, execution ownership, Live Trading and broker-boundary checks.
 Existing attempt-rate limits and cooldowns remain in force.
+
+Queue refresh also retires an old FILLED compatibility lock when the canonical
+card is a fresh Buy Today activation, broker-flat, and carries no durable execution
+evidence. Account identity must match, and broker/open-order and canonical-order
+checks must show no active order. Old candidates and breakout confirmations are
+discarded together, so the next entry requires rebuilt geometry and fresh market
+data. Working, ambiguous, partial and currently held execution remains fenced.
 
 Re-entry rejects nonzero held/sellable shares, nonterminal position/entry/exit
 state, pending stop changes, reserved capital, active owned/external orders and

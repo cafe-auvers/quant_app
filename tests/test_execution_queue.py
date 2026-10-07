@@ -60,6 +60,68 @@ def test_one_symbol_creates_only_one_execution_queue_item():
     assert manager.items[queue_key("AAPL", "PROD")].name == "Apple"
 
 
+def test_fresh_canonical_activation_retires_old_filled_queue_and_confirmation():
+    from src.core.trade_card_state import BoardStatus, TradeCardState
+
+    manager = ExecutionQueueManager()
+    old = _candidate("1m", 90)
+    old.breakout_confirmed = True
+    item = manager.upsert_item(symbol="AAPL", account_no="account-a", candidates={"1m": old})
+    manager.mark_order_filled("AAPL")
+    card = TradeCardState(environment="PROD", account_no="account-a", symbol="AAPL",
+        board_status=BoardStatus.BUY_TODAY, breakout_price=99, buylist_member=True)
+    assert manager.retire_completed_order_for_fresh_activation(card, has_active_order=False)
+    assert not item.locked and item.order_status is None and item.candidates == {}
+    assert item.selected_candidate is None
+    rebuilt = _candidate("5m", 80, status=OrbCandidateStatus.WAITING_BREAKOUT)
+    manager.upsert_item(symbol="AAPL", account_no="account-a", candidates={"5m": rebuilt})
+    assert item.selected_window == "5m" and item.status == ExecutionQueueStatus.ARMED
+    assert not rebuilt.breakout_confirmed
+
+
+@pytest.mark.parametrize("fence", ["position", "entry_identity", "unresolved", "cancel", "reservation",
+                                  "wrong_account", "wrong_stage", "active_order", "working_lock"])
+def test_completed_queue_lock_retirement_preserves_every_current_execution_fence(fence):
+    from src.core.trade_card_state import BoardStatus, TradeCardState
+
+    manager = ExecutionQueueManager()
+    item = manager.upsert_item(symbol="AAPL", account_no="account-a", candidates={"1m": _candidate("1m", 90)})
+    manager.mark_order_filled("AAPL")
+    card = TradeCardState(environment="PROD", account_no="account-a", symbol="AAPL",
+        board_status=BoardStatus.BUY_TODAY, breakout_price=99)
+    if fence == "position": card.broker_quantity = 1
+    if fence == "entry_identity": card.entry_client_order_id = "current-buy"
+    if fence == "unresolved": card.entry_submission_unresolved = True
+    if fence == "cancel": card.entry_block_reason = "cancel_requested"
+    if fence == "reservation": card.capital_reservation_id = "reservation"
+    if fence == "wrong_account": card.account_no = "account-b"
+    if fence == "wrong_stage": card.board_status = BoardStatus.OPEN_POSITION
+    if fence == "working_lock": item.order_status = "SUBMITTED"
+    assert not manager.retire_completed_order_for_fresh_activation(card, has_active_order=fence == "active_order")
+    assert item.locked and item.selected_window == "1m" and item.selected_candidate is not None
+
+
+def test_changed_be_breakout_rebuilds_zone_and_retires_previous_confirmation():
+    frame = _intraday(minutes=3, high=290.231, low=284.785, close=292)
+    manager = ExecutionQueueManager()
+    plan = SimpleNamespace(symbol="BE", name="BE", breakout_price=293.19, stop_loss=None, notes="")
+    def build():
+        return manager.build_or_update_from_watchlist_item(plan, {"1m": frame},
+            current_price=292, account_size=100000, risk_percent=.0075, account_no="account-a",
+            adr_percent=6).candidates["1m"]
+    rejected = build()
+    assert rejected.status == OrbCandidateStatus.REJECTED
+    plan.breakout_price = 289
+    rebuilt = build()
+    assert rebuilt.valid and rebuilt.floor_price == 289 and rebuilt.execution_price == 290.24
+    assert rebuilt.orb_high == rejected.orb_high and rebuilt.orb_low == rejected.orb_low
+    rebuilt.breakout_confirmed = True
+    plan.breakout_price = 289.5
+    changed = build()
+    assert changed.floor_price == 289.5 and not changed.breakout_confirmed
+    assert changed.status == OrbCandidateStatus.WAITING_BREAKOUT
+
+
 def test_non_production_environment_is_rejected():
     manager = ExecutionQueueManager()
 

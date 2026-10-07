@@ -77,7 +77,7 @@ def test_sandbox_watchlist_breakout_buylist_flow_persists(authenticated):
     assert authenticated.get("/api/v1/buy-today-drafts").json()["rows"] == []
 
 
-def test_buy_today_cancellation_rejects_a_stale_revision(authenticated):
+def test_buy_today_cancellation_accepts_a_stale_revision(authenticated):
     assert command(authenticated, "add_watchlist", 0).status_code == 200
     assert command(authenticated, "set_breakout", 1, price=149).status_code == 200
     assert command(authenticated, "promote_buylist", 2).status_code == 200
@@ -92,8 +92,10 @@ def test_buy_today_cancellation_rejects_a_stale_revision(authenticated):
         "/api/v1/planning/AAPL/buy-today-preview",
         json={"expected_revision": 3},
     )
-    assert stale.status_code == 409
-    assert stale.json()["current"]["version"] == 4
+    assert stale.status_code == 200
+    assert authenticated.get("/api/v1/buy-today-drafts").json()["rows"] == []
+    card = authenticated.get("/api/v1/planning/AAPL").json()["card"]
+    assert card["version"] == 4 and card["breakout_price"] == 150
 
 
 def test_breakout_is_independent_and_buylist_requires_it(authenticated):

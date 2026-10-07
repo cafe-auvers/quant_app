@@ -174,6 +174,31 @@ class BuylistExecutionController(WindowController):
                     OrderSide.BUY,
                     OrderIntent.ENTRY,
                 )
+                if request.trade_card_engine is not None and hasattr(
+                    request.manager, "retire_completed_order_for_fresh_activation"
+                ) and (previous_queue := request.manager.get_item(symbol, request.env)) is not None and (
+                    previous_queue.locked and str(previous_queue.order_status or "").upper() == "FILLED"
+                ):
+                    from src.core.execution_order_record import TERMINAL_EXECUTION_ORDER_STATUSES
+                    from src.services.execution_order_repository import list_execution_orders_for_card
+                    from src.services.trade_card_repository import get_trade_card
+
+                    canonical = get_trade_card(
+                        request.trade_card_engine, request.env, item_account_no, symbol
+                    )
+                    if canonical is not None:
+                        orders = list_execution_orders_for_card(
+                            request.trade_card_engine, environment=request.env,
+                            account_no=item_account_no, symbol=symbol,
+                        )
+                        request.manager.retire_completed_order_for_fresh_activation(
+                            canonical, has_active_order=bool(
+                                broker_has_open_order or any(
+                                    order.status not in TERMINAL_EXECUTION_ORDER_STATUSES
+                                    for order in orders
+                                )
+                            ),
+                        )
                 duplicate_order = bool(
                     broker_has_open_order and not queue_has_working_order
                 )

@@ -1098,6 +1098,31 @@ class ExecutionQueueManager:
         item.order_id = None
         item.warnings = []
 
+    def retire_completed_order_for_fresh_activation(
+        self, card: Any, *, has_active_order: bool
+    ) -> bool:
+        """Retire a completed legacy lock only after a clean canonical activation."""
+        from src.core.trade_card_state import BoardStatus, has_durable_execution_evidence
+
+        item = self.get_item(card.symbol, card.environment)
+        if (
+            item is None
+            or has_active_order
+            or card.board_status != BoardStatus.BUY_TODAY
+            or has_durable_execution_evidence(card)
+            or card.entry_block_reason == "cancel_requested"
+            or not str(card.account_no or "").strip()
+            or item.account_no != card.account_no
+            or not item.locked
+            or item.manual_window_lock
+            or str(item.order_status or "").upper() != "FILLED"
+        ):
+            return False
+        # Discard previous confirmations as well as the lock. The new entry
+        # must receive newly built candidates and a fresh post-range trade.
+        self._reset_for_account_reassignment(item)
+        return True
+
     def upsert_item(
         self,
         *,

@@ -371,7 +371,7 @@ def test_review_actions_are_inline_and_daily_view_opens_at_six_months():
     assert 'id="quick-buy-today"' in page_source
     assert "byId('quick-buy-today').addEventListener('click', toggleBuyTodayDraft)" in script_source
     assert "method: 'DELETE'" in script_source
-    assert "quickBuyToday.textContent = hasBuyToday ? 'Cancel Today' : 'Buy Today'" in script_source
+    assert "? 'Cancelling…' : hasBuyToday ? 'Cancel Today' : 'Buy Today'" in script_source
     assert "quickBuyToday.disabled = busy || !buyTodayActionEligible" in script_source
     assert 'data-list="buy_today"' in page_source
     assert 'id="planning-drawer-button"' not in page_source

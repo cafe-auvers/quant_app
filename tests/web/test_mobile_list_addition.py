@@ -26,7 +26,8 @@ def list_browser():
         asyncio.set_event_loop_policy(previous)
 
 
-def open_watchlist(page, *, delegated=True, reject="", closed=False):
+def open_watchlist(page, *, delegated=True, reject="", closed=False, runtime_conflict=False,
+                   competing_price=False, entry_pending=False):
     root = Path(__file__).resolve().parents[2]
     static = root / "src/web/static"
     assets = ReleaseAssets(static, root / "src/ui/static/vendor")
@@ -39,6 +40,9 @@ def open_watchlist(page, *, delegated=True, reject="", closed=False):
     state = {"card": card, "posts": [], "errors": [], "draft": False}
     if closed:
         card.update(stage="BREAKOUT", canonical_stage="CLOSED", breakout_price=2.75)
+    if entry_pending:
+        card.update(stage="BUYLIST", canonical_stage="ENTRY_PENDING", buylist_member=True,
+                    breakout_price=2.75, buy_today_display_member=True, purchase_status="ENTRY_PENDING")
     session = {
         "mode": "CONNECTED", "csrf_token": "test", "planning_writable": True,
         "operator": {"delegated": delegated, "operations": ["activate_buy_today", "deactivate_buy_today"]},
@@ -51,6 +55,12 @@ def open_watchlist(page, *, delegated=True, reject="", closed=False):
             payload = route.request.post_data_json
             state["posts"].append((path, payload))
             operation = payload.get("operation", "")
+            if operation == "set_breakout" and runtime_conflict and len(state["posts"]) == 1:
+                card["version"] += 1
+                if competing_price:
+                    card["breakout_price"] = 2.65
+                route.fulfill(status=409, json={"detail": "Stale planning revision", "current": dict(card)})
+                return
             if reject and operation == reject:
                 route.fulfill(status=409, json={"detail": "Stale planning revision", "current": dict(card)})
                 return
@@ -60,8 +70,11 @@ def open_watchlist(page, *, delegated=True, reject="", closed=False):
             elif operation == "promote_buylist":
                 card.update(stage="BUYLIST", canonical_stage="BUYLIST", buylist_member=True, version=card["version"] + 1)
             elif path.endswith("activate-buy-today"):
-                assert payload["enabled"] is True
-                card.update(canonical_stage="BUY_TODAY", buy_today_member=True, version=card["version"] + 1)
+                if payload["enabled"]:
+                    card.update(canonical_stage="BUY_TODAY", buy_today_member=True, version=card["version"] + 1)
+                else:
+                    assert entry_pending
+                    card.update(entry_cancellation_pending=True, version=card["version"] + 1)
             elif path.endswith("buy-today-preview"):
                 state["draft"] = True
             else:
@@ -95,6 +108,43 @@ def open_watchlist(page, *, delegated=True, reject="", closed=False):
     page.goto("http://localhost:8779/")
     page.wait_for_function("document.querySelector('#quick-watchlist').getAttribute('aria-pressed') === 'true'")
     return state
+
+
+@pytest.mark.parametrize("competing_price", [False, True])
+def test_breakout_edit_retries_observation_revision_without_overwriting_another_price(
+    list_browser, competing_price
+):
+    page = list_browser.new_page(viewport={"width": 390, "height": 844}, has_touch=True)
+    state = open_watchlist(page, runtime_conflict=True, competing_price=competing_price)
+    page.locator("#quick-buylist").click()
+    page.locator("#breakout-price-popup-input").fill("2.75")
+    page.locator("#breakout-price-form button[type=submit]").click()
+    if competing_price:
+        page.wait_for_function("document.querySelector('#quick-plan-message').textContent.includes('Stale planning revision')")
+        assert len(state["posts"]) == 1
+        assert state["card"]["breakout_price"] == 2.65
+    else:
+        page.wait_for_function("document.querySelector('#quick-buylist').getAttribute('aria-pressed') === 'true' && !document.querySelector('#quick-buylist').disabled")
+        assert [payload["expected_revision"] for _, payload in state["posts"]] == [1, 2, 3]
+        assert state["posts"][0][1]["command_id"] != state["posts"][1][1]["command_id"]
+        assert state["card"]["breakout_price"] == 2.75
+    assert state["errors"] == []
+    page.close()
+
+
+@pytest.mark.parametrize("width", [320, 390, 1400])
+def test_pending_buy_has_cancel_today_and_shows_cancellation_progress(list_browser, width):
+    page = list_browser.new_page(viewport={"width": width, "height": 844}, has_touch=width < 900)
+    state = open_watchlist(page, entry_pending=True)
+    button = page.locator("#quick-buy-today")
+    assert button.inner_text() == "Cancel Today" and button.is_enabled()
+    button.click()
+    page.wait_for_function("document.querySelector('#quick-buy-today').textContent === 'Cancelling…'")
+    assert button.is_disabled()
+    assert len(state["posts"]) == 1 and state["posts"][0][1]["enabled"] is False
+    assert state["card"]["canonical_stage"] == "ENTRY_PENDING"
+    assert state["errors"] == []
+    page.close()
 
 
 def assert_feedback_visible(page):
