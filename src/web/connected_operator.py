@@ -455,7 +455,8 @@ class ConnectedOperatorService:
     ) -> dict[str, Any]:
         """Apply one desktop-equivalent typed Kanban command.
 
-        Presentation moves and Buy Today planning intent commit immediately.
+        Presentation moves, Buy Today intent, and withdrawal of an unsubmitted
+        Sell All commit immediately.
         Broker-facing entry/exit intent is queued when Operator Control is not
         also the Execution Owner. In neither case can the browser contact the
         broker.
@@ -494,8 +495,10 @@ class ConnectedOperatorService:
         if card is None:
             raise ConflictError("No canonical Buy Board card exists")
         if action == "activate_buy_today":
-            if card.board_status != BoardStatus.BUYLIST or not card.buylist_member:
-                raise ConflictError("Buy Today activation requires a Buylist card")
+            if card.board_status != BoardStatus.CLOSED and (
+                card.board_status != BoardStatus.BUYLIST or not card.buylist_member
+            ):
+                raise ConflictError("Buy Today activation requires a Buylist or fully closed card")
             breakout = self.source._positive_number(card.breakout_price)
             if breakout is None:
                 raise ConflictError("Set a breakout price before Buy Today activation")
@@ -551,7 +554,12 @@ class ConnectedOperatorService:
             "move_buylist",
             "reorder_card",
         }
-        direct_intent_actions = {"activate_buy_today", "deactivate_buy_today"}
+        # Withdrawing an unsubmitted exit is an atomic canonical intent edit.
+        # The workflow rejects every durable SELL lifecycle; no broker cancel
+        # is requested and a separate executor need not consume a command.
+        direct_intent_actions = {
+            "activate_buy_today", "deactivate_buy_today", "cancel_sell_all"
+        }
         queued = (
             not bool(authority.get("same_device"))
             and action not in presentation_actions

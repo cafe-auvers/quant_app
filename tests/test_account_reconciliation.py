@@ -57,6 +57,16 @@ from src.services import account_reconciliation as reconciliation_module
 NOW = datetime(2026, 8, 15, 14, 0, tzinfo=timezone.utc)
 
 
+def test_prefetched_snapshot_is_account_scoped_and_cannot_be_applied_elsewhere(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'snapshot-account.db'}", future=True)
+    snapshot = AccountBrokerSnapshot(environment="PROD", account_no="other",
+                                     observed_at=NOW, session_date=NOW.date(),
+                                     completeness=SnapshotCompleteness())
+    with pytest.raises(ValueError, match="different account"):
+        run_account_reconciliation_pass(broker=None, engine=engine, environment="PROD",
+                                        account_no="1", cards=(), broker_snapshot=snapshot)
+
+
 def test_unchanged_reconciliation_plan_emits_no_commit(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'no-op-plan.db'}", future=True)
     commits = []
@@ -987,6 +997,41 @@ def test_exact_entry_cancellation_with_zero_fill_returns_card_to_buylist():
     )
     assert plan.card_updates[0].board_status == BoardStatus.BUYLIST
     assert plan.order_updates[0].status == ExecutionOrderStatus.CANCELLED
+
+
+def test_cancelled_original_history_does_not_escalate_a_terminal_exact_order():
+    original = BrokerOrderStatusSnapshot(
+        environment="PROD", account_no="1", symbol="AAPL", broker_order_id="B-1",
+        side=OrderSide.BUY, status=OrderStatus.PARTIALLY_FILLED, quantity_requested=10,
+        raw_response={"rvse_cncl_dvsn":"00", "ord_dt":"20261005", "ord_tmd":"000446"})
+    cancel = BrokerOrderStatusSnapshot(
+        environment="PROD", account_no="1", symbol="AAPL", broker_order_id="B-1",
+        side=OrderSide.BUY, status=OrderStatus.CANCELLED, quantity_requested=10,
+        raw_response={"rvse_cncl_dvsn":"02", "ord_dt":"20261005", "ord_tmd":"045916"})
+    order = _order(status=ExecutionOrderStatus.CANCELLED)
+    plan = reduce_account_reconciliation(
+        _snapshot(orders=(original,cancel)), AccountLocalState(execution_orders=(order,)))
+    assert not any(a.code == "BROKER_STATUS_CONTRADICTION" for a in plan.alerts)
+    assert all(o.recovery_state == OrderRecoveryState.NONE for o in plan.order_updates)
+    assert plan.commands == ()
+
+
+def test_zero_fill_cancel_history_resolves_working_entry_without_false_partial_fill():
+    original = BrokerOrderStatusSnapshot(
+        environment="PROD", account_no="1", symbol="AAPL", broker_order_id="B-1",
+        side=OrderSide.BUY, status=OrderStatus.PARTIALLY_FILLED, quantity_requested=10,
+        raw_response={"rvse_cncl_dvsn":"00", "ord_dt":"20261005", "ord_tmd":"000446"})
+    cancel = BrokerOrderStatusSnapshot(
+        environment="PROD", account_no="1", symbol="AAPL", broker_order_id="B-1",
+        side=OrderSide.BUY, status=OrderStatus.CANCELLED, quantity_requested=10,
+        raw_response={"rvse_cncl_dvsn":"02", "ord_dt":"20261005", "ord_tmd":"045916"})
+    plan = reduce_account_reconciliation(_snapshot(orders=(original,cancel)),
+        AccountLocalState(cards=(_card(),), execution_orders=(_order(),),
+                          capital_reservations=(_reservation(),)))
+    assert plan.order_updates[0].status == ExecutionOrderStatus.CANCELLED
+    assert plan.order_updates[0].filled_quantity == 0
+    assert plan.card_updates[0].board_status == BoardStatus.BUYLIST
+    assert not any(a.code == "BROKER_STATUS_CONTRADICTION" for a in plan.alerts)
 
 
 def test_definitive_entry_rejection_without_broker_id_clears_pending_card():

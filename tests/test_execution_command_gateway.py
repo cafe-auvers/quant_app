@@ -112,6 +112,53 @@ from fakes.fake_execution_broker import FakeExecutionBroker
 pytestmark = pytest.mark.usefixtures("authorized_full_live")
 
 
+@pytest.mark.usefixtures("trading_enabled")
+def test_exact_kis_funds_deny_before_journaling_then_allow_after_real_funds_change(tmp_path):
+    from src.services.capital_reservation_repository import InsufficientAvailableCapitalError
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    evidence = {"available_usd": 915.31, "orderable_quantity": 4, "currency": "USD",
+        "symbol": "AAPL", "exchange": "NASD", "limit_price": 100.0,
+        "observed_at": datetime.now(timezone.utc).isoformat()}
+    broker.get_buying_power = lambda **kwargs: dict(evidence)
+    with pytest.raises(InsufficientAvailableCapitalError):
+        gateway.submit_guarded(_submit_request())
+    assert get_command_by_idempotency_key(engine, "SUBMIT:CID-1") is None
+    assert broker.submit_calls == []
+    evidence.update(available_usd=1001.0, orderable_quantity=10)
+    broker.queue_acceptance()
+    order = gateway.submit_guarded(_submit_request())
+    assert order.status == ExecutionOrderStatus.ACKNOWLEDGED
+    assert len(broker.submit_calls) == 1
+
+
+@pytest.mark.parametrize("bad", [
+    {"currency": "KRW"}, {"symbol": "WRONG"}, {"limit_price": 100.000001},
+    {"available_usd": float("nan")}, {"orderable_quantity": 9},
+    {"observed_at": "2000-01-01T00:00:00+00:00"},
+    {"observed_at": "2100-01-01T00:00:00+00:00"},
+])
+def test_kis_orderability_rejects_stale_or_mismatched_evidence(bad):
+    from src.services.capital_reservation_repository import InsufficientAvailableCapitalError
+    evidence = {"available_usd": 1001.0, "orderable_quantity": 10, "currency": "USD",
+        "symbol": "AAPL", "exchange": "NASD", "limit_price": 100.0,
+        "observed_at": datetime.now(timezone.utc).isoformat(), **bad}
+    with pytest.raises(InsufficientAvailableCapitalError):
+        ExecutionCommandGateway._validate_entry_funding(evidence, _submit_request())
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_entry_expired_at_dispatch_is_local_abort_without_broker_call_or_held_cash(tmp_path):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    def expired():
+        raise PreTradeRiskRejectedError("KIS entry data expired while waiting for HTTP dispatch")
+    with pytest.raises(GuardedSubmissionPreBrokerAbortedError):
+        gateway.submit_guarded(_submit_request(entry_freshness_validator=expired))
+    assert broker.submit_calls == []
+    assert fetch_execution_order(engine, "CID-1").status == ExecutionOrderStatus.CANCELLED_LOCALLY
+    assert get_command_by_idempotency_key(engine, "SUBMIT:CID-1").status == "PRE_BROKER_ABORTED"
+    assert list_active_reservations(engine, environment="PROD", account_no="12345678-01") == []
+
+
 def _make_engine(tmp_path):
     return create_engine(f"sqlite:///{tmp_path / 'gateway.db'}", future=True, poolclass=NullPool)
 

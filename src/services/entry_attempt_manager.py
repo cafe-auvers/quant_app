@@ -490,6 +490,12 @@ class EntryAttemptManager:
             broker_code = str(
                 getattr(exc, "broker_code", "") or ""
             ).strip().upper()
+            if broker_code == "APBK0952" or (not broker_code and "APBK0952" in detail.upper()):
+                state.cooldown_until = now + timedelta(seconds=execution_config.ENTRY_RETRY_COOLDOWN_SECONDS)
+                return AttemptResult(trigger, AttemptOutcome.WAITING_FOR_CAPITAL,
+                    attempt_group_id=attempt_group_id, attempt_count=state.attempt_count,
+                    retry_at=state.cooldown_until,
+                    detail="KIS declined available funds (APBK0952); waiting for fresh verified orderability")
             if broker_code == "APBK0656" or (
                 not broker_code and "APBK0656" in detail.upper()
             ):
@@ -528,7 +534,13 @@ class EntryAttemptManager:
                     engine=self._capital_reservation_engine,
                 )
             state.cooldown_until = now + timedelta(seconds=execution_config.ENTRY_RETRY_COOLDOWN_SECONDS)
-            logger.exception("Entry submission raised for %s", trigger.symbol)
+            if type(exc).__name__ == "ShadowMutationIntercepted":
+                raise
+            from src.risk.pre_trade import PreTradeRiskRejectedError
+            if isinstance(exc, PreTradeRiskRejectedError):
+                logger.info("Entry risk check blocked %s: %s", trigger.symbol, exc)
+            else:
+                logger.exception("Entry submission raised for %s", trigger.symbol)
             return AttemptResult(
                 trigger,
                 AttemptOutcome.REJECTED,

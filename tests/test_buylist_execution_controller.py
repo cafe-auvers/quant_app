@@ -470,6 +470,7 @@ def test_submit_selected_queue_order_uses_queue_candidate_not_buylist_mirrors(
         last_price=123.0,
         ask=123.1,
         is_execution_fresh=lambda **kwargs: True,
+        is_entry_fresh=lambda **kwargs: True,
     )
     market_data = SimpleNamespace(
         latest_quote=lambda symbol: quote,

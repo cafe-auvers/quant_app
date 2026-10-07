@@ -131,7 +131,11 @@ class RequestSellAll(BoardCommand):
 
 @dataclass(frozen=True)
 class CancelQueuedSellAll(BoardCommand):
-    pass
+    """Withdraw an unsubmitted Sell All, including during regular hours.
+
+    The wire name is retained for stored commands. A durable SELL identity,
+    reservation, or unresolved cancellation requires broker reconciliation.
+    """
 
 
 @dataclass(frozen=True)

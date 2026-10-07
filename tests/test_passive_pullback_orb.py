@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from decimal import Decimal
 
 import pytest
 
@@ -12,6 +13,42 @@ from src.core.execution_queue import (
 from src.core.orb_entry_logic import passive_entry_prices, score_strictly_higher
 from src.core.trade_card_state import BoardStatus, EntryRuntimeStatus, TradeCardState
 from src.services.trade_card_orb_bridge import TradeCardOrbEvaluator
+
+
+@pytest.mark.parametrize(
+    ("high", "low", "breakout", "limit"),
+    [("19.1899", "19.09", "18.65", "19.18"),
+     ("19.705", "19.09", "18.65", "19.70"),
+     ("0.98765", "0.97", "0.96", "0.9876")],
+)
+def test_automatic_fractional_high_uses_legal_passive_buy_tick(high, low, breakout, limit):
+    floor, trigger, execution, reason = passive_entry_prices(
+        breakout_price=breakout, orb_high=high, orb_low=low,
+    )
+    assert reason == ""
+    assert execution == Decimal(limit)
+    assert trigger == Decimal(high)  # Raw ORH still requires a confirmed breakout.
+    assert floor == Decimal(low)
+    assert floor < execution <= trigger
+
+
+def test_manual_fractional_high_is_not_silently_rounded():
+    _, _, execution, reason = passive_entry_prices(
+        breakout_price=18.65, orb_high=19.705, orb_low=19.09,
+        execution_price=19.705,
+    )
+    assert execution == Decimal("19.705")
+    assert "valid U.S. equity tick" in reason
+
+
+def test_tick_rounding_does_not_widen_a_collapsed_passive_zone():
+    floor, trigger, execution, reason = passive_entry_prices(
+        breakout_price=19.701, orb_high=19.705, orb_low=19.09,
+    )
+    assert reason
+    assert floor == Decimal("19.701")
+    assert trigger == Decimal("19.705")
+    assert execution == Decimal("19.70") < floor
 
 
 @pytest.mark.parametrize(

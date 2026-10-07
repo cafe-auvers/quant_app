@@ -18,6 +18,13 @@ from PyQt5.QtCore import (
 from src.ui.main_window import MainWindow
 
 
+def test_qt_message_callback_works_without_pythonw_stderr(monkeypatch, caplog):
+    import main
+    monkeypatch.setattr(main.sys, "stderr", None)
+    main._qt_message_handler(None, None, "Unusual actionable Qt diagnostic")
+    assert "Unusual actionable Qt diagnostic" in caplog.text
+
+
 def test_windows_qt_rendering_defaults_are_safe_and_overridable(monkeypatch):
     import main
 

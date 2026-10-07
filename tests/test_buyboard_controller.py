@@ -501,6 +501,7 @@ def test_cancel_queued_sell_all_returns_to_open_position(tmp_path):
         board_status=BoardStatus.SELL_ALL,
         sell_all_at_market_open=True,
         exit_all_required=True,
+        broker_quantity=100,
     )
     result = apply_board_command(engine, _cmd(CancelQueuedSellAll, card))
     assert result.board_status == BoardStatus.OPEN_POSITION
@@ -529,14 +530,70 @@ def test_triggered_stop_loss_cannot_be_withdrawn_or_reduced(tmp_path, command_ty
     assert stored.stop_loss_triggered is True
 
 
-def test_cancel_queued_sell_all_refuses_when_actively_working(tmp_path):
-    """A Sell All that is not premarket-queued is actively working at the
-    broker -- cancelling that path is a different, engine-owned flow, not a
-    board-level drag."""
+@pytest.mark.parametrize("quantity", [1, 643])
+def test_cancel_unsubmitted_regular_sell_all_preserves_holding_and_stop(tmp_path, quantity):
     engine = _make_engine(tmp_path)
-    card = _seed(engine, board_status=BoardStatus.SELL_ALL, sell_all_at_market_open=False)
+    card = _seed(
+        engine, board_status=BoardStatus.SELL_ALL, sell_all_at_market_open=False,
+        position_runtime_status=PositionRuntimeStatus.LIQUIDATING,
+        broker_quantity=quantity, orderable_quantity=quantity,
+        average_entry_price=4.35, stop_type=StopType.ORB_LOW,
+        active_stop_price=4.24, stop_quantity=quantity, exit_all_required=True,
+        exit_attempt_count=3, exit_attempt_group_id="OLD-EXIT",
+        next_exit_retry_at="2026-10-05T14:53:00+00:00",
+        last_exit_error="Emergency SELL collar retry limit reached",
+    )
+    result = apply_board_command(engine, _cmd(CancelQueuedSellAll, card))
+    assert result.board_status == BoardStatus.OPEN_POSITION
+    assert result.position_runtime_status == PositionRuntimeStatus.OPEN
+    assert result.broker_quantity == result.orderable_quantity == quantity
+    assert result.active_stop_price == 4.24 and result.stop_quantity == quantity
+    assert result.stop_type == StopType.ORB_LOW and result.average_entry_price == 4.35
+    assert not result.exit_all_required and result.pending_partial_sell_quantity == 0
+    assert result.exit_attempt_count == 0 and result.exit_attempt_group_id == ""
+    assert result.next_exit_retry_at is None and result.last_exit_error == ""
+
+
+@pytest.mark.parametrize("changes", [
+    {"exit_client_order_id": "SELL-CID"},
+    {"exit_pending_attempt_number": 1},
+    {"reserved_sell_quantity": 100},
+    {"exit_submission_unresolved": True},
+    {"exit_cancel_in_flight": True},
+    {"exit_cancel_command_id": "CANCEL-CID"},
+    {"exit_cancel_requested_at": "2026-10-05T14:53:00+00:00"},
+    {"broker_quantity": 0},
+])
+def test_cancel_sell_all_rejects_durable_lifecycle_without_changing_card(tmp_path, changes):
+    engine = _make_engine(tmp_path)
+    fields = dict(board_status=BoardStatus.SELL_ALL, broker_quantity=100,
+                  active_stop_price=95.0, stop_quantity=100, exit_all_required=True)
+    fields.update(changes)
+    card = _seed(engine, **fields)
     with pytest.raises(CommandRejectedError):
         apply_board_command(engine, _cmd(CancelQueuedSellAll, card))
+    stored = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert stored.version == card.version and stored.board_status == BoardStatus.SELL_ALL
+    assert stored.exit_all_required and stored.active_stop_price == 95.0
+
+
+def test_cancel_sell_all_cannot_orphan_a_working_sell(tmp_path):
+    from src.core.execution_order_record import ExecutionOrderRecord, ExecutionOrderStatus, BrokerIdentityStatus
+    from src.core.order_state import OrderSide, OrderIntent
+    from src.services.execution_order_repository import record_execution_order
+
+    engine = _make_engine(tmp_path)
+    card = _seed(engine, board_status=BoardStatus.SELL_ALL, broker_quantity=100, exit_all_required=True)
+    record_execution_order(engine, ExecutionOrderRecord(
+        environment="PROD", account_no="1", symbol="AAPL", side=OrderSide.SELL,
+        intent=OrderIntent.MANUAL_EXIT, client_order_id="WORKING-SELL",
+        broker_order_id="BROKER-SELL", broker_identity_status=BrokerIdentityStatus.EXACT,
+        status=ExecutionOrderStatus.WORKING, submitted_quantity=100,
+        remaining_quantity=100, submitted_limit_price=100.0,
+    ))
+    with pytest.raises(CommandRejectedError):
+        apply_board_command(engine, _cmd(CancelQueuedSellAll, card))
+    assert repo.get_trade_card(engine, "PROD", "1", "AAPL").version == card.version
 
 
 # --- Reorder (spec section 379, code review finding P1-8) ------------------
@@ -562,3 +619,24 @@ def test_reorder_card_respects_stale_version(tmp_path):
     apply_board_command(engine, _cmd(ReorderCard, card, target_priority=1))  # bumps version
     with pytest.raises(TradeCardVersionConflictError):
         apply_board_command(engine, _cmd(ReorderCard, card, target_priority=2))  # stale version
+
+
+@pytest.mark.parametrize("command_type", [CancelQueuedSellAll, RequestPartialSell])
+def test_triggered_stop_loss_cannot_be_withdrawn_or_reduced(tmp_path, command_type):
+    engine = _make_engine(tmp_path)
+    card = _seed(
+        engine,
+        board_status=BoardStatus.SELL_ALL,
+        position_runtime_status=PositionRuntimeStatus.QUEUED_FOR_OPEN,
+        sell_all_at_market_open=True,
+        exit_all_required=True,
+        stop_loss_triggered=True,
+        broker_quantity=12,
+        orderable_quantity=12,
+    )
+    kwargs = {"quantity": 4} if command_type is RequestPartialSell else {}
+    with pytest.raises(CommandRejectedError, match="triggered stop loss"):
+        apply_board_command(engine, _cmd(command_type, card, **kwargs))
+    stored = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert stored.exit_all_required is True
+    assert stored.stop_loss_triggered is True

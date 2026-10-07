@@ -16,9 +16,29 @@ from src.services.kis_request_scheduler import (
     RequestPriority,
 )
 from src.services.kis_request_boundary import (
+    PreBrokerDispatchAbortedError,
     execute_kis_request,
     kis_request_scope,
 )
+
+
+def test_final_entry_validation_occurs_after_http_scheduler_wait():
+    class WaitingScheduler:
+        def execute_mutation(self, operation, **kwargs):
+            events.append("waited")
+            return operation()
+
+    events = []
+    def expired():
+        events.append("validated")
+        raise ValueError("quote expired during scheduler wait")
+
+    with kis_request_scope(scheduler=WaitingScheduler(), account_no="test",
+            kind=RequestKind.MUTATION, priority=RequestPriority.NEW_ENTRY,
+            pre_dispatch_check=expired):
+        with pytest.raises(PreBrokerDispatchAbortedError, match="quote expired"):
+            execute_kis_request(lambda: events.append("HTTP sent"), account_no="test", endpoint="/order")
+    assert events == ["waited", "validated"]
 from src.services.mutation_budget_protocol import (
     CommandType,
     MutationBudgetExceededError,
@@ -37,6 +57,36 @@ def _scheduler(**kwargs):
         sleeper=kwargs.pop("sleeper", lambda _seconds: None),
         **kwargs,
     )
+
+
+def test_protective_http_capacity_bypasses_slow_read_and_preserves_shared_pacing():
+    scheduler = _scheduler(protective_parallelism=1, min_request_spacing_seconds=0.05, sleeper=time.sleep)
+    started, release, sold = (threading.Event() for _ in range(3))
+    starts = []
+    def slow_read():
+        starts.append(time.monotonic())
+        started.set()
+        assert release.wait(3)
+    reader = threading.Thread(target=lambda: scheduler.execute_read(slow_read,
+        account_no="test", endpoint="balance", priority=RequestPriority.ACCOUNT_RECONCILIATION))
+    def stop():
+        starts.append(time.monotonic())
+        sold.set()
+    protective = threading.Thread(target=lambda: scheduler.execute_mutation(stop,
+        command_type=CommandType.SUBMIT, account_no="test", endpoint="submit",
+        priority=RequestPriority.EMERGENCY_EXIT))
+    try:
+        reader.start()
+        assert started.wait(1)
+        protective.start()
+        assert sold.wait(1)
+        assert not release.is_set()
+        assert starts[1] - starts[0] >= 0.04
+    finally:
+        release.set()
+        reader.join(3)
+        protective.join(3)
+    assert scheduler.metrics().active_requests == 0
 
 
 def test_rate_limited_read_backs_off_and_retries():

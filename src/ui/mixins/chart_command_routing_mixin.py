@@ -333,7 +333,7 @@ class ChartCommandRoutingMixin:
         card = projection.card
         payload = card_drag_payload(projection)
         common = _command_kwargs(payload)
-        if card.board_status == BoardStatus.BUYLIST:
+        if card.board_status in {BoardStatus.BUYLIST, BoardStatus.CLOSED}:
             if self._chart_positive_price(card.breakout_price) is None:
                 QMessageBox.information(
                     self,
@@ -410,8 +410,8 @@ class ChartCommandRoutingMixin:
             btn.setStyleSheet(
                 "background-color: #c0392b; color: white; font-weight: 600;"
             )
-        elif card is not None and card.board_status == BoardStatus.BUYLIST and target:
-            btn.setText("Activate (A)")
+        elif card is not None and card.board_status in {BoardStatus.BUYLIST, BoardStatus.CLOSED} and target:
+            btn.setText("Re-enter (A)" if card.board_status == BoardStatus.CLOSED else "Activate (A)")
             btn.setEnabled(True)
             btn.setStyleSheet(
                 "background-color: #27ae60; color: white; font-weight: 600;"

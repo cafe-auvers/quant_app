@@ -12,7 +12,9 @@ from typing import Any
 from sqlalchemy import BigInteger, Column, DateTime, MetaData, String, Table, Text, text
 from sqlalchemy.engine import Engine
 
-from src.core.trade_card_state import BoardStatus, TradeCardState
+from src.core.trade_card_state import BoardStatus, TradeCardState, can_withdraw_sell_all_intent
+from src.core.buy_today_feedback import buy_today_feedback_is_current
+from src.services.monitor_equity import read_monitor_equity_snapshot
 from src.infrastructure.database.coordination_engine import (
     create_coordination_connection_engine,
     normalize_coordination_database_config,
@@ -129,6 +131,7 @@ class CanonicalPlanningSource:
         engine: Engine | None = None,
         unavailable_reason: str = "Canonical planning reads are disabled",
         cache_seconds: float = 2.0,
+        equity_path: Path | None = None,
     ) -> None:
         self.enabled = bool(enabled)
         self.environment = str(environment or "PROD").strip().upper()
@@ -136,6 +139,7 @@ class CanonicalPlanningSource:
         self.engine = engine
         self.unavailable_reason = str(unavailable_reason or "Canonical planning unavailable")
         self.cache_seconds = max(0.0, float(cache_seconds))
+        self.equity_path = equity_path
         self._resolved_account_no = ""
         self._snapshot: _Snapshot | None = None
         self._lock = threading.RLock()
@@ -166,6 +170,7 @@ class CanonicalPlanningSource:
             environment=config.canonical_environment,
             account_no=config.canonical_account_no,
             engine=engine,
+            equity_path=repository / "data" / "monitor_equity.json",
         )
 
     @property
@@ -427,6 +432,7 @@ class CanonicalPlanningSource:
             "previous_board_status": self._enum_value(card.previous_board_status),
             "version": int(card.version),
             "kanban_priority": int(card.kanban_priority or 0),
+            "risk_percent": float(card.risk_percent),
             "breakout_price": self._positive_number(card.breakout_price),
             "buffer_pct": float(card.buffer_pct or 0.0),
             "session_date": self._date_value(card.session_date),
@@ -435,8 +441,20 @@ class CanonicalPlanningSource:
             "entry_orb_high": card.entry_orb_high,
             "entry_orb_low": card.entry_orb_low,
             "entry_trigger": card.entry_trigger,
+            "entry_execution_price": card.entry_execution_price,
+            "entry_breakout_trigger": card.entry_breakout_trigger,
+            "entry_remaining_target_quantity": max(
+                0, int(card.entry_remaining_target_quantity or 0)
+            ),
+            "next_retry_at": self._date_value(card.next_retry_at),
             "entry_runtime_status": self._enum_value(card.entry_runtime_status),
             "entry_block_reason": str(card.entry_block_reason or ""),
+            "buy_today_note": (
+                str(card.buy_today_note or "")
+                if card.board_status == BoardStatus.BUYLIST
+                and buy_today_feedback_is_current(card)
+                else ""
+            ),
             "entry_order_pending": bool(
                 card.entry_client_order_id
                 or card.entry_pending_attempt_number
@@ -455,13 +473,16 @@ class CanonicalPlanningSource:
             "average_entry_price": float(card.average_entry_price or 0.0),
             "stop_type": self._enum_value(card.stop_type),
             "active_stop_price": card.active_stop_price,
+            "stop_quantity": max(0, int(card.stop_quantity or 0)),
             "pending_stop_type": self._enum_value(card.pending_stop_type),
             "pending_stop_price": card.pending_stop_price,
+            "pending_stop_quantity": max(0, int(card.pending_stop_quantity or 0)),
             "pending_partial_sell_quantity": max(
                 0, int(card.pending_partial_sell_quantity or 0)
             ),
             "reserved_sell_quantity": max(0, int(card.reserved_sell_quantity or 0)),
             "sell_all_at_market_open": bool(card.sell_all_at_market_open),
+            "can_cancel_sell_all": can_withdraw_sell_all_intent(card),
             "exit_all_required": bool(card.exit_all_required),
             "exit_order_pending": bool(
                 card.exit_client_order_id
@@ -470,6 +491,9 @@ class CanonicalPlanningSource:
             ),
             "exit_cancel_in_flight": bool(card.exit_cancel_in_flight),
             "last_exit_error": str(card.last_exit_error or ""),
+            "next_exit_retry_at": self._date_value(card.next_exit_retry_at),
+            "last_reported_price": self._positive_number(card.market_data_last_trusted_price),
+            "price_as_of": self._date_value(card.market_data_last_trusted_at),
             "warnings": [str(item) for item in card.warnings if str(item).strip()],
             "updated_at": card.updated_at.isoformat(),
             "source": self.source_name,
@@ -498,7 +522,18 @@ class CanonicalPlanningSource:
                 str(row["symbol"]),
             )
         )
-        return {"rows": rows, "revision": snapshot.revision}
+        nav, nav_as_of, nav_note = None, None, "Account NAV unavailable; refresh the PC account"
+        account_no = self._resolved_account_no or self.configured_account_no
+        if self.equity_path is not None and account_no:
+            nav, nav_as_of, nav_note = read_monitor_equity_snapshot(
+                self.equity_path, self.environment, account_no,
+                dt.datetime.now(dt.timezone.utc),
+            )
+        return {
+            "rows": rows, "revision": snapshot.revision,
+            "account_nav_usd": nav, "account_nav_as_of": nav_as_of,
+            "account_nav_note": nav_note,
+        }
 
     def get_plan(
         self,

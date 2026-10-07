@@ -14,6 +14,10 @@ from src.services.mutation_budget_protocol import CommandType
 T = TypeVar("T")
 
 
+class PreBrokerDispatchAbortedError(RuntimeError):
+    """A final queued-request check failed before any HTTP mutation."""
+
+
 @dataclass(frozen=True)
 class KisRequestContext:
     scheduler: Optional[Any]
@@ -24,11 +28,27 @@ class KisRequestContext:
     endpoint: str = ""
     is_new_entry: bool = False
     mutation_classifier: Optional[Callable[[BaseException], bool]] = None
+    pre_dispatch_check: Optional[Callable[[], None]] = None
 
 
 _context: ContextVar[Optional[KisRequestContext]] = ContextVar(
     "kis_request_context", default=None
 )
+_read_priority: ContextVar[Optional[RequestPriority]] = ContextVar("kis_read_priority", default=None)
+
+
+def effective_kis_read_priority(default):
+    override = _read_priority.get()
+    return min(default, override) if override is not None else default
+
+
+@contextmanager
+def kis_read_priority_scope(priority):
+    token = _read_priority.set(priority)
+    try:
+        yield
+    finally:
+        _read_priority.reset(token)
 _scheduler_lock = threading.Lock()
 _process_scheduler_ref: Optional[weakref.ReferenceType[Any]] = None
 
@@ -84,6 +104,7 @@ def kis_request_scope(
     endpoint: str = "",
     is_new_entry: bool = False,
     mutation_classifier: Optional[Callable[[BaseException], bool]] = None,
+    pre_dispatch_check: Optional[Callable[[], None]] = None,
 ) -> Iterator[None]:
     token = _context.set(
         KisRequestContext(
@@ -95,6 +116,7 @@ def kis_request_scope(
             endpoint=str(endpoint or ""),
             is_new_entry=bool(is_new_entry),
             mutation_classifier=mutation_classifier,
+            pre_dispatch_check=pre_dispatch_check,
         )
     )
     try:
@@ -125,10 +147,15 @@ def execute_kis_request(
         if context is not None and context.scheduler is not None
         else get_process_kis_request_scheduler()
     )
+    kind = force_kind or (context.kind if context is not None else default_kind)
     if scheduler is None:
+        if kind == RequestKind.MUTATION and context is not None and context.pre_dispatch_check is not None:
+            try:
+                context.pre_dispatch_check()
+            except Exception as exc:
+                raise PreBrokerDispatchAbortedError(str(exc)) from exc
         return operation()
 
-    kind = force_kind or (context.kind if context is not None else default_kind)
     priority = force_priority or (
         context.priority if context is not None else default_priority
     )
@@ -143,6 +170,7 @@ def execute_kis_request(
         else str(endpoint or "unknown")
     )
     if kind == RequestKind.READ:
+        priority = effective_kis_read_priority(priority)
         return scheduler.execute_read(
             operation,
             account_no=resolved_account,
@@ -162,8 +190,15 @@ def execute_kis_request(
         if context is not None and context.mutation_classifier is not None
         else mutation_classifier
     )
+    def checked_operation():
+        if context is not None and context.pre_dispatch_check is not None:
+            try:
+                context.pre_dispatch_check()
+            except Exception as exc:
+                raise PreBrokerDispatchAbortedError(str(exc)) from exc
+        return operation()
     return scheduler.execute_mutation(
-        operation,
+        checked_operation,
         command_type=command_type,
         account_no=resolved_account,
         endpoint=resolved_endpoint,

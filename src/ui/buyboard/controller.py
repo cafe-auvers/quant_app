@@ -85,6 +85,7 @@ class BuyboardProjectionWorker(QThread):
         super().__init__()
         self.request = request
         self.resolved_revision = None
+        self.recovery_snapshot_signature = None
 
     def run(self) -> None:
         started_at = time.perf_counter()
@@ -162,6 +163,22 @@ class BuyboardProjectionWorker(QThread):
                 # the exact revision that triggered this projection.  Avoid a
                 # second four-table aggregate query after downloading it.
                 self.resolved_revision = current_revision
+            # Disk/fsync work belongs on this projection worker, so it cannot
+            # pause Qt while prices and operator intent are changing.
+            cards = [value.card for value in projections if getattr(value, "card", None) is not None]
+            if cards:
+                try:
+                    from src.services import trade_card_repository
+                    existing = trade_card_repository.load_local_trade_cards_snapshot(
+                        path=trade_card_repository.LOCAL_TRADE_CARDS_FILE)
+                    merged = {card.card_key: card for card in existing}
+                    merged.update({card.card_key: card for card in cards})
+                    trade_card_repository.save_local_trade_cards_snapshot(merged.values(),
+                        path=trade_card_repository.LOCAL_TRADE_CARDS_FILE)
+                    self.recovery_snapshot_signature = tuple(sorted(
+                        (card.card_key, int(card.version or 0), str(card.updated_at or "")) for card in cards))
+                except Exception:
+                    logger.exception("Could not refresh the local Buy Board recovery snapshot")
             self.completed.emit(projections, "", request.generation)
         except SQLAlchemyError as exc:
             logger.warning(
@@ -1070,6 +1087,10 @@ class BuyboardMixin:
             )
         )
         if signature == self.__dict__.get("_buyboard_local_snapshot_signature"):
+            return
+        projection_worker = self.__dict__.get("_buyboard_projection_worker")
+        if signature == getattr(projection_worker, "recovery_snapshot_signature", None):
+            self._buyboard_local_snapshot_signature = signature
             return
         try:
             from src.services import trade_card_repository

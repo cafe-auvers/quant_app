@@ -7,6 +7,8 @@ pure function over that immutable snapshot and cloned local state.
 """
 from __future__ import annotations
 
+from src.core.broker_order_history import authoritative_order_history
+
 import copy
 import logging
 import threading
@@ -152,6 +154,19 @@ def _local_write_generation(engine: Engine) -> int:
     _track_local_coordination_writes(engine)
     with _local_state_cache_lock:
         return int(_local_write_generations.get(engine, 0))
+
+
+def account_broker_state_generation(engine: Engine) -> tuple:
+    """Invalidate an asynchronous read after local or remote order changes."""
+    from src.services.coordination_change_pulse import coordination_table_change_generation
+
+    return (
+        _local_write_generation(engine),
+        coordination_table_change_generation(
+            engine,
+            {"execution_orders", "capital_reservations", "discovered_external_orders", "execution_commands"},
+        ),
+    )
 
 
 class ReconciliationCategory(str, Enum):
@@ -359,6 +374,7 @@ def fetch_account_broker_snapshot(
     errors = []
     holdings = ()
     holdings_complete = False
+    balance_observed_at = None
     try:
         if position_snapshot is _POSITION_SNAPSHOT_NOT_PROVIDED:
             position_snapshot = broker.get_positions(
@@ -372,6 +388,9 @@ def fetch_account_broker_snapshot(
         ):
             raise ValueError("position snapshot did not contain overseas holdings")
         holdings = _extract_account_holdings(position_snapshot)
+        balance_observed_at = clock()
+        if position_snapshot.get("received_at"):
+            balance_observed_at = datetime.fromisoformat(position_snapshot["received_at"])
         holdings_complete = True
     except Exception as exc:  # one failed source must not erase the others
         errors.append(f"holdings: {exc}")
@@ -415,6 +434,7 @@ def fetch_account_broker_snapshot(
         orders=tuple(discovery.snapshots),
         account_buying_power=balance,
         account_equity=equity,
+        account_balance_observed_at=balance_observed_at,
         observed_at=observed_at,
         session_date=_us_market_session_date(observed_at),
         errors=tuple(errors) + tuple(discovery.errors),
@@ -1490,7 +1510,7 @@ def reduce_account_reconciliation(
             )
 
     # C3 primary path: exact broker-order identity.
-    for broker_snapshot in snapshot.orders:
+    for broker_snapshot in authoritative_order_history(snapshot.orders):
         exact = order_by_broker_id.get(broker_snapshot.broker_order_id)
         if exact is None:
             continue
@@ -2248,11 +2268,12 @@ def run_account_reconciliation_pass(
         Callable[[Mapping], Tuple[float, float]]
     ] = None,
     position_snapshot=_POSITION_SNAPSHOT_NOT_PROVIDED,
+    broker_snapshot: Optional[AccountBrokerSnapshot] = None,
     clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     persist: bool = True,
 ) -> AccountReconciliationResult:
     """Fetch broker truth once and retry one local optimistic-write race."""
-    snapshot = fetch_account_broker_snapshot(
+    snapshot = broker_snapshot or fetch_account_broker_snapshot(
         broker=broker,
         environment=environment,
         account_no=account_no,
@@ -2261,6 +2282,8 @@ def run_account_reconciliation_pass(
         position_snapshot=position_snapshot,
         clock=clock,
     )
+    if snapshot.environment != environment or snapshot.account_no != account_no:
+        raise ValueError("Broker snapshot belongs to a different account or environment")
     attempt_cards = cards
     for attempt in range(2):
         local_state = load_account_local_state(
@@ -2291,6 +2314,10 @@ def run_account_reconciliation_pass(
                 raise_on_error=True,
             )
             continue
+        from src.services.execution_command_repository import reconcile_ambiguous_cancellations
+        reconciled_orders = {order.client_order_id: order for order in local_state.execution_orders}
+        reconciled_orders.update({order.client_order_id: order for order in plan.order_updates})
+        reconcile_ambiguous_cancellations(engine, snapshot, tuple(reconciled_orders.values()))
         return AccountReconciliationResult(snapshot=snapshot, plan=plan)
     raise AssertionError("unreachable reconciliation retry state")
 

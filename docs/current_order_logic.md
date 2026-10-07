@@ -63,7 +63,10 @@ Therefore:
 
 - `orb_high` must be strictly above both the structural breakout price and the
   ORB low; otherwise no passive execution zone exists.
-- The automatic execution price defaults to that candidate's `orb_high`.
+- The automatic BUY execution price is the highest legal tick at or below that
+  candidate's raw `orb_high`. Fractional-cent market highs are rounded down,
+  never above the range. The raw high remains the breakout confirmation trigger.
+  If rounding leaves no price strictly above the floor, the plan is rejected.
 - A manual execution price may be below `orb_high`, but it must remain strictly
   above both `breakout_price` and `orb_low`.
 - A manual price is never silently changed.
@@ -274,6 +277,14 @@ during replacement cannot inherit the proposed later-generation stop.
   Position, uncertainty stays Entry Pending.
 - Open Position remains open. EOD stops trying to complete any unfilled entry
   remainder and keeps the filled position protected.
+- Outside regular hours, feed unavailability does not create a new automatic
+  Sell All. Existing stop and explicit exit intent remain pending; during
+  regular hours, the normal structural-outage protection still applies.
+- KIS may return both an original zero-fill order and its later cancellation.
+  The original is retired only with unique cancellation proof for the exact
+  environment/account/symbol/side/order ID, matching quantity, zero fills and
+  remaining quantity, and a valid later broker timestamp on the same date.
+  Missing or contradictory evidence remains fenced.
 
 ## 9. Hard stop-loss exits
 

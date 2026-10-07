@@ -842,6 +842,13 @@ Trading halt:
 
 #### D10. Feed-outage policy for existing positions (corrected reclassification)
 
+The structural outage timer runs only during the NYSE regular session. A
+closed exchange does not create a new Sell All or next-open liquidation from
+missing regular-session feed registrations. Closing resets the outage timer;
+the next session starts a new grace period if the feed is still unavailable.
+An already recorded stop, operator exit, or regular-session liquidation remains
+sticky and is never withdrawn by this reset.
+
 Tier classification (`HIGH`/`LOW`), the short grace period for `HIGH`, and
 the long hard ceiling for `LOW` are unchanged from revision 2. Corrected:
 **during a total outage for a specific symbol, its price-based tier freezes

@@ -534,9 +534,78 @@ def test_protocol_latency_statistics_cover_more_than_the_old_rolling_window():
     metrics = service.protocol_metrics_snapshot()
 
     assert metrics.receive_lag_sample_count == 3_000
-    assert metrics.queue_lag_sample_count == 3_000
+    assert metrics.parser_lag_sample_count == 3_000
+    assert metrics.queue_lag_sample_count == 0
     assert metrics.receive_lag_max_ms >= 499
-    assert metrics.queue_lag_max_ms >= 699
+    assert metrics.parser_lag_max_ms >= 699
+
+
+def test_queue_latency_measures_engine_drain_instead_of_parser_work():
+    service, _ = _service()
+    assert service.ingest_trade(_event(processed_at=NOW + dt.timedelta(milliseconds=3)))
+    service._clock = lambda: NOW + dt.timedelta(seconds=8)
+    quotes = service.poll_once()
+    metrics = service.protocol_metrics_snapshot()
+    assert metrics.parser_lag_p99_ms == 3
+    assert metrics.queue_lag_p99_ms == 8_000
+    # The extrema/latest/combined delivery of one event is one timing sample.
+    assert metrics.queue_lag_sample_count == 1
+    assert all(not quote.is_execution_fresh(now=service._clock()) for quote in quotes)
+    service.poll_once()
+    assert service.protocol_metrics_snapshot().queue_lag_sample_count == 1
+
+
+def test_regular_latency_separates_premarket_and_trade_quote_channels():
+    service, _ = _service()
+    day = dt.datetime(2026, 10, 5, tzinfo=dt.timezone.utc)
+    premarket = day.replace(hour=12)
+    regular = day.replace(hour=18)
+    for stamp, channel, lag in ((premarket, "HDFSCNT0", 4.5),
+                                (regular, "HDFSCNT0", 3.9),
+                                (regular, "HDFSASP0", .2)):
+        event = QuoteSnapshot(symbol="AAPL", last_price=100, ask=101, bid=99,
+                              broker_event_at=stamp, received_at=stamp + dt.timedelta(seconds=lag),
+                              channel=channel, payload_fingerprint=f"{stamp}-{channel}")
+        assert (service.ingest_trade(event) if channel == "HDFSCNT0" else service.ingest_quote(event))
+    metrics = service.latency_metrics_snapshot()
+    assert metrics["runtime"]["receive"]["sample_count"] == 3
+    assert metrics["runtime"]["receive"]["p99_ms"] == 4_500
+    regular_metrics = metrics["regular_session"]
+    assert regular_metrics["session_date"] == "2026-10-05"
+    assert regular_metrics["receive"]["sample_count"] == 2
+    assert regular_metrics["receive"]["p99_ms"] == 3_900
+    assert regular_metrics["channels"]["HDFSCNT0"]["receive"]["p99_ms"] == 3_900
+    assert regular_metrics["channels"]["HDFSASP0"]["receive"]["p99_ms"] == 200
+
+
+def test_late_arrival_of_regular_session_event_is_not_hidden_by_close_boundary():
+    service, _ = _service()
+    stamp = dt.datetime(2026, 10, 5, 19, 59, 58, tzinfo=dt.timezone.utc)
+    event = QuoteSnapshot(symbol="AAPL", last_price=100, broker_event_at=stamp,
+                          received_at=stamp + dt.timedelta(seconds=4), channel="HDFSCNT0")
+    assert service.ingest_trade(event)
+    metrics = service.latency_metrics_snapshot()["regular_session"]
+    assert metrics["receive"]["sample_count"] == 1
+    assert metrics["receive"]["p99_ms"] == 4_000
+
+
+def test_qualification_reset_excludes_already_pending_premarket_drain():
+    service, _ = _service(qualification_mode=True)
+    assert service.ingest_trade(_event(fingerprint="before-reset"))
+    service._clock = lambda: NOW + dt.timedelta(seconds=1)
+    service.reset_qualification_latency_metrics()
+    service.poll_once()
+    assert service.protocol_metrics_snapshot().queue_lag_sample_count == 0
+    assert service.latency_metrics_snapshot()["runtime"]["engine_queue"]["sample_count"] == 0
+
+
+def test_latency_channel_storage_is_bounded_for_unknown_channel_names():
+    service, _ = _service()
+    for index in range(100):
+        assert service.ingest_trade(_event(channel=f"unknown-{index}", fingerprint=f"unknown-{index}"))
+    channels = service.latency_metrics_snapshot()["runtime"]["channels"]
+    assert set(channels) == {"OTHER"}
+    assert channels["OTHER"]["receive"]["sample_count"] == 100
 
 
 def test_qualification_latency_metrics_can_start_a_new_measurement_window():
@@ -559,6 +628,7 @@ def test_qualification_latency_metrics_can_start_a_new_measurement_window():
 
 
 def test_qualification_silent_channel_probe_uses_live_service_freshness(monkeypatch):
+    monkeypatch.setattr("src.core.execution_config.ENTRY_MARKET_DATA_MAX_AGE_SECONDS", 2.0)
     monkeypatch.setattr(
         "src.services.kis_realtime_market_data.execution_config.BROKER_EVENT_STALE_SECONDS",
         2.0,
@@ -578,7 +648,7 @@ def test_qualification_silent_channel_probe_uses_live_service_freshness(monkeypa
     assert service.ingest_quote(
         _event(channel="HDFSASP0", fingerprint="quote-before-suppression")
     )
-    assert not service.entry_quote_ready("AAPL", now=NOW)
+    assert service.entry_quote_ready("AAPL", now=NOW)
     service.poll_once()
     assert service.entry_quote_ready("AAPL", now=NOW)
 
@@ -698,7 +768,7 @@ def test_structural_feed_continuity_ignores_rejected_event_but_execution_does_no
     service.poll_once()
 
     delayed_trade = replace(
-        _event(seconds=10, fingerprint="delayed-trade"),
+        _event(seconds=16, fingerprint="delayed-trade"),
         broker_event_at=NOW,
     )
     assert not service.ingest_trade(delayed_trade)
@@ -901,6 +971,93 @@ def test_one_healthy_symbol_does_not_mark_a_failing_symbol_ready():
 
     assert service.is_symbol_execution_ready("AAPL", now=NOW)
     assert not service.is_symbol_execution_ready("MSFT", now=NOW)
+
+
+def test_latest_trade_is_evaluated_without_older_quote_or_extrema_timestamps():
+    service, _ = _service()
+    service.configure_desired_channels(trade_priorities={"AAPL": 1}, quote_priorities={"AAPL": 1})
+    _ack(service, "AAPL", "HDFSCNT0")
+    _ack(service, "AAPL", "HDFSASP0")
+    assert service.ingest_quote(_event(channel="HDFSASP0", seconds=-2, fingerprint="quote"))
+    assert service.ingest_trade(_event(price=99, seconds=-2.8, fingerprint="minimum"))
+    assert service.ingest_trade(_event(price=105, seconds=-2.6, fingerprint="maximum"))
+    assert service.ingest_trade(_event(price=102, seconds=-0.1, fingerprint="latest"))
+    events = service.poll_once()
+    fresh_trade = [event for event in events if event.channel == "HDFSCNT0" and event.last_price == 102]
+    assert fresh_trade and fresh_trade[0].is_execution_fresh(now=NOW)
+    assert any(event.last_price == 99 for event in events)
+    assert any(event.last_price == 105 for event in events)
+    assert service.latest_quote("AAPL").received_at == NOW - dt.timedelta(seconds=0.1)
+    assert service.latest_quote("AAPL").ask is not None
+    assert service.entry_quote_ready("AAPL", now=NOW)
+
+
+def test_fresh_trade_cannot_hide_stale_quote_channel_and_explains_block():
+    service, _ = _service()
+    service.configure_desired_channels(trade_priorities={"AAPL": 1}, quote_priorities={"AAPL": 1})
+    _ack(service, "AAPL", "HDFSCNT0")
+    _ack(service, "AAPL", "HDFSASP0")
+    assert service.ingest_quote(_event(channel="HDFSASP0", seconds=-2, fingerprint="quote"))
+    assert service.ingest_trade(_event(seconds=-0.1, fingerprint="trade"))
+    service.poll_once()
+    reference = NOW + dt.timedelta(seconds=13.1)
+    assert not service.entry_quote_ready("AAPL", now=reference)
+    assert "fresh KIS bid/ask" in service.entry_quote_unavailable_reason("AAPL", now=reference)
+
+
+def test_delayed_processing_is_explained_and_still_blocks_entry():
+    service, _ = _service()
+    service.configure_desired_channels(trade_priorities={"AAPL": 1}, quote_priorities={"AAPL": 1})
+    _ack(service, "AAPL", "HDFSCNT0")
+    _ack(service, "AAPL", "HDFSASP0")
+    assert service.ingest_quote(_event(channel="HDFSASP0", seconds=-2, fingerprint="quote"))
+    assert service.ingest_trade(_event(seconds=-2, fingerprint="trade"))
+    service._clock = lambda: NOW + dt.timedelta(seconds=16)
+    service.poll_once()
+    reference = service._clock()
+    assert not service.entry_quote_ready("AAPL", now=reference)
+    assert "processing queue limit" in service.entry_quote_unavailable_reason("AAPL", now=reference)
+
+
+def test_entry_allows_worker_wait_up_to_total_age_limit_but_keeps_exit_freshness():
+    service, _ = _service()
+    service.configure_desired_channels(trade_priorities={"AAPL": 1}, quote_priorities={"AAPL": 1})
+    _ack(service, "AAPL", "HDFSCNT0")
+    _ack(service, "AAPL", "HDFSASP0")
+    assert service.ingest_quote(_event(channel="HDFSASP0", fingerprint="quote"))
+    assert service.ingest_trade(_event(fingerprint="trade"))
+    service._clock = lambda: NOW + dt.timedelta(seconds=10)
+    quotes = service.poll_once()
+    assert quotes
+    assert service.entry_quote_ready("AAPL", now=service._clock())
+    assert all(quote.is_entry_fresh(now=service._clock()) for quote in quotes)
+    assert not service.is_symbol_execution_ready("AAPL", now=service._clock())
+    assert service.entry_quote_ready("AAPL", now=NOW + dt.timedelta(seconds=15))
+    assert not service.entry_quote_ready("AAPL", now=NOW + dt.timedelta(seconds=15.01))
+
+
+def test_entry_ingress_accepts_source_delay_inside_approved_total_age():
+    service, _ = _service()
+    service.configure_desired_channels(trade_priorities={"AAPL": 1}, quote_priorities={"AAPL": 1})
+    _ack(service, "AAPL", "HDFSCNT0")
+    _ack(service, "AAPL", "HDFSASP0")
+    for channel in ("HDFSCNT0", "HDFSASP0"):
+        event = replace(_event(channel=channel, seconds=10, fingerprint=channel), broker_event_at=NOW)
+        assert (service.ingest_trade if channel == "HDFSCNT0" else service.ingest_quote)(event)
+    assert service.entry_quote_ready("AAPL", now=NOW + dt.timedelta(seconds=10))
+    assert not service.entry_quote_ready("AAPL", now=NOW + dt.timedelta(seconds=15.01))
+
+
+def test_stop_breach_notifies_before_the_owner_drains_and_latest_price_is_current():
+    service, _ = _service()
+    seen = []
+    service.on_stop_breach(lambda quote, rule: seen.append((quote, rule, service.latest_quote("AAPL"))))
+    service.replace_stop_rules("AAPL", [StopRule("held", 100.0, "v1")])
+    assert service.ingest_trade(replace(_event(fingerprint="gap"), last_price=95.0))
+    assert seen and seen[0][0].last_price == 95.0
+    assert seen[0][2].last_price == 95.0
+    assert service.ingest_trade(replace(_event(seconds=1, fingerprint="rebound"), last_price=105.0))
+    assert any(quote.last_price == 95.0 and quote.breached_stop_versions for quote in service.poll_once())
 
 
 def test_trade_channel_for_open_position_outranks_quote_channel_for_buy_today():

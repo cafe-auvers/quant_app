@@ -27,7 +27,7 @@ def _synchronize_repository_environment() -> None:
         RUNTIME_LOCAL_CONFIG_FILE,
     )
     if result.env_changed or result.pc_env_changed or result.runtime_local_changed:
-        sys.stderr.write(
+        logging.getLogger(__name__).info(
             "Credential/runtime configuration synchronized "
             f"(.env={'updated' if result.env_changed else 'current'}, "
             f".env.pc={'updated' if result.pc_env_changed else 'current'}, "
@@ -98,7 +98,7 @@ def _qt_message_handler(mode, context, message):
     """Suppress handled Qt fallbacks while preserving actionable output."""
     if _should_suppress_qt_message(message):
         return
-    sys.stderr.write(f"{message}\n")
+    logger.warning("Qt: %s", message)
 
 
 def _install_global_excepthook():
@@ -129,7 +129,10 @@ def main():
 
     configure_logging()
     try:
-        faulthandler.enable(all_threads=True)
+        from src.utils.config import DATA_DIR
+        global _fault_trace_file
+        _fault_trace_file = (DATA_DIR / "logs" / "native_faults.log").open("a", encoding="utf-8")
+        faulthandler.enable(file=_fault_trace_file, all_threads=True)
     except (OSError, RuntimeError):
         logger.warning("Native Python fault tracing could not be enabled.")
     _install_global_excepthook()

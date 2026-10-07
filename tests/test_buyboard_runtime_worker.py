@@ -24,6 +24,13 @@ from PyQt5.QtWidgets import QApplication
 from sqlalchemy import create_engine
 from sqlalchemy.pool import NullPool
 
+
+@pytest.fixture(autouse=True)
+def isolated_monitor_equity_writer(monkeypatch, tmp_path):
+    from src.services import monitor_equity
+
+    monkeypatch.setattr(monitor_equity, "MONITOR_EQUITY_FILE", tmp_path / "monitor_equity.json")
+
 from src.api.kis_account_snapshot_dual import (
     KisRateLimitError,
     KisTransientApiError,
@@ -368,6 +375,73 @@ def test_construction_builds_nothing(tmp_path):
     assert worker.runtime is None
 
 
+@pytest.mark.parametrize("explicit_engine", [False, True])
+def test_production_composition_reads_existing_pending_buy_reservation(
+    tmp_path, monkeypatch, explicit_engine
+):
+    import src.ui.buyboard.runtime_worker as worker_module
+    from src.core.capital_reservation import CapitalReservation
+    from src.services import capital_reservation_repository
+
+    if explicit_engine:
+        (tmp_path / "reservations").mkdir()
+        reservation_engine = _db_engine(tmp_path / "reservations")
+        worker, engine = _worker(tmp_path, capital_reservation_engine=reservation_engine)
+    else:
+        worker, engine = _worker(tmp_path)
+        reservation_engine = engine
+    reservation = CapitalReservation.create(
+        environment="PROD", account_no="1", symbol="SVIA",
+        attempt_group_id="pending-svia", requested_notional=2797.05,
+        projected_open_risk=70.73,
+    )
+    capital_reservation_repository.save_reservation_strict(reservation_engine, reservation)
+    order = ExecutionOrderRecord(
+        environment="PROD", account_no="1", symbol="SVIA",
+        side=OrderSide.BUY, intent=OrderIntent.ENTRY,
+        client_order_id="pending-svia", broker_order_id="broker-svia",
+        broker_identity_status=BrokerIdentityStatus.EXACT,
+        status=ExecutionOrderStatus.WORKING,
+        submitted_quantity=643, remaining_quantity=643, submitted_limit_price=4.35,
+        capital_reservation_id=reservation.reservation_id,
+    )
+    record_execution_order(engine, order)
+    pending_card = _seed_card(engine, symbol="SVIA", entry_orb_low=4.24)
+    captured = {}
+
+    def capture_composition(**kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("composition captured")
+
+    lease = ExecutionLease(device_id="test", lease_token="test", lease_epoch=1)
+    worker._broker = ExecutionCommandGateway(
+        real_broker=FakeExecutionBroker(), engine=engine, mode_override=True,
+        lease_protocol=FakeExecutionLeaseProtocol(current=lease),
+        mutation_budget=AllowAllMutationBudget(), buying_power_provider=lambda *_: 100_000.0,
+    )
+    worker._schema_migration_manager = SimpleNamespace(prepare_cutover=lambda **_: None)
+    monkeypatch.setattr(worker_module, "is_buyboard_engine_enabled", lambda: True)
+    monkeypatch.setattr(execution_config, "KIS_LIVE_EXECUTION_MODE", "DISABLED")
+    monkeypatch.setattr(worker_module, "require_compatible_runtime_schema", lambda *_, **__: None)
+    monkeypatch.setattr(worker, "_set_device_state", lambda *_: None)
+    monkeypatch.setattr(worker, "_perform_shutdown_sequence", lambda: None)
+    monkeypatch.setattr(runtime_module, "build_buyboard_runtime", capture_composition)
+    worker.run()
+    assert captured
+
+    active = captured["portfolio_reservations_provider"]("PROD", "1")
+    orders = captured["portfolio_orders_provider"]("PROD", "1")
+    exposures = runtime_module._portfolio_projected_exposures(
+        cards=(pending_card,), execution_orders=orders, active_reservations=active,
+    )
+    assert len(exposures) == 1
+    assert exposures[0].source == "PENDING_BUY"
+    assert exposures[0].reservation_id == reservation.reservation_id
+    assert exposures[0].gross_notional_usd == pytest.approx(2797.05)
+    assert exposures[0].open_risk_usd == pytest.approx(70.73)
+    assert captured["portfolio_reservations_provider"]("PROD", "other-account") == []
+
+
 def test_unclaimed_new_store_allows_read_only_standby_migration_bootstrap(tmp_path):
     worker, engine = _worker(tmp_path, standby_only=True, device_id="laptop")
     manager = SchemaMigrationManager(
@@ -435,6 +509,173 @@ def test_card_cache_downloads_payload_only_when_revision_changes(
     third = worker._load_cards_if_changed()
     assert third[0].name == "Changed elsewhere"
     assert len(calls) == 2
+
+
+def test_unchanged_final_card_state_avoids_write_and_own_write_avoids_reload(tmp_path, monkeypatch):
+    worker, engine = _worker(tmp_path)
+    _seed_card(engine)
+    card = worker._load_cards_if_changed()[0]
+    original = card.name
+    card.name = "Transient planning state"
+    card.name = original
+    assert worker._persist_changed([card]) == [card]
+    assert repo.get_trade_card(engine, "PROD", "1", "AAPL").version == 1
+    card.stop_loss_triggered = True
+    worker._persist_changed([card])
+    assert repo.get_trade_card(engine, "PROD", "1", "AAPL").stop_loss_triggered
+    monkeypatch.setattr(repo, "get_trade_card_collection_revision", lambda *a, **k: pytest.fail("Own write caused reload"))
+    assert worker._load_cards_if_changed()[0] is card
+
+
+def test_background_account_read_does_not_block_quote_and_stop_evaluation(tmp_path, monkeypatch):
+    from src.services.background_account_reader import BackgroundAccountReader
+
+    entered, release = threading.Event(), threading.Event()
+    broker = _FakeBroker()
+    original_read = broker.get_positions
+
+    def blocking_read(**kwargs):
+        entered.set()
+        assert release.wait(3)
+        return original_read(**kwargs)
+
+    broker.get_positions = blocking_read
+    worker, engine = _worker(tmp_path, broker=broker)
+    worker.runtime = _build_test_runtime(
+        buying_power_provider=worker._buying_power_provider,
+        card_lookup=worker._card_lookup, broker=broker, market_data=_dummy_market_data(),
+    )
+    _seed_card(engine, board_status=BoardStatus.OPEN_POSITION, broker_quantity=10,
+               orderable_quantity=10, active_stop_price=101.0, stop_quantity=10)
+    worker._account_reader = BackgroundAccountReader()
+    monkeypatch.setattr(execution_config, "is_buyboard_engine_enabled", lambda: True)
+    monkeypatch.setattr("src.services.trading_engine.is_buyboard_engine_enabled", lambda: True)
+    try:
+        worker._run_one_cycle()
+        assert entered.wait(1)
+        assert not release.is_set()
+        assert worker.last_market_data_drain_at is not None
+        assert worker._cached_cards[0].stop_loss_triggered
+        pending = worker._account_reader._pending
+        worker._run_one_cycle()
+        assert worker._account_reader._pending is pending
+    finally:
+        release.set()
+        worker._account_reader.close()
+
+
+def test_async_symbol_cycle_handles_gap_stop_while_another_card_is_blocked(tmp_path, monkeypatch):
+    from src.services.background_symbol_executor import BackgroundSymbolExecutor
+
+    worker, engine, service, now = _stale_snapshot_stop_worker(tmp_path, monkeypatch, stop_price=100.0)
+    other = _seed_card(engine, symbol="OTHER", board_status=BoardStatus.BUY_TODAY)
+    worker._cached_cards = repo.list_trade_cards(engine)
+    held = next(c for c in worker._cached_cards if c.symbol == "AAPL")
+    worker.device_state = RuntimeDeviceState.ACTIVE
+    worker._symbol_executor = BackgroundSymbolExecutor(ordinary_workers=1, protective_workers=1)
+    started, release, stopped = (threading.Event() for _ in range(3))
+    def heartbeat(cards, *, allow_entries=True):
+        assert worker._card_lookup("PROD", "1", cards[0].symbol) is cards[0]
+        if cards[0].symbol == "OTHER":
+            started.set()
+            assert release.wait(3)
+        else:
+            assert not allow_entries
+            assert cards[0].exit_all_required
+            stopped.set()
+        return []
+    worker.runtime.trading_engine.run_heartbeat = heartbeat
+    try:
+        worker._queue_symbol_cycle(other, (), entry_allowed=False, protective=False)
+        assert started.wait(1)
+        quote = QuoteSnapshot(symbol="AAPL", last_price=95.0, broker_event_at=now,
+            received_at=now, channel="HDFSCNT0")
+        worker._queue_symbol_cycle(held, (quote,), entry_allowed=False, protective=True, critical=True)
+        assert stopped.wait(1)
+        assert not release.is_set()
+    finally:
+        release.set()
+        worker._symbol_executor.close()
+    durable = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert durable.stop_loss_triggered and durable.exit_all_required
+    assert durable.board_status == BoardStatus.SELL_ALL
+    assert durable.market_data_last_trusted_price == 95.0
+
+
+def test_background_result_is_discarded_after_order_state_changes(tmp_path, monkeypatch):
+    from src.services.background_account_reader import BackgroundAccountReader
+
+    broker = _FakeBroker()
+    worker, engine = _worker(tmp_path, broker=broker)
+    worker.runtime = SimpleNamespace(broker=broker)
+    _seed_card(engine)
+    cards = worker._load_cards_if_changed()
+    worker._account_reader = BackgroundAccountReader()
+    worker._refresh_account_state_if_due(cards)
+    pending = worker._account_reader._pending
+    pending[1].result(timeout=3)
+    cards[0].exit_client_order_id = "new-sell-after-read-started"
+    monkeypatch.setattr("src.ui.buyboard.runtime_worker.run_account_reconciliation_pass",
+                        lambda **kwargs: pytest.fail("Superseded snapshot was applied"))
+    try:
+        worker._refresh_account_state_if_due(cards)
+        assert worker._latest_reconciliation_snapshots == {}
+        assert worker._account_reader._pending is not pending
+    finally:
+        worker._account_reader.close()
+
+
+def test_background_snapshot_applies_on_owner_thread_without_refetch(tmp_path, monkeypatch):
+    from src.services.background_account_reader import BackgroundAccountReader
+
+    broker = _FakeBroker()
+    worker, engine = _worker(tmp_path, broker=broker)
+    worker.runtime = SimpleNamespace(broker=broker)
+    _seed_card(engine)
+    cards = worker._load_cards_if_changed()
+    worker._account_reader = BackgroundAccountReader()
+    worker._refresh_account_state_if_due(cards)
+    worker._account_reader._pending[1].result(timeout=3)
+    calls = len(broker.get_positions_calls)
+    assert worker._latest_reconciliation_snapshots == {}
+    worker._refresh_account_state_if_due(cards, execute_commands=False)
+    assert len(broker.get_positions_calls) == calls
+    assert "1" in worker._latest_reconciliation_snapshots
+    assert not worker.reconciliation_accounts_in_progress
+    worker._account_reader.close()
+
+
+def test_background_balance_retains_response_time_instead_of_request_or_apply_time(tmp_path, monkeypatch):
+    from src.services.background_account_reader import BackgroundAccountReader
+    from src.services import buying_power_cache
+
+    broker = _FakeBroker()
+    worker, engine = _worker(tmp_path, broker=broker)
+    worker.runtime = SimpleNamespace(broker=broker)
+    started = dt.datetime.now(dt.timezone.utc)
+    clock = [started]
+
+    class Clock:
+        @staticmethod
+        def now(_zone):
+            return clock[0]
+
+    def read(**kwargs):
+        clock[0] = started + dt.timedelta(seconds=5)
+        return {"overseas": {"holdings": [], "summary_by_exchange": {"NASD": {"cash_balance_usd": 5000.0}}}}
+
+    monkeypatch.setattr("src.ui.buyboard.runtime_worker.datetime", Clock)
+    broker.get_positions = read
+    worker._account_reconciled_at["1"] = started
+    worker._account_reader = BackgroundAccountReader()
+    worker._refresh_account_state_if_due([])
+    worker._account_reader._pending[1].result(timeout=3)
+    clock[0] = started + dt.timedelta(seconds=10)
+    worker._refresh_account_state_if_due([])
+    snapshot = buying_power_cache.get_snapshot("PROD", "1")
+    assert snapshot.received_at == started + dt.timedelta(seconds=5)
+    assert worker._account_balance_refreshed_at["1"] == snapshot.received_at
+    worker._account_reader.close()
 
 
 def test_same_device_mode_disables_elapsed_card_fallback(
@@ -870,8 +1111,8 @@ def test_ui_stop_commit_reaches_feed_when_worker_card_snapshot_is_stale(
 
     after_conflict = repo.get_trade_card(engine, "PROD", "1", "AAPL")
     assert after_conflict.pending_stop_command_id
-    assert after_conflict.exit_all_required is False
-    assert any(quote.breached_stop_versions for quote in service.poll_once())
+    assert after_conflict.exit_all_required is True
+    assert not any(quote.breached_stop_versions for quote in service.poll_once())
 
     worker._run_one_cycle()
 
@@ -1005,8 +1246,8 @@ def test_stop_breach_ack_waits_for_successful_card_cas(tmp_path, monkeypatch):
 
     after_conflict = repo.get_trade_card(engine, "PROD", "1", "AAPL")
     assert after_conflict.kanban_priority == 7
-    assert after_conflict.exit_all_required is False
-    assert any(quote.breached_stop_versions for quote in service.poll_once())
+    assert after_conflict.exit_all_required is True
+    assert not any(quote.breached_stop_versions for quote in service.poll_once())
 
     worker._run_one_cycle()
 
@@ -1222,6 +1463,33 @@ def test_action_readiness_uses_exact_symbol_not_another_quiet_symbol(tmp_path):
     assert action_readiness.critical_quote_subscriptions_acked is True
     assert action_readiness.critical_quotes_fresh is True
     assert stale_symbol_readiness.critical_quotes_fresh is False
+
+
+def test_entry_action_readiness_uses_approved_total_age_not_default_execution_age(tmp_path, monkeypatch):
+    monkeypatch.setattr(execution_config, "ENTRY_MARKET_DATA_MAX_AGE_SECONDS", 15)
+    now = dt.datetime.now(dt.timezone.utc)
+    transport = SimpleNamespace(on_data=lambda _: None, on_ack=lambda _: None,
+        on_connection=lambda _: None, subscribe=lambda _: None, unsubscribe=lambda _: None,
+        is_connected=lambda: True, reconnect_count=0, malformed_frame_count=0)
+    service = KisRealtimeMarketDataService(transport=transport, symbol_key_resolver=lambda symbol, channel: symbol,
+        trade_capacity=10, quote_capacity=10, clock=lambda: now, regular_session_filter=lambda _: True)
+    service._on_connection(True, "", 1)
+    event_at = now - dt.timedelta(seconds=13)
+    service.ingest_quote(QuoteSnapshot(symbol="AAPL", last_price=101.0, bid=100.9, ask=101.1,
+        broker_event_at=event_at, received_at=event_at, channel="HDFSASP0"))
+    service.ingest_trade(QuoteSnapshot(symbol="AAPL", last_price=101.0,
+        broker_event_at=event_at, received_at=event_at, channel="HDFSCNT0"))
+    service._states["AAPL"].trade_acked = True
+    service._states["AAPL"].quote_acked = True
+    assert not service.is_symbol_execution_ready("AAPL", now=now)
+    worker, _ = _worker(tmp_path)
+    worker.runtime = SimpleNamespace(market_data=service)
+    worker.startup_reconciliation_ran = worker.startup_reconciliation_complete = True
+    worker._database_writable = True
+    worker.last_market_data_drain_at = now
+    worker.device_state = RuntimeDeviceState.ACTIVE
+    assert worker.engine_readiness(symbol="AAPL", action="NEW_ENTRY", now=now).critical_quotes_fresh
+    assert not worker.engine_readiness(symbol="AAPL", action="NEW_ENTRY", now=now + dt.timedelta(seconds=3)).critical_quotes_fresh
 
 
 def test_database_probe_logs_one_concise_warning_for_an_outage(
@@ -2701,18 +2969,20 @@ def test_due_reconciliation_failure_invalidates_cached_action_readiness(
 
 
 def test_reconciliation_alert_incidents_are_account_scoped_and_rearm_after_resolution(
-    tmp_path,
+    tmp_path, monkeypatch,
 ):
     worker, _ = _worker(tmp_path)
     messages = []
     worker.alert.connect(messages.append)
+    resolved = []
+    monkeypatch.setattr(worker, "_resolve_external_alert", lambda kind, key: resolved.append((kind, key)))
 
     def result(account_no, alerts):
         return AccountReconciliationResult(
             snapshot=AccountBrokerSnapshot(
                 environment="PROD",
                 account_no=account_no,
-                completeness=SnapshotCompleteness(),
+                completeness=SnapshotCompleteness(True, True, True, True, True),
                 snapshot_id=f"snapshot-{account_no}",
             ),
             plan=ReconciliationPlan(
@@ -2734,6 +3004,21 @@ def test_reconciliation_alert_incidents_are_account_scoped_and_rearm_after_resol
 
     assert len(messages) == 3
     assert "incident 2" in messages[-1]
+    assert len(resolved) == 1
+    assert resolved[0][1].startswith("PROD:1:")
+
+
+def test_incomplete_reconciliation_keeps_existing_critical_incident(tmp_path, monkeypatch):
+    worker, _ = _worker(tmp_path)
+    incident = ("PROD", "1", "UNKNOWN_SUBMISSION", "AAPL", "order-1")
+    worker._active_reconciliation_incidents.add(incident)
+    resolved = []
+    monkeypatch.setattr(worker, "_resolve_external_alert", lambda *args: resolved.append(args))
+    result = AccountReconciliationResult(snapshot=AccountBrokerSnapshot(environment="PROD", account_no="1", completeness=SnapshotCompleteness()),
+        plan=ReconciliationPlan(snapshot_id="incomplete"))
+    worker._handle_reconciliation_result(result)
+    assert incident in worker._active_reconciliation_incidents
+    assert not resolved
 
 
 def test_startup_reconciliation_complete_when_every_account_succeeds(tmp_path):
@@ -2852,7 +3137,7 @@ def test_account_balance_converts_krw_totals_with_fallback_fx(monkeypatch):
 
     usable, equity = BuyboardRuntimeWorker._extract_account_balance(snapshot)
 
-    assert usable == pytest.approx(7_811_119.0 / 1342.51)
+    assert usable == 0.0  # Foreign account valuation is not orderable cash.
     assert equity == pytest.approx(18_995_455.0 / 1342.51)
 
 
@@ -2879,6 +3164,33 @@ def test_account_balance_preserves_explicit_usd_only_snapshot_without_fx(monkeyp
 
     assert usable == 5000.0
     assert equity == 5000.0
+
+
+def test_worker_balance_refresh_and_reconciliation_publish_real_equity_timestamp(tmp_path, monkeypatch):
+    from src.services import monitor_equity
+
+    published = []
+    monkeypatch.setattr(monitor_equity, "queue_monitor_equity", published.append)
+    worker, _ = _worker(tmp_path)
+    monkeypatch.setattr(worker, "_extract_account_balance", lambda _snapshot: (4000.0, 6000.0))
+    worker._record_buying_power("1", {})
+    assert published[-1].total_equity_usd == 6000.0
+    assert published[-1].source == "buyboard_runtime_periodic_refresh"
+    fetched = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=10)
+    broker_snapshot = AccountBrokerSnapshot(
+        environment="PROD", account_no="1", completeness=SnapshotCompleteness(account_balance_complete=True),
+        account_buying_power=3000.0, account_equity=7000.0, observed_at=fetched,
+    )
+    worker._record_reconciliation_balance("1", SimpleNamespace(snapshot=broker_snapshot))
+    assert published[-1].received_at > fetched
+    assert published[-1].total_equity_usd == 6000.0
+    latest = published[-1].received_at
+    path = tmp_path / "equity-projection.json"
+    monitor_equity.publish_monitor_equity(path, published[-1])
+    equity, error = monitor_equity.read_monitor_equity(path, "PROD", "1", latest + dt.timedelta(seconds=5))
+    assert equity == 6000.0 and not error
+    equity, error = monitor_equity.read_monitor_equity(path, "PROD", "1", latest + dt.timedelta(seconds=901))
+    assert equity is None and "stale" in error
 
 
 def test_periodic_refresh_populates_buying_power_cache_on_first_cycle(tmp_path, monkeypatch):
@@ -3067,6 +3379,38 @@ def test_pending_exit_uses_fast_broker_reconciliation(tmp_path, board_status):
     else:
         assert stored.broker_quantity == 10
         assert broker.get_positions_calls == []
+
+
+def test_reconciliation_refresh_starts_before_existing_freshness_deadline(tmp_path, monkeypatch):
+    import datetime as dt
+    import src.ui.buyboard.runtime_worker as worker_module
+    from src.services.account_reconciliation import AccountReconciliationResult, ReconciliationPlan
+
+    worker, _ = _worker(tmp_path)
+    worker.runtime = _build_test_runtime(
+        buying_power_provider=worker._buying_power_provider,
+        card_lookup=worker._card_lookup, broker=worker._broker, market_data=_dummy_market_data())
+    now = dt.datetime.now(dt.timezone.utc)
+    completed = now + dt.timedelta(seconds=2)
+    worker._account_reconciled_at["1"] = now-dt.timedelta(seconds=51)
+    worker._account_balance_refreshed_at["1"] = now
+    snapshot = AccountBrokerSnapshot(environment="PROD", account_no="1", observed_at=completed,
+        completeness=SnapshotCompleteness(holdings_complete=True, open_orders_complete=True,
+            history_complete=True, reserved_orders_complete=True, account_balance_complete=True),
+        account_buying_power=100_000, account_equity=100_000)
+    calls = []
+
+    def reconcile(**kwargs):
+        calls.append(kwargs)
+        return AccountReconciliationResult(snapshot=snapshot, plan=ReconciliationPlan(snapshot_id=snapshot.snapshot_id))
+
+    monkeypatch.setattr(worker_module, "run_account_reconciliation_pass", reconcile)
+    worker._refresh_account_state_if_due([], execute_commands=False)
+    assert len(calls) == 1
+    assert worker._account_reconciled_at["1"] == completed
+    assert worker._account_balance_refreshed_at["1"] == completed
+    assert worker._account_reconciliation_is_fresh("1", now=completed+dt.timedelta(seconds=59))
+    assert not worker._account_reconciliation_is_fresh("1", now=completed+dt.timedelta(seconds=61))
 
 
 def test_periodic_reconciliation_discovers_external_position_change(tmp_path, monkeypatch):
@@ -3508,6 +3852,26 @@ def test_sync_orb_plans_blocks_same_symbol_active_in_multiple_accounts(tmp_path)
     assert second.entry_runtime_status == EntryRuntimeStatus.RISK_INVALID
     assert "multiple accounts" in first.entry_block_reason
     assert "multiple accounts" in second.entry_block_reason
+
+
+def test_sync_orb_plans_waits_for_initial_calculation_and_clears_unverified_sizing(tmp_path):
+    worker, engine = _worker(tmp_path)
+    worker._execution_queue_item_lookup = lambda *_args: None
+    card = _seed_card(
+        engine, board_status=BoardStatus.BUY_TODAY,
+        entry_runtime_status=EntryRuntimeStatus.EXECUTE_READY,
+        entry_trigger=19.705, entry_execution_price=19.705,
+        entry_orb_high=19.705, entry_orb_low=19.09,
+        planned_quantity=100, target_position_quantity=100,
+        selected_orb_window="30m",
+    )
+    assert worker._sync_orb_plans([card]) == [card]
+    assert card.entry_runtime_status == EntryRuntimeStatus.DATA_UNAVAILABLE
+    assert card.entry_block_reason == "Waiting for the PC's current-session ORB calculation"
+    assert card.entry_trigger is None and card.entry_execution_price is None
+    assert card.planned_quantity == card.target_position_quantity == 0
+    assert card.selected_orb_window is None
+    assert worker._sync_orb_plans([card]) == []
 
 
 def test_sync_orb_plans_does_not_mark_price_only_movement_for_db_write(tmp_path):
@@ -4422,3 +4786,33 @@ def test_lease_still_current_false_once_expired(tmp_path):
         execution_lease=LeaseHandle(device_id="other-device", lease_token="tok"),
     )
     assert worker._lease_still_current() is False
+
+
+@pytest.mark.parametrize("board_status", [BoardStatus.OPEN_POSITION, BoardStatus.SELL_ALL])
+def test_pending_exit_uses_fast_broker_reconciliation(tmp_path, board_status):
+    from src.core import execution_config
+
+    broker = _FakeBroker()
+    broker.positions = {"overseas": {"holdings": []}}
+    worker, engine = _worker(tmp_path, broker=broker)
+    worker.runtime = _build_test_runtime(
+        buying_power_provider=worker._buying_power_provider,
+        card_lookup=worker._card_lookup,
+        broker=worker._broker,
+        market_data=_dummy_market_data(),
+    )
+    _seed_card(engine, board_status=board_status, broker_quantity=10, orderable_quantity=10)
+    cards = repo.list_trade_cards(engine, environment="PROD", account_no="1")
+    now = dt.datetime.now(dt.timezone.utc)
+    worker._account_balance_refreshed_at["1"] = now
+    worker._account_reconciled_at["1"] = now - dt.timedelta(
+        seconds=execution_config.PENDING_ORDER_RECONCILIATION_SECONDS + 1
+    )
+    worker._refresh_account_state_if_due(cards)
+    stored = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    if board_status == BoardStatus.SELL_ALL:
+        assert stored.board_status == BoardStatus.CLOSED
+        assert stored.broker_quantity == 0
+    else:
+        assert stored.broker_quantity == 10
+        assert broker.get_positions_calls == []

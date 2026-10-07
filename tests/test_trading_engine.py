@@ -158,6 +158,29 @@ def _make_engine(
 # --- Disabled engine is a strict no-op --------------------------------------
 
 
+def test_pre_broker_risk_rejection_is_visible_on_retrying_card(tmp_path):
+    from src.risk.pre_trade import PreTradeRiskRejectedError
+
+    reason = "Existing pending BUY has no active capital reservation"
+
+    def reject(**kwargs):
+        raise PreTradeRiskRejectedError(reason)
+
+    engine = _make_engine(tmp_path, submit_order=reject)
+    engine._market_is_open_fn = lambda: True
+    card = _buy_today_card()
+    engine._market_data.subscribe([card.symbol])
+    engine._market_data.poll_once()
+    changed = engine._evaluate_buy_today([card])
+
+    assert card in changed
+    assert card.board_status == BoardStatus.BUY_TODAY
+    assert card.entry_runtime_status == EntryRuntimeStatus.RETRY_COOLDOWN
+    assert card.entry_block_reason == reason
+    assert card.next_retry_at is not None
+    assert not card.entry_submission_unresolved
+
+
 def test_disabled_engine_ignores_everything(tmp_path, monkeypatch):
     import src.services.trading_engine as trading_engine_module
 
@@ -270,6 +293,17 @@ def test_stale_quote_blocks_entry_and_flags_data_unavailable(tmp_path):
     assert card.entry_runtime_status == EntryRuntimeStatus.DATA_UNAVAILABLE
     assert card.board_status == BoardStatus.BUY_TODAY  # never attempted
     assert "Fresh KIS WebSocket trade and quote events" in card.entry_block_reason
+
+
+def test_entry_guard_displays_specific_feed_reason_and_keeps_order_blocked(tmp_path):
+    engine = _make_engine(tmp_path)
+    engine._market_data.entry_quote_unavailable_reason = lambda symbol, now=None: "PC evaluation delayed: the KIS event exceeded the processing queue limit"
+    card = _buy_today_card()
+    engine.run_heartbeat([card])
+    assert card.entry_runtime_status == EntryRuntimeStatus.DATA_UNAVAILABLE
+    assert "processing queue limit" in card.entry_block_reason
+    assert card.board_status == BoardStatus.BUY_TODAY
+    assert not card.entry_client_order_id
 
 
 def test_fresh_quote_allows_entry_submission_and_moves_to_entry_pending(tmp_path):
@@ -429,13 +463,14 @@ def test_stale_representative_maximum_cannot_trigger_entry_from_fresh_cache(tmp_
         last_price=105.0,
         bid=104.9,
         ask=105.0,
-        broker_event_at=now - dt.timedelta(seconds=2),
-        received_at=now - dt.timedelta(seconds=2),
+        broker_event_at=now - dt.timedelta(seconds=16),
+        received_at=now - dt.timedelta(seconds=16),
         processed_at=now,
     )
 
     assert engine._market_data.entry_quote_ready("AAPL", now=now)
     assert not stale_maximum.is_execution_fresh(now=now)
+    assert not stale_maximum.is_entry_fresh(now=now)
     assert engine.evaluate_entry_quote([card], stale_maximum) == []
     assert submitted == []
     assert card.entry_runtime_status == EntryRuntimeStatus.EXECUTE_READY
@@ -548,7 +583,11 @@ def test_passive_submission_blocks_when_trade_or_ask_reaches_execution_limit(
     engine.evaluate_entry_quote([card], quote)
 
     assert submitted == []
-    assert card.entry_block_reason == "EXECUTION_LEVEL_ALREADY_REACHED"
+    assert card.entry_block_reason == (
+        "Waiting for a trade above the ORB execution level"
+        if last_price <= 100.0
+        else "Waiting for a valid ask above the ORB execution level"
+    )
 
 
 def test_waiting_orb_does_not_submit_before_confirmed_breakout(tmp_path):
@@ -2616,7 +2655,7 @@ def test_recovered_trusted_symbol_price_reclassifies_immediately(tmp_path):
     assert card.market_data_outage_risk_tier == "HIGH"
 
 
-def test_high_outage_outside_session_persists_next_session_sell_intent(
+def test_closed_session_feed_loss_does_not_create_next_session_sell_intent(
     tmp_path, monkeypatch
 ):
     monkeypatch.setattr(execution_config, "MARKET_DATA_OUTAGE_GRACE_SECONDS", 1)
@@ -2633,10 +2672,42 @@ def test_high_outage_outside_session_persists_next_session_sell_intent(
     now[0] += dt.timedelta(seconds=2)
     engine.run_heartbeat([card])
 
-    assert card.board_status == BoardStatus.SELL_ALL
-    assert card.sell_all_at_market_open is True
-    assert card.position_runtime_status == PositionRuntimeStatus.QUEUED_FOR_OPEN
+    assert card.board_status == BoardStatus.OPEN_POSITION
+    assert card.exit_all_required is False
+    assert card.sell_all_at_market_open is False
+    assert card.market_data_outage_started_at is None
     assert sells == []
+
+
+def test_closed_session_does_not_cancel_existing_liquidation(tmp_path):
+    engine = _make_engine(tmp_path)
+    engine._market_is_open_fn = lambda: False
+    card = _open_card(board_status=BoardStatus.SELL_ALL, exit_all_required=True,
+                      market_data_outage_started_at=dt.datetime.now(dt.timezone.utc))
+    _seed_then_disconnect(engine)
+    engine._detect_stale_position_quotes([card])
+    assert card.board_status == BoardStatus.SELL_ALL
+    assert card.exit_all_required is True
+    assert card.active_stop_price == 95.0
+
+
+def test_outage_grace_starts_at_open_after_closed_interval(tmp_path, monkeypatch):
+    monkeypatch.setattr(execution_config, "MARKET_DATA_OUTAGE_GRACE_SECONDS", 5)
+    now = [dt.datetime.now(dt.timezone.utc)]
+    opened = [False]
+    engine = _make_engine(tmp_path)
+    engine._clock = lambda: now[0]
+    engine._market_is_open_fn = lambda: opened[0]
+    card = _open_card(active_stop_price=99.5,
+                     market_data_outage_started_at=now[0]-dt.timedelta(hours=6))
+    _seed_then_disconnect(engine)
+    engine._detect_stale_position_quotes([card])
+    opened[0] = True
+    engine._detect_stale_position_quotes([card])
+    assert card.exit_all_required is False
+    now[0] += dt.timedelta(seconds=6)
+    engine._detect_stale_position_quotes([card])
+    assert card.exit_all_required is True
 
 
 def test_verified_trading_halt_retains_exit_intent_and_retries_when_resumed(

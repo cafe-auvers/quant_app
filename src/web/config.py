@@ -34,6 +34,7 @@ class WebConfig:
     chart_cache_max_symbols: int = 350
     pc_repository_path: str = ""
     local_mirror_path: str = ""
+    pc_hourly_reads: bool = False
     watchlist_history_path: str = ""
     canonical_planning_reads: bool = False
     canonical_environment: str = "PROD"
@@ -126,6 +127,7 @@ def _from_mapping(values: Mapping[str, Any]) -> WebConfig:
         chart_cache_max_symbols=int(values.get("chart_cache_max_symbols", 350)),
         pc_repository_path=str(values.get("pc_repository_path", "")).strip(),
         local_mirror_path=str(values.get("local_mirror_path", "")).strip(),
+        pc_hourly_reads=bool(values.get("pc_hourly_reads", False)),
         watchlist_history_path=str(values.get("watchlist_history_path", "")).strip(),
         canonical_planning_reads=bool(
             values.get("canonical_planning_reads", False)
@@ -183,6 +185,8 @@ def _validate(config: WebConfig) -> None:
         raise WebConfigError("chart_cache_max_symbols must be between 25 and 2000")
     if config.canonical_environment != "PROD":
         raise WebConfigError("canonical_environment must be PROD")
+    if config.pc_hourly_reads and (config.mode != "CONNECTED" or config.resolved_pc_repository is None):
+        raise WebConfigError("PC hourly reads require CONNECTED mode and pc_repository_path")
     if config.canonical_planning_reads:
         if config.mode != "CONNECTED":
             raise WebConfigError("canonical planning reads require CONNECTED mode")

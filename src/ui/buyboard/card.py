@@ -5,7 +5,6 @@ import hashlib
 import html
 import json
 import math
-from datetime import date
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QFrame, QLabel, QPushButton, QVBoxLayout
@@ -13,7 +12,7 @@ from PyQt5.QtWidgets import QFrame, QLabel, QPushButton, QVBoxLayout
 from src.core.board_workflow import BoardCardProjection
 from src.core.discovered_external_order import DiscoveredExternalOrder
 from src.core.execution_order_record import ExecutionOrderRecord
-from src.core.exit_policy import market_session_date, market_session_date_from_value
+from src.core.buy_today_feedback import buy_today_feedback_is_current
 from src.core.trade_card_state import BoardStatus, PositionRuntimeStatus, TradeCardState
 
 # Colors follow the existing Buy Dashboard convention (view.py row coloring):
@@ -31,37 +30,6 @@ _BOARD_STATUS_ACCENT = {
     BoardStatus.SELL_ALL: "#c62828",
     BoardStatus.CLOSED: "#455a64",
 }
-
-
-def buy_today_feedback_is_current(
-    card: TradeCardState,
-    *,
-    current_session_date: date | None = None,
-) -> bool:
-    """Show Buylist rejection feedback only on the session that produced it.
-
-    The durable fields remain on the card as a recovery source for Daily
-    Summary history.  They are cleared on a new activation, but they must not
-    make yesterday's ORB rejection look actionable on today's Buylist.
-    """
-
-    if not (card.buy_today_note or card.rejected_orb_snapshot):
-        return False
-    feedback_session = card.last_buy_today_session_date
-    if feedback_session is None:
-        feedback_session = market_session_date_from_value(
-            card.rejected_orb_snapshot.get("session_date")
-        )
-    if feedback_session is None:
-        observed = getattr(card, "board_status_updated_at", None)
-        if observed is not None:
-            feedback_session = market_session_date(observed)
-    if feedback_session is None:
-        # A malformed legacy timestamp cannot be labelled stale safely. It
-        # will be replaced/cleared by the next explicit Buy Today activation.
-        return True
-    today = current_session_date or market_session_date()
-    return feedback_session >= today
 
 
 def _fmt_price(value) -> str:

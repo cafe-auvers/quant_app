@@ -218,6 +218,7 @@ def request_submit(
             pre_trade_risk_decision=pre_trade_risk_decision,
             risk_strategy_id=risk_strategy_id,
             risk_plan_id=risk_plan_id,
+            entry_freshness_validator=legacy_kwargs.pop("entry_freshness_validator", None),
         )
         return ExecutionSubmissionResult.from_execution_order(
             resolved_gateway.submit_guarded(request)
@@ -372,6 +373,7 @@ def request_replace(
     risk_strategy_id: str = "",
     risk_plan_id: str = "",
     post_cancel_revalidate: Optional[Callable[[], None]] = None,
+    entry_freshness_validator=None,
 ) -> ExecutionOrderRecord:
     """``GUARDED_ENGINE`` only -- no legacy or Kanban call site performs a
     broker-level replace today (confirmed by codebase survey); raises
@@ -399,6 +401,7 @@ def request_replace(
         pre_trade_risk_decision=pre_trade_risk_decision,
         risk_strategy_id=risk_strategy_id,
         risk_plan_id=risk_plan_id,
+        entry_freshness_validator=entry_freshness_validator,
     )
     return resolved_gateway.replace_guarded(
         request,
@@ -423,6 +426,7 @@ def resume_replace(
     pre_trade_risk_decision: Any = None,
     risk_strategy_id: str = "",
     risk_plan_id: str = "",
+    entry_freshness_validator=None,
 ) -> ExecutionOrderRecord:
     """Resume a persisted replacement after authoritative cancellation.
 
@@ -445,6 +449,7 @@ def resume_replace(
         pre_trade_risk_decision=pre_trade_risk_decision,
         risk_strategy_id=risk_strategy_id,
         risk_plan_id=risk_plan_id,
+        entry_freshness_validator=entry_freshness_validator,
     )
     return gateway.resume_replace_guarded(
         request,
@@ -539,12 +544,13 @@ def _is_breakout_plan_command(command) -> bool:
     return isinstance(command, (types.SetBreakoutPrice, types.ClearBreakoutPrice))
 
 
-def _closed_card_cycle_blockers(card) -> tuple[str, ...]:
+def _closed_card_cycle_blockers(card, *, reservation_retired: bool = False) -> tuple[str, ...]:
     """Return unresolved state that prevents a CLOSED card from being reused.
 
     CLOSED is the durable end of one trade cycle, not a permanent tombstone
-    for the symbol.  A later breakout-price edit may start a fresh BUYLIST
-    cycle, but only when the aggregate is still broker-flat and no unresolved
+    for the symbol. An explicit Buy Today, Buylist, or breakout-price request
+    may start a fresh cycle, but only when the aggregate is broker-flat and no
+    unresolved
     order/stop/exit operation remains.  Historical price, stop, correlation,
     and terminal-order evidence intentionally is not a blocker; the restart
     mutation retires those completed-cycle fields.
@@ -590,9 +596,31 @@ def _closed_card_cycle_blockers(card) -> tuple[str, ...]:
         or card.exit_cancel_command_id
     ):
         blockers.append("exit reconciliation is not terminal")
-    if card.capital_reservation_id:
+    if card.capital_reservation_id and not reservation_retired:
         blockers.append("capital remains reserved")
     return tuple(blockers)
+
+
+def _closed_card_reservation_is_retired(engine, card) -> bool:
+    """Verify a completed reservation before retiring its old card reference."""
+    if not card.capital_reservation_id:
+        return False
+    from src.core.capital_reservation import CapitalReservationStatus
+    from src.services.capital_reservation_repository import fetch_reservation
+
+    reservation = fetch_reservation(engine, card.capital_reservation_id)
+    return bool(
+        reservation is not None
+        and (reservation.environment, reservation.account_no, reservation.symbol)
+        == (card.environment, card.account_no, card.symbol)
+        and reservation.status in {
+            CapitalReservationStatus.CONSUMED,
+            CapitalReservationStatus.RELEASED,
+            CapitalReservationStatus.EXPIRED,
+        }
+        and reservation.remaining_reserved_notional == 0
+        and reservation.remaining_projected_open_risk == 0
+    )
 
 
 def _require_breakout_plan_mutation_policy(command, card, context) -> None:
@@ -808,11 +836,53 @@ def _active_external_orders(engine, card):
     ]
 
 
+def _cancel_target_is_confirmed_terminal(command, orders) -> bool:
+    """A later exact broker observation can retire an ambiguous cancel blocker."""
+    if (
+        command.command_type != "cancel"
+        or command.status != "AMBIGUOUS"
+        or not command.target_broker_order_id
+    ):
+        return False
+    targets = [order for order in orders if (
+        order.environment == command.environment
+        and order.account_no == command.account_no
+        and order.symbol == command.symbol
+        and order.broker_order_id == command.target_broker_order_id
+    )]
+    if len(targets) != 1:
+        return False
+    target = targets[0]
+    if (
+        target.broker_identity_status != BrokerIdentityStatus.EXACT
+        or target.status not in {
+            ExecutionOrderStatus.FILLED, ExecutionOrderStatus.CANCELLED,
+            ExecutionOrderStatus.EXPIRED,
+        }
+        or target.remaining_quantity != 0
+    ):
+        return False
+
+    def timestamp(raw):
+        value = datetime.fromisoformat(str(raw or "").replace("Z", "+00:00"))
+        return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+
+    try:
+        requested = timestamp(command.requested_at)
+        reconciled = timestamp(target.last_reconciled_at)
+        broker_seen = timestamp(target.last_broker_seen_at)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    now = datetime.now(timezone.utc)
+    return requested <= broker_seen <= reconciled <= now
+
+
 def _require_board_action_not_conflicted(engine, command, card) -> List[ExecutionOrderRecord]:
     types = _load_board_types()
     from src.core.trade_card_state import (
         BoardStatus,
         PositionRuntimeStatus,
+        can_withdraw_sell_all_intent,
         has_durable_execution_evidence,
         has_legacy_planning_stop,
     )
@@ -899,28 +969,61 @@ def _require_board_action_not_conflicted(engine, command, card) -> List[Executio
             or any(order_has_current_cycle_fill(order) for order in owned_orders)
         )
 
+    if card.board_status == BoardStatus.CLOSED and isinstance(
+        command, (types.SetBreakoutPrice, types.MoveToBuylist, types.ActivateForToday)
+    ):
+        from src.services.capital_reservation_repository import list_active_reservations
+
+        if any(row.symbol == card.symbol for row in list_active_reservations(
+            engine, environment=card.environment, account_no=card.account_no
+        )):
+            raise BoardCommandRejectedError(
+                "Cannot start a new trade cycle from CLOSED while capital remains reserved"
+            )
+        blockers = _closed_card_cycle_blockers(
+            card, reservation_retired=_closed_card_reservation_is_retired(engine, card)
+        )
+        if blockers:
+            raise BoardCommandRejectedError(
+                "Cannot start a new breakout plan from CLOSED while "
+                + "; ".join(blockers)
+            )
+        if active_orders:
+            raise BoardCommandRejectedError(
+                "Cannot start a new breakout plan from CLOSED while an "
+                "owned order is still active"
+            )
+        if _active_external_orders(engine, card):
+            raise BoardCommandRejectedError(
+                "Cannot start a new breakout plan from CLOSED while an "
+                "unowned broker order is still active"
+            )
+        from src.services.execution_command_repository import (
+            list_execution_commands_for_account,
+        )
+
+        if any(
+            row.symbol == card.symbol
+            and row.status in {"REQUESTED", "AMBIGUOUS"}
+            and not _cancel_target_is_confirmed_terminal(row, owned_orders)
+            for row in list_execution_commands_for_account(
+                engine, environment=card.environment, account_no=card.account_no
+            )
+        ):
+            raise BoardCommandRejectedError(
+                "Cannot start a new trade cycle from CLOSED while a broker command is unresolved"
+            )
+        if not isinstance(command, types.SetBreakoutPrice):
+            try:
+                breakout = float(card.breakout_price or 0.0)
+            except (TypeError, ValueError, OverflowError):
+                breakout = 0.0
+            if not math.isfinite(breakout) or breakout <= 0:
+                raise BoardCommandRejectedError("Set a breakout price before re-entry")
+        # Completed fills stay in the ledger, outside the new planning cycle.
+        return active_orders
+
     if isinstance(command, types.SetBreakoutPrice):
-        if card.board_status == BoardStatus.CLOSED:
-            blockers = _closed_card_cycle_blockers(card)
-            if blockers:
-                raise BoardCommandRejectedError(
-                    "Cannot start a new breakout plan from CLOSED while "
-                    + "; ".join(blockers)
-                )
-            if active_orders:
-                raise BoardCommandRejectedError(
-                    "Cannot start a new breakout plan from CLOSED while an "
-                    "owned order is still active"
-                )
-            if _active_external_orders(engine, card):
-                raise BoardCommandRejectedError(
-                    "Cannot start a new breakout plan from CLOSED while an "
-                    "unowned broker order is still active"
-                )
-            # Terminal fills belong to the completed cycle and remain in the
-            # immutable order ledger.  They must not make the symbol
-            # impossible to plan again after broker-confirmed flatness.
-            return active_orders
         if has_confirmed_fill_or_position_evidence():
             raise BoardCommandRejectedError(
                 "Breakout price cannot change after a fill or position is confirmed"
@@ -1056,11 +1159,11 @@ def _require_board_action_not_conflicted(engine, command, card) -> List[Executio
     if isinstance(command, types.RequestSellAll) and card.board_status.value == "SELL_ALL":
         raise BoardCommandRejectedError("Sell All is already pending")
     if isinstance(command, types.CancelQueuedSellAll) and (
-        card.exit_client_order_id
+        not can_withdraw_sell_all_intent(card)
         or any(order.side == OrderSide.SELL for order in active_orders)
     ):
         raise BoardCommandRejectedError(
-            "The market-open SELL has already reached the execution lifecycle; it cannot be withdrawn as a local queue gesture"
+            "Only an unsubmitted Sell All for a confirmed holding can be withdrawn; reconcile any SELL identity, reservation, or cancellation first"
         )
     return active_orders
 
@@ -1156,6 +1259,11 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
         card.exit_cancel_command_id = ""
         card.return_to_buylist_after_close = False
         card.warnings = []
+
+    if card.board_status == BoardStatus.CLOSED and isinstance(
+        command, (types.ActivateForToday, types.MoveToBuylist)
+    ):
+        restart_closed_cycle()
 
     if isinstance(command, types.SetBreakoutPrice):
         restarting_closed_cycle = card.board_status == BoardStatus.CLOSED
@@ -1359,13 +1467,18 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
     if isinstance(command, types.CancelQueuedSellAll):
         if card.stop_loss_triggered:
             raise BoardCommandRejectedError("A triggered stop loss cannot be withdrawn")
-        if card.board_status != BoardStatus.SELL_ALL or not card.sell_all_at_market_open:
-            raise BoardCommandRejectedError("No queued market-open Sell All to cancel")
+        if card.board_status != BoardStatus.SELL_ALL:
+            raise BoardCommandRejectedError("No Sell All objective to withdraw")
         _move_board_card(card, BoardStatus.OPEN_POSITION)
         card.sell_all_at_market_open = False
         card.exit_all_required = False
         card.stop_loss_triggered = False
+        card.pending_partial_sell_quantity = 0
         card.position_runtime_status = PositionRuntimeStatus.OPEN
+        card.next_exit_retry_at = None
+        card.exit_attempt_count = 0
+        card.exit_attempt_group_id = ""
+        card.last_exit_error = ""
         return
 
     if isinstance(command, types.ReorderCard):
@@ -1412,6 +1525,7 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
             card.entry_attempt_group_id = ""
             card.entry_attempt_count = 0
     elif isinstance(command, types.ActivateForToday):
+        card.board_status_updated_at = command.requested_at
         card.buy_today_note = ""
         card.last_buy_today_session_date = None
         card.rejected_orb_snapshot = {}
@@ -1466,6 +1580,7 @@ def request_board_action(
         BoardActionContext,
         BoardWorkflowResult,
         ActivateForToday,
+        MoveToBuylist,
         CancelPartialSell,
         CancelQueuedSellAll,
         RequestPartialSell,
@@ -1683,6 +1798,10 @@ def request_board_action(
                 command, current, resolved_context
             )
             _require_current_board_runtime(command, current, resolved_context)
+            if current.board_status == BoardStatus.CLOSED and isinstance(
+                command, (SetBreakoutPrice, MoveToBuylist, ActivateForToday)
+            ):
+                active_orders = _require_board_action_not_conflicted(engine, command, current)
             ownership = get_ownership_in_transaction(
                 conn,
                 environment=current.environment,

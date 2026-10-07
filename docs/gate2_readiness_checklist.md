@@ -2,6 +2,11 @@
 
 Current disposition: **NOT READY / DO NOT START THE SOAK**
 
+For passive observations alongside trading, use the
+[live latency diagnostics](live_latency_diagnostics.md) to distinguish
+regular-session receive delay, parser delay, and actual engine-drain delay.
+Passive diagnostics do not certify Gate 2 or alter the limits below.
+
 The normative Gate-2 predicate, activation snapshot, metrics, and evidence
 identity are defined in the
 [Activation Gate Specification](activation_gate_specification.md). This file

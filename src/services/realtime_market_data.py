@@ -122,6 +122,14 @@ class QuoteSnapshot:
         )
         return self.age_seconds(now=now) > max_age
 
+    def is_entry_fresh(self, *, now: Optional[datetime] = None) -> bool:
+        """Bound total BUY data age, including time waiting for evaluation."""
+        budget = execution_config.ENTRY_MARKET_DATA_MAX_AGE_SECONDS
+        return self.is_execution_fresh(
+            now=now, broker_max_age_seconds=budget,
+            receive_max_age_seconds=budget, queue_max_delay_seconds=budget,
+        )
+
 
 def is_quote_stale(
     quote: Optional[QuoteSnapshot], *, now: Optional[datetime] = None
@@ -226,8 +234,11 @@ class InMemoryQuoteCache:
         self._lock = threading.Lock()
         self._quotes: Dict[str, QuoteSnapshot] = {}
 
-    def update(self, quote: QuoteSnapshot) -> None:
+    def update(self, quote: QuoteSnapshot, *, only_if_newer: bool = False) -> None:
         with self._lock:
+            previous = self._quotes.get(quote.symbol.upper())
+            if only_if_newer and previous is not None and quote.received_at < previous.received_at:
+                return
             self._quotes[quote.symbol.upper()] = quote
 
     def get(self, symbol: str) -> Optional[QuoteSnapshot]:

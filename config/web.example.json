@@ -11,6 +11,7 @@
   "chart_cache_max_symbols": 350,
   "pc_repository_path": "",
   "local_mirror_path": "",
+  "pc_hourly_reads": false,
   "watchlist_history_path": "",
   "canonical_planning_reads": false,
   "canonical_environment": "PROD",

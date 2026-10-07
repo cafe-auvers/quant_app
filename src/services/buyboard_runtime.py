@@ -154,7 +154,7 @@ from src.risk.portfolio import (
     PortfolioRiskSnapshot,
     ProposedPortfolioEntry,
 )
-from src.risk.pre_trade import PreTradeRiskDecision
+from src.risk.pre_trade import PreTradeRiskDecision, PreTradeRiskRejectedError
 from src.services import capital_allocator, order_ledger, order_reconciliation
 from src.services.broker import Broker, ReadOnlyBroker
 from src.services.entry_attempt_manager import EntryAttemptManager
@@ -897,6 +897,21 @@ def build_buyboard_runtime(
     guarded_lease = execution_lease if isinstance(execution_lease, ExecutionLease) else None
     legacy_lease = execution_lease if isinstance(execution_lease, LeaseHandle) else None
     resolved_equity_provider = account_equity_provider or buying_power_provider
+
+    def entry_buying_power(environment, account_no, symbol, exchange, limit_price):
+        reader = getattr(resolved_broker, "get_buying_power", None)
+        evidence = reader(environment=environment, account_no=account_no, symbol=symbol,
+                          exchange=exchange, limit_price=limit_price) if callable(reader) else None
+        if evidence is not None:
+            return float(evidence["available_usd"])
+        return float(buying_power_provider(environment, account_no))
+
+    def validate_live_entry_quote(symbol):
+        quote = resolved_market_data.latest_quote(symbol)
+        now = trading_engine._clock()
+        if (quote is None or not quote.regular_session or not quote.entry_trigger_eligible
+                or not quote.is_entry_fresh(now=now) or not resolved_market_data.entry_quote_ready(symbol, now=now)):
+            raise PreTradeRiskRejectedError("KIS entry data expired while waiting for HTTP dispatch")
     uses_default_portfolio_risk_manager = portfolio_risk_manager is None
     resolved_portfolio_risk_manager = (
         portfolio_risk_manager or _default_portfolio_risk_manager()
@@ -1198,7 +1213,7 @@ def build_buyboard_runtime(
                 )
                 try:
                     usable_buying_power = float(
-                        buying_power_provider(environment, account_no)
+                        entry_buying_power(environment, account_no, symbol, exchange, limit_price)
                     )
                 except (TypeError, ValueError, OverflowError):
                     usable_buying_power = 0.0
@@ -1276,6 +1291,22 @@ def build_buyboard_runtime(
         # and Kanban use (INV-21). It normalizes the two persistence models
         # into one workflow result while preserving this function's risk
         # revalidation and gate sequence.
+        if guarded_mode and decision is not None and decision.approved:
+            now = trading_engine._clock()
+            quote = resolved_market_data.latest_quote(symbol)
+            if (
+                quote is None
+                or not quote.regular_session
+                or not quote.entry_trigger_eligible
+                or not quote.is_entry_fresh(now=now)
+                or not resolved_market_data.entry_quote_ready(symbol, now=now)
+            ):
+                raise RuntimeError("KIS entry data expired during pre-trade validation")
+            def validate_entry_freshness():
+                dispatch_at = trading_engine._clock()
+                if not quote.is_entry_fresh(now=dispatch_at) or not resolved_market_data.entry_quote_ready(symbol, now=dispatch_at):
+                    raise PreTradeRiskRejectedError("KIS entry data expired while waiting for HTTP dispatch")
+            submit_kwargs["entry_freshness_validator"] = validate_entry_freshness
         try:
             return request_submit(
                 source=ExecutionSource.KANBAN_BOARD,
@@ -1530,14 +1561,16 @@ def build_buyboard_runtime(
             )
             try:
                 buying_power = float(
-                    buying_power_provider(
-                        candidate_card.environment, candidate_card.account_no
-                    )
+                    entry_buying_power(candidate_card.environment, candidate_card.account_no,
+                                       candidate_card.symbol, exchange, limit_price)
                 )
             except (TypeError, ValueError, OverflowError):
                 buying_power = 0.0
             if not math.isfinite(buying_power) or buying_power <= 0:
                 buying_power = 0.0
+            if replaced_reservation_id:
+                buying_power += sum(float(reservation.remaining_reserved_notional or 0.0)
+                    for reservation in reservations if reservation.reservation_id == replaced_reservation_id)
             portfolio_decision = current_portfolio_risk_manager().evaluate_entry(
                 ProposedPortfolioEntry(
                     symbol=candidate_card.symbol,
@@ -1663,7 +1696,7 @@ def build_buyboard_runtime(
                 or not trading_engine._market_is_open()
                 or not quote.regular_session
                 or not quote.entry_trigger_eligible
-                or not quote.is_execution_fresh(now=now)
+                or not quote.is_entry_fresh(now=now)
                 or not market_data_service.entry_quote_ready(card.symbol, now=now)
                 or quote.last_price <= execution_price
                 or quote.ask is None
@@ -1700,6 +1733,7 @@ def build_buyboard_runtime(
                 risk_strategy_id=RISK_STRATEGY_ID,
                 risk_plan_id=_entry_plan_id(candidate_card),
                 post_cancel_revalidate=post_cancel_revalidate,
+                entry_freshness_validator=lambda: validate_live_entry_quote(card.symbol),
             )
         finally:
             cache_recent_guarded_record(original.client_order_id)
@@ -1769,7 +1803,7 @@ def build_buyboard_runtime(
                 or not trading_engine._market_is_open()
                 or not quote.regular_session
                 or not quote.entry_trigger_eligible
-                or not quote.is_execution_fresh(now=now)
+                or not quote.is_entry_fresh(now=now)
                 or not market_data_service.entry_quote_ready(card.symbol, now=now)
                 or quote.last_price <= execution_price
                 or quote.ask is None
@@ -1813,6 +1847,7 @@ def build_buyboard_runtime(
                 replace_command_id=replace_command_id,
                 new_client_order_id=new_client_order_id,
                 post_cancel_revalidate=fresh_revalidate,
+                entry_freshness_validator=lambda: validate_live_entry_quote(card.symbol),
                 lease=guarded_lease,
                 environment=original.environment,
                 account_no=original.account_no,
