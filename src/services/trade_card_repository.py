@@ -201,15 +201,20 @@ def get_trade_card(
     symbol = str(symbol or "").upper()
     try:
         table = _ensure_trade_cards_table(engine)
-        with coordination_read_connection(engine) as conn:
-            row = conn.execute(
-                select(table).where(
-                    table.c.environment == environment,
-                    table.c.account_no == account_no,
-                    table.c.symbol == symbol,
-                )
-            ).first()
-        return _row_to_card(row) if row is not None else None
+        from src.services.coordination_snapshot import read_versioned_rows
+
+        rows = read_versioned_rows(
+            engine, table,
+            cache_key=("trade_card", environment, account_no, symbol),
+            key_columns=("environment", "account_no", "symbol"),
+            revision_column="version",
+            conditions=(
+                table.c.environment == environment,
+                table.c.account_no == account_no,
+                table.c.symbol == symbol,
+            ),
+        )
+        return _row_to_card(rows[0]) if rows else None
     except SQLAlchemyError as exc:
         if raise_on_error:
             raise

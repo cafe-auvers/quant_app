@@ -73,6 +73,40 @@ def test_unchanged_reads_return_no_rows_and_mutable_models_are_isolated(store):
         assert transfers[-1] == []
 
 
+def test_single_card_reads_remain_fresh_without_retransferring_payloads(store):
+    engine, table, transfers = store
+    first = cards.get_trade_card(engine, "PROD", "1", "S000", raise_on_error=True)
+    first.name = "uncommitted caller edit"
+    for _ in range(10):
+        current = cards.get_trade_card(engine, "PROD", "1", "S000", raise_on_error=True)
+        assert current.name != "uncommitted caller edit"
+        assert transfers[-1] == []
+    peer = create_engine(engine.url)
+    with peer.begin() as connection:
+        connection.execute(table.update().where(table.c.symbol == "S000").values(version=2))
+    assert cards.get_trade_card(engine, "PROD", "1", "S000", raise_on_error=True).version == 2
+    assert len(transfers[-1]) == 1
+    with peer.begin() as connection:
+        connection.execute(table.delete().where(table.c.symbol == "S000"))
+    assert cards.get_trade_card(engine, "PROD", "1", "S000", raise_on_error=True) is None
+    assert len(transfers[-1]) == 1 and transfers[-1][0].version is None
+    assert cards.get_trade_card(engine, "PROD", "2", "S001", raise_on_error=True) is None
+    assert cards.get_trade_card(engine, "PROD", "1", "S001", raise_on_error=True).symbol == "S001"
+    peer.dispose()
+
+
+def test_single_card_failed_verification_never_returns_cached_success(store, monkeypatch):
+    engine, _, _ = store
+    assert cards.get_trade_card(engine, "PROD", "1", "S000", raise_on_error=True)
+
+    def unavailable(_engine):
+        raise OperationalError("SELECT", {}, RuntimeError("unavailable"))
+
+    monkeypatch.setattr(snapshots, "coordination_read_connection", unavailable)
+    with pytest.raises(OperationalError):
+        cards.get_trade_card(engine, "PROD", "1", "S000", raise_on_error=True)
+
+
 def test_external_updates_inserts_deletes_and_scope_changes_are_immediate(store):
     engine, table, transfers = store
     cards.list_trade_cards(engine, environment="PROD", raise_on_error=True)
