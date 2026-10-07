@@ -500,7 +500,7 @@ class KisAccountClient:
             "/uapi/overseas-stock/v1/trading/inquire-psamount",
             tr_id="TTTS3007R" if self.config.environment.is_prod else "VTTS3007R",
             params={"CANO": self.config.cano, "ACNT_PRDT_CD": self.config.account_product_code,
-                    "OVRS_EXCG_CD": exchange, "OVRS_ORD_UNPR": format(limit_price, ".8f"),
+                    "OVRS_EXCG_CD": exchange, "OVRS_ORD_UNPR": format(limit_price, ".8f").rstrip("0").rstrip("."),
                     "ITEM_CD": symbol},
         )
         row = first_dict(data.get("output"))

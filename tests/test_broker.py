@@ -32,7 +32,8 @@ from src.services.broker import (
 from src.services.trading_state import TradingDisabledError
 
 
-def test_kis_buying_power_queries_exact_symbol_exchange_and_price():
+@pytest.mark.parametrize("price, wire_price", [(211.85, "211.85"), (389.8, "389.8"), (100.0, "100"), (0.3251, "0.3251")])
+def test_kis_buying_power_queries_exact_symbol_exchange_and_price(price, wire_price):
     client = kis_account_snapshot_dual.KisAccountClient.__new__(kis_account_snapshot_dual.KisAccountClient)
     client.config = SimpleNamespace(environment=kis_account_snapshot_dual.KisEnvironment.PROD,
         cano="12345678", account_product_code="01", overseas_currency="USD")
@@ -41,13 +42,13 @@ def test_kis_buying_power_queries_exact_symbol_exchange_and_price():
         calls.append((endpoint, kwargs))
         return {"output": {"ovrs_ord_psbl_amt": "915.31", "ord_psbl_qty": "4", "tr_crcy_cd": "USD"}}
     client._get = read
-    evidence = client.get_overseas_buying_power(symbol="ZS", exchange="NASD", limit_price=211.85)
+    evidence = client.get_overseas_buying_power(symbol="ZS", exchange="NASD", limit_price=price)
     assert evidence["available_usd"] == 915.31
     assert evidence["orderable_quantity"] == 4
     assert calls[0][0].endswith("/inquire-psamount")
     assert calls[0][1]["tr_id"] == "TTTS3007R"
     assert calls[0][1]["params"]["ITEM_CD"] == "ZS"
-    assert float(calls[0][1]["params"]["OVRS_ORD_UNPR"]) == 211.85
+    assert calls[0][1]["params"]["OVRS_ORD_UNPR"] == wire_price
     with pytest.raises(ValueError):
         client.get_overseas_buying_power(symbol="ZS", exchange="NASD", limit_price=float("nan"))
 
