@@ -118,3 +118,5 @@ anything: controlled-live scope comes only from persisted active Trade Cards.
 For lossless cleanup, the synchronizer validates the old list, records it in
 gitignored `data/retired_controlled_live_symbols.json` with
 `authorization_effect: false`, and only then removes the environment line.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

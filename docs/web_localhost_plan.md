@@ -196,3 +196,5 @@ does not rewrite or extend historical gate evidence.
   session had no attached `iab` browser instance. Supabase and real-iPhone
   visual inspection remain explicitly blocked; real mirror, two-session
   invalidation/conflict, and canonical passive-write checks passed.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

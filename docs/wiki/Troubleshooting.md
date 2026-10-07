@@ -116,6 +116,14 @@ wait for a fresh gated retry. It must not be moved to Buylist merely because of
 this code. A different definitive broker rejection can return a zero-position
 card to Buylist with its rejection memo.
 
+## A breakout passes but opening liquidity blocks entry
+
+Check Menu → Settings → Minimum opening volume and the candidate's opening
+volume evidence. The default is 200 shares/minute averaged over completed
+opening minutes, capped at the first 30. Empty minutes count and later volume
+does not count. Wait for valid current-session bars if the evidence is missing;
+do not change an exit stop to resolve an entry liquidity failure.
+
 ## A higher-score ORB did not replace a working order
 
 Replacement is intentionally strict. It is allowed only from 1m to 5m/30m or
@@ -147,3 +155,5 @@ intentionally blanks all `MYSQL_*` credentials.
 Do not force global software rendering unless the machine requires it. Confirm
 PyQtWebEngine is installed from the lock and review the application log for
 actionable errors.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](../opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

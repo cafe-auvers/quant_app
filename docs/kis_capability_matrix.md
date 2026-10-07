@@ -286,3 +286,5 @@ for later execution gates, but do not block a zero-mutation Gate-2 soak.
 
 Current disposition: **WS0 WebSocket subset incomplete; Gate 2 blocked; live
 execution unauthorized.**
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

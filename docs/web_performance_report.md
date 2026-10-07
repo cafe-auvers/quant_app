@@ -68,3 +68,5 @@ the user's real browser and iPhone remains part of UAT.
   routing/auth/serialization but not TCP, TLS, browser parsing, or paint.
 - Nearby prefetch remains bounded to the other current timeframe plus one
   previous and one next stock. The browser bundle cache remains capped at 36.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

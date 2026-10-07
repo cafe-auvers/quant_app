@@ -1892,3 +1892,5 @@ requires its own independently verified envelope.
   `submit_guarded`, blank/mismatched strategy identity is rejected, a plain
   broker cannot downgrade enabled mode, and a post-broker persistence
   ambiguity remains unresolved without automatic retry.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

@@ -43,6 +43,9 @@ use the [Activation Gate Handoff](docs/activation_gate_handoff.md).
 - Guarded Kanban entry, partial-exit, sell-all, stop-management, ownership, failover/readiness, and external-order review paths. The engine remains fail-closed unless its production gates are explicitly satisfied.
 - Daily, hourly, TradingView, and intraday chart views with persisted drawings and breakout markers.
 - Shutdown-safe local JSON persistence with atomic writes, rolling `.bak` recovery, and save-status metadata.
+- A configurable opening-liquidity minimum, defaulting to 200 shares/minute across completed opening minutes only, capped at the first 30 minutes; it blocks new buys and replacements while preserving protective exits.
+- A one-row mobile Monitor with Today %, breakout, best passing ORB, and 1M/3M returns for all watchlists, with an explicit Buy Today action.
+- A bottom-left hamburger for Home and gear-shaped Settings, with Watchlist, Chart, Buy Board, and stock arrows always visible.
 
 ## Strategy Terminology
 
@@ -244,3 +247,5 @@ Only enable KIS intraday after the endpoint, TR ID, request parameters, output f
 ## License
 
 Proprietary
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](docs/opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

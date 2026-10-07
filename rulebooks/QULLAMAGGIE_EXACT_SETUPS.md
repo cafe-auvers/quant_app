@@ -382,3 +382,5 @@ The key: Small losses + Big winners = Big account growth
 
 **Learn this methodology deeply. Master one setup at a time.
 Then build your edge through thousands of hours of study and trading.**
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](../docs/opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

@@ -512,6 +512,18 @@ compatibility, but it is not the active broker-order trigger. `src/core/orb.py`
 re-exports the strategy calculations for older imports. ORB remains one plugin;
 generic contracts do not depend on risk, execution, or KIS.
 
+## Opening liquidity and mobile workspace
+
+`src/core/opening_liquidity.py` calculates completed opening volume and its
+elapsed-minute denominator from existing intraday bars. The shared
+`OrbSettings.opening_min_shares_per_minute` defaults to 200 and is enforced by
+the execution queue, trade-card projection, runtime entry/replacement approval,
+and final pre-trade boundary. `src/web/intraday_monitor.py` uses the same helper
+with an explicit settings snapshot; it does not mutate global risk settings.
+The Monitor uses existing daily history for Today %, 21-session, and 63-session
+returns. Mobile Settings owns the shared risk form and Operator Control; the
+hamburger navigates to Home or Settings without writing state.
+
 ## Risk
 
 | Module | Responsibility |
@@ -887,3 +899,5 @@ Kanban coverage includes pure transitions and card serialization, optimistic rep
 - `REMOTE_CONTROL_TOKEN` and the WinRM trust set up for remote log access grant real remote-execution capability on the always-on PC; treat them with the same care as any other admin credential.
 - `data/` files are local state unless intentionally replaced with sanitized sample data.
 - Keep generated `.bak` files, `data/state_metadata.json`, `data/local_mirror.db*`, and `data/device_role.json` out of source control with the rest of local runtime state.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](docs/opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

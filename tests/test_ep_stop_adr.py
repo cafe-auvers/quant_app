@@ -100,7 +100,8 @@ def test_risk_boundary_and_card_revalidation_use_ep_profile():
     decision = assess_orb_entry_candidate(candidate, environment="PROD", account_no="1", symbol="EPX",
         quantity=candidate.shares, reference_price=100, plan_id=orb_candidate_plan_id(candidate))
     assert decision.approved
-    card = TradeCardState(environment="PROD", account_no="1", symbol="EPX", is_ep=True, entry_orb_low=94, stop_adr=120)
+    card = TradeCardState(environment="PROD", account_no="1", symbol="EPX", is_ep=True, entry_orb_low=94, stop_adr=120,
+        selected_orb_window="1m", orb_candidate_states={"1m": candidate.to_dict()})
     assert _revalidate_and_approve(card, quantity=17, limit_price=100, exchange="NASD", account_size=10_000).approved
     card.is_ep = False
     assert not _revalidate_and_approve(card, quantity=17, limit_price=100, exchange="NASD", account_size=10_000).approved

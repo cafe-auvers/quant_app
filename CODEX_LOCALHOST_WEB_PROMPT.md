@@ -245,3 +245,5 @@ Definition of done:
 Update project documentation to make this localhost milestone the immediate priority. Do not edit historical gate evidence to claim it covers the new SHA; record change impact and follow the normative requalification policy before future activation.
 
 At handoff report: files changed, exact launch commands, localhost URL, actual data mode, tested workflow, measured performance, test results, optional integration blockers, and exact user-owned setup steps. Do not end with a mockup, a roadmap-only answer, or an unsupported claim that live trading is ready.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](docs/opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

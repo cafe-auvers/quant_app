@@ -378,3 +378,5 @@ communication path from Supabase to the PC market-data tables.
 | Local operational SQLite engine | `src/infrastructure/database/operational_engine.py` |
 | Individual coordination table definitions | Repository modules under `src/services/` |
 | Scheduled historical refresh | `scripts/run_daily_refresh.py` and `historical.py` |
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

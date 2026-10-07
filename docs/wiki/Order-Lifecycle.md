@@ -116,3 +116,5 @@ Liquidation is not blocked by entry risk rules. Outside the U.S. regular
 session, eligible manual production partial/full exits use the persisted KIS
 market-on-open reservation policy. Broker acceptance still requires later
 reconciliation.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](../opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

@@ -29,6 +29,8 @@ def _candidate(window: str, **overrides) -> OrbCandidate:
         stop_adr=50.0,
         status=OrbCandidateStatus.WAITING_BREAKOUT,
         reason="Waiting for price to clear entry trigger",
+        opening_volume=6000,
+        opening_volume_minutes=30,
     )
     values.update(overrides)
     return OrbCandidate(**values)

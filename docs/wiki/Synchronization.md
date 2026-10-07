@@ -71,3 +71,5 @@ Trading switch.
 
 See [Operations and Monitoring](Operations-and-Monitoring) before enabling
 physical sleep/wake automation.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](../opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

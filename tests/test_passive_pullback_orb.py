@@ -94,6 +94,8 @@ def _candidate(window: str, score: float, *, high: float, low: float) -> OrbCand
         risk_percent=0.01,
         status=OrbCandidateStatus.WAITING_BREAKOUT,
         valid=True,
+        opening_volume=6000,
+        opening_volume_minutes=30,
     )
 
 

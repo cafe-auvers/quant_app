@@ -286,3 +286,5 @@ Recovery payloads remain private and excluded from Git.
 No application release, execution owner, risk settings, stop rule, live session
 activation, or broker orders were changed by this migration preparation. No paid
 plan or Oracle resource was enabled. The existing PC runtime remains the executor.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

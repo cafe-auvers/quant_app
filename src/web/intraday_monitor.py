@@ -12,6 +12,7 @@ from typing import Any, Callable
 
 import pandas as pd
 
+from src.core.opening_liquidity import opening_liquidity_rejection, opening_volume_totals
 from src.core.orb_entry_logic import passive_entry_prices
 from src.risk.orb_position import (
     OrbSettings, calculate_orb_position_values, is_orb_position_plan_valid,
@@ -75,7 +76,7 @@ class YahooMonitorProvider:
             chunk = names[offset:offset + 40]
             try:
                 data = yf.download(
-                    chunk, period=period or ("1d" if interval == "1m" else "3mo"),
+                    chunk, period=period or ("1d" if interval == "1m" else "6mo"),
                     interval=interval, group_by="ticker", auto_adjust=False,
                     prepost=interval == "1m", threads=4, progress=False,
                     timeout=8, ignore_tz=False,
@@ -170,6 +171,34 @@ def suppress_stale_signals(row: dict) -> None:
             window.update(price_status="UNKNOWN", price_reason="Quote is stale")
 
 
+def apply_daily_performance(row: dict, daily: pd.DataFrame, now: dt.datetime) -> None:
+    """Use the quoted price and completed daily bars, matching 21/63-bar growth."""
+    row.update(change_percent=None, return_1m=None, return_3m=None)
+    price = positive(row.get("current_price"))
+    if price is None or not row.get("quote_as_of") or daily.empty or "Close" not in daily:
+        return
+    quote_day = dt.datetime.fromisoformat(row["quote_as_of"]).astimezone(US_MARKET_ZONE).date()
+    index = pd.DatetimeIndex(daily.index)
+    if index.tz is not None:
+        index = index.tz_convert(US_MARKET_ZONE)
+    history = daily.copy()
+    history.index = index
+    history = history.loc[index.date < quote_day].sort_index()
+    if history.empty or history.index.has_duplicates:
+        return
+    expected = previous_nyse_trading_day(quote_day - dt.timedelta(days=1))
+    if history.index[-1].date() != expected:
+        return
+    close = pd.to_numeric(history["Close"], errors="coerce")
+    for key, periods in (("change_percent", 1), ("return_1m", 21), ("return_3m", 63)):
+        if len(close) < periods or (key == "change_percent" and quote_day != now.astimezone(US_MARKET_ZONE).date()):
+            continue
+        base = positive(close.iloc[-periods])
+        if base is not None:
+            value = (price / base - 1) * 100
+            row[key] = value if math.isfinite(value) else None
+
+
 def evaluate_monitor_row(
     card: dict, frame: pd.DataFrame, *, now: dt.datetime, context: MonitorContext,
     adr: float | None = None, fetch_failed: bool = False, stale_seconds: float = 180,
@@ -179,7 +208,8 @@ def evaluate_monitor_row(
     row = {**card, "breakout_price": breakout, "current_price": None,
            "quote_as_of": None, "quote_status": "UNAVAILABLE", "quote_source": "MINUTE", "distance_percent": None,
            "breakout_status": "UNKNOWN", "broke_out_today": None,
-           "orb_session_date": now.date().isoformat(), "orb": []}
+           "orb_session_date": now.date().isoformat(), "orb": [],
+           "change_percent": None, "return_1m": None, "return_3m": None}
     if not frame.empty and frame.index.tz is not None:
         frame = frame.copy()
         frame.index = frame.index.tz_convert(US_MARKET_ZONE)
@@ -199,6 +229,12 @@ def evaluate_monitor_row(
         row["distance_percent"] = round((price / breakout - 1) * 100, 2)
     close = nyse_regular_session_close_time(now.date())
     session = frame[(frame.index.date == now.date()) & (frame.index.time >= dt.time(9, 30)) & (frame.index.time < close)]
+    start = pd.Timestamp(dt.datetime.combine(now.date(), dt.time(9, 30), US_MARKET_ZONE))
+    opening_volume, opening_minutes = opening_volume_totals(session, session.index, start) if not session.empty else (None, 0)
+    liquidity_reason = opening_liquidity_rejection(opening_volume, opening_minutes, settings=context.settings) if context.settings else "Shared ORB settings unavailable"
+    liquidity_status = "PASS" if not liquidity_reason else "FAIL" if liquidity_reason.startswith("Low opening liquidity") else "UNKNOWN"
+    row.update(opening_volume=opening_volume, opening_volume_minutes=opening_minutes,
+               liquidity_status=liquidity_status, liquidity_reason=liquidity_reason)
     if breakout is None:
         row["breakout_status"] = "NO_LEVEL"
     elif not stale and not session.empty:
@@ -213,12 +249,12 @@ def evaluate_monitor_row(
         row["breakout_status"] = "PRE_MARKET" if now.time() < dt.time(9, 30) else "CLOSED"
     for window, minutes in ORB_WINDOWS.items():
         result = {"window": window, "price_status": "UNKNOWN", "position_status": "UNKNOWN",
+                  "liquidity_status": liquidity_status, "liquidity_reason": liquidity_reason,
                   "price_reason": "Current regular-session data unavailable", "position_reason": "",
                   "high": None, "low": None, "risk_percent": None}
         row["orb"].append(result)
         if session.empty or breakout is None:
             continue
-        start = pd.Timestamp(dt.datetime.combine(now.date(), dt.time(9, 30), US_MARKET_ZONE))
         end = start + pd.Timedelta(minutes=minutes)
         if now < end:
             result.update(price_status="FORMING", price_reason="Opening range still forming")
@@ -261,9 +297,9 @@ def evaluate_monitor_row(
             valid = is_orb_position_plan_valid(sizing, adr, context.settings, is_ep=card.get("is_ep") is True)
             score = score_orb_position_recommendation(sizing, risk, context.settings, is_ep=card.get("is_ep") is True)
             candidates.append((valid, score, risk, sizing))
-        valid, _score, risk, sizing = max(candidates, key=lambda item: (item[0], item[1]))
+        valid, score, risk, sizing = max(candidates, key=lambda item: (item[0], item[1]))
         warnings = validate_orb_position_values(sizing, adr, context.settings, is_ep=card.get("is_ep") is True)
-        result.update(position_status="PASS" if valid else "FAIL", risk_percent=risk * 100,
+        result.update(position_status="PASS" if valid else "FAIL", risk_percent=risk * 100, score=score,
                       capital_percent=round(sizing["capital_percent"], 2),
                       stop_adr_percent=round(sizing["sl_adr"], 2) if sizing["sl_adr"] is not None else None,
                       position_reason="Capital and stop/ADR bounds passed" if valid else "; ".join(warnings))
@@ -299,6 +335,7 @@ class IntradayMonitor:
         self._failed_symbols = set()
         self._adr = {}
         self._daily_quotes = {}
+        self._daily_frames = {}
         self._adr_retry_after = {}
         self._adr_session = None
         self._context = MonitorContext()
@@ -326,6 +363,7 @@ class IntradayMonitor:
             elif not active and row.get("quote_status") != "STALE":
                 row["quote_status"] = "CLOSED"
             if quoted.date() != now.date():
+                row["change_percent"] = None
                 row["broke_out_today"] = None
                 if row["quote_status"] != "STALE":
                     row["breakout_status"] = "CLOSED" if row.get("breakout_price") else "NO_LEVEL"
@@ -367,6 +405,7 @@ class IntradayMonitor:
             missing_adr = [s for s in symbols if s not in adr or (adr[s] is None and self.monotonic() >= self._adr_retry_after.get(s, 0))]
             if missing_adr:
                 daily = self.provider.fetch(missing_adr, interval="1d")
+                self._daily_frames.update(daily)
                 adr.update({s: daily_adr(daily.get(s, pd.DataFrame()), now.date()) for s in missing_adr})
                 for symbol, frame in daily.items():
                     quote = latest_daily_close(frame, now)
@@ -383,7 +422,9 @@ class IntradayMonitor:
             ) for row in context.rows]
             for row in rows:
                 apply_daily_close_fallback(row, self._daily_quotes.get(row["symbol"]), self.now())
+                apply_daily_performance(row, self._daily_frames.get(row["symbol"], pd.DataFrame()), self.now())
             self._daily_quotes = {s: quote for s, quote in self._daily_quotes.items() if s in symbols}
+            self._daily_frames = {s: frame for s, frame in self._daily_frames.items() if s in symbols}
             with self._lock:
                 self._adr = {s: adr.get(s) for s in symbols}
                 self._adr_session = now.date()

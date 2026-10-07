@@ -220,3 +220,5 @@ Recommended next implementation sequence: fix the Qt callback; correct broker fu
 ## Root cause remediation deployed — 7 October 2026
 
 Release `58c797c04ca3aa5d8423ee81174fb8f366d81737` is deployed and ACTIVE on the PC. The identified processing, ingress-age, protective scheduling, exact orderability, replacement cash, persistence, UI/logging and daily-evidence causes were corrected. All five hosted checks passed; Gate 1 passed. Five broker positions and their full stops were preserved, and no maintenance broker orders were submitted. The US 7 October collector is running; Gates 2/3/4 remain NOT_CERTIFIED. See the [root-cause fixes and verified deployment report](trading_root_cause_fixes_2026-10-07.md) for the issue-by-issue corrections, tests, operational proof and remaining qualification/ticker requirements.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

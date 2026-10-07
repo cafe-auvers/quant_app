@@ -346,3 +346,5 @@ reviewer's real identity and independence through the referenced GitHub
 review, signed attestation, or documented dual-control record. Until that
 external control exists, the bundle is not independently reviewed even if a
 locally supplied string passes schema validation.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

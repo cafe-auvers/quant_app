@@ -50,6 +50,15 @@ explicitly selected production account. If either is unavailable, the action
 leaves both the canonical card and local Watchlist/Buylist mirrors unchanged;
 there is no offline promotion that can later overwrite a newer device change.
 
+## Shared opening liquidity
+
+The shared ORB settings also contain Minimum opening volume, defaulting to
+200 shares per completed minute from 09:30 New York through at most 10:00.
+Every 1m/5m/30m candidate uses that same minimum and existing minute-volume
+evidence. Exactly the threshold passes; zero disables it. Missing evidence or
+low opening activity blocks new buys and replacements. Protective sells are
+exempt. On mobile, edit it through Menu → Settings and Save shared settings.
+
 ## Buffer %
 
 `Buffer %` sits in the Buy Board header immediately left of `Engine`. It uses
@@ -338,3 +347,5 @@ Filled/Cancelled/Expired broker observation reconciled after that cancel was
 requested. Missing, earlier or inconsistent evidence still blocks. An unresolved
 submit, replace or in-flight requested cancel always blocks. This check retains
 the original command and order records; it does not retry or send a cancel.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

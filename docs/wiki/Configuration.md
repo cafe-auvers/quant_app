@@ -39,6 +39,11 @@ raise the active passive-order trigger: live confirmation uses
 legacy `ENTRY_ATTEMPT_TTL_SECONDS` setting remains readable for compatibility,
 but new passive entries have no 15-second auto-cancel/reprice deadline.
 
+Shared ORB settings include `opening_min_shares_per_minute` (default 200;
+zero disables). It is stored with the existing shared bounds, not in `.env`.
+On the phone, open Menu → Settings → Minimum opening volume, then Save shared
+settings. Operator Control and revision checks govern writes.
+
 Multiple PROD accounts can use `KIS_PROD_ACCOUNTS` or numbered
 `KIS_PROD_ACCOUNT_NO_1` through `_20`. Do not put real account numbers in
 documentation, tests, or committed fixtures.
@@ -57,3 +62,5 @@ Changing a feature flag never bypasses lease, ownership, reconciliation, risk,
 market-data, mutation-budget, or broker-boundary checks. See
 [Risk and Safety Controls](Risk-and-Safety-Controls) and
 [Current Order Logic](https://github.com/cafe-auvers/quant_app/blob/master/docs/current_order_logic.md).
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](../opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

@@ -85,6 +85,24 @@ class OrbSettingsDialog(QDialog):
                 self.spins[name] = spin
         layout.addLayout(grid)
 
+        liquidity_grid = QGridLayout()
+        liquidity_grid.addWidget(QLabel("Minimum opening volume (shares / minute)"), 0, 0)
+        volume_spin = QDoubleSpinBox()
+        volume_spin.setObjectName("opening_min_shares_per_minute_spin")
+        volume_spin.setRange(0.0, 1_000_000_000.0)
+        volume_spin.setDecimals(2)
+        volume_spin.setSingleStep(50.0)
+        volume_spin.setSuffix(" shares/min")
+        self.spins["opening_min_shares_per_minute"] = volume_spin
+        liquidity_grid.addWidget(volume_spin, 0, 1)
+        layout.addLayout(liquidity_grid)
+        liquidity_note = QLabel(
+            "Average over completed minutes from 09:30 New York time, capped at 10:00. "
+            "Later volume is excluded. Set 0 to disable this minimum."
+        )
+        liquidity_note.setWordWrap(True)
+        layout.addWidget(liquidity_note)
+
         note = QLabel(
             "Capital allocation may equal either user-selected bound. "
             "Stop / ADR may equal either bound."

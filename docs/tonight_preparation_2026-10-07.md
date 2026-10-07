@@ -217,3 +217,5 @@ Private evidence includes `deployment.json`, `supervised_release.json`,
 `owner_activation.json`, `live_session_restored.json`, `post_restart_health.json`,
 `collection_readiness.json` and `supabase_post_deploy_comparison.json` under
 `artifacts/tonight_preparation_20261007/`.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

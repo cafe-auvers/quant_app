@@ -475,3 +475,5 @@ Targeted manual checks by phase:
 | 7A | `src/ui/mixins/charts_render_mixin.py` | Completed |
 | 7B | `src/ui/mixins/charts_controller_mixin.py` | Completed |
 | 8 | optional shared/shell helper extraction | Superseded by `src/ui/controllers/` and existing shared shell helpers |
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](../docs/opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

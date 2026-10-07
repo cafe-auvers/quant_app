@@ -141,6 +141,7 @@ from src.core.order_state import (
     is_open_status,
 )
 from src.core.trade_card_state import BoardStatus, TradeCardState
+from src.core.opening_liquidity import opening_liquidity_rejection
 from src.risk.orb_position import (
     calculate_orb_position_values,
     get_orb_settings,
@@ -446,6 +447,15 @@ def _revalidate_and_approve(
     """
     stop_price = card.entry_orb_low
     reasons = []
+    opening_snapshot = card.orb_candidate_states.get(card.selected_orb_window or card.entry_orb_window, {})
+    if not isinstance(opening_snapshot, dict):
+        opening_snapshot = {}
+    liquidity_reason = opening_liquidity_rejection(
+        opening_snapshot.get("opening_volume"),
+        opening_snapshot.get("opening_volume_minutes"),
+    )
+    if liquidity_reason:
+        reasons.append(liquidity_reason)
     try:
         # ``account_size`` is the risk-sizing base at this boundary: fresh
         # total account equity, not usable cash/buying power.  Availability
@@ -1016,6 +1026,9 @@ def build_buyboard_runtime(
             intent=OrderIntent.ENTRY,
         )
         card.entry_submission_unresolved = False
+        # Persist the chosen generation before broker I/O so refresh/recovery
+        # cannot attach the order identity to a different planning candidate.
+        card.entry_orb_window = card.selected_orb_window or card.entry_orb_window
         persist_execution_identity(card)
         return card.entry_client_order_id, group_id, number
 

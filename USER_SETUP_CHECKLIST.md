@@ -106,3 +106,5 @@ the separately gated desktop runtime.
 - Supabase overwrite caveat: https://supabase.com/docs/guides/storage/uploads/standard-uploads
 - PWA installation requirements: https://developer.mozilla.org/en-US/docs/Web/Progressive_web_apps/Guides/Making_PWAs_installable
 - Private Tailscale Serve: https://tailscale.com/docs/features/tailscale-serve
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](docs/opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

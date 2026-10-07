@@ -52,6 +52,7 @@ def _card(**overrides):
         risk_percent=1.0,
         selected_orb_window="5m",
         planned_quantity=20,
+        orb_candidate_states={"5m": {"opening_volume": 6000, "opening_volume_minutes": 30}},
     )
     fields.update(overrides)
     return TradeCardState(**fields)

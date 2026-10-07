@@ -55,3 +55,5 @@ The release is built in an isolated worktree from deployed commit `32866eae80016
 Exact release SHA, regression counts, hosted CI/Gate 1 results, supervised maintenance inventory, credential/config preservation, owner activation and post-deployment broker reconciliation are recorded in the `artifacts/trading_root_causes_20261007` review bundle. The initial broad local run produced 3,507 passes, seven skips and five failures: two obsolete assertions, one composition failure that passed in isolation, and two Windows socket errors in browser setup. Follow-up regression and exact-release hosted results supersede that preliminary run.
 
 Live latency under the new architecture and formal gate closure require subsequent real-session evidence. No artificial buy, sell or future-session arming is part of validation or deployment.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

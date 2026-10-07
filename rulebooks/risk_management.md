@@ -538,3 +538,13 @@ Every trade gets logged. Every decision gets audited.
 │                                                          │
 └─────────────────────────────────────────────────────────┘
 ```
+
+## Implemented opening-liquidity minimum (2026-10-08)
+
+New ORB buys and replacements require the adjustable shared minimum of
+200 shares/minute by default, averaged over completed opening minutes from
+09:30 New York and capped at 30 minutes. Empty minutes count; premarket,
+unfinished bars, prior sessions, and later volume do not. Missing/invalid
+volume blocks entries. Zero disables the minimum. Protective sells are exempt.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](../docs/opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

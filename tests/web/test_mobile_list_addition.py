@@ -27,7 +27,7 @@ def list_browser():
 
 
 def open_watchlist(page, *, delegated=True, reject="", closed=False, runtime_conflict=False,
-                   competing_price=False, entry_pending=False):
+                   competing_price=False, entry_pending=False, breakout=None):
     root = Path(__file__).resolve().parents[2]
     static = root / "src/web/static"
     assets = ReleaseAssets(static, root / "src/ui/static/vendor")
@@ -35,7 +35,7 @@ def open_watchlist(page, *, delegated=True, reject="", closed=False, runtime_con
         "symbol": "SHMD", "name": "SHMD", "stage": "WATCHLIST",
         "canonical_stage": "WATCHLIST", "watchlist_member": True,
         "buylist_member": False, "buy_today_member": False,
-        "breakout_price": None, "version": 1,
+        "breakout_price": breakout, "version": 1,
     }
     state = {"card": card, "posts": [], "errors": [], "draft": False}
     if closed:
@@ -211,6 +211,33 @@ def test_buy_today_from_watchlist_promotes_and_requires_operator_confirmation(li
         assert state["posts"][2][0].endswith("buy-today-preview")
         assert state["card"]["buy_today_member"] is False
     assert_feedback_visible(page)
+    assert state["errors"] == []
+    page.close()
+
+
+@pytest.mark.parametrize("breakout", [None, 2.75])
+def test_monitor_add_today_uses_watchlist_promotion_and_existing_confirmation(list_browser, breakout):
+    page = list_browser.new_page(viewport={"width": 390, "height": 844}, has_touch=True)
+    state = open_watchlist(page, breakout=breakout)
+    page.locator("#mobile-list-menu").click()
+    page.locator('[data-mobile-symbol="SHMD"] .mobile-monitor-action button').click()
+    if breakout is None:
+        page.locator("#breakout-price-popup").wait_for(state="visible")
+        assert state["posts"] == []
+        page.locator("#breakout-price-popup-input").fill("2.75")
+        page.locator("#breakout-price-form button[type=submit]").click()
+    page.locator("#operator-confirm-dialog").wait_for(state="visible")
+    assert state["card"]["buy_today_member"] is False
+    assert state["card"]["buylist_member"] is True
+    assert [payload["operation"] for _, payload in state["posts"]] == (
+        ["set_breakout", "promote_buylist"] if breakout is None else ["promote_buylist"]
+    )
+    page.locator("#operator-confirm-submit").click()
+    page.wait_for_function("document.querySelector('#quick-buy-today').textContent === 'Cancel Today' && !document.querySelector('#quick-buy-today').disabled")
+    assert state["card"]["buy_today_member"] is True
+    assert state["posts"][-1][0].endswith("activate-buy-today")
+    page.locator("#mobile-list-menu").click()
+    assert page.locator('[data-mobile-symbol="SHMD"] .mobile-monitor-action button').is_disabled()
     assert state["errors"] == []
     page.close()
 

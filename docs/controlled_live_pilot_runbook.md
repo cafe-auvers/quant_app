@@ -183,3 +183,5 @@ Today feed capacity.
 explicit operational promotion decision. Unattended operation still requires
 a complete-session live feed/reconnect/reconciliation/alert record and an
 independent external heartbeat watchdog.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

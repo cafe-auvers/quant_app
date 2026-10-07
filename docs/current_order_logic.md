@@ -44,6 +44,26 @@ available liquidity remain broker/exchange concerns.
 - Queue sizing provenance must match the card's canonical production account
   and breakout price.
 
+### Minimum opening liquidity
+
+New BUY orders require an average of at least **200 shares per minute** by
+default, adjustable as **Minimum opening volume** in the shared ORB settings
+alongside the position bounds. A value of zero disables this minimum.
+
+The check uses the existing intraday bar volume from 09:30 New York time
+through the latest completed opening minute, capped at 10:00. Divide by all
+elapsed completed minutes, including minutes with no trades. Before 10:00,
+1-minute and 5-minute entries can qualify without waiting for the full
+30-minute range. After 10:00, only the first 30 minutes count; later volume
+cannot rescue an illiquid opening. The threshold is inclusive, so exactly
+200 shares/minute passes. This is an average, not a floor for every bar.
+
+Missing or invalid opening volume blocks new buys until a refreshed candidate
+provides it. A low-volume candidate remains observable and can recover while
+the opening is forming or when the operator changes the minimum. Candidate
+selection, replacement selection, and final pre-trade approval use the same
+shared setting. Existing positions and protective sells are unaffected.
+
 ## 2. Candidate price rules
 
 For one finalized ORB candidate:
@@ -74,6 +94,12 @@ Therefore:
 - ORB high, ORB low, score, execution price, range-close time, and confirmation
   time are frozen for each submitted order generation.
 
+The runtime persists the selected ORB window with the entry identity before
+broker I/O. From that point through order resolution, observation refreshes
+cannot replace or clear that generation's price, stop, risk, or quantity,
+including while the card still says Buy Today and broker acknowledgment is
+pending. A later ORB becomes active only through the guarded replacement path.
+
 The persisted `Buffer %` remains planning metadata and is retained across
 devices, but the finalized passive-order zone and live confirmation above use
 the raw canonical `breakout_price`. The active order trigger is **not**
@@ -95,6 +121,11 @@ stored prices, or a planning-only/yfinance quote.
 In automatic mode, if several candidates have confirmed breakouts before the
 initial order is submitted, the runtime chooses the highest ORB score. An
 equal-score tie favors the earlier timeframe. A manual window lock stays exact.
+
+Before the initial identity is prepared, a confirmed candidate also takes
+precedence during observation refresh over a higher-scoring candidate whose
+breakout has not confirmed. A refresh cannot revert a confirmed 5m entry to an
+unconfirmed 30m planning choice.
 
 ## 4. Initial order submission
 
@@ -354,3 +385,5 @@ Related operator documentation:
 - [Execution Owner and Operator Control](execution_operator_control.md)
 - [Controlled-Live Pilot](controlled_live_pilot_runbook.md)
 - [Wiki Order Lifecycle](wiki/Order-Lifecycle.md)
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

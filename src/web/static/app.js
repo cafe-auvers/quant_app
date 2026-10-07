@@ -39,6 +39,7 @@
     ep_stop_adr_min_percent: 50,
     ep_stop_adr_ideal_percent: 100,
     ep_stop_adr_max_percent: 150,
+    opening_min_shares_per_minute: 200,
   });
 
   function loadDisplayPreferences() {
@@ -216,7 +217,7 @@
   }
 
   function lockPageDragging() {
-    const interactiveSurfaces = '.chart-surface, .rs-surface, .mobile-page, .mobile-board-list, .mobile-list-items, .mobile-symbol-search-results, .display-settings-scroll, .stock-list, .planning-panel';
+    const interactiveSurfaces = '.chart-surface, .rs-surface, .mobile-page, .mobile-board-list, .mobile-list-items, .mobile-symbol-search-results, .display-settings-scroll, .mobile-navigation-popover, .stock-list, .planning-panel';
     const shouldLock = () => compactLayout.matches || standaloneLayout.matches;
     document.addEventListener('touchmove', event => {
       if (!shouldLock()) return;
@@ -475,6 +476,7 @@
     ep_stop_adr_min_percent: 'orb-ep-stop-adr-min',
     ep_stop_adr_ideal_percent: 'orb-ep-stop-adr-ideal',
     ep_stop_adr_max_percent: 'orb-ep-stop-adr-max',
+    opening_min_shares_per_minute: 'orb-opening-volume-min',
   });
 
   function canEditOrbSettings() {
@@ -510,6 +512,9 @@
     );
     if (!Object.values(values).every(Number.isFinite)) {
       throw new Error('Enter a number in every ORB setting.');
+    }
+    if (values.opening_min_shares_per_minute < 0) {
+      throw new Error('Minimum opening volume cannot be negative.');
     }
     if (values.capital_min_percent < 0 || values.capital_max_percent > 100) {
       throw new Error('Capital allocation bounds must be between 0% and 100%.');
@@ -1333,8 +1338,13 @@
     }
   }
 
+  function closeMobileNavigation() {
+    byId('mobile-navigation-popover').hidden = true;
+    byId('mobile-navigation-menu').setAttribute('aria-expanded', 'false');
+  }
+
   function setMobilePage(page) {
-    const next = ['summary', 'chart', 'buy-board'].includes(page)
+    const next = ['summary', 'settings', 'chart', 'buy-board'].includes(page)
       ? page : 'chart';
     state.mobilePage = next;
     byId('mobile-workspace').dataset.mobilePage = next;
@@ -1349,6 +1359,8 @@
     });
     byId('mobile-list-popover').hidden = true;
     byId('mobile-menu-popover').hidden = true;
+    closeMobileNavigation();
+    byId('mobile-navigation-menu').classList.toggle('active', ['summary', 'settings'].includes(next));
     byId('mobile-list-menu').setAttribute('aria-expanded', 'false');
     if (next === 'buy-board' && state.session) startBuyBoardPolling();
     else stopBuyBoardPolling();
@@ -2988,14 +3000,57 @@
     }).filter(row => {
       if (state.monitorQuery && !`${row.symbol} ${row.name || ''}`.toLowerCase().includes(state.monitorQuery)) return false;
       if (state.monitorFilter === 'breakouts') return row.broke_out_today === true;
-      if (state.monitorFilter === 'orb') return (row.orb || []).some(orb => orb.price_status === 'PASS');
+      if (state.monitorFilter === 'orb') return Boolean(bestMonitorOrb(row));
       if (state.monitorFilter === 'today') return Boolean(row.buy_today_member);
       return true;
     }).sort((a, b) => (
       Number(Boolean(b.broke_out_today)) - Number(Boolean(a.broke_out_today))
-      || Number(Boolean(b.buy_today_member)) - Number(Boolean(a.buy_today_member))
+      || Number(Boolean(bestMonitorOrb(b))) - Number(Boolean(bestMonitorOrb(a)))
+      || (monitorNumber(b.change_percent) ?? -Infinity) - (monitorNumber(a.change_percent) ?? -Infinity)
       || a.symbol.localeCompare(b.symbol)
     ));
+  }
+
+  function monitorNumber(value) {
+    if (value === null || value === undefined || value === '') return null;
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+  }
+
+  function bestMonitorOrb(row) {
+    if (monitorMarketClosed()) return null;
+    return (row.orb || []).filter(orb => orb.price_status === 'PASS'
+      && orb.position_status === 'PASS' && orb.liquidity_status === 'PASS')
+      .sort((a, b) => (monitorNumber(b.score) ?? 0) - (monitorNumber(a.score) ?? 0)
+        || ['1m', '5m', '30m'].indexOf(a.window) - ['1m', '5m', '30m'].indexOf(b.window))[0] || null;
+  }
+
+  function monitorOrbSummary(row) {
+    const best = bestMonitorOrb(row);
+    if (best) {
+      const stale = row.quote_status === 'STALE';
+      const risk = boardNumber(best.risk_percent);
+      const riskLabel = risk === null ? '—' : String(Number(risk.toFixed(2)));
+      return {text: `${best.window} · ${riskLabel}%${stale ? '*' : ''}`,
+        status: stale ? 'STALE' : 'PASS',
+        title: `${stale ? 'Passed earlier · latest quote stale. ' : ''}Best ORB: ${best.window}, risk ${riskLabel}%, capital ${best.capital_percent}%, stop/ADR ${best.stop_adr_percent}%. Price, position bounds and opening liquidity passed.`};
+    }
+    if (!normalizeBreakoutPrice(row.breakout_price)) return {text: '—', title: 'Set a breakout level to check ORB'};
+    if (monitorMarketClosed()) return {text: '—', title: 'ORB checks resume next session'};
+    if (row.quote_status === 'STALE') return {text: 'Stale', status: 'STALE', title: 'Latest quote stale'};
+    const windows = row.orb || [];
+    const completed = windows.filter(orb => ['PASS', 'WAITING'].includes(orb.price_status));
+    if (completed.some(orb => orb.liquidity_status === 'FAIL')) {
+      return {text: 'Low vol', status: 'FAIL', title: row.liquidity_reason || completed.find(orb => orb.liquidity_status === 'FAIL').liquidity_reason};
+    }
+    if (completed.some(orb => orb.position_status === 'PASS' && orb.liquidity_status === 'PASS')) {
+      return {text: 'Waiting', title: completed.map(orb => `${orb.window}: Range complete · waiting above $${Number(orb.breakout_trigger).toFixed(2)}`).join('; ')};
+    }
+    if (completed.some(orb => orb.position_status === 'FAIL')) {
+      return {text: 'No pass', status: 'FAIL', title: completed.filter(orb => orb.position_status === 'FAIL').map(orb => `${orb.window}: ${orb.position_reason}`).join('; ')};
+    }
+    if (windows.some(orb => orb.price_status === 'FORMING')) return {text: 'Forming', title: 'Opening range still forming'};
+    return {text: '—', title: row.liquidity_reason || completed[0]?.position_reason || windows[0]?.price_reason || 'Awaiting data'};
   }
 
   function monitorMarketClosed() {
@@ -3004,68 +3059,71 @@
   }
 
   function mobileMonitorRow(row) {
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = `mobile-monitor-row${row.symbol === state.symbol ? ' active' : ''}`;
-    button.dataset.mobileSymbol = row.symbol;
-    button.setAttribute('role', 'option');
-    button.setAttribute('aria-selected', String(row.symbol === state.symbol));
-    const add = (parent, tag, text, className = '') => {
-      const node = document.createElement(tag);
+    const line = document.createElement('tr');
+    line.className = `mobile-monitor-row${row.symbol === state.symbol ? ' active' : ''}`;
+    line.dataset.mobileSymbol = row.symbol;
+    line.setAttribute('aria-selected', String(row.symbol === state.symbol));
+    const cell = (text, className = '', title = '') => {
+      const node = document.createElement('td');
       node.textContent = text;
       node.className = className;
-      parent.appendChild(node);
+      node.title = title;
+      line.appendChild(node);
       return node;
     };
-    const top = add(button, 'span', '', 'mobile-monitor-top');
-    add(top, 'strong', row.symbol);
-    const labels = {ABOVE: 'Broken out', PULLED_BACK: 'Broke out · pulled back', WAITING: 'Waiting', NO_LEVEL: 'Set breakout', PRE_MARKET: 'Pre-market', CLOSED: 'Market closed', UNKNOWN: 'Awaiting data'};
-    const status = add(top, 'small', labels[row.breakout_status] || 'Awaiting data', 'mobile-monitor-breakout');
+    const identity = cell('', 'mobile-monitor-stock');
+    const stock = document.createElement('button');
+    stock.type = 'button';
+    stock.textContent = row.symbol;
+    stock.title = `${row.name || row.symbol} · ${row.current_price ? `$${row.current_price}` : 'Price unavailable'} · ${row.quote_status || 'UNAVAILABLE'}${row.quote_as_of ? ` · ${new Date(row.quote_as_of).toLocaleTimeString('en-US', {timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit'})} ET` : ''}`;
+    stock.setAttribute('aria-label', `Open ${row.symbol} chart — ${row.name || row.symbol}`);
+    identity.appendChild(stock);
+    const percent = (key, title) => {
+      const value = monitorNumber(row[key]);
+      const node = cell(value === null ? '—' : `${value >= 0 ? '+' : ''}${value.toFixed(1)}%`, 'mobile-monitor-percent', title);
+      node.dataset.tone = value === null ? 'neutral' : value >= 0 ? 'positive' : 'negative';
+      if (row.quote_status === 'STALE') { node.classList.add('stale'); node.title += ' · cached quote is stale'; }
+    };
+    percent('change_percent', 'Change from the previous regular-session close');
+    const labels = {ABOVE: 'Yes', PULLED_BACK: 'Pullback', WAITING: 'Waiting', NO_LEVEL: '—', PRE_MARKET: 'Pre-mkt', CLOSED: 'Closed', UNKNOWN: '—'};
+    const status = cell(labels[row.breakout_status] || '—', 'mobile-monitor-breakout',
+      row.breakout_status === 'PULLED_BACK' ? `Broke out today · pulled back below $${row.breakout_price}`
+        : row.breakout_price ? `Breakout level $${row.breakout_price}` : 'No breakout level set');
     status.dataset.status = row.breakout_status || 'UNKNOWN';
-    const prices = add(button, 'span', '', 'mobile-monitor-prices');
-    const closed = monitorMarketClosed() || row.quote_status === 'CLOSED';
-    const price = add(prices, 'span', closed ? 'Latest price' : 'Current price', 'mobile-monitor-price-block');
-    const currentPrice = Number(row.current_price);
-    add(price, 'b', Number.isFinite(currentPrice) && currentPrice > 0 ? currentPrice.toFixed(currentPrice < 1 ? 4 : 2) : '—');
-    const level = add(prices, 'span', 'Breakout price', 'mobile-monitor-price-block');
-    add(level, 'b', normalizeBreakoutPrice(row.breakout_price)?.toFixed(2) || 'Not set');
-    const distance = normalizeBreakoutPrice(row.current_price) && normalizeBreakoutPrice(row.breakout_price)
-      ? (row.current_price / row.breakout_price - 1) * 100 : null;
-    const meta = add(button, 'span', '', 'mobile-monitor-meta');
-    const quoted = row.quote_as_of ? new Date(row.quote_as_of) : null;
-    const quoteDay = quoted?.toLocaleDateString('en-US', {timeZone: 'America/New_York', weekday: 'short', month: 'short', day: 'numeric'});
-    const today = new Date().toLocaleDateString('en-US', {timeZone: 'America/New_York', weekday: 'short', month: 'short', day: 'numeric'});
-    const quoteTime = quoted ? `${quoteDay === today ? '' : `${quoteDay} · `}${quoted.toLocaleTimeString('en-US', {timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false})}` : '';
-    const sourceLabel = row.quote_source === 'DAILY_CLOSE' ? 'Last close' : closed ? 'Last price' : '';
-    add(meta, 'small', !quoteTime ? state.monitorAsOf ? 'Quote unavailable' : 'Fetching latest price…'
-      : `${sourceLabel ? `${sourceLabel} · ` : ''}${quoteTime} ET${row.quote_status === 'STALE' ? ' · stale' : ''}`, `mobile-monitor-quote ${row.quote_status === 'STALE' ? 'stale' : ''}`);
-    add(meta, 'small', distance === null ? '' : `${Math.abs(distance).toFixed(2)}% ${distance > 0 ? 'above' : 'below'} breakout`, 'mobile-monitor-distance');
-    if (!closed) {
-      const table = add(button, 'span', '', 'mobile-monitor-orb');
-      ['1m', '5m', '30m'].forEach(window => {
-        const orb = (row.orb || []).find(item => item.window === window) || {};
-        const line = add(table, 'span', '', 'mobile-monitor-orb-line');
-        add(line, 'b', window);
-        const cell = (value, reason) => {
-          const names = {PASS: '✓ Passed', FAIL: '✕ Failed', WAITING: 'Await breakout', FORMING: 'Forming', UNKNOWN: 'Unavailable'};
-          const node = add(line, 'span', names[value] || 'Unavailable', 'mobile-monitor-result');
-          node.dataset.status = value || 'UNKNOWN';
-          node.title = reason || '';
-        };
-        cell(orb.price_status, orb.price_reason);
-        cell(orb.position_status, orb.position_reason);
-        if (orb.price_status === 'WAITING') add(table, 'small', `${window}: Range complete · waiting above $${Number(orb.breakout_trigger || Math.max(row.breakout_price || 0, orb.high || 0)).toFixed(2)}`, 'mobile-monitor-reason');
-        if (orb.price_status === 'UNKNOWN' && orb.price_reason) add(table, 'small', `${window}: ${orb.price_reason}`, 'mobile-monitor-reason');
-        if (orb.price_status === 'PASS' && row.quote_status === 'STALE') add(table, 'small', `${window}: Passed earlier · latest quote stale`, 'mobile-monitor-reason');
-        if (orb.position_status === 'FAIL' && orb.position_reason) add(table, 'small', `${window}: ${orb.position_reason}`, 'mobile-monitor-reason');
-      });
-    }
-    button.addEventListener('click', () => {
+    const summary = monitorOrbSummary(row);
+    const orb = cell(summary.text, 'mobile-monitor-result', summary.title || '');
+    orb.dataset.status = summary.status || 'UNKNOWN';
+    percent('return_1m', '1-month return · 21 trading sessions');
+    percent('return_3m', '3-month return · 63 trading sessions');
+    const action = cell('', 'mobile-monitor-action');
+    const addToday = document.createElement('button');
+    addToday.type = 'button';
+    const active = Boolean(row.buy_today_member) || canonicalBuyTodayActive(row);
+    const pending = planningPending(row.symbol) || operatorPending(row.symbol);
+    const owned = Number(row.broker_quantity) > 0 || row.canonical_stage === 'ENTRY_PENDING';
+    addToday.textContent = active ? '✓' : pending ? '…' : '+';
+    addToday.disabled = active || pending || owned;
+    addToday.title = active ? 'Already in Buy Today' : owned ? 'Entry active or shares already owned' : 'Add to Buy Today';
+    addToday.setAttribute('aria-label', `${addToday.title}: ${row.symbol}`);
+    addToday.addEventListener('click', async event => {
+      event.stopPropagation();
+      addToday.disabled = true;
+      byId('mobile-list-popover').hidden = true;
+      byId('mobile-list-menu').setAttribute('aria-expanded', 'false');
+      try {
+        await selectSymbol(row.symbol);
+        if (state.symbol === row.symbol && !canonicalBuyTodayActive() && !hasCurrentBuyTodayDraft()) await toggleBuyTodayDraft();
+      } finally {
+        renderMobileStockList();
+      }
+    });
+    action.appendChild(addToday);
+    stock.addEventListener('click', () => {
       byId('mobile-list-popover').hidden = true;
       byId('mobile-list-menu').setAttribute('aria-expanded', 'false');
       void selectSymbol(row.symbol);
     });
-    return button;
+    return line;
   }
 
   async function loadIntradayMonitor() {
@@ -3113,26 +3171,45 @@
       return;
     }
     const fragment = document.createDocumentFragment();
-    state.visibleRows.forEach((row, index) => {
-      fragment.appendChild(state.listMode === 'monitor' ? mobileMonitorRow(row) : mobileStockRow(row, index));
-    });
+    const monitor = state.listMode === 'monitor';
+    list.classList.toggle('monitor-table-scroll', monitor);
+    byId('mobile-list-popover').classList.toggle('monitor-view', monitor);
+    list.setAttribute('role', monitor ? 'region' : 'listbox');
+    if (monitor) {
+      const table = document.createElement('table');
+      table.className = 'mobile-monitor-table';
+      table.setAttribute('aria-label', 'Watchlist breakout monitor');
+      const header = table.createTHead().insertRow();
+      ['Stock', 'Today %', 'Breakout', 'Best ORB', '1M %', '3M %', '+'].forEach((label, index) => {
+        const cell = document.createElement('th');
+        cell.scope = 'col';
+        cell.textContent = label;
+        if (index === 6) cell.setAttribute('aria-label', 'Add to Buy Today');
+        header.appendChild(cell);
+      });
+      const body = table.createTBody();
+      state.visibleRows.forEach(row => body.appendChild(mobileMonitorRow(row)));
+      fragment.appendChild(table);
+    } else {
+      state.visibleRows.forEach((row, index) => fragment.appendChild(mobileStockRow(row, index)));
+    }
     if (!state.visibleRows.length) {
       const empty = document.createElement('div');
       empty.className = 'mobile-list-empty';
       empty.textContent = listEmptyMessage();
       fragment.appendChild(empty);
     }
+    const scrollLeft = list.scrollLeft;
     replaceStockListRows(list, fragment);
+    list.scrollLeft = monitor ? scrollLeft : 0;
     byId('mobile-list-count').textContent = String(state.visibleRows.length);
-    const monitor = state.listMode === 'monitor';
     byId('mobile-monitor-controls').hidden = !monitor;
     byId('mobile-monitor-status').hidden = !monitor;
-    byId('mobile-monitor-legend').hidden = monitorMarketClosed();
     byId('mobile-monitor-status').textContent = state.monitorError || (state.monitorEnabled === false
       ? 'Sandbox · intraday quotes are available in Connected mode'
       : state.monitorAsOf ? monitorMarketClosed()
         ? 'Market closed · showing latest available prices. ORB checks resume next session.'
-        : `Yahoo 1m · checks every minute · quotes may be delayed${state.monitorPositionError ? ` · ${state.monitorPositionError}` : ''}`
+        : `All watchlists · checks every minute · Yahoo quotes may be delayed. 1M / 3M = months. Swipe for all columns. * = earlier pass, stale quote.${state.monitorPositionError ? ` ${state.monitorPositionError}` : ''}`
       : 'Checking prices · Watchlist + Buylist + Buy Today');
   }
 
@@ -4128,6 +4205,8 @@
     const mobileListMenu = byId('mobile-list-menu');
     const mobileListPopover = byId('mobile-list-popover');
     const mobileMenuPopover = byId('mobile-menu-popover');
+    const navigationMenu = byId('mobile-navigation-menu');
+    const navigationPopover = byId('mobile-navigation-popover');
     const closeMobileListPopover = () => {
       mobileListPopover.hidden = true;
       mobileListMenu.setAttribute('aria-expanded', 'false');
@@ -4138,12 +4217,21 @@
     document.querySelectorAll('.mobile-workspace-tab').forEach(button => {
       button.addEventListener('click', () => setMobilePage(button.dataset.mobilePage));
     });
+    navigationMenu.addEventListener('click', () => {
+      const opening = navigationPopover.hidden;
+      closeMobileListPopover();
+      closeMobileMenuPopover();
+      navigationPopover.hidden = !opening;
+      navigationMenu.setAttribute('aria-expanded', String(opening));
+      if (opening) navigationPopover.querySelector('[aria-current="page"], button').focus();
+    });
     byId('pulse-open-chart').addEventListener('click', () => setMobilePage('chart'));
     byId('summary-open-lists').addEventListener('click', () => {
       setMobilePage('chart');
       mobileListMenu.click();
     });
-    byId('summary-open-settings').addEventListener('click', () => {
+    byId('settings-open-chart').addEventListener('click', () => {
+      closeMobileNavigation();
       closeMobileListPopover();
       mobileMenuPopover.hidden = false;
       syncDisplaySettingInputs();
@@ -4188,7 +4276,7 @@
     byId('buy-board-action-value').addEventListener('input', event => event.target.setCustomValidity(''));
     byId('operator-confirm-cancel').addEventListener('click', () => closeOperatorConfirm(false));
     byId('desktop-orb-settings').addEventListener('click', () => {
-      setMobilePage('summary');
+      setMobilePage('settings');
       void loadOrbSettings();
     });
     byId('desktop-orb-settings-close').addEventListener('click', () => setMobilePage('chart'));
@@ -4199,6 +4287,7 @@
     });
     mobileListMenu.addEventListener('click', () => {
       const opening = mobileListPopover.hidden;
+      closeMobileNavigation();
       closeMobileMenuPopover();
       if (opening && state.mobilePage !== 'chart') setMobilePage('chart');
       mobileListPopover.hidden = !opening;
@@ -4255,7 +4344,8 @@
     }));
     document.addEventListener('pointerdown', event => {
       if (!mobileListPopover.hidden && !event.target.closest('.mobile-list-control')) closeMobileListPopover();
-      if (!mobileMenuPopover.hidden && !event.target.closest('#mobile-menu-popover, #summary-open-settings')) closeMobileMenuPopover();
+      if (!mobileMenuPopover.hidden && !event.target.closest('#mobile-menu-popover, #settings-open-chart')) closeMobileMenuPopover();
+      if (!navigationPopover.hidden && !event.target.closest('.mobile-navigation-control')) closeMobileNavigation();
       const breakoutPopup = byId('breakout-price-popup');
       if (!breakoutPopup.hidden && event.target === breakoutPopup) closeBreakoutPricePopup();
     });
@@ -4457,6 +4547,12 @@
     bindSymbolSearch('mobile-symbol-search', 'mobile-symbol-search-results', closeMobileSymbolSearch);
 
     document.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && !navigationPopover.hidden) {
+        event.preventDefault();
+        closeMobileNavigation();
+        navigationMenu.focus();
+        return;
+      }
       if (event.key === 'Escape' && !byId('buy-board-action-sheet').hidden) {
         event.preventDefault();
         closeBuyBoardActionSheet();

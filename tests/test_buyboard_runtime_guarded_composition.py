@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -251,6 +252,7 @@ def _card(symbol: str = "AAPL", **overrides) -> TradeCardState:
         selected_orb_window="5m",
         planned_quantity=100,
         target_position_quantity=100,
+        orb_candidate_states={"5m": {"opening_volume": 6000, "opening_volume_minutes": 30}},
     )
     values.update(overrides)
     return TradeCardState(**values)
@@ -860,7 +862,7 @@ def test_explicit_reentry_waits_for_a_new_plan_then_submits_once_with_new_identi
         "entry_runtime_status", "planned_quantity", "target_position_quantity",
         "entry_trigger", "entry_execution_price", "entry_floor_price", "entry_breakout_trigger",
         "entry_breakout_confirmed_at", "entry_range_closed_at", "entry_orb_high", "entry_orb_low",
-        "entry_orb_window", "selected_orb_window", "stop_adr",
+        "entry_orb_window", "selected_orb_window", "stop_adr", "orb_candidate_states",
     ):
         setattr(card, name, getattr(approved_plan, name))
     trade_card_repository.update_trade_card(engine, card, expected_version=card.version)
@@ -923,6 +925,55 @@ def test_canonical_portfolio_position_limit_rejects_entry_before_broker(
         engine, environment="PROD", account_no="1"
     ) == []
     assert entry.entry_runtime_status == EntryRuntimeStatus.RETRY_COOLDOWN
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_orb_refresh_during_broker_submission_preserves_the_submitted_generation(
+    tmp_path, monkeypatch
+):
+    from src.core.execution_queue import ExecutionQueueItem, OrbCandidate, OrbCandidateStatus
+    from src.services.trade_card_orb_bridge import TradeCardOrbEvaluator
+
+    runtime, broker, gateway, engine, market_data = _make_runtime(tmp_path, monkeypatch)
+    card = _persist_owned_card(engine, _card(entry_orb_window=None))
+    broker.queue_acceptance(broker_order_id="B-FROZEN-ORB")
+    market_data.subscribe([card.symbol])
+    market_data.poll_once()
+    original_submit = broker.submit_order
+    observed = []
+
+    def submit_with_concurrent_refresh(**kwargs):
+        current = trade_card_repository.get_trade_card(engine, "PROD", "1", card.symbol)
+        observed.append(current.to_dict())
+        candidate = OrbCandidate(symbol=card.symbol, window="30m", orb_high=110.0,
+            orb_low=96.0, breakout_price=card.breakout_price, entry_trigger=110.0,
+            execution_price=110.0, risk_percent=0.015, shares=100, score=80.6,
+            source_session_date=datetime.now(ZoneInfo("America/New_York")).date().isoformat(),
+            status=OrbCandidateStatus.WAITING_BREAKOUT, valid=True)
+        item = ExecutionQueueItem(symbol=card.symbol, environment="PROD", account_no="1",
+            breakout_price=card.breakout_price, selected_candidate=candidate,
+            selected_window="30m", candidates={"30m": candidate})
+        before = current.to_dict()
+        TradeCardOrbEvaluator().update_card(current, item)
+        if current.to_dict() != before:
+            trade_card_repository.update_trade_card(engine, current, expected_version=current.version)
+        return original_submit(**kwargs)
+
+    broker.submit_order = submit_with_concurrent_refresh
+    runtime.trading_engine.run_heartbeat([card])
+
+    stored = trade_card_repository.get_trade_card(engine, "PROD", "1", card.symbol)
+    assert stored.selected_orb_window == "5m"
+    assert observed[0]["entry_orb_window"] == "5m"
+    assert stored.entry_orb_window == "5m"
+    assert stored.entry_execution_price == 100.0
+    assert stored.entry_orb_low == 95.0
+    assert stored.risk_percent == 0.01
+    assert len(broker.submit_calls) == 1
+    assert broker.submit_calls[0]["limit_price"] == 100.0
+    assert card.board_status == BoardStatus.ENTRY_PENDING
+    trade_card_repository.update_trade_card(engine, card, expected_version=card.version)
+    assert trade_card_repository.get_trade_card(engine, "PROD", "1", card.symbol).entry_orb_window == "5m"
 
 
 @pytest.mark.usefixtures("trading_enabled")

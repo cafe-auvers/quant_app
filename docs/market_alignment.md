@@ -155,3 +155,5 @@ unavailable context where Market Pulse lacks a matching proxy/history, and no
 historical score playback in this version. Until that outcome validation
 exists, **Strong** means "strong relative rank under this formula," not
 "reliable buy" or "likely profitable."
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

@@ -39,3 +39,5 @@ also records the observed non-business-day rejection and proves that it left
 no matching open order. Accepted simulation mutations, real event frames, and
 execution notices are still missing; see
 `docs/kis_capability_matrix.md` for the authoritative row status.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](../../../docs/opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

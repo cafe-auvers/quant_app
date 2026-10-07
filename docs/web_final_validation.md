@@ -276,3 +276,5 @@ Supabase is not required for this checklist.
 Do not merge to master yet. Complete the physical browser/iPhone checklist and
 resolve or explicitly accept the listed environment blockers first. Supabase
 is optional and does not block localhost acceptance.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

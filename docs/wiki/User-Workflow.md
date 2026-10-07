@@ -19,6 +19,13 @@ The normal workflow narrows candidates before any execution intent exists.
 11. Monitor position, partial-exit, stop, and final-exit evidence in Buy Board,
     Health, and the event journal.
 
+On the phone, use Watchlist → Monitor to inspect every watchlist stock on one
+line: Today %, breakout, best passing ORB, and 1M/3M returns. The + action starts
+the existing explicit Buy Today workflow. Review low-volume failures before
+publishing. Menu → Settings contains ORB bounds, the opening minimum, and
+Operator Control; Home is the daily overview. Watchlist, Chart, Buy Board, and
+stock arrows remain on the bottom bar.
+
 During regular market hours, non-execution-owner planning changes are locked;
 authorized intervention commands are routed through the operator command path.
 Published plan immutability and account ownership remain enforced.
@@ -39,3 +46,5 @@ broker-confirmed state.
 
 See [Current Order Logic](https://github.com/cafe-auvers/quant_app/blob/master/docs/current_order_logic.md).
 For cross-device confirmation semantics, see [Web/PWA Operator Synchronization](https://github.com/cafe-auvers/quant_app/blob/master/docs/web_operator_sync.md).
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](../opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

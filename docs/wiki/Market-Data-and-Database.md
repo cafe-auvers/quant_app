@@ -41,3 +41,5 @@ configured stock universe. Hourly coverage uses only symbols currently relevant
 to Scanner, Watchlist, and Buylist workflows, matching the selective hourly
 copy policy. A symbol outside that hourly scope does not make the mirror look
 unhealthy.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](../opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

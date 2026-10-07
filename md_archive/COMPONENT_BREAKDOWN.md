@@ -170,3 +170,5 @@ This architecture is ready for implementation. Would you like me to:
 5. **Refine any specific area** (ask questions first)
 
 What would you prefer?
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](../docs/opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

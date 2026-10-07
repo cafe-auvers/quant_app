@@ -43,6 +43,15 @@ Synthetic performance checks:
 python scripts/benchmark_performance.py --sidebar-rows 6000 --db-symbols 2000 --samples 20
 ```
 
+Opening-liquidity coverage verifies exact threshold equality, elapsed empty
+minutes, the 30-minute cap, missing/invalid volume, shared-setting changes,
+entry/replacement rejection, and exit exemptions. Mobile Playwright tests cover
+320/390/820-pixel navigation, one-row Monitor rendering, best-ORB filtering,
+scroll preservation, read-only controls, and unsaved Settings navigation.
+
+When artifacts contain archived source trees, use `pytest tests -q` to keep
+collection in the real test directory.
+
 ## Test boundaries
 
 Normal tests must not require a developer MySQL instance, KIS credentials, a
@@ -59,3 +68,5 @@ checks and `Gate 1 deterministic simulation`.
 
 Do not delete, suppress, or weaken a test to obtain a green result. Trading
 behavior changes need characterization and boundary tests.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](../opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

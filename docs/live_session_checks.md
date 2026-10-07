@@ -45,3 +45,5 @@ needs complete branch/fence replay and its reviewed Gate-2 chain; Gate 4 needs
 its reviewed Gate-3 chain, three supervised dates, and required lifecycle/disarm
 coverage. Never inject disconnects into an active live session to manufacture
 that missing evidence. Use the separate qualification workflow for closure.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

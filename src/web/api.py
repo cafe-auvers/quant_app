@@ -250,6 +250,7 @@ class OrbSettingsUpdateRequest(BaseModel):
     ep_stop_adr_min_percent: float = Field(default=50, ge=0, le=1000)
     ep_stop_adr_ideal_percent: float = Field(default=100, ge=0, le=1000)
     ep_stop_adr_max_percent: float = Field(default=150, ge=0, le=1000)
+    opening_min_shares_per_minute: float = Field(default=200, ge=0)
 
 
 class DrawingCreateRequest(BaseModel):

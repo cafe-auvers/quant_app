@@ -50,3 +50,5 @@ Status values: `TODO`, `IN_PROGRESS`, `DONE`, `BLOCKED`.
 - The required in-app Browser capability is installed but no browser instance
   was attached to this session. Live HTTP smoke testing passed; visual desktop
   and 390 px screenshot inspection remains explicitly blocked.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

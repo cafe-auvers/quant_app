@@ -63,3 +63,5 @@ changing a local percentile calculation. Inspect the new phase timings and
 per-channel tails after genuine collection before claiming a performance
 improvement or a formal gate pass. No timestamp adjustment, stale-feed entry,
 test order, or live fault injection is authorized by these diagnostics.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

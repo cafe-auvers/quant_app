@@ -716,6 +716,7 @@ def test_mobile_orb_settings_api_round_trip_is_revision_safe(
         initial = phone.get("/api/v1/operator/orb-settings")
         assert initial.status_code == 200
         assert initial.json()["settings"]["capital_max_percent"] == 30.0
+        assert initial.json()["settings"]["opening_min_shares_per_minute"] == 200.0
 
         payload = {
             "command_id": str(uuid.uuid4()),
@@ -726,18 +727,32 @@ def test_mobile_orb_settings_api_round_trip_is_revision_safe(
             "stop_adr_min_percent": 15.0,
             "stop_adr_ideal_percent": 65.0,
             "stop_adr_max_percent": 66.0,
+            "opening_min_shares_per_minute": 350.0,
         }
         saved = phone.put("/api/v1/operator/orb-settings", json=payload)
         assert saved.status_code == 200, saved.text
         assert saved.json()["revision"] == 1
         assert saved.json()["settings"]["capital_max_percent"] == 35.0
+        assert saved.json()["settings"]["opening_min_shares_per_minute"] == 350.0
+
+        invalid = phone.put(
+            "/api/v1/operator/orb-settings",
+            json={**payload, "command_id": str(uuid.uuid4()), "opening_min_shares_per_minute": -1},
+        )
+        assert invalid.status_code == 422
+
+        legacy_payload = {key: value for key, value in payload.items() if key != "opening_min_shares_per_minute"}
+        legacy_payload.update(command_id=str(uuid.uuid4()), expected_revision=saved.json()["revision"])
+        legacy_saved = phone.put("/api/v1/operator/orb-settings", json=legacy_payload)
+        assert legacy_saved.status_code == 200
+        assert legacy_saved.json()["settings"]["opening_min_shares_per_minute"] == 350.0
 
         stale = phone.put(
             "/api/v1/operator/orb-settings",
             json={**payload, "command_id": str(uuid.uuid4())},
         )
         assert stale.status_code == 409
-        assert stale.json()["current"]["revision"] == 1
+        assert stale.json()["current"]["revision"] == legacy_saved.json()["revision"]
         assert ss.pull_state(engine, ss.SETTINGS_KEY).state.payload[
             "orb_settings"
         ]["capital_max_percent"] == 35.0

@@ -165,3 +165,5 @@ per-action work: Watchlist 5 statements, breakout 14, Buylist 7, Buy Today 29.
 These include authority/revision/ownership/read-back checks and introduce no
 one-second SQL polling or per-card fanout. See
 [web_final_validation.md](web_final_validation.md).
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

@@ -605,3 +605,5 @@ the wake time itself is harmless idle time either way.
   via the retained `AtLogOn` fallback and the stale-heartbeat claim path
   rather than the clean-release path -- the less-clean of the two, but still
   fully gated by broker reconciliation before anything trades.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

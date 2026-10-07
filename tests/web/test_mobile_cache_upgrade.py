@@ -137,8 +137,9 @@ def test_mobile_upgrade_bypasses_old_cache_and_recovers_price_timeout(tmp_path, 
             page.clock.fast_forward(5_001)
             page.wait_for_function("document.querySelector('#mobile-monitor-status').textContent.includes('Market closed')")
             assert not page.evaluate("Boolean(window.__legacyAssetLoaded)")
-            assert page.locator(".mobile-monitor-price-block b").all_text_contents() == ["185.25", "180.00"]
-            assert page.locator(".mobile-monitor-price-block").first.evaluate("n => n.getBoundingClientRect().width > 100")
+            assert "$185.25" in page.locator(".mobile-monitor-stock button").get_attribute("title")
+            assert "$180" in page.locator(".mobile-monitor-breakout").get_attribute("title")
+            assert page.locator(".mobile-monitor-row").evaluate("n => n.getBoundingClientRect().height <= 42")
             assert "good" in page.locator("#executor-dot").get_attribute("class")
             page.wait_for_function("caches.keys().then(keys => keys.includes('quant-web-static-v92') && !keys.includes('quant-web-static-v81'))")
             assert page.evaluate("caches.has('unrelated-cache')")
@@ -157,7 +158,7 @@ def test_mobile_upgrade_bypasses_old_cache_and_recovers_price_timeout(tmp_path, 
             page.wait_for_function("document.querySelector('#mobile-monitor-status').textContent.includes('Market closed')")
             page.set_viewport_size({"width": 320, "height": 740})
             assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
-            assert page.locator(".mobile-monitor-price-block").first.evaluate("n => n.getBoundingClientRect().width > 100")
+            assert page.locator(".mobile-monitor-row").evaluate("n => n.getBoundingClientRect().height <= 42")
             page.screenshot(path=str(tmp_path / "cache-upgrade-320.png"))
             assert any(url.startswith("/release-static/") for url in state["urls"])
             assert not errors, errors

@@ -27,11 +27,14 @@ class OrbSettings:
     ep_stop_adr_min_percent: float = 50.0
     ep_stop_adr_ideal_percent: float = 100.0
     ep_stop_adr_max_percent: float = 150.0
+    opening_min_shares_per_minute: float = 200.0
 
     def __post_init__(self) -> None:
         values = tuple(asdict(self).values())
         if not all(math.isfinite(value) for value in values):
             raise ValueError("ORB settings must be finite numbers")
+        if self.opening_min_shares_per_minute < 0:
+            raise ValueError("Opening volume per minute cannot be negative")
         if self.capital_min_percent < 0 or self.capital_max_percent > 100:
             raise ValueError("Capital allocation bounds must be between 0% and 100%")
         if self.stop_adr_min_percent < 0:
@@ -104,6 +107,9 @@ class OrbSettings:
                 ),
                 ep_stop_adr_max_percent=float(
                     values.get("ep_stop_adr_max_percent", defaults.ep_stop_adr_max_percent)
+                ),
+                opening_min_shares_per_minute=float(
+                    values.get("opening_min_shares_per_minute", defaults.opening_min_shares_per_minute)
                 ),
             )
         except (TypeError, ValueError, OverflowError):

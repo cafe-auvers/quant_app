@@ -2810,6 +2810,8 @@ def test_run_one_cycle_refreshes_orb_observation_for_reconciliation_blocked_acco
         source_session_date=_current_us_session_date(),
         shares=10,
         status=OrbCandidateStatus.WAITING_BREAKOUT,
+        opening_volume=6000,
+        opening_volume_minutes=30,
     )
     item = ExecutionQueueItem(
         symbol="AAPL",
@@ -3809,6 +3811,8 @@ def test_sync_orb_plans_applies_the_execution_queue_bridge(tmp_path):
         breakout_price=100.0, breakout_trigger=100.1, entry_trigger=101.5,
         source_session_date=_current_us_session_date(), shares=10,
         status=OrbCandidateStatus.EXECUTE_READY,
+        opening_volume=6000,
+        opening_volume_minutes=30,
     )
     item = ExecutionQueueItem(
         symbol="AAPL", environment="PROD", account_no="1", breakout_price=100.0
@@ -3821,6 +3825,33 @@ def test_sync_orb_plans_applies_the_execution_queue_bridge(tmp_path):
     assert changed == [card]
     assert card.entry_runtime_status == EntryRuntimeStatus.EXECUTE_READY
     assert card.entry_trigger == 101.5
+
+
+@pytest.mark.parametrize("lookup_state", ["missing", "failed", "new_plan"])
+def test_sync_orb_plans_preserves_prepared_entry_during_refresh(tmp_path, lookup_state):
+    worker, engine = _worker(tmp_path)
+    card = _seed_card(engine, board_status=BoardStatus.BUY_TODAY,
+        entry_client_order_id="prepared-five", entry_pending_attempt_number=1,
+        selected_orb_window="5m", entry_orb_window="5m", entry_orb_high=101.0,
+        entry_orb_low=95.0, entry_trigger=101.0, entry_execution_price=101.0,
+        breakout_price=100.0, entry_runtime_status=EntryRuntimeStatus.EXECUTE_READY,
+        risk_percent=0.005, planned_quantity=20, target_position_quantity=20)
+    candidate = OrbCandidate(symbol="AAPL", window="30m", orb_high=110.0,
+        orb_low=96.0, entry_trigger=110.0, shares=30, risk_percent=0.0075,
+        source_session_date=_current_us_session_date(),
+        status=OrbCandidateStatus.WAITING_BREAKOUT, valid=True)
+    item = ExecutionQueueItem(symbol="AAPL", environment="PROD", account_no="1",
+        breakout_price=100.0, selected_window="30m", selected_candidate=candidate)
+
+    def lookup(*_args):
+        if lookup_state == "failed":
+            raise RuntimeError("refresh unavailable")
+        return item if lookup_state == "new_plan" else None
+
+    worker._execution_queue_item_lookup = lookup
+    before = card.to_dict()
+    assert worker._sync_orb_plans([card]) == []
+    assert card.to_dict() == before
 
 
 def test_sync_orb_plans_blocks_same_symbol_active_in_multiple_accounts(tmp_path):
@@ -4375,6 +4406,9 @@ def test_runtime_executes_crossed_lower_trigger_orb_once_in_auto_mode(
         risk_percent=0.01,
         score=10.0,
         status=OrbCandidateStatus.WAITING_BREAKOUT,
+        valid=True,
+        opening_volume=6000,
+        opening_volume_minutes=30,
     )
     five_minute = OrbCandidate(
         symbol="AAPL",
@@ -4393,6 +4427,9 @@ def test_runtime_executes_crossed_lower_trigger_orb_once_in_auto_mode(
         risk_percent=0.01,
         score=20.0,
         status=OrbCandidateStatus.WAITING_BREAKOUT,
+        valid=True,
+        opening_volume=6000,
+        opening_volume_minutes=30,
     )
     queue_item = ExecutionQueueItem(
         symbol="AAPL",
@@ -4473,6 +4510,8 @@ def test_runtime_active_queue_order_lock_blocks_crossing_submission(
         shares=200,
         risk_percent=0.01,
         status=OrbCandidateStatus.WAITING_BREAKOUT,
+        opening_volume=6000,
+        opening_volume_minutes=30,
     )
     queue_item = ExecutionQueueItem(
         symbol="AAPL",

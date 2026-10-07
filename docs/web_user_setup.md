@@ -274,26 +274,52 @@ confirmation, pulse, fallback, and execution-safety contract.
 
 ## Intraday Watchlist monitor
 
+The bottom bar contains **Menu**, **Watchlist**, **Chart**, **Buy Board**, and
+the previous/next stock arrows. The hamburger **Menu** at the bottom left opens
+**Home** and **Settings** (gear icon). Home holds the daily overview and Market
+Pulse. Settings holds shared ORB position bounds, minimum opening liquidity,
+Operator Control, saved scanner setups, and chart preferences. Shared risk
+changes still require **Save shared settings**; navigating between pages keeps
+unsaved form values. Opening a page does not change risk settings or control.
+
 The mobile bottom **Watchlist** button opens **Monitor** by default. It combines
 Watchlist, Buylist, canonical Buy Today, and current Buy Today drafts into one
-deduplicated list. Each stock shows its latest available price, saved breakout,
-distance from that level, and quote time. Stocks that broke out today appear
-first. **Broken out**, **ORB passed**, **Buy Today**, and symbol search narrow
-the view; tap a stock to review its chart and use the existing planning actions.
+deduplicated table, with one line per stock: **Stock**, **Today %**, **Breakout**,
+**Best ORB**, **1M %**, and **3M %**. Today % compares the latest quote with the
+previous regular-session close; monthly returns use 21 and 63 trading sessions,
+matching the chart growth convention. Missing history shows a dash. Daily
+history is cached from the existing ADR batch (six months, once per session),
+while the latest price updates each minute. Swipe horizontally on narrow phones;
+the stock column stays visible. Tap a symbol to review its chart, or **+** to
+use the existing Buy Today workflow. Watchlist-only stocks are promoted through
+the existing Buylist step, and executable activation keeps its confirmation.
+Stocks that broke out today appear first, followed by passing ORBs and stronger
+daily changes. **Broken out**, **ORB passed**, **Buy Today**, and symbol search narrow
+the view.
 New intraday additions enter the next refresh cycle automatically.
 
-For each 1m, 5m, and 30m range, two results are shown separately:
+The worker checks all 1m, 5m, and 30m ranges and eight risk cases. **Best ORB**
+shows the highest-scoring valid window and risk, such as `5m · 0.5%`. A pass
+requires all three checks; the **ORB passed** filter applies the same rule:
 
 - **Price breakout** passes after a regular-session minute bar, following the
   completed opening range, trades strictly above both the saved breakout and
   the opening-range high. Confirmation remains visible after a pullback; the
-  headline then says **Broke out · pulled back** when below the saved level.
+  Breakout cell then says **Pullback** when below the saved level.
 - **Position bounds** checks the existing passive entry geometry, uses ORH as
   the execution level and ORL as the stop, and evaluates the desktop's eight
   risk cases (0.25%–2%) against shared capital and stop/ADR bounds. A valid case
-  passes independently of the price test. Failed bounds include their reason.
+  passes independently of the price test. Failed bounds show **No pass**, with
+  the reason in the cell tooltip.
   Missing equity, shared settings, complete minute bars, or daily ADR show an
   unavailable result instead of a pass.
+- **Opening liquidity** uses the same adjustable minimum shares/minute rule
+  as execution, from completed opening bars only, capped at the first 30 minutes.
+  Insufficient liquidity shows **Low vol**, even if price and sizing pass.
+
+An earlier confirmed ORB with a stale quote has an asterisk and amber text,
+with its stale status in the tooltip. It does not claim a fresh entry signal.
+Hover over the stock for its company name, latest price, and quote time.
 
 Connected mode uses a separate web-process Yahoo/yfinance worker with batches
 of at most 40 symbols and four download threads. It polls once per minute
@@ -303,7 +329,8 @@ market downloads. Yahoo data can be delayed. Quote age and failed refreshes are
 explicit; partial failures retain prices but suppress fresh signals. A failed
 quote batch backs off for two minutes; failed daily history retries after
 15 minutes. There are no broker calls, scanner runs, order submissions, or
-execution-state changes from this monitor. Sandbox does not download quotes.
+execution-state changes from reading this monitor. The **+** action explicitly
+uses the existing planning/operator endpoints. Sandbox does not download quotes.
 
 Restart the updated web process and desktop app to enable the monitor and
 equity projection. The desktop publishes a small gitignored
@@ -320,8 +347,8 @@ On weekends and holidays, Monitor keeps saved breakout levels and the latest
 available price visible with its actual quote date. Off-hours minute downloads
 use a five-day lookback; missing minute quotes fall back to completed daily
 closes from the existing ADR download. A daily close never supplies an intraday
-breakout or ORB pass. The closed-market layout focuses on the two prices and
-hides unavailable intraday checks until the next session.
+breakout or ORB pass. Quotes from previous dates leave **Today %** blank, and
+unavailable intraday checks show a dash until the next session.
 
 Pages and their CSS/JavaScript are loaded from one release snapshot. Content
 fingerprints in asset paths bypass older phone service workers immediately;
@@ -336,3 +363,5 @@ the legacy process heartbeat used only for older deployments. Starting and
 standby states are amber; stale, stopped, or blocked owners remain unhealthy.
 The status includes the owner, heartbeat age, and reason without changing
 execution ownership or readiness gates.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

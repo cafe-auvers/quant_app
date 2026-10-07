@@ -215,3 +215,5 @@ collector errors or dropped batches. Previously accumulated egress and current
 billing/quota verification remain separate outstanding items. Full deployment,
 approval, collection and measurement evidence is recorded in
 `docs/tonight_preparation_2026-10-07.md`.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

@@ -40,6 +40,8 @@ def _candidate(**overrides):
         status=OrbCandidateStatus.EXECUTE_READY,
         valid=True,
         terminal_rejection=False,
+        opening_volume=6000,
+        opening_volume_minutes=30,
     )
     fields.update(overrides)
     return OrbCandidate(**fields)
@@ -243,6 +245,56 @@ def test_live_cross_selects_lower_trigger_risk_valid_window_in_auto_mode():
     assert card.entry_trigger == 197.71
     assert card.entry_orb_high == 197.71
     assert card.planned_quantity == one_minute.shares
+
+
+def test_refresh_keeps_confirmed_lower_orb_until_a_higher_orb_confirms():
+    now = datetime(2026, 10, 7, 14, 18, tzinfo=timezone.utc)
+    five = _candidate(window="5m", orb_high=574.205, orb_low=560.76,
+        breakout_price=570.04, entry_trigger=574.20, execution_price=574.20,
+        breakout_trigger=574.205, floor_price=570.04, score=74.0,
+        risk_percent=0.005, shares=6, source_session_date="2026-10-07",
+        range_closed_at="2026-10-07T09:35:00-04:00",
+        status=OrbCandidateStatus.WAITING_BREAKOUT)
+    thirty = _candidate(window="30m", orb_high=580.979, orb_low=560.76,
+        breakout_price=570.04, entry_trigger=580.97, execution_price=580.97,
+        breakout_trigger=580.979, floor_price=570.04, score=80.6,
+        risk_percent=0.0075, shares=6, source_session_date="2026-10-07",
+        range_closed_at="2026-10-07T10:00:00-04:00",
+        status=OrbCandidateStatus.WAITING_BREAKOUT)
+    item = _queue_item(thirty, breakout_price=570.04,
+        candidates={"5m": five, "30m": thirty}, last_updated=now)
+    card = _card(breakout_price=570.04)
+    evaluator = TradeCardOrbEvaluator(clock=lambda: now)
+    evaluator.update_card(card, item)
+    assert card.selected_orb_window == "30m"
+    assert evaluator.select_crossed_candidate(card, item, last_price=579.055)
+
+    evaluator.update_card(card, item)
+
+    assert card.selected_orb_window == "5m"
+    assert card.entry_runtime_status == EntryRuntimeStatus.EXECUTE_READY
+    assert card.entry_execution_price == 574.20
+    assert card.entry_breakout_confirmed_at == now
+    assert card.risk_percent == 0.005
+    assert evaluator.select_crossed_candidate(card, item, last_price=581.0)
+    evaluator.update_card(card, item)
+    assert card.selected_orb_window == "30m"
+
+
+def test_refresh_does_not_replace_a_prepared_entry_identity():
+    card = _card(entry_client_order_id="entry-five", entry_pending_attempt_number=1,
+        selected_orb_window="5m", entry_orb_window="5m", entry_orb_high=101.0,
+        entry_orb_low=95.0, entry_trigger=101.0, entry_execution_price=101.0,
+        entry_runtime_status=EntryRuntimeStatus.EXECUTE_READY, planned_quantity=20,
+        target_position_quantity=20, risk_percent=0.005, stop_adr=49.9)
+    before = card.to_dict()
+    item = _queue_item(_candidate(window="30m", orb_high=110.0,
+        entry_trigger=110.0, risk_percent=0.0075, score=80.6,
+        status=OrbCandidateStatus.WAITING_BREAKOUT))
+
+    TradeCardOrbEvaluator().update_card(card, item)
+
+    assert card.to_dict() == before
 
 
 def test_live_cross_respects_manual_window_lock():

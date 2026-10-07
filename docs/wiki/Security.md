@@ -49,3 +49,5 @@ Before publishing:
 3. verify `.gitignore` covers restore backups and runtime files;
 4. rotate/revoke any credential that was ever exposed—deleting it from the
    latest commit is not sufficient.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](../opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

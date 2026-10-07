@@ -34,6 +34,7 @@ def test_orb_settings_dialog_shows_defaults_and_restores_them():
         stop_adr_min_percent=25.0,
         stop_adr_ideal_percent=55.0,
         stop_adr_max_percent=80.0,
+        opening_min_shares_per_minute=350.0,
     )
     dialog = OrbSettingsDialog(custom)
 
@@ -102,6 +103,7 @@ def test_main_window_saves_and_applies_accepted_orb_settings(monkeypatch):
         stop_adr_min_percent=20.0,
         stop_adr_ideal_percent=50.0,
         stop_adr_max_percent=75.0,
+        opening_min_shares_per_minute=300.0,
     )
     published = {}
     log_messages = []

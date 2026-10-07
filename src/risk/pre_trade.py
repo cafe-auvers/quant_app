@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional, Tuple
 
 from src.core.order_state import OrderIntent, OrderSide
+from src.core.opening_liquidity import opening_liquidity_rejection
 from src.risk.orb_position import validate_orb_position_values
 
 DEFAULT_APPROVAL_TTL = timedelta(seconds=30)
@@ -330,6 +331,12 @@ def assess_orb_entry_candidate(
         reasons.extend(
             str(value) for value in (getattr(candidate, "warnings", ()) or ())
         )
+        liquidity_reason = opening_liquidity_rejection(
+            getattr(candidate, "opening_volume", None),
+            getattr(candidate, "opening_volume_minutes", 0),
+        )
+        if liquidity_reason:
+            reasons.append(liquidity_reason)
 
     normalized_reasons = tuple(dict.fromkeys(reason for reason in reasons if reason))
     if normalized_reasons:

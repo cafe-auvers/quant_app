@@ -288,3 +288,5 @@ For an intraday Buy Today instruction:
 The global live-trading switch remains an emergency disable available from
 either physical device. Broker submissions retain the existing lease-token
 fence and re-read shared ownership at the broker boundary.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

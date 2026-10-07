@@ -28,6 +28,7 @@ from src.risk.orb_position import (
     validate_orb_position_values,
 )
 from src.core.orb_entry_logic import ORB_SCORE_VERSION, passive_entry_prices
+from src.core.opening_liquidity import opening_liquidity_rejection, opening_volume_totals
 from src.strategy import MarketSnapshot, PortfolioSnapshot
 from src.strategy.orb import ORBStrategy, ORBStrategyConfig, market_local_index
 
@@ -253,6 +254,10 @@ class OrbCandidate:
     warnings: List[str] = field(default_factory=list)
     reason: str = ""
     is_ep: bool = False
+
+    # Completed minutes since the session open, capped at the first 30 minutes.
+    opening_volume: Optional[float] = None
+    opening_volume_minutes: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -732,6 +737,7 @@ def build_orb_candidate(
     execution_price: Optional[float] = None,
     execution_price_manual: bool = False,
     is_ep: bool = False,
+    liquidity_intraday: Optional[pd.DataFrame] = None,
 ) -> OrbCandidate:
     symbol = str(symbol or "").upper()
     has_sizing_equity = _has_known_positive_sizing_equity(account_size)
@@ -783,6 +789,21 @@ def build_orb_candidate(
     candidate_stop = _optional_float(stop_loss) or orb_low
     warnings: List[str] = []
     range_closed_at = orb_range.end.isoformat()
+    bars = (liquidity_intraday if liquidity_intraday is not None else intraday).sort_index()
+    local_index = market_local_index(
+        bars.index, naive_timezone=kis_market_timezone(bars, symbol=symbol)
+    )
+    if local_index is None:
+        opening_volume, opening_minutes = None, 0
+    else:
+        opening_start = pd.Timestamp.combine(orb_range.start.date(), orb_range.start.time())
+        if local_index.tz is not None:
+            opening_start = opening_start.tz_localize(local_index.tz)
+        opening_volume, opening_minutes = opening_volume_totals(bars, local_index, opening_start)
+    liquidity_fields = {
+        "opening_volume": opening_volume,
+        "opening_volume_minutes": opening_minutes,
+    }
 
     if breakout is None or breakout <= 0:
         warnings.append("Manual breakout price is required")
@@ -804,6 +825,7 @@ def build_orb_candidate(
             valid=False,
             warnings=warnings,
             reason=warnings[0],
+            **liquidity_fields,
         )
 
     # A working earlier generation must not suppress later-window candidate
@@ -853,6 +875,7 @@ def build_orb_candidate(
             ),
             warnings=[reason],
             reason=reason,
+            **liquidity_fields,
         )
 
     assert resolved_execution is not None
@@ -911,10 +934,13 @@ def build_orb_candidate(
     risk_percent = _best_risk
     warnings.extend(validate_position_values(sizing, adr_percent, is_ep=is_ep))
     score = score_orb_candidate(sizing, risk_percent, is_ep=is_ep)
+    liquidity_reason = opening_liquidity_rejection(opening_volume, opening_minutes)
+    if liquidity_reason:
+        warnings.append(liquidity_reason)
 
     if warnings:
         terminal_rejection = (
-            has_sizing_equity
+            has_sizing_equity and not liquidity_reason
         )
         return OrbCandidate(
             symbol=symbol,
@@ -943,6 +969,7 @@ def build_orb_candidate(
             terminal_rejection=terminal_rejection,
             warnings=warnings,
             reason="; ".join(warnings),
+            **liquidity_fields,
         )
 
     return OrbCandidate(
@@ -971,6 +998,7 @@ def build_orb_candidate(
         valid=True,
         warnings=[],
         reason="Opening range finalized; waiting for a confirmed breakout",
+        **liquidity_fields,
     )
 
 
@@ -1210,7 +1238,8 @@ class ExecutionQueueManager:
                 if prior.breakout_confirmed:
                     refreshed.breakout_confirmed = True
                     refreshed.breakout_confirmed_at = prior.breakout_confirmed_at
-                    refreshed.status = OrbCandidateStatus.EXECUTE_READY
+                    if refreshed.valid:
+                        refreshed.status = OrbCandidateStatus.EXECUTE_READY
             existing.candidates = refreshed_candidates
         existing.warnings = list(warnings or [])
         existing.last_updated = _utc_now()
@@ -1278,6 +1307,9 @@ class ExecutionQueueManager:
             selected_risk_percent = None
             selected_buffer_pct = None
         candidates = {}
+        liquidity_bars = intraday_by_window.get("1m")
+        if liquidity_bars is not None and liquidity_bars.empty:
+            liquidity_bars = None
         for window in SUPPORTED_ORB_WINDOWS:
             use_saved_selection = window == selected_window
             candidates[window] = build_orb_candidate(
@@ -1309,6 +1341,7 @@ class ExecutionQueueManager:
                     use_saved_selection and selected_risk_percent is not None
                 ),
                 is_ep=is_ep,
+                liquidity_intraday=liquidity_bars,
             )
         queue_item = self.upsert_item(
             symbol=symbol,

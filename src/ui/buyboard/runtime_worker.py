@@ -132,6 +132,7 @@ from src.services.state_sync import (
 from src.services.stop_change_coordinator import stop_change_coordinator_for
 from src.services.trade_card_orb_bridge import (
     TradeCardOrbEvaluator,
+    entry_plan_has_execution_identity,
     queue_has_execution_order_lock,
 )
 from src.utils.device_identity import detect_local_device_kind
@@ -3819,6 +3820,7 @@ class BuyboardRuntimeWorker(QThread):
             if (
                 card.board_status not in _ORB_SYNCED_STATUSES
                 or not _buy_today_session_is_current(card)
+                or entry_plan_has_execution_identity(card)
             ):
                 continue
             symbol_key = (

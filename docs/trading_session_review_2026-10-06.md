@@ -215,3 +215,5 @@ The reviewed passive JSONL segments contained no malformed JSON, reported no col
 No credentials or full account numbers are included in this report. Broker identifiers in supporting captures are redacted; the supplemental hashed order references permit correlation without exposing the originals.
 
 Recommended implementation order: actual broker funding validation; stable reconciliation scheduling; removal of remaining blocking work from protective evaluation; command/telemetry/alert finalization; symbol/message/ignore-policy cleanup; final session evidence and qualification.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.
