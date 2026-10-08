@@ -13,7 +13,7 @@ import weakref
 from dataclasses import dataclass, field
 
 from sqlalchemy import (
-    Text, and_, bindparam, case, cast, column, exists, func, null,
+    DateTime, Text, and_, bindparam, case, cast, column, exists, func, null,
     select, union_all, values,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -46,6 +46,7 @@ def read_versioned_rows(
     key_columns: tuple[str, ...],
     revision_column: str,
     conditions=(),
+    comparison_columns: tuple[str, ...] = (),
 ):
     """Return immutable raw rows, freshly verified in one database snapshot.
 
@@ -59,7 +60,9 @@ def read_versioned_rows(
         stamp = table.c.updated_at
         statement = select(table).where(*conditions)
         if snapshot.rows:
-            columns = (*key_columns, revision_column, "updated_at")
+            columns = tuple(dict.fromkeys((
+                *key_columns, revision_column, "updated_at", *comparison_columns,
+            )))
             typed_columns = tuple(column(name, table.c[name].type) for name in columns)
             if engine.dialect.name == "postgresql":
                 # One bind and stable SQL as history grows; VALUES otherwise
@@ -82,6 +85,7 @@ def read_versioned_rows(
                 *(known.c[name] == table.c[name] for name in key_columns)
             )
             known_stamp, stored_stamp = known.c.updated_at, stamp
+            comparisons = []
             if engine.dialect.name == "sqlite":
                 # CURRENT_TIMESTAMP has no fractional suffix; SQLAlchemy's
                 # datetime binds do. Compare the same exact representation.
@@ -91,11 +95,18 @@ def read_versioned_rows(
                     return func.rtrim(func.rtrim(padded, "0"), ".")
 
                 known_stamp, stored_stamp = normalized_stamp(known_stamp), normalized_stamp(stored_stamp)
+            for name in comparison_columns:
+                known_value, stored_value = known.c[name], table.c[name]
+                if engine.dialect.name == "sqlite" and isinstance(table.c[name].type, DateTime):
+                    known_value = normalized_stamp(known_value)
+                    stored_value = normalized_stamp(stored_value)
+                comparisons.append(known_value.is_not_distinct_from(stored_value))
             unchanged = exists(
                 select(1).select_from(known).where(
                     identity_matches,
                     known.c[revision_column] == revision,
                     known_stamp == stored_stamp,
+                    *comparisons,
                 )
             )
             changed = statement.where(~unchanged)

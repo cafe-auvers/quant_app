@@ -6,7 +6,12 @@ write paths keep their explicit transactions in their own repository tests.
 """
 from __future__ import annotations
 
+import datetime as dt
+import json
+
 from sqlalchemy import create_engine, event, inspect
+from sqlalchemy.exc import OperationalError
+import pytest
 
 from src.core import execution_config
 from src.core.runtime_readiness import RuntimeDeviceState
@@ -125,6 +130,51 @@ def test_idle_operator_command_poll_uses_covering_index_without_commit(tmp_path)
     )
     assert sum("FROM OPERATOR_COMMANDS" in statement for statement in statements) == 1
     assert commits == []
+
+
+def test_status_command_history_omits_payloads_and_remains_fresh(tmp_path, monkeypatch):
+    from src.services import operator_commands as commands
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'command_history.db'}")
+    table = commands.ensure_operator_commands_table(engine)
+    timestamp = dt.datetime(2026, 10, 8)
+    with engine.begin() as connection:
+        connection.execute(table.insert(), [dict(
+            command_id=str(index), idempotency_key=str(index),
+            command_type=commands.OperatorCommandType.ADD_BUY_TODAY.value,
+            symbol=f"S{index}", payload_json=json.dumps({"notes": "x" * 100_000}),
+            status=commands.OperatorCommandStatus.PENDING.value,
+            requested_by_device="laptop", requested_by_host="LAPTOP",
+            created_at=timestamp + dt.timedelta(seconds=index), error_message="",
+        ) for index in range(3)])
+    statements, commits = [], []
+    event.listen(engine, "before_cursor_execute", lambda _conn, _cursor, sql, *_args: statements.append(sql))
+    event.listen(engine, "commit", lambda _conn: commits.append(True))
+    history = commands.list_operator_command_summaries(engine, limit=2)
+    assert [item.command_id for item in history] == ["2", "1"]
+    assert history[0].created_at.tzinfo == dt.timezone.utc
+    assert not hasattr(history[0], "payload")
+    assert len(statements) == 1 and "payload_json" not in statements[0]
+    assert commits == []
+    peer = create_engine(engine.url)
+    with peer.begin() as connection:
+        connection.execute(table.update().where(table.c.command_id == "2").values(
+            status=commands.OperatorCommandStatus.COMPLETED.value,
+        ))
+        connection.execute(table.delete().where(table.c.command_id == "1"))
+    history = commands.list_operator_command_summaries(engine, limit=2)
+    assert [item.command_id for item in history] == ["2", "0"]
+    assert history[0].status == commands.OperatorCommandStatus.COMPLETED
+    assert len(commands.get_operator_command(engine, "2").payload["notes"]) == 100_000
+
+    def unavailable(_engine):
+        raise OperationalError("SELECT", {}, RuntimeError("unavailable"))
+
+    monkeypatch.setattr(commands, "coordination_read_connection", unavailable)
+    with pytest.raises(OperationalError):
+        commands.list_operator_command_summaries(engine)
+    peer.dispose()
+    engine.dispose()
 
 
 def test_routine_order_repository_reads_emit_no_commits(tmp_path):

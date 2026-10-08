@@ -193,6 +193,151 @@ def test_state_pull_rechecks_controls_and_only_transfers_changed_payloads(store)
     assert len(transfers[-1]) == 1
 
 
+def test_batched_states_transfer_changes_and_deletions_in_one_fresh_read(store):
+    engine, _, transfers = store
+    table = state_sync._ensure_state_sync_table(engine)
+    with engine.begin() as connection:
+        connection.execute(table.insert(), [
+            dict(state_key=key, payload=json.dumps({"large": "x" * 47000}),
+                 revision=1, updated_at=dt.datetime(2026, 10, 7))
+            for key in ("watchlist", "buylist")
+        ])
+    keys = ("watchlist", "buylist", "settings")
+    first = state_sync.pull_states(engine, keys)
+    assert len(transfers[-1]) == 2
+    assert first["settings"].status == state_sync.PULL_MISSING
+    first["watchlist"].state.payload["large"] = "local edit"
+    transfers.clear()
+    current = state_sync.pull_states(engine, reversed(keys))
+    assert len(transfers) == 1 and transfers[0] == []
+    assert current["watchlist"].state.payload["large"] != "local edit"
+
+    peer = create_engine(engine.url)
+    with peer.begin() as connection:
+        connection.execute(table.update().where(table.c.state_key == "watchlist").values(
+            payload='{"changed":true}', revision=2))
+        connection.execute(table.delete().where(table.c.state_key == "buylist"))
+    current = state_sync.pull_states(engine, keys)
+    assert len(transfers[-1]) == 2
+    assert current["watchlist"].state.payload == {"changed": True}
+    assert current["buylist"].status == state_sync.PULL_MISSING
+    peer.dispose()
+
+
+def test_batched_state_errors_do_not_return_cached_success(store, monkeypatch):
+    engine, _, transfers = store
+    table = state_sync._ensure_state_sync_table(engine)
+    with engine.begin() as connection:
+        connection.execute(table.insert(), [
+            dict(state_key=key, payload=payload, revision=1,
+                 updated_at=dt.datetime(2026, 10, 7))
+            for key, payload in (("watchlist", "{}"), ("settings", "invalid JSON"))
+        ])
+    current = state_sync.pull_states(engine, ("watchlist", "settings"))
+    assert current["watchlist"].status == state_sync.PULL_OK
+    assert current["settings"].status == state_sync.PULL_ERROR
+
+    def unavailable(_engine):
+        raise OperationalError("SELECT", {}, RuntimeError("offline"))
+
+    monkeypatch.setattr(snapshots, "coordination_read_connection", unavailable)
+    current = state_sync.pull_states(engine, ("watchlist", "settings"))
+    assert all(result.status == state_sync.PULL_ERROR for result in current.values())
+    assert state_sync.pull_states(engine, ()) == {}
+
+
+def test_ownership_reads_transfer_changes_without_sharing_models(store, monkeypatch):
+    from src.core.execution_ownership import ExecutionOwner, ExecutionOwnership
+    from src.services import execution_ownership_repository as ownership
+
+    engine, _, transfers = store
+    table = ownership.ensure_execution_ownership_table(engine)
+    for symbol in ("AAPL", "MSFT"):
+        ownership.assign_ownership(engine, ExecutionOwnership(
+            environment="PROD", account_no="1", symbol=symbol,
+            owner=ExecutionOwner.KANBAN, strategy_instance_id="test",
+        ))
+    first = ownership.list_execution_ownership(engine, environment="PROD")
+    first[0].strategy_instance_id = "local edit"
+    current = ownership.list_execution_ownership(engine, environment="PROD")
+    assert transfers[-1] == []
+    assert current[0].strategy_instance_id == "test"
+    ownership.get_ownership(engine, environment="PROD", account_no="1", symbol="AAPL")
+    ownership.get_ownership(engine, environment="PROD", account_no="1", symbol="AAPL")
+    assert transfers[-1] == []
+
+    peer = create_engine(engine.url)
+    with peer.begin() as connection:
+        connection.execute(table.update().where(table.c.symbol == "AAPL").values(
+            owner="LEGACY", version=2))
+        connection.execute(table.delete().where(table.c.symbol == "MSFT"))
+    current = ownership.list_execution_ownership(engine, environment="PROD")
+    assert len(transfers[-1]) == 2
+    assert len(current) == 1 and current[0].owner == ExecutionOwner.LEGACY
+    assert ownership.get_ownership(
+        engine, environment="PROD", account_no="1", symbol="AAPL"
+    ).version == 2
+    assert ownership.get_ownership(
+        engine, environment="PROD", account_no="2", symbol="AAPL"
+    ).version == 0
+
+    def unavailable(_engine):
+        raise OperationalError("SELECT", {}, RuntimeError("offline"))
+
+    monkeypatch.setattr(snapshots, "coordination_read_connection", unavailable)
+    with pytest.raises(OperationalError):
+        ownership.list_execution_ownership(engine, environment="PROD")
+    peer.dispose()
+
+
+def test_device_deltas_observe_confirmation_without_refreshing_heartbeat(store, monkeypatch):
+    from src.services import runtime_device_state_repository as devices
+
+    engine, _, transfers = store
+    table = devices.ensure_runtime_device_state_table(engine)
+    stamp = dt.datetime(2026, 10, 7)
+    with engine.begin() as connection:
+        connection.execute(table.insert(), [
+            dict(device_id=device_id, hostname=hostname, state="STANDBY_READY",
+                 readiness_generation=1, details_json='{"device_kind":"Laptop"}',
+                 updated_at=stamp)
+            for device_id, hostname in (("pc", "PC"), ("laptop", "LAPTOP"))
+        ])
+    first = devices.list_runtime_device_states(engine)
+    assert [record.hostname for record in first] == ["LAPTOP", "PC"]
+    first[0].details["device_kind"] = "local edit"
+    assert devices.list_runtime_device_states(engine)[0].details["device_kind"] == "Laptop"
+    assert transfers[-1] == []
+
+    peer = create_engine(engine.url)
+    with peer.begin() as connection:
+        connection.execute(table.update().where(table.c.device_id == "laptop").values(
+            handoff_confirmed=True, confirmed_generation=1,
+            confirmed_by_lease_epoch=3, confirmed_at=dt.datetime(2026, 10, 8)))
+    current = devices.list_runtime_device_states(engine)
+    assert len(transfers[-1]) == 1
+    assert current[0].handoff_confirmed and current[0].confirmed_by_lease_epoch == 3
+    assert current[0].updated_at.replace(tzinfo=None) == stamp
+    devices.list_runtime_device_states(engine)
+    assert transfers[-1] == []
+    with peer.begin() as connection:
+        connection.execute(table.update().where(table.c.device_id == "pc").values(
+            details_json='{"main_py_alive":false}', state="STOPPED"))
+        connection.execute(table.delete().where(table.c.device_id == "laptop"))
+    current = devices.list_runtime_device_states(engine)
+    assert len(transfers[-1]) == 2
+    assert len(current) == 1 and current[0].state.value == "STOPPED"
+    assert current[0].details == {"main_py_alive": False}
+
+    def unavailable(_engine):
+        raise OperationalError("SELECT", {}, RuntimeError("offline"))
+
+    monkeypatch.setattr(snapshots, "coordination_read_connection", unavailable)
+    with pytest.raises(OperationalError):
+        devices.list_runtime_device_states(engine)
+    peer.dispose()
+
+
 def test_monthly_egress_budget_includes_changes_and_protocol_allowance(store):
     engine, table, transfers = store
     cards.list_trade_cards(engine, environment="PROD", raise_on_error=True)

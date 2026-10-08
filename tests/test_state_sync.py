@@ -410,6 +410,31 @@ def test_unchanged_pull_only_sync_uses_revisions_without_payload_downloads(
     assert payload_reads == []
 
 
+@pytest.mark.parametrize("is_main", [True, False])
+def test_unchanged_reconcile_batches_planning_state_with_two_fresh_reads(
+    monkeypatch, tmp_path, is_main
+):
+    engine = _make_engine(tmp_path)
+    paths = _use_machine(monkeypatch, tmp_path / "writer")
+    _save_local_state(paths, {"items": [{"symbol": "AAPL"}]})
+    writer = ss.LocalDeviceRole("writer-id", "LAPTOP", True)
+    assert not app_state.reconcile_state_with_remote(engine, writer).errors
+    role = writer
+    if not is_main:
+        _use_machine(monkeypatch, tmp_path / "reader")
+        role = ss.LocalDeviceRole("reader-id", "PC", False)
+        assert not app_state.reconcile_state_with_remote(engine, role).errors
+
+    statements = []
+    event.listen(engine, "before_cursor_execute", lambda _c, _u, statement, *_a:
+                 statements.append(statement))
+    result = app_state.reconcile_state_with_remote(engine, role)
+    assert not result.errors and result.updated_keys == set()
+    assert result.is_main_device is is_main
+    assert len(statements) == 2  # ownership plus one coherent six-key batch
+    assert all("app_state_sync" in statement for statement in statements)
+
+
 def test_activating_pc_deactivates_laptop_and_rejects_old_writer(
     monkeypatch, tmp_path
 ):
@@ -913,8 +938,10 @@ def test_read_error_never_falls_through_to_push(monkeypatch, tmp_path):
 
     monkeypatch.setattr(
         app_state,
-        "pull_state",
-        lambda engine, key: ss.PullResult(ss.PULL_ERROR, error="read failed"),
+        "pull_states",
+        lambda engine, keys: {
+            key: ss.PullResult(ss.PULL_ERROR, error="read failed") for key in keys
+        },
     )
     monkeypatch.setattr(
         app_state,

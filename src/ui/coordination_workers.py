@@ -121,13 +121,13 @@ class StateSyncWorker(QThread):
         if not result.state_revisions:
             result.state_revisions = coordination_status.state_revisions
         try:
-            from src.services.operator_commands import list_operator_commands
+            from src.services.operator_commands import list_operator_command_summaries
             from src.services.runtime_device_state_repository import (
                 list_runtime_device_states,
             )
 
             result.runtime_devices = list_runtime_device_states(self.engine)
-            result.operator_commands = list_operator_commands(self.engine, limit=10)
+            result.operator_commands = list_operator_command_summaries(self.engine, limit=10)
         except Exception:
             logger.debug("Could not read runtime device/command status", exc_info=True)
             result.runtime_devices = []

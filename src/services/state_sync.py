@@ -17,7 +17,7 @@ import weakref
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional
 
 from sqlalchemy import (
     BigInteger,
@@ -516,26 +516,48 @@ def _remote_state_from_row(row, state_key: str) -> RemoteState:
 
 def pull_state(engine: Optional[Engine], state_key: str) -> PullResult:
     """Fetch a row while keeping missing data distinct from read failures."""
+    return pull_states(engine, (state_key,))[state_key]
+
+
+def pull_states(
+    engine: Optional[Engine], state_keys: Iterable[str]
+) -> Dict[str, PullResult]:
+    """Freshly verify a group of state rows with one differential statement."""
+    keys = tuple(sorted(set(state_keys)))
+    if not keys:
+        return {}
     if engine is None:
-        return PullResult(PULL_ERROR, error="State sync database is unavailable.")
+        return {
+            key: PullResult(PULL_ERROR, error="State sync database is unavailable.")
+            for key in keys
+        }
     try:
         table = _ensure_state_sync_table(engine)
         from src.services.coordination_snapshot import read_versioned_rows
 
         rows = read_versioned_rows(
             engine, table,
-            cache_key=("app_state_sync", state_key),
+            cache_key=("app_state_sync", *keys),
             key_columns=("state_key",),
             revision_column="revision",
-            conditions=(table.c.state_key == state_key,),
+            conditions=(table.c.state_key.in_(keys),),
         )
-        row = rows[0] if rows else None
-        if row is None:
-            return PullResult(PULL_MISSING)
-        return PullResult(PULL_OK, state=_remote_state_from_row(row, state_key))
     except (SQLAlchemyError, ValueError, TypeError) as exc:
-        logger.info("State sync pull failed for %s: %s", state_key, exc)
-        return PullResult(PULL_ERROR, error=str(exc))
+        logger.info("State sync pull failed for %s: %s", keys, exc)
+        return {key: PullResult(PULL_ERROR, error=str(exc)) for key in keys}
+
+    by_key = {row.state_key: row for row in rows}
+    results = {}
+    for key in keys:
+        row = by_key.get(key)
+        if row is None:
+            results[key] = PullResult(PULL_MISSING)
+            continue
+        try:
+            results[key] = PullResult(PULL_OK, state=_remote_state_from_row(row, key))
+        except (ValueError, TypeError) as exc:
+            results[key] = PullResult(PULL_ERROR, error=str(exc))
+    return results
 
 
 def get_live_trading_control(

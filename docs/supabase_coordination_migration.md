@@ -111,6 +111,47 @@ more mutations, cold starts and other Supabase products must be monitored in
 the organization dashboard. Already accumulated usage remains until the next
 billing cycle. No paid plan or resource is enabled by this change.
 
+### October 8 egress follow-up
+
+The organization dashboard recorded 16.197 GB on October 5, 21.372 GB on
+October 6, and 2.695 GB on October 7, almost entirely Shared Pooler egress.
+October 7 was about 87% lower than October 6, but still too high for the
+5 GB monthly Free allowance. The final single-card optimization was deployed
+at 16:45 KST on October 7, so that daily bucket includes earlier code.
+The organization dashboard, rather than query counts or database size, is
+the source for billed daily bandwidth.
+
+The October 8 audit verified the deployed card and individual state readers:
+over a 755-second sample, 151 collection reads and 1,059 individual state
+reads returned no changed payload rows. The same sample still downloaded full
+device details and full command audit records on each five-second state sync.
+Historical counters also showed 1.53 million rows from repeated ownership-list
+reads; those lists were not active in this particular sample.
+
+The follow-up source changes batch six state keys into one fresh differential
+statement, replacing a revision query plus six separate pulls. They also apply
+differential reads to ownership lists and device lists. Device comparison checks
+all confirmation and detail fields as well as generation and heartbeat time:
+handoff confirmations intentionally do not advance the heartbeat. The status
+display now selects only command identity, type, symbol, status, and creation
+time; executor and audit readers retain complete command records.
+
+A read-only check of the new code against the existing Supabase schema loaded
+six state rows, 64 ownership rows, and two device rows initially; ten subsequent
+reads of each returned zero rows. Serialized command history fell from 3,813 to
+523 bytes while preserving the visible history. These are returned-data checks,
+not billed bandwidth measurements; SQL metadata and transport overhead still
+count. Tests cover peer updates, removals, caller isolation, invalid state JSON,
+read failures, and handoff changes without a heartbeat update.
+
+These follow-up changes require deployment and process restart before they
+affect running consumers. Daily usage before that cutover measures the previous
+release. Evaluate a full dashboard day after cutover, aiming below roughly
+167 MB/day for a 30-day 5 GB cycle, with additional headroom for activity and
+backups. The earlier card-only model does not establish a production-wide
+monthly quota guarantee. Private query-counter and probe evidence is in the
+gitignored `artifacts/supabase_usage_20261008` directory.
+
 The current app contains no TiDB connection path. Old deployed releases must
 continue to use the same Supabase settings until upgraded.
 Monitor Supabase database size and egress in its dashboard. Keep dated verified

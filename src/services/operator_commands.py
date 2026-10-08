@@ -140,6 +140,15 @@ class OperatorCommandRecord:
 
 
 @dataclass(frozen=True)
+class OperatorCommandSummary:
+    command_id: str
+    command_type: OperatorCommandType
+    symbol: str
+    status: OperatorCommandStatus
+    created_at: datetime
+
+
+@dataclass(frozen=True)
 class OperatorCommandInsertResult:
     command: OperatorCommandRecord
     created: bool
@@ -650,3 +659,25 @@ def list_operator_commands(
     with coordination_read_connection(engine) as conn:
         rows = conn.execute(statement).fetchall()
     return [_record(row) for row in rows]
+
+
+def list_operator_command_summaries(
+    engine: Engine, *, limit: int = 10
+) -> list[OperatorCommandSummary]:
+    """Fresh command history for the status display without audit payloads."""
+    table = ensure_operator_commands_table(engine)
+    statement = select(
+        table.c.command_id, table.c.command_type, table.c.symbol,
+        table.c.status, table.c.created_at,
+    ).order_by(table.c.created_at.desc(), table.c.command_id.desc()).limit(
+        max(1, int(limit))
+    )
+    with coordination_read_connection(engine) as conn:
+        rows = conn.execute(statement).fetchall()
+    return [OperatorCommandSummary(
+        command_id=str(row.command_id),
+        command_type=OperatorCommandType(row.command_type),
+        symbol=str(row.symbol or "").upper(),
+        status=OperatorCommandStatus(row.status),
+        created_at=_aware(row.created_at) or datetime.min.replace(tzinfo=timezone.utc),
+    ) for row in rows]

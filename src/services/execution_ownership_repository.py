@@ -28,7 +28,7 @@ from sqlalchemy import (
 from sqlalchemy.engine import Connection, Engine
 
 from src.core.execution_ownership import ExecutionOwner, ExecutionOwnership
-from src.infrastructure.database.coordination_engine import coordination_read_connection, coordination_server_now
+from src.infrastructure.database.coordination_engine import coordination_server_now
 
 logger = logging.getLogger(__name__)
 
@@ -93,13 +93,19 @@ def get_ownership(engine: Engine, *, environment: str, account_no: str, symbol: 
     environment = str(environment or "").upper()
     account_no = str(account_no or "")
     symbol = str(symbol or "").upper()
-    with coordination_read_connection(engine) as conn:
-        row = conn.execute(
-            select(table).where(
-                table.c.environment == environment, table.c.account_no == account_no,
-                table.c.symbol == symbol,
-            )
-        ).first()
+    from src.services.coordination_snapshot import read_versioned_rows
+
+    rows = read_versioned_rows(
+        engine, table,
+        cache_key=("execution_ownership", environment, account_no, symbol),
+        key_columns=("environment", "account_no", "symbol"),
+        revision_column="version",
+        conditions=(
+            table.c.environment == environment, table.c.account_no == account_no,
+            table.c.symbol == symbol,
+        ),
+    )
+    row = rows[0] if rows else None
     if row is None:
         return ExecutionOwnership(environment=environment, account_no=account_no, symbol=symbol)
     return _row_to_ownership(row)
@@ -111,13 +117,18 @@ def list_execution_ownership(
     """Bulk-read ownership for projections and emergency-proof refreshes."""
 
     table = ensure_execution_ownership_table(engine)
-    statement = select(table)
+    conditions = ()
     if environment:
-        statement = statement.where(
-            table.c.environment == str(environment or "").upper()
-        )
-    with coordination_read_connection(engine) as conn:
-        rows = conn.execute(statement).fetchall()
+        conditions = (table.c.environment == str(environment).upper(),)
+    from src.services.coordination_snapshot import read_versioned_rows
+
+    rows = read_versioned_rows(
+        engine, table,
+        cache_key=("execution_ownership_list", str(environment or "").upper()),
+        key_columns=("environment", "account_no", "symbol"),
+        revision_column="version",
+        conditions=conditions,
+    )
     return [_row_to_ownership(row) for row in rows]
 
 

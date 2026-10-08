@@ -592,9 +592,20 @@ def list_runtime_device_states(engine: Engine) -> list[RuntimeDeviceRecord]:
     """Return the latest readiness publication for every known device."""
 
     table = ensure_runtime_device_state_table(engine)
-    with coordination_read_connection(engine) as conn:
-        rows = conn.execute(select(table).order_by(table.c.hostname.asc())).fetchall()
-    return [_record(row) for row in rows]
+    from src.services.coordination_snapshot import read_versioned_rows
+
+    rows = read_versioned_rows(
+        engine, table,
+        cache_key=("runtime_device_state_list",),
+        key_columns=("device_id",),
+        revision_column="readiness_generation",
+        # Handoff confirmation changes fields without refreshing liveness.
+        comparison_columns=tuple(
+            item.name for item in table.c
+            if item.name not in {"device_id", "readiness_generation", "updated_at"}
+        ),
+    )
+    return [_record(row) for row in sorted(rows, key=lambda row: row.hostname)]
 
 
 def require_compatible_runtime_schema(
