@@ -15,6 +15,7 @@ from .sql_helpers import _clean_symbols, _execute_bulk_upsert
 from .time_utils import _utcnow_naive
 
 _ensured_engines: weakref.WeakSet[Engine] = weakref.WeakSet()
+_scanner_schema_engines: weakref.WeakSet[Engine] = weakref.WeakSet()
 _price_history_index_ensured_engines: weakref.WeakSet[
     Engine
 ] = weakref.WeakSet()
@@ -327,6 +328,8 @@ def _get_scanner_metrics_table(metadata: MetaData) -> Table:
         Column("price_history_days", Integer),
         Column("adr", Float),
         Column("adr_20", Float),
+        Column("adr_20_high_low", Float),
+        Column("ti65", Float),
         Column("atr_14_pct", Float),
         Column("range_today_pct", Float),
         Column("return_1w", Float),
@@ -336,6 +339,10 @@ def _get_scanner_metrics_table(metadata: MetaData) -> Table:
         Column("growth_rank", Float),
         Column("growth_rank_1m", Float),
         Column("growth_rank_3m", Float),
+        Column("momentum_rank_1m", Float),
+        Column("momentum_rank_3m", Float),
+        Column("momentum_rank_6m", Float),
+        Column("momentum_rank_any", Float),
         Column("sma_20", Float),
         Column("ema_50", Float),
         Column("sma_200", Float),
@@ -377,7 +384,17 @@ def _get_scanner_metrics_table(metadata: MetaData) -> Table:
 def _ensure_scanner_metrics_table(engine: Engine) -> Table:
     metadata = MetaData()
     table = _get_scanner_metrics_table(metadata)
+    if engine in _scanner_schema_engines:
+        return table
     metadata.create_all(engine)
+    columns = {column["name"] for column in inspect(engine).get_columns(table.name)}
+    additions = ("adr_20_high_low", "ti65", "momentum_rank_1m", "momentum_rank_3m",
+                 "momentum_rank_6m", "momentum_rank_any")
+    with engine.begin() as conn:
+        for name in additions:
+            if name not in columns:
+                conn.execute(text(f"ALTER TABLE scanner_metrics ADD COLUMN {name} FLOAT"))
+    _scanner_schema_engines.add(engine)
     return table
 
 

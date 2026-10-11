@@ -175,6 +175,7 @@ from src.ui.selectable_text import (
     make_widget_text_selectable,
 )
 from src.ui.workers import PcRemoteServiceStartWorker, PcRemoteStatusWorker
+from src.ui.trade_journal import TradeJournalMixin
 from src.utils.config import DATA_DIR, ROOT_DIR, get_env_value
 from src.utils.data_loader import get_default_universe
 from src.utils.device_identity import detect_local_device_kind, runtime_device_kind
@@ -217,6 +218,7 @@ US_MARKET_CLOSE_TIME = dt.time(16, 0)
 
 
 class MainWindow(
+    TradeJournalMixin,
     SidebarMixin,
     HealthPanelMixin,
     DashboardMixin,
@@ -2872,6 +2874,13 @@ class MainWindow(
         if not isinstance(raw_setups, dict):
             raw_setups = {}
 
+        legacy_scanner_two = (
+            ("volume", ">=", "250000"),
+            ("dollar_volume", ">=", "5000000"),
+            ("adr_20", ">=", "3"),
+            ("growth_rank_1m", ">=", "95"),
+            ("trend_intensity", ">=", "80"),
+        )
         setups = {}
         for name, values in raw_setups.items():
             if not isinstance(values, dict):
@@ -2932,6 +2941,12 @@ class MainWindow(
                         },
                     ]
 
+                if setup_name == "Setup 2" and sorted(
+                    ScannerMixin._scanner_rule_signature(setup_data["rules"])
+                ) == sorted(legacy_scanner_two):
+                    # Upgrade an old app's saved default after restarting.
+                    preset = DEFAULT_SCANNER_SETUPS["Setup 2"]
+                    setup_data = {**preset, "rules": [rule.copy() for rule in preset["rules"]]}
                 setups[setup_name] = setup_data
             except (TypeError, ValueError):
                 continue
@@ -3026,6 +3041,7 @@ class MainWindow(
             self.__dict__.get("_buyboard_orb_data_timer"),
             self.__dict__.get("_buyboard_broker_truth_timer"),
             self.__dict__.get("_refresh_poll_timer"),
+            self.__dict__.get("journal_capture_timer"),
         ]
         timer_states = []
         for timer in timers:
@@ -3529,6 +3545,10 @@ class MainWindow(
         self.health_widget = QWidget()
         self._add_configured_tab("health", self.health_widget, "Health")
         self._build_health_tab()
+
+        self.journal_widget = QWidget()
+        self._add_configured_tab("journal", self.journal_widget, "Journal")
+        self._build_trade_journal_tab()
 
         self.intraday_charts_widget = QWidget()
         # A single empty, hidden combo preserves the one unguarded completion

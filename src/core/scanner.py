@@ -5,6 +5,31 @@ from dataclasses import dataclass
 from enum import Enum
 
 
+def add_momentum_ranks(stocks: List[Dict]) -> None:
+    """Add scanner2 leadership ranks without changing legacy scanner ranks."""
+    import pandas as pd
+
+    rank_fields = []
+    for period, sessions in (("1m", 21), ("3m", 63), ("6m", 126)):
+        rank_field = f"momentum_rank_{period}"
+        rank_fields.append(rank_field)
+        values = []
+        for stock in stocks:
+            value = stock.get(f"return_{period}")
+            try:
+                value = float(value)
+                enough_history = stock.get("price_history_days", sessions + 1) > sessions
+                values.append(value if enough_history and math.isfinite(value) else None)
+            except (TypeError, ValueError):
+                values.append(None)
+        ranks = pd.Series(values, dtype=float).rank(pct=True, method="average") * 100
+        for stock, rank in zip(stocks, ranks):
+            stock[rank_field] = float(rank) if math.isfinite(rank) else None
+    for stock in stocks:
+        valid = [stock[field] for field in rank_fields if stock[field] is not None]
+        stock["momentum_rank_any"] = max(valid) if valid else None
+
+
 class ComparisonOperator(Enum):
     """Comparison operators for rules."""
     GREATER_THAN = ">"

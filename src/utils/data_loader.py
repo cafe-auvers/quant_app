@@ -367,10 +367,12 @@ def _chunked_symbols(symbols: List[str], chunk_size: int) -> List[List[str]]:
 
 def _download_yfinance_batch(
     symbols: List[str],
-    period: str,
+    period: Optional[str],
     interval: str,
     threads: bool | int,
     timeout: float = 15.0,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
 ) -> pd.DataFrame:
     yf_logger = logging.getLogger("yfinance")
     old_level = yf_logger.level
@@ -378,7 +380,7 @@ def _download_yfinance_batch(
     try:
         return yf.download(
             tickers=symbols,
-            period=period,
+            **({"start": start, "end": end} if start else {"period": period}),
             interval=interval,
             group_by="ticker",
             auto_adjust=True,
@@ -907,6 +909,11 @@ def compute_stock_metrics(
     # Volatility
     adr_series = ((high - low) / prev_close).replace([np.inf, -np.inf], np.nan)
     adr_20 = float(adr_series.rolling(20, min_periods=5).mean().iloc[-1] * 100) if len(adr_series.dropna()) >= 1 else 0.0
+    # Keep scanner1's ADR unchanged; scanner2 uses the published High/Low formula.
+    high_low_ranges = (high / low.where(low > 0) - 1).replace([np.inf, -np.inf], np.nan)
+    adr_high_low_value = high_low_ranges.rolling(20, min_periods=20).mean().iloc[-1] * 100
+    adr_20_high_low = float(adr_high_low_value) if pd.notna(adr_high_low_value) else None
+    ti65 = float(close.iloc[-7:].mean() / close.iloc[-65:].mean()) if close.iloc[-65:].mean() > 0 else None
 
     tr = pd.concat([
         high - low,
@@ -1043,6 +1050,8 @@ def compute_stock_metrics(
         # Volatility
         "adr": adr_20,
         "adr_20": adr_20,
+        "adr_20_high_low": adr_20_high_low,
+        "ti65": ti65,
         "atr_14_pct": atr_14_pct,
         "range_today_pct": range_today_pct,
 
@@ -1140,6 +1149,8 @@ def get_universe_stock_metrics(
     for idx, item in enumerate(metrics):
         item["growth_rank_3m"] = float(ranks_3m.iloc[idx])
 
+    from src.core.scanner import add_momentum_ranks
+    add_momentum_ranks(metrics)
     return metrics
 
 

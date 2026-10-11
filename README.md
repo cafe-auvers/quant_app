@@ -37,6 +37,7 @@ use the [Activation Gate Handoff](docs/activation_gate_handoff.md).
 - Strict zero-fill ORB upgrades: a later, strictly higher-scoring 5m/30m candidate can replace an earlier working order only after authoritative cancellation and full post-cancel revalidation.
 - A strategy-neutral `MarketSnapshot -> Strategy -> Signal` interface, with the existing ORB behavior as the first plugin.
 - An append-only, redacted trading event journal and a read-only Health tab for KIS, MySQL, mirror freshness, and reconciliation status.
+- A [chat-written trading day journal](docs/trading_journey_journal.md): simple daily comments in chat, purchase charts, observed NAV and cash-flow-adjusted daily P&L, benchmark/macro movements, and publication only after confirmation of the finished entry and its destinations.
 - Buy Board monitoring with partial-exit and EMA-close exit workflow support.
 - A six-column operator-facing Kanban Buy Board (`Buylist` through `Sell All`) backed by one durable trade-card aggregate per production account and symbol. `WATCHLIST` remains a hidden, passive planning stage shown in the sidebar; `CLOSED` remains hidden for history.
 - Typed, revision-fenced board commands: drag/drop records intent, while the background runtime and broker reconciliation own order effects and automatic lifecycle moves.
@@ -240,6 +241,7 @@ Only enable KIS intraday after the endpoint, TR ID, request parameters, output f
 - `docs/kanban_production_readiness.md` records the detailed production invariants and rollout evidence requirements.
 - `docs/market_pulse.md` documents the Market Pulse universe, EOD calculations, batched refresh, and idempotent cache schema.
 - `docs/performance-audit.md` records reproducible responsiveness measurements, implemented optimizations, and remaining limits.
+- `docs/breakout_replay.md` explains Breakout Lab at `http://localhost:8765`: Scanner 2 historical replay, free Alpaca intraday data, independent paper studies, annotations, and the MySQL learning database. Launch with `Launch_Breakout_Lab.bat`.
 - `docs/wiki/` contains the Wiki-ready operator and maintainer guide set when the GitHub Wiki repository has not yet been initialized.
 - `rulebooks/` contains active trading rules used by review workflows.
 - `md_archive/` contains completed implementation notes and old planning documents that are not canonical.

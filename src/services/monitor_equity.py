@@ -55,6 +55,15 @@ def publish_monitor_equity(path: Path, snapshot) -> None:
         document[key] = {"equity_usd": value[0], "received_at": value[1]}
         save_json(path, document)
         _published[identity] = value
+    try:
+        from src.services.journal_context import record_journal_nav
+        from src.utils.config import get_env_value
+
+        if str(get_env_value("TRADE_JOURNAL_ENABLED", "true")).lower() in {"true", "1", "yes"}:
+            record_journal_nav(snapshot)
+    except Exception:
+        # The journal must never interfere with the live monitor or account cache.
+        logging.getLogger(__name__).warning("Journal NAV archive unavailable", exc_info=True)
 
 
 def read_monitor_equity(

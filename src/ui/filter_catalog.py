@@ -34,17 +34,13 @@ DEFAULT_SCANNER_SETUPS = {
         ]
     },
     "Setup 2": {
-        "min_volume": 250000.0,
-        "min_dollar_volume": 5000000.0,
-        "min_adr": 3.0,
-        "min_growth_rank": 95.0,
-        "min_trend_intensity": 80.0,
+        "min_adr": 2.4,
+        "min_avg_dollar_volume_20d": 3000000.0,
+        "min_momentum_rank_any": 98.0,
         "rules": [
-            {"attribute": "volume", "operator": ">=", "threshold": 250000.0},
-            {"attribute": "dollar_volume", "operator": ">=", "threshold": 5000000.0},
-            {"attribute": "adr_20", "operator": ">=", "threshold": 3.0},
-            {"attribute": "growth_rank_1m", "operator": ">=", "threshold": 95.0},
-            {"attribute": "trend_intensity", "operator": ">=", "threshold": 80.0},
+            {"attribute": "adr_20_high_low", "operator": ">=", "threshold": 2.4},
+            {"attribute": "avg_dollar_volume_20d", "operator": ">=", "threshold": 3000000.0},
+            {"attribute": "momentum_rank_any", "operator": ">=", "threshold": 98.0},
         ]
     },
 }
@@ -57,6 +53,8 @@ SCANNER_METRICS_LABELS = {
     "avg_dollar_volume_20d": "Avg Dollar Volume (20d)",
     "price_history_days": "Price History Days",
     "adr_20": "ADR (20d, %)",
+    "adr_20_high_low": "ADR (20d High/Low, %)",
+    "ti65": "TI65 (SMA 7 / SMA 65)",
     "atr_14_pct": "ATR (14d, %)",
     "range_today_pct": "Daily Range (%)",
     "return_1w": "1-Week Return (%)",
@@ -65,6 +63,10 @@ SCANNER_METRICS_LABELS = {
     "return_6m": "6-Month Return (%)",
     "growth_rank_1m": "1-Month Growth Rank",
     "growth_rank_3m": "3-Month Growth Rank",
+    "momentum_rank_1m": "1-Month Leadership Rank",
+    "momentum_rank_3m": "3-Month Leadership Rank",
+    "momentum_rank_6m": "6-Month Leadership Rank",
+    "momentum_rank_any": "Best Leadership Rank (1/3/6m)",
     "sma_20": "SMA (20d)",
     "ema_50": "EMA (50d)",
     "sma_200": "SMA (200d)",
@@ -109,10 +111,17 @@ DEFAULT_TAB_OPTIONS = {
     "buyboard": True,
     "tradingview": True,
     "health": True,
+    "journal": True,
     "trade_plan": True,
 }
 
 FILTER_CATALOG = [
+    ("Volatility", "adr_20_high_low", "adr_20_high_low", "100 * average(High / Low - 1), using 20 complete sessions. Scanner2 ADR.", "Scanner2: >= 2.4%; fast-stock tag: >= 5%"),
+    ("Momentum / growth", "momentum_rank_any", "momentum_rank_any", "Best percentile of 21-, 63-, and 126-session returns. Each ranking excludes stocks lacking that lookback.", "Scanner2: >= 98 (top 2% in any timeframe)"),
+    ("Momentum / growth", "momentum_rank_1m", "momentum_rank_1m", "21-session return percentile among stocks with sufficient history.", "Display / ranking"),
+    ("Momentum / growth", "momentum_rank_3m", "momentum_rank_3m", "63-session return percentile among stocks with sufficient history.", "Display / ranking"),
+    ("Momentum / growth", "momentum_rank_6m", "momentum_rank_6m", "126-session return percentile among stocks with sufficient history.", "Display / ranking"),
+    ("Trend", "ti65", "ti65", "7-day SMA divided by 65-day SMA. Separate from the legacy EMA50 trend score.", "Display only; no scanner2 cutoff"),
     ("Identification", "symbol", "symbol", "Stock ticker.", "Required"),
     ("Identification", "name", "name", "Company name if available; otherwise use symbol.", "Optional"),
     ("Basic tradability", "price", "price", "Latest close price. Avoids penny stocks.", "Hard filter: >= 5; quality filter: >= 10"),

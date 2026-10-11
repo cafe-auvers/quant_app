@@ -31,6 +31,7 @@ from ..time_utils import _utcnow_naive
 from .market_bars import (load_symbol_history_from_db,
                           load_universe_history_from_db)
 from .market_watermarks import get_price_history_watermarks
+from src.core.scanner import add_momentum_ranks
 
 
 def scanner_metrics_snapshot_date(expected_date: Optional[dt.date] = None) -> dt.datetime:
@@ -179,6 +180,7 @@ def get_universe_stock_metrics_from_db(
     for idx, item in enumerate(metrics):
         item["growth_rank_3m"] = float(ranks_3m.iloc[idx])
 
+    add_momentum_ranks(metrics)
     return metrics
 
 
@@ -624,18 +626,55 @@ def query_scanner_metrics_with_funnel(
     }
 
 
+def ensure_scanner_metrics_for_rules(
+    tickers: List[str],
+    engine: Engine,
+    rules: List[dict],
+    log_callback: Optional[Callable[[str], None]] = None,
+) -> None:
+    """Upgrade scanner2's cached metrics once, using only stored daily bars."""
+    study_fields = {
+        "adr_20_high_low", "ti65", "momentum_rank_any",
+        "momentum_rank_1m", "momentum_rank_3m", "momentum_rank_6m",
+    }
+    if not any(rule.get("attribute") in study_fields for rule in rules):
+        return
+    symbols, input_symbols = _scanner_metric_and_input_symbols(tickers)
+    if not symbols:
+        return
+    expected_date = scanner_metrics_snapshot_date()
+    snapshot_date = _latest_completed_scanner_snapshot_date(engine, expected_date) or expected_date
+    watermarks = get_price_history_watermarks(engine, input_symbols, interval="1d", strict=True)
+    if is_scanner_metrics_snapshot_current(
+        engine, symbols, history_watermarks=watermarks, snapshot_date=snapshot_date, strict=True
+    ):
+        return
+    if log_callback:
+        log_callback(f"Preparing scanner2 metrics from local daily bars for {snapshot_date.date()}...")
+    refresh_scanner_metrics_to_db(
+        symbols, engine, log_callback=log_callback, history_watermarks=watermarks,
+        snapshot_date=snapshot_date,
+    )
+    if not is_scanner_metrics_snapshot_current(
+        engine, symbols, history_watermarks=watermarks, snapshot_date=snapshot_date, strict=True
+    ):
+        raise RuntimeError("Scanner2 metrics could not be prepared from the local daily cache.")
+
+
 def refresh_scanner_metrics_to_db(
     tickers: List[str],
     engine: Engine,
     log_callback: Optional[Callable[[str], None]] = None,
     force: bool = False,
     history_watermarks: Optional[Dict[str, object]] = None,
+    snapshot_date: Optional[dt.datetime] = None,
 ) -> List[str]:
     """Calculate and store scanner metrics for the universe."""
     symbols, input_symbols = _scanner_metric_and_input_symbols(tickers)
     if not symbols:
         return []
-    snapshot_date = scanner_metrics_snapshot_date()
+    explicit_snapshot = snapshot_date is not None
+    snapshot_date = snapshot_date or scanner_metrics_snapshot_date()
     if history_watermarks is None:
         history_watermarks = get_price_history_watermarks(
             engine, input_symbols, interval="1d", strict=True
@@ -662,8 +701,11 @@ def refresh_scanner_metrics_to_db(
     try:
         # Compute directly so a stale snapshot is never read during generation.
         metrics_list = []
-        start_date = _utcnow_naive() - dt.timedelta(days=380)
-        histories = load_universe_history_from_db(input_symbols, engine, start=start_date)
+        start_date = (snapshot_date if explicit_snapshot else _utcnow_naive()) - dt.timedelta(days=380)
+        history_options = {"start": start_date}
+        if explicit_snapshot:
+            history_options["end"] = snapshot_date + dt.timedelta(days=1, microseconds=-1)
+        histories = load_universe_history_from_db(input_symbols, engine, **history_options)
         if not histories:
             if log_callback:
                 log_callback("  Failed to load history for calculation.")
@@ -672,7 +714,8 @@ def refresh_scanner_metrics_to_db(
         spy_history = histories.get("SPY")
         if spy_history is None:
             try:
-                spy_history = load_symbol_history_from_db("SPY", engine, interval="1d")
+                spy_options = history_options if explicit_snapshot else {}
+                spy_history = load_symbol_history_from_db("SPY", engine, interval="1d", **spy_options)
             except Exception:
                 spy_history = None
 
@@ -717,6 +760,7 @@ def refresh_scanner_metrics_to_db(
         for idx, item in enumerate(metrics_list):
             item["growth_rank_3m"] = float(ranks_3m.iloc[idx])
 
+        add_momentum_ranks(metrics_list)
         save_total = len(metrics_list)
         save_start_ts = time.time()
         if log_callback:
