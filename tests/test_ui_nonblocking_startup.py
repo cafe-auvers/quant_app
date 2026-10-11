@@ -481,6 +481,8 @@ def test_database_outage_renders_local_snapshot_read_only_instead_of_emptying_bo
         shares=10,
         status=OrbCandidateStatus.WAITING_BREAKOUT,
         valid=True,
+        opening_volume=6000,
+        opening_volume_minutes=30,
     )
     queue_item = ExecutionQueueItem(
         symbol="MAX",

@@ -1,8 +1,8 @@
 """Process-local dirty pulses and Tailscale change-token persistence.
 
 The one-second runtime loop may inspect this module freely: all hot-path
-operations are in-memory or local-file reads.  TiDB is contacted by callers
-only after a local or remote generation changes.  Cross-device delivery uses
+operations are in-memory or local-file reads. Callers contact the database
+only after a local or remote generation changes. Cross-device delivery uses
 the already deployed PC remote-control listener; the listener reads/writes the
 small files below and never opens a database connection.
 """
@@ -338,7 +338,7 @@ def change_notifications_available(engine: Optional[Engine]) -> bool:
 def set_remote_peer_confirmed_off(
     engine: Optional[Engine], confirmed_off: bool
 ) -> None:
-    """Record locally observed peer-off state without contacting TiDB."""
+    """Record locally observed peer-off state without contacting coordination database."""
 
     if engine is None:
         return

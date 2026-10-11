@@ -9,24 +9,64 @@ from sqlalchemy.dialects import postgresql
 
 def _values(**overrides):
     values = {
-        "COORD_DB_HOST": "example.tidbcloud.com",
-        "COORD_DB_PORT": "4000",
+        "COORD_DB_HOST": "example.supabase.com",
+        "COORD_DB_PORT": "5432",
         "COORD_DB_USER": "app.user",
         "COORD_DB_PASSWORD": "secret-value",
-        "COORD_DB_NAME": "quant_coordination",
+        "COORD_DB_NAME": "postgres",
         "COORD_DB_SSL_CA": "",
     }
     values.update(overrides)
     return values
 
 
-def test_coordination_config_requires_complete_sql_credentials(monkeypatch):
+def test_partial_coordination_config_stays_on_shared_route(monkeypatch):
     values = _values(COORD_DB_PASSWORD="")
     monkeypatch.setattr(
         coordination, "get_env_value", lambda key, default=None: values.get(key, default)
     )
 
+    assert coordination.coordination_database_configured() is True
+    with pytest.raises(ValueError, match="Set COORD_DB_HOST"):
+        coordination.get_coordination_connection_url()
+    assert coordination.init_coordination_engine(ensure_schema=False) is None
+
+
+def test_empty_coordination_config_allows_local_mode(monkeypatch):
+    monkeypatch.setattr(coordination, "get_env_value", lambda *_args: None)
     assert coordination.coordination_database_configured() is False
+
+
+def test_default_coordination_backend_is_postgresql():
+    config = coordination.normalize_coordination_database_config({})
+    assert config["backend"] == "postgresql"
+    assert config["port"] == 5432
+    assert config["database"] == "postgres"
+    assert config["schema"] == "quant_coordination"
+
+
+@pytest.mark.parametrize("backend", ["mysql", "tidb", "sqlite"])
+def test_retired_coordination_backend_fails_closed(monkeypatch, backend):
+    values = _values(COORD_DB_BACKEND=backend)
+    monkeypatch.setattr(
+        coordination, "get_env_value", lambda key, default=None: values.get(key, default)
+    )
+    monkeypatch.setattr(
+        coordination, "create_engine",
+        lambda *_args, **_kwargs: pytest.fail("Rejected backend must not connect"),
+    )
+    assert coordination.coordination_database_configured() is True
+    assert coordination.init_coordination_engine(ensure_schema=False) is None
+    with pytest.raises(ValueError, match="requires COORD_DB_BACKEND=postgresql"):
+        coordination.init_coordination_engine(ensure_schema=False, raise_on_error=True)
+
+
+def test_connection_helpers_cannot_bypass_retired_backend():
+    config = {"backend": "mysql"}
+    with pytest.raises(ValueError, match="requires PostgreSQL"):
+        coordination.coordination_connection_url(config)
+    with pytest.raises(ValueError, match="requires PostgreSQL"):
+        coordination.create_coordination_connection_engine(config, read_only=False)
 
 
 def test_coordination_url_does_not_expose_password(monkeypatch):
@@ -37,8 +77,8 @@ def test_coordination_url_does_not_expose_password(monkeypatch):
 
     url = coordination.get_coordination_connection_url()
 
-    assert url.drivername == "mysql+pymysql"
-    assert url.port == 4000
+    assert url.drivername == "postgresql+psycopg"
+    assert url.port == 5432
     assert "secret-value" not in str(url)
 
 
@@ -72,8 +112,10 @@ def test_coordination_engine_uses_small_tls_pool(monkeypatch):
         coordination,
         "get_coordination_database_config",
         lambda: {
-            "host": "example.tidbcloud.com",
-            "port": 4000,
+            "backend": "postgresql",
+            "schema": "quant_coordination",
+            "host": "example.supabase.com",
+            "port": 5432,
             "user": "user",
             "password": "password",
             "database": "quant_coordination",
@@ -83,7 +125,7 @@ def test_coordination_engine_uses_small_tls_pool(monkeypatch):
     monkeypatch.setattr(
         coordination,
         "get_coordination_connection_url",
-        lambda: URL.create("mysql+pymysql", host="example.tidbcloud.com"),
+        lambda: URL.create("postgresql+psycopg", host="example.supabase.com"),
     )
 
     def _create_engine(url, **kwargs):
@@ -94,6 +136,7 @@ def test_coordination_engine_uses_small_tls_pool(monkeypatch):
 
     monkeypatch.setattr(coordination, "create_engine", _create_engine)
     monkeypatch.setattr(coordination.event, "listen", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(coordination, "configure_postgresql_session", lambda *_args: None)
 
     assert coordination.init_coordination_engine(ensure_schema=False) is not None
     assert len(captured) == 2
@@ -102,8 +145,8 @@ def test_coordination_engine_uses_small_tls_pool(monkeypatch):
     assert writer["max_overflow"] == 1
     assert writer["pool_pre_ping"] is True
     assert writer["pool_recycle"] == 240
-    assert writer["connect_args"]["ssl_verify_cert"] is True
-    assert writer["connect_args"]["ssl_verify_identity"] is True
+    assert writer["connect_args"]["sslmode"] == "verify-full"
+    assert writer["connect_args"]["sslrootcert"]
     assert reader["isolation_level"] == "AUTOCOMMIT"
     assert reader["skip_autocommit_rollback"] is True
     assert reader["pool_pre_ping"] is False

@@ -39,6 +39,14 @@ requires the applicable combination of:
 - The stop always uses the ORB low belonging to the generation that actually
   filled.
 
+## Opening liquidity
+
+New entries and replacements require at least the shared minimum average
+opening shares/minute (default 200). Count completed minutes from 09:30 New
+York, cap at 30, and include empty minutes in the denominator. Missing or
+invalid evidence blocks buys; protective exits are exempt. Later volume cannot
+rescue an illiquid first 30 minutes. See Current Order Logic for exact rules.
+
 ## Strategy/risk behavior
 
 Do not change scanner rules, ORB trigger logic, position sizing, risk caps,
@@ -56,3 +64,5 @@ evidence checklist; default remains disabled.
 
 See [Current Order Logic](https://github.com/cafe-auvers/quant_app/blob/master/docs/current_order_logic.md)
 for the exact entry and replacement invariants.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](../opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

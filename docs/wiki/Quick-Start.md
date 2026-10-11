@@ -49,3 +49,5 @@ explicit operation allowlists. Routine actions synchronize automatically; a
 manual desktop or browser refresh is not an execution requirement. Read
 [Web/PWA Operator Synchronization](https://github.com/cafe-auvers/quant_app/blob/master/docs/web_operator_sync.md)
 before enabling connected writes.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](../opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

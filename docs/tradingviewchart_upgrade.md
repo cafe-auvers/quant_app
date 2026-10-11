@@ -2408,3 +2408,5 @@ Acceptance checks:
 [ ] the browser/WebEngine context menu is suppressed in the price panel
 [ ] existing left-button chart tools still work
 ```
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

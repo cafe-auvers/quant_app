@@ -27,3 +27,5 @@ by the normative
 Branch protection is GitHub-hosted state and cannot be enforced by
 `.github/workflows/ci.yml` itself. Re-check this rule if the workflow/job name
 or Python matrix changes, because required-check names must match exactly.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](../docs/opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

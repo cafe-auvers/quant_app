@@ -68,3 +68,5 @@ scanning/push protection report no alerts. Earlier public commits still contain
 historical account/order identifiers. They are not authentication secrets, so
 history was not force-rewritten automatically. If the operator confirms they
 must be purged, that is a separately approved repository-history migration.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator
 
+from src.utils.config import RUNTIME_KEY_ALIASES, normalize_runtime_key_aliases
+
 _ASSIGNMENT_RE = re.compile(
     r"^(\s*(?:export\s+)?)([A-Za-z_][A-Za-z0-9_]*)(\s*)=(.*)$"
 )
@@ -378,6 +380,9 @@ def _render_runtime_local(
     existing: dict[str, object],
     current_env_values: dict[str, str],
 ) -> tuple[str | None, tuple[str, ...]]:
+    defaults = normalize_runtime_key_aliases(defaults)
+    existing = normalize_runtime_key_aliases(existing)
+    current_env_values = normalize_runtime_key_aliases(current_env_values)
     unknown = sorted(set(existing) - set(defaults))
     if unknown:
         raise ValueError(
@@ -479,7 +484,7 @@ def synchronize_environment_files(
     current_values, _ = _assignments(
         [] if current_text is None else current_text.splitlines()
     )
-    runtime_values = _json_object(runtime_defaults)
+    runtime_values = normalize_runtime_key_aliases(_json_object(runtime_defaults))
     runtime_local_values = _json_object(runtime_local)
     secret_values, _ = _assignments(template_text.splitlines())
     overlap = sorted(set(runtime_values) & set(secret_values))
@@ -498,6 +503,7 @@ def synchronize_environment_files(
         current_text,
         runtime_keys=set(runtime_values),
         legacy_migration_keys={
+            *RUNTIME_KEY_ALIASES,
             _LEGACY_SYMBOL_KEYS_ENV,
             _RETIRED_CONTROLLED_LIVE_SYMBOLS_ENV,
         },

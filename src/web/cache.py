@@ -320,10 +320,13 @@ class ChartLoadCoordinator:
             runtime = set(self._runtime_pins)
         return runtime | set(self._pinned_symbols())
 
-    def _cache_expectations(self) -> dict[str, str]:
+    def _cache_expectations(self, symbol: str, timeframe: str) -> dict[str, str]:
         return {
             "expected_source": self.source.source_name,
-            "expected_source_revision": self.source.cache_revision(),
+            "expected_source_revision": (
+                self.source.chart_cache_revision(symbol, timeframe, hourly_months=self.hourly_months)
+                if hasattr(self.source, "chart_cache_revision") else self.source.cache_revision()
+            ),
             "expected_adjustment_mode": str(
                 getattr(self.source, "adjustment_mode", "") or ""
             ),
@@ -365,7 +368,7 @@ class ChartLoadCoordinator:
                 lambda: self.cache.publication_artifact(
                     symbol,
                     timeframe,
-                    **self._cache_expectations(),
+                    **self._cache_expectations(symbol, timeframe),
                 )
             )
             if artifact is not None:
@@ -374,12 +377,18 @@ class ChartLoadCoordinator:
                     "cache": "HIT",
                 }
                 return artifact, True
-        await self._get_payload(symbol, timeframe, refresh=True)
+        generated = await self._get_payload(symbol, timeframe, refresh=True)
+        expectations = self._cache_expectations(symbol, timeframe)
+        # Publish the snapshot just generated even when the mirror advances
+        # during preparation. The next request still validates the new revision.
+        expectations["expected_source_revision"] = generated.payload.get("coverage", {}).get(
+            "source_revision", ""
+        )
         artifact = await anyio.to_thread.run_sync(
             lambda: self.cache.publication_artifact(
                 symbol,
                 timeframe,
-                **self._cache_expectations(),
+                **expectations,
             )
         )
         if artifact is None:
@@ -394,7 +403,7 @@ class ChartLoadCoordinator:
                 lambda: self.cache.read(
                     symbol,
                     timeframe,
-                    **self._cache_expectations(),
+                    **self._cache_expectations(symbol, timeframe),
                 )
             )
             if cached is not None:
@@ -432,7 +441,7 @@ class ChartLoadCoordinator:
                 result = await anyio.to_thread.run_sync(
                     lambda: self.cache.write(
                         payload,
-                        generation_key=self._cache_expectations()[
+                        generation_key=self._cache_expectations(symbol, timeframe)[
                             "expected_generation_key"
                         ],
                     )

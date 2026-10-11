@@ -189,3 +189,5 @@ Current live toggle behavior:
 3. Wire the 5-minute scheduler to append only missing bars after the latest cached timestamp.
 4. Add Dashboard ORB monitor controls: start/stop, ORB window selector, profile selector, status table.
 5. Add alert logging when `target_met` or ORB breakout changes from false to true.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](../docs/opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

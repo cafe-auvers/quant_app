@@ -19,6 +19,7 @@ in-memory cache via a provider built by :func:`make_buying_power_provider`/
 from __future__ import annotations
 
 import logging
+import math
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -44,6 +45,7 @@ class BuyingPowerSnapshot:
 
 _lock = threading.Lock()
 _snapshots: Dict[Tuple[str, str], BuyingPowerSnapshot] = {}
+_stale_logged = {}
 
 
 def _key(environment: str, account_no: str) -> Tuple[str, str]:
@@ -75,6 +77,9 @@ def record_snapshot(
         source=str(source or ""),
     )
     with _lock:
+        previous = _snapshots.get(_key(environment, account_no))
+        if previous is not None and previous.received_at > snapshot.received_at:
+            return previous
         _snapshots[_key(environment, account_no)] = snapshot
     return snapshot
 
@@ -88,6 +93,7 @@ def clear() -> None:
     """Test/reset hook -- drops every cached snapshot."""
     with _lock:
         _snapshots.clear()
+        _stale_logged.clear()
 
 
 def _fresh_snapshot(
@@ -101,13 +107,19 @@ def _fresh_snapshot(
     if snapshot is None:
         return None
     age_seconds = (clock() - snapshot.received_at).total_seconds()
-    if age_seconds > max_age_seconds:
-        logger.warning(
-            "Buying-power snapshot for %s:%s is %.1fs old (> %.0fs max) -- "
-            "failing closed rather than sizing/reserving off stale capital.",
-            environment, account_no, age_seconds, max_age_seconds,
-        )
+    if age_seconds < 0 or age_seconds > max_age_seconds or not math.isfinite(snapshot.total_equity_usd):
+        with _lock:
+            should_log = _stale_logged.get(_key(environment, account_no)) != snapshot.received_at
+            _stale_logged[_key(environment, account_no)] = snapshot.received_at
+        if should_log:
+            logger.warning(
+                "Buying-power snapshot for %s:%s is %.1fs old (> %.0fs max) -- "
+                "failing closed rather than sizing/reserving off stale capital.",
+                environment, account_no, age_seconds, max_age_seconds,
+            )
         return None
+    with _lock:
+        _stale_logged.pop(_key(environment, account_no), None)
     return snapshot
 
 

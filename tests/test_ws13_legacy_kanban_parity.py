@@ -214,6 +214,7 @@ def _capture_real_kanban_exit_command(
 def test_l3_buylist_activate_routes_through_buy_today_kanban_command(
     tmp_path, monkeypatch
 ):
+    monkeypatch.setattr("src.ui.buyboard.dialogs.prompt_buy_today_profile", lambda *_args: False)
     from src.core.board_workflow import BoardCardProjection
 
     monkeypatch.setattr(

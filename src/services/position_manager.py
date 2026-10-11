@@ -310,6 +310,8 @@ class PositionManager:
     def evaluate_tick(self, card: TradeCardState, current_price: float) -> TradeCardState:
         """Called on every market-data tick (section 766-770)."""
         if evaluate_stop_trigger(card, current_price):
+            if card.active_stop_price is not None and current_price <= card.active_stop_price:
+                card.stop_loss_triggered = True
             card.exit_all_required = True
         return card
 
@@ -395,6 +397,7 @@ class PositionManager:
         card.pending_stop_command_id = ""
         card.pending_stop_requested_at = None
         card.exit_all_required = False
+        card.stop_loss_triggered = False
         card.sell_all_at_market_open = False
         card.market_data_outage_started_at = None
         card.market_data_outage_risk_tier = ""
@@ -421,6 +424,7 @@ class PositionManager:
         card.reserved_sell_quantity = 0
         card.next_exit_retry_at = None
         card.last_exit_error = ""
+        card.warnings = [w for w in card.warnings if w != "EXIT_CANCEL_STALLED"]
         return card
 
     # --- Manual purchases outside the application (section 14) -----------

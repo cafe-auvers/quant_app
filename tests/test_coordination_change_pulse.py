@@ -201,7 +201,7 @@ def test_change_pulse_files_round_trip_without_database_access(monkeypatch, tmp_
     assert pulse.record_inbound_change_pulse("bad event with spaces") is False
 
 
-def test_pc_listener_routes_change_tokens_without_tidb(monkeypatch, tmp_path):
+def test_pc_listener_routes_change_tokens_without_database(monkeypatch, tmp_path):
     from scripts import pc_remote_control_listener as listener
     from src.services import pc_remote_control as client
 

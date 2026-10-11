@@ -44,6 +44,26 @@ available liquidity remain broker/exchange concerns.
 - Queue sizing provenance must match the card's canonical production account
   and breakout price.
 
+### Minimum opening liquidity
+
+New BUY orders require an average of at least **200 shares per minute** by
+default, adjustable as **Minimum opening volume** in the shared ORB settings
+alongside the position bounds. A value of zero disables this minimum.
+
+The check uses the existing intraday bar volume from 09:30 New York time
+through the latest completed opening minute, capped at 10:00. Divide by all
+elapsed completed minutes, including minutes with no trades. Before 10:00,
+1-minute and 5-minute entries can qualify without waiting for the full
+30-minute range. After 10:00, only the first 30 minutes count; later volume
+cannot rescue an illiquid opening. The threshold is inclusive, so exactly
+200 shares/minute passes. This is an average, not a floor for every bar.
+
+Missing or invalid opening volume blocks new buys until a refreshed candidate
+provides it. A low-volume candidate remains observable and can recover while
+the opening is forming or when the operator changes the minimum. Candidate
+selection, replacement selection, and final pre-trade approval use the same
+shared setting. Existing positions and protective sells are unaffected.
+
 ## 2. Candidate price rules
 
 For one finalized ORB candidate:
@@ -63,13 +83,22 @@ Therefore:
 
 - `orb_high` must be strictly above both the structural breakout price and the
   ORB low; otherwise no passive execution zone exists.
-- The automatic execution price defaults to that candidate's `orb_high`.
+- The automatic BUY execution price is the highest legal tick at or below that
+  candidate's raw `orb_high`. Fractional-cent market highs are rounded down,
+  never above the range. The raw high remains the breakout confirmation trigger.
+  If rounding leaves no price strictly above the floor, the plan is rejected.
 - A manual execution price may be below `orb_high`, but it must remain strictly
   above both `breakout_price` and `orb_low`.
 - A manual price is never silently changed.
 - U.S. equity ticks are `$0.0001` below `$1` and `$0.01` at or above `$1`.
 - ORB high, ORB low, score, execution price, range-close time, and confirmation
   time are frozen for each submitted order generation.
+
+The runtime persists the selected ORB window with the entry identity before
+broker I/O. From that point through order resolution, observation refreshes
+cannot replace or clear that generation's price, stop, risk, or quantity,
+including while the card still says Buy Today and broker acknowledgment is
+pending. A later ORB becomes active only through the guarded replacement path.
 
 The persisted `Buffer %` remains planning metadata and is retained across
 devices, but the finalized passive-order zone and live confirmation above use
@@ -92,6 +121,11 @@ stored prices, or a planning-only/yfinance quote.
 In automatic mode, if several candidates have confirmed breakouts before the
 initial order is submitted, the runtime chooses the highest ORB score. An
 equal-score tie favors the earlier timeframe. A manual window lock stays exact.
+
+Before the initial identity is prepared, a confirmed candidate also takes
+precedence during observation refresh over a higher-scoring candidate whose
+breakout has not confirmed. A refresh cannot revert a confirmed 5m entry to an
+unconfirmed 30m planning choice.
 
 ## 4. Initial order submission
 
@@ -274,8 +308,48 @@ during replacement cannot inherit the proposed later-generation stop.
   Position, uncertainty stays Entry Pending.
 - Open Position remains open. EOD stops trying to complete any unfilled entry
   remainder and keeps the filled position protected.
+- Outside regular hours, feed unavailability does not create a new automatic
+  Sell All. Existing stop and explicit exit intent remain pending; during
+  regular hours, the normal structural-outage protection still applies.
+- KIS may return both an original zero-fill order and its later cancellation.
+  The original is retired only with unique cancellation proof for the exact
+  environment/account/symbol/side/order ID, matching quantity, zero fills and
+  remaining quantity, and a valid later broker timestamp on the same date.
+  Missing or contradictory evidence remains fenced.
 
-## 9. What must never happen
+## 9. Hard stop-loss exits
+
+A regular-session trade at or below `active_stop_price` latches a mandatory
+full liquidation. A recovery, restart, or executor handoff cannot withdraw
+that objective. The stop is a trigger, not a minimum acceptable sale price;
+gap-down prices below it must still be sold.
+
+The exit uses the current execution-fresh bid, or a fresh trade when only
+the trade channel is available, with an aggressive sell-limit discount.
+Fresh trades take precedence over an old planning price. The accepted
+breach trade and later liquidation trades update the trusted fallback.
+When both live channels are unavailable, a fresh KIS holding price refreshes
+the liquidation reference and also latches a stop breach.
+
+Hard-stop exits run before new-entry work and retain `STOP_LOSS` intent on
+every attempt. Full Sell All requests also keep repricing until
+broker-confirmed flat, without the partial-exit three-attempt or five-percent
+fallback limits. Manual partial-sell
+and queued-exit withdrawal commands cannot cancel a latched hard stop.
+
+An outstanding order remains fenced until KIS confirms terminal status so a
+late fill cannot overlap a replacement sell. While liquidating, account
+reconciliation uses the pending-order cadence instead of the normal minute
+cadence. A pending broker cancellation is adopted without resending it.
+
+KIS's regular U.S. order API documents limit orders and auction-specific
+orders, rather than a continuous-session market order. See the
+[official KIS order sample](https://github.com/koreainvestment/open-trading-api/blob/main/examples_user/overseas_stock/overseas_stock_functions.py).
+The app therefore follows the market with aggressive limits; broker outages,
+trading halts, and absent liquidity can still delay fills. Closure requires
+broker confirmation that no shares remain.
+
+## 10. What must never happen
 
 - Never infer a fill from price crossing or broker acceptance.
 - Never use yfinance or stale/cached display data to authorize a live order.
@@ -289,7 +363,7 @@ during replacement cannot inherit the proposed later-generation stop.
 - Never let `.env` or `.env.pc` contain live symbol lists; active symbols come
   from canonical Trade Cards and their dedicated runtime data.
 
-## 10. Implementation and verification map
+## 11. Implementation and verification map
 
 | Concern | Primary implementation |
 |---|---|
@@ -311,3 +385,5 @@ Related operator documentation:
 - [Execution Owner and Operator Control](execution_operator_control.md)
 - [Controlled-Live Pilot](controlled_live_pilot_runbook.md)
 - [Wiki Order Lifecycle](wiki/Order-Lifecycle.md)
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional, Tuple
 
 from src.core.order_state import OrderIntent, OrderSide
+from src.core.opening_liquidity import opening_liquidity_rejection
 from src.risk.orb_position import validate_orb_position_values
 
 DEFAULT_APPROVAL_TTL = timedelta(seconds=30)
@@ -228,6 +229,8 @@ def orb_candidate_plan_id(candidate: Any) -> str:
         "stop_adr": _finite_float(getattr(candidate, "stop_adr", None)),
         "risk_percent": _finite_float(getattr(candidate, "risk_percent", None)),
     }
+    if getattr(candidate, "is_ep", False) is True:
+        payload["is_ep"] = True
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return f"ORB:{hashlib.sha256(encoded.encode('utf-8')).hexdigest()}"
 
@@ -322,11 +325,18 @@ def assess_orb_entry_candidate(
                         "sl_adr": stop_adr,
                     },
                     adr_percent=None,
+                    is_ep=getattr(candidate, "is_ep", False) is True,
                 )
             )
         reasons.extend(
             str(value) for value in (getattr(candidate, "warnings", ()) or ())
         )
+        liquidity_reason = opening_liquidity_rejection(
+            getattr(candidate, "opening_volume", None),
+            getattr(candidate, "opening_volume_minutes", 0),
+        )
+        if liquidity_reason:
+            reasons.append(liquidity_reason)
 
     normalized_reasons = tuple(dict.fromkeys(reason for reason in reasons if reason))
     if normalized_reasons:

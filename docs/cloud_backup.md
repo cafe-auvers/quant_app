@@ -230,3 +230,5 @@ separately versioned export or use storage with retention/immutability.
 - Plaintext `.env`, token caches, and loose credential files -- never copied
   by the automatic state backup. `.env` is supported only through the
   separate manual encrypted-envelope workflow above.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

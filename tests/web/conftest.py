@@ -1,10 +1,26 @@
 from __future__ import annotations
 
+import asyncio
+import sys
+
 import pytest
 from fastapi.testclient import TestClient
 
 from src.web.api import build_services, create_api_app
 from src.web.config import WebConfig
+
+
+@pytest.fixture
+def browser_event_loop():
+    """Playwright's subprocess transport requires Proactor on Windows."""
+
+    previous = asyncio.get_event_loop_policy()
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    try:
+        yield
+    finally:
+        asyncio.set_event_loop_policy(previous)
 
 
 @pytest.fixture(autouse=True)

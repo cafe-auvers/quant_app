@@ -555,6 +555,16 @@ class ScannerMixin:
 
         lines = []
         lines.append(f"<b>--- {stock['symbol']} Metrics Summary ---</b><br>")
+        study_adr = stock.get("adr_20_high_low")
+        if study_adr is not None:
+            fast_tag = " | Fast stock (ADR >= 5%)" if study_adr >= 5 else ""
+            lines.append(f"<b>Scanner2 ADR (High/Low): {study_adr:.2f}%{fast_tag}</b>")
+            ranks = " | ".join(
+                f"{period.upper()}: {stock.get('momentum_rank_' + period):.1f}"
+                if stock.get('momentum_rank_' + period) is not None else f"{period.upper()}: unavailable"
+                for period in ("1m", "3m", "6m")
+            )
+            lines.append(f"Leadership percentiles: {ranks}<br>")
 
         lines.append("<b>Basic:</b>")
         lines.append(

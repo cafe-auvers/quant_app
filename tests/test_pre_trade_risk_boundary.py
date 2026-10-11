@@ -284,6 +284,8 @@ def test_orb_candidate_is_revalidated_into_full_order_decision():
         stop_adr=50.0,
         risk_percent=0.4,
         warnings=[],
+        opening_volume=6000,
+        opening_volume_minutes=30,
     )
     plan_id = orb_candidate_plan_id(ready)
 

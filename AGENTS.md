@@ -45,3 +45,27 @@ Pull requests should include a short summary, test results such as `pytest -q`, 
 Keep secrets out of source control. Store credentials and private tokens only in `.env`; non-secret hosts, ports, feature flags, limits, and timing settings belong in `config/runtime.json` or the gitignored `config/runtime.local.json` override. Treat files in `data/` as local state unless intentionally adding sample data. Live symbol lists belong only in their dedicated `data/` files, never in an environment file.
 
 Application startup and the PC morning routine synchronize the credential-only `.env.example` schema, migrate recognized legacy runtime keys out of `.env` into `config/runtime.local.json`, and regenerate the gitignored credential-only `.env.pc` copy. Run `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\sync_pc_env.ps1` when an immediate manual sync is needed. Preserve credential values, preserve migrated runtime overrides, and keep generated `MYSQL_*` credentials blank in `.env.pc`; never commit `.env`, `.env.pc`, or `config/runtime.local.json`.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](docs/opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.
+
+## Trading Day Journals
+
+The user shares simple comments about the trading day **in chat**. The assistant
+writes one journal entry in the user's first-person voice using plain language
+and few adjectives. Do not ask the user to fill structured trade-writing forms,
+invent motivations or emotions, or turn the entry into promotional prose.
+
+Use the recorded facts and attach daily and 5-minute graphs for stocks bought on
+the chosen New York trading session. Read
+[the journal workflow](docs/trading_journey_journal.md) for chart packets and
+draft persistence. Show the finished draft and its graphs for review. Publish
+only after the user confirms that exact draft and chooses the destinations;
+an earlier approval does not cover changed text or charts. Social platforms will
+be chosen after the first draft. Preparing an entry or approving a draft is not
+evidence that it has been posted.
+
+Include daily observed NAV/account equity, cash-flow-adjusted daily P&L and
+market context in the journal evidence. Russell 1000 is the user's requested
+"1000 index"; label IWB, SPY and QQQ as ETF proxies. Use basis points for yield
+changes. Do not treat cumulative Health-tab P&L as daily P&L, assume unknown
+cash flows are zero, or infer a causal macro explanation from price movements.

@@ -54,6 +54,9 @@ def configured_collector() -> Gate4EvidenceCollector | None:
 
 def observe_gate4_event(event_type: str, **payload: Any) -> None:
     """Durably append an event, or do nothing when qualification is disabled."""
+    from src.services.live_session_checks import observe_execution_event
+
+    observe_execution_event(event_type, payload)
     collector = configured_collector()
     if collector is None:
         return

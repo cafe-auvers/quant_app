@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -83,7 +84,7 @@ def test_dashboard_is_a_static_shell_without_hydration_runtime():
     assert "new MutationObserver" not in script_source
     assert "bootApp();" in script_source
     assert 'id="quant-app"' in page_source
-    assert '/live-static/app.js?v=91' in page_source
+    assert re.search(r'<script src="/live-static/app\.js\?v=\d+" defer></script>', page_source)
     assert page_source.index('id="market-summary"') < page_source.index('id="browser-status"')
     assert page_source.index('id="browser-status"') < page_source.index('id="web-status"')
     assert page_source.index('id="web-status"') < page_source.index('id="data-summary"')
@@ -194,14 +195,18 @@ def test_mobile_layout_uses_a_scrollable_stock_drawer_and_chart_edges():
     assert 'id="mobile-menu-popover"' in page_source
     assert 'aria-label="Chart display settings"' in page_source
     assert '<div class="display-settings-heading"><strong>Chart Settings</strong>' in page_source
-    home_control = page_source.index('data-mobile-page="summary"')
-    watchlist_control = page_source.index('id="mobile-list-menu"', home_control)
+    menu_control = page_source.index('id="mobile-navigation-menu"')
+    home_control = page_source.index('data-mobile-page="summary"', menu_control)
+    settings_control = page_source.index('data-mobile-page="settings"', home_control)
+    watchlist_control = page_source.index('id="mobile-list-menu"', settings_control)
     chart_control = page_source.index('data-mobile-page="chart"', watchlist_control)
     board_control = page_source.index('data-mobile-page="buy-board"', chart_control)
     stocks_control = page_source.index('id="mobile-previous-symbol"', board_control)
-    assert home_control < watchlist_control < chart_control < board_control < stocks_control
+    assert menu_control < home_control < settings_control < watchlist_control < chart_control < board_control < stocks_control
     assert 'data-mobile-page="summary" aria-label="Home"' in page_source
     assert '<span>Home</span>' in page_source
+    assert '<span>Settings</span>' in page_source
+    assert 'id="mobile-settings-page"' in page_source
     assert '<span id="mobile-list-label">Watchlist</span>' in page_source
     assert 'aria-selected="true" class="active" data-mobile-list="monitor"' in page_source
     assert "listMode: 'monitor'" in script_source
@@ -283,12 +288,14 @@ def test_mobile_workspace_has_five_primary_bottom_controls():
     page_source = (
         ROOT / "src" / "web" / "static" / "dashboard.html"
     ).read_text(encoding="utf-8")
-    home = page_source.index('data-mobile-page="summary"')
-    watchlist = page_source.index('id="mobile-list-menu"', home)
+    menu = page_source.index('id="mobile-navigation-menu"')
+    home = page_source.index('data-mobile-page="summary"', menu)
+    settings = page_source.index('data-mobile-page="settings"', home)
+    watchlist = page_source.index('id="mobile-list-menu"', settings)
     chart = page_source.index('data-mobile-page="chart"', watchlist)
     board = page_source.index('data-mobile-page="buy-board"', chart)
     stocks = page_source.index('id="mobile-previous-symbol"', board)
-    assert home < watchlist < chart < board < stocks
+    assert menu < home < settings < watchlist < chart < board < stocks
     assert 'data-mobile-page="chart" aria-label="Chart" aria-current="page"' in page_source
     assert 'id="mobile-summary-page"' in page_source
     assert 'id="mobile-market-pulse-page"' not in page_source
@@ -370,7 +377,7 @@ def test_review_actions_are_inline_and_daily_view_opens_at_six_months():
     assert 'id="quick-buy-today"' in page_source
     assert "byId('quick-buy-today').addEventListener('click', toggleBuyTodayDraft)" in script_source
     assert "method: 'DELETE'" in script_source
-    assert "quickBuyToday.textContent = hasBuyToday ? 'Cancel Today' : 'Buy Today'" in script_source
+    assert "? 'Cancelling…' : hasBuyToday ? 'Cancel Today' : 'Buy Today'" in script_source
     assert "quickBuyToday.disabled = busy || !buyTodayActionEligible" in script_source
     assert 'data-list="buy_today"' in page_source
     assert 'id="planning-drawer-button"' not in page_source

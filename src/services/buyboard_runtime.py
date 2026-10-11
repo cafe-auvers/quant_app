@@ -141,6 +141,7 @@ from src.core.order_state import (
     is_open_status,
 )
 from src.core.trade_card_state import BoardStatus, TradeCardState
+from src.core.opening_liquidity import opening_liquidity_rejection
 from src.risk.orb_position import (
     calculate_orb_position_values,
     get_orb_settings,
@@ -154,7 +155,7 @@ from src.risk.portfolio import (
     PortfolioRiskSnapshot,
     ProposedPortfolioEntry,
 )
-from src.risk.pre_trade import PreTradeRiskDecision
+from src.risk.pre_trade import PreTradeRiskDecision, PreTradeRiskRejectedError
 from src.services import capital_allocator, order_ledger, order_reconciliation
 from src.services.broker import Broker, ReadOnlyBroker
 from src.services.entry_attempt_manager import EntryAttemptManager
@@ -295,8 +296,10 @@ def _marketable_sell_limit_price(
     quote: Optional[QuoteSnapshot],
     *,
     quote_is_execution_ready: bool = True,
+    trade_is_execution_ready: Optional[bool] = None,
     last_trusted_price: Optional[float] = None,
     emergency_reprice_attempt: int = 0,
+    hard_stop: bool = False,
 ) -> Optional[float]:
     """Compatibility wrapper around the shared frontend-neutral policy."""
 
@@ -305,7 +308,9 @@ def _marketable_sell_limit_price(
         last_price=quote.last_price if quote is not None else None,
         last_trusted_price=last_trusted_price,
         quote_is_execution_ready=quote_is_execution_ready,
+        trade_is_execution_ready=trade_is_execution_ready,
         emergency_reprice_attempt=emergency_reprice_attempt,
+        hard_stop=hard_stop,
     )
 
 
@@ -442,6 +447,15 @@ def _revalidate_and_approve(
     """
     stop_price = card.entry_orb_low
     reasons = []
+    opening_snapshot = card.orb_candidate_states.get(card.selected_orb_window or card.entry_orb_window, {})
+    if not isinstance(opening_snapshot, dict):
+        opening_snapshot = {}
+    liquidity_reason = opening_liquidity_rejection(
+        opening_snapshot.get("opening_volume"),
+        opening_snapshot.get("opening_volume_minutes"),
+    )
+    if liquidity_reason:
+        reasons.append(liquidity_reason)
     try:
         # ``account_size`` is the risk-sizing base at this boundary: fresh
         # total account equity, not usable cash/buying power.  Availability
@@ -481,7 +495,7 @@ def _revalidate_and_approve(
         ),
         "sl_adr": card.stop_adr,
     }
-    if not reasons and not is_orb_position_plan_valid(sizing, adr_percent=None):
+    if not reasons and not is_orb_position_plan_valid(sizing, adr_percent=None, is_ep=card.is_ep):
         reasons.append(
             f"Order fingerprint fails ORB position bounds: "
             f"capital_percent={sizing['capital_percent']:.1f}%, sl_adr={card.stop_adr}"
@@ -893,6 +907,21 @@ def build_buyboard_runtime(
     guarded_lease = execution_lease if isinstance(execution_lease, ExecutionLease) else None
     legacy_lease = execution_lease if isinstance(execution_lease, LeaseHandle) else None
     resolved_equity_provider = account_equity_provider or buying_power_provider
+
+    def entry_buying_power(environment, account_no, symbol, exchange, limit_price):
+        reader = getattr(resolved_broker, "get_buying_power", None)
+        evidence = reader(environment=environment, account_no=account_no, symbol=symbol,
+                          exchange=exchange, limit_price=limit_price) if callable(reader) else None
+        if evidence is not None:
+            return float(evidence["available_usd"])
+        return float(buying_power_provider(environment, account_no))
+
+    def validate_live_entry_quote(symbol):
+        quote = resolved_market_data.latest_quote(symbol)
+        now = trading_engine._clock()
+        if (quote is None or not quote.regular_session or not quote.entry_trigger_eligible
+                or not quote.is_entry_fresh(now=now) or not resolved_market_data.entry_quote_ready(symbol, now=now)):
+            raise PreTradeRiskRejectedError("KIS entry data expired while waiting for HTTP dispatch")
     uses_default_portfolio_risk_manager = portfolio_risk_manager is None
     resolved_portfolio_risk_manager = (
         portfolio_risk_manager or _default_portfolio_risk_manager()
@@ -997,6 +1026,9 @@ def build_buyboard_runtime(
             intent=OrderIntent.ENTRY,
         )
         card.entry_submission_unresolved = False
+        # Persist the chosen generation before broker I/O so refresh/recovery
+        # cannot attach the order identity to a different planning candidate.
+        card.entry_orb_window = card.selected_orb_window or card.entry_orb_window
         persist_execution_identity(card)
         return card.entry_client_order_id, group_id, number
 
@@ -1194,7 +1226,7 @@ def build_buyboard_runtime(
                 )
                 try:
                     usable_buying_power = float(
-                        buying_power_provider(environment, account_no)
+                        entry_buying_power(environment, account_no, symbol, exchange, limit_price)
                     )
                 except (TypeError, ValueError, OverflowError):
                     usable_buying_power = 0.0
@@ -1272,6 +1304,22 @@ def build_buyboard_runtime(
         # and Kanban use (INV-21). It normalizes the two persistence models
         # into one workflow result while preserving this function's risk
         # revalidation and gate sequence.
+        if guarded_mode and decision is not None and decision.approved:
+            now = trading_engine._clock()
+            quote = resolved_market_data.latest_quote(symbol)
+            if (
+                quote is None
+                or not quote.regular_session
+                or not quote.entry_trigger_eligible
+                or not quote.is_entry_fresh(now=now)
+                or not resolved_market_data.entry_quote_ready(symbol, now=now)
+            ):
+                raise RuntimeError("KIS entry data expired during pre-trade validation")
+            def validate_entry_freshness():
+                dispatch_at = trading_engine._clock()
+                if not quote.is_entry_fresh(now=dispatch_at) or not resolved_market_data.entry_quote_ready(symbol, now=dispatch_at):
+                    raise PreTradeRiskRejectedError("KIS entry data expired while waiting for HTTP dispatch")
+            submit_kwargs["entry_freshness_validator"] = validate_entry_freshness
         try:
             return request_submit(
                 source=ExecutionSource.KANBAN_BOARD,
@@ -1526,14 +1574,16 @@ def build_buyboard_runtime(
             )
             try:
                 buying_power = float(
-                    buying_power_provider(
-                        candidate_card.environment, candidate_card.account_no
-                    )
+                    entry_buying_power(candidate_card.environment, candidate_card.account_no,
+                                       candidate_card.symbol, exchange, limit_price)
                 )
             except (TypeError, ValueError, OverflowError):
                 buying_power = 0.0
             if not math.isfinite(buying_power) or buying_power <= 0:
                 buying_power = 0.0
+            if replaced_reservation_id:
+                buying_power += sum(float(reservation.remaining_reserved_notional or 0.0)
+                    for reservation in reservations if reservation.reservation_id == replaced_reservation_id)
             portfolio_decision = current_portfolio_risk_manager().evaluate_entry(
                 ProposedPortfolioEntry(
                     symbol=candidate_card.symbol,
@@ -1659,7 +1709,7 @@ def build_buyboard_runtime(
                 or not trading_engine._market_is_open()
                 or not quote.regular_session
                 or not quote.entry_trigger_eligible
-                or not quote.is_execution_fresh(now=now)
+                or not quote.is_entry_fresh(now=now)
                 or not market_data_service.entry_quote_ready(card.symbol, now=now)
                 or quote.last_price <= execution_price
                 or quote.ask is None
@@ -1696,6 +1746,7 @@ def build_buyboard_runtime(
                 risk_strategy_id=RISK_STRATEGY_ID,
                 risk_plan_id=_entry_plan_id(candidate_card),
                 post_cancel_revalidate=post_cancel_revalidate,
+                entry_freshness_validator=lambda: validate_live_entry_quote(card.symbol),
             )
         finally:
             cache_recent_guarded_record(original.client_order_id)
@@ -1765,7 +1816,7 @@ def build_buyboard_runtime(
                 or not trading_engine._market_is_open()
                 or not quote.regular_session
                 or not quote.entry_trigger_eligible
-                or not quote.is_execution_fresh(now=now)
+                or not quote.is_entry_fresh(now=now)
                 or not market_data_service.entry_quote_ready(card.symbol, now=now)
                 or quote.last_price <= execution_price
                 or quote.ask is None
@@ -1809,6 +1860,7 @@ def build_buyboard_runtime(
                 replace_command_id=replace_command_id,
                 new_client_order_id=new_client_order_id,
                 post_cancel_revalidate=fresh_revalidate,
+                entry_freshness_validator=lambda: validate_live_entry_quote(card.symbol),
                 lease=guarded_lease,
                 environment=original.environment,
                 account_no=original.account_no,
@@ -1845,6 +1897,12 @@ def build_buyboard_runtime(
             submit_kwargs.get("account_no", ""),
             symbol,
         )
+        if card is not None and card.stop_loss_triggered:
+            intent = OrderIntent.STOP_LOSS
+        mandatory_liquidation = intent == OrderIntent.STOP_LOSS or bool(
+            card is not None
+            and (card.exit_all_required or card.board_status == BoardStatus.SELL_ALL)
+        )
         exchange = _execution_exchange_for_card(
             card,
             resolved_market_data,
@@ -1863,9 +1921,36 @@ def build_buyboard_runtime(
             quote_ready = resolved_market_data.is_symbol_execution_ready(
                 symbol, require_trade=False, require_quote=True
             )
+            trade_ready = resolved_market_data.is_symbol_execution_ready(
+                symbol, require_trade=True, require_quote=False
+            )
+            if mandatory_liquidation and not quote_ready and not trade_ready:
+                # A disconnected feed must not leave exits priced from an
+                # old entry observation when fresh KIS holdings are available.
+                try:
+                    positions = resolved_broker.get_positions(
+                        environment=submit_kwargs["environment"],
+                        account_no=submit_kwargs["account_no"],
+                    )
+                    holdings = (positions.get("overseas") or {}).get("holdings") or []
+                    for holding in holdings:
+                        if str(holding.get("symbol") or "").upper() != symbol.upper():
+                            continue
+                        current_price = float(holding.get("current_price") or 0.0)
+                        if math.isfinite(current_price) and current_price > 0 and card is not None:
+                            card.market_data_last_trusted_price = current_price
+                            card.market_data_last_trusted_at = datetime.now(timezone.utc)
+                            if card.active_stop_price and current_price <= card.active_stop_price:
+                                card.stop_loss_triggered = True
+                                intent = OrderIntent.STOP_LOSS
+                        break
+                except Exception:
+                    logger.warning("Fresh broker exit price unavailable for %s", symbol)
             emergency_attempt = int(card.exit_attempt_count if card is not None else 0)
             if (
                 not quote_ready
+                and not trade_ready
+                and not mandatory_liquidation
                 and emergency_attempt
                 >= execution_config.EMERGENCY_EXIT_MAX_REPRICE_ATTEMPTS
             ):
@@ -1875,10 +1960,12 @@ def build_buyboard_runtime(
             limit_price = _marketable_sell_limit_price(
                 quote,
                 quote_is_execution_ready=quote_ready,
+                trade_is_execution_ready=trade_ready,
                 last_trusted_price=(
                     card.market_data_last_trusted_price if card is not None else None
                 ),
                 emergency_reprice_attempt=emergency_attempt,
+                hard_stop=mandatory_liquidation,
             )
             if limit_price is None:
                 raise ExecutionGradeDataUnavailableError(

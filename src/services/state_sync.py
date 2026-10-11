@@ -17,7 +17,7 @@ import weakref
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional
 
 from sqlalchemy import (
     BigInteger,
@@ -485,8 +485,10 @@ def _select_row(
     state_key: str,
     *,
     for_update: bool = False,
+    include_payload: bool = True,
 ):
-    statement = select(table).where(table.c.state_key == state_key)
+    selected = list(table.c) if include_payload else [item for item in table.c if item.name != "payload"]
+    statement = select(*selected).where(table.c.state_key == state_key)
     if for_update:
         statement = statement.with_for_update()
     return conn.execute(statement).first()
@@ -514,18 +516,48 @@ def _remote_state_from_row(row, state_key: str) -> RemoteState:
 
 def pull_state(engine: Optional[Engine], state_key: str) -> PullResult:
     """Fetch a row while keeping missing data distinct from read failures."""
+    return pull_states(engine, (state_key,))[state_key]
+
+
+def pull_states(
+    engine: Optional[Engine], state_keys: Iterable[str]
+) -> Dict[str, PullResult]:
+    """Freshly verify a group of state rows with one differential statement."""
+    keys = tuple(sorted(set(state_keys)))
+    if not keys:
+        return {}
     if engine is None:
-        return PullResult(PULL_ERROR, error="State sync database is unavailable.")
+        return {
+            key: PullResult(PULL_ERROR, error="State sync database is unavailable.")
+            for key in keys
+        }
     try:
         table = _ensure_state_sync_table(engine)
-        with coordination_read_connection(engine) as conn:
-            row = _select_row(conn, table, state_key)
-        if row is None:
-            return PullResult(PULL_MISSING)
-        return PullResult(PULL_OK, state=_remote_state_from_row(row, state_key))
+        from src.services.coordination_snapshot import read_versioned_rows
+
+        rows = read_versioned_rows(
+            engine, table,
+            cache_key=("app_state_sync", *keys),
+            key_columns=("state_key",),
+            revision_column="revision",
+            conditions=(table.c.state_key.in_(keys),),
+        )
     except (SQLAlchemyError, ValueError, TypeError) as exc:
-        logger.info("State sync pull failed for %s: %s", state_key, exc)
-        return PullResult(PULL_ERROR, error=str(exc))
+        logger.info("State sync pull failed for %s: %s", keys, exc)
+        return {key: PullResult(PULL_ERROR, error=str(exc)) for key in keys}
+
+    by_key = {row.state_key: row for row in rows}
+    results = {}
+    for key in keys:
+        row = by_key.get(key)
+        if row is None:
+            results[key] = PullResult(PULL_MISSING)
+            continue
+        try:
+            results[key] = PullResult(PULL_OK, state=_remote_state_from_row(row, key))
+        except (ValueError, TypeError) as exc:
+            results[key] = PullResult(PULL_ERROR, error=str(exc))
+    return results
 
 
 def get_live_trading_control(
@@ -1080,7 +1112,7 @@ def publish_planning_snapshot(
                 )
 
             rows = {
-                key: _select_row(conn, table, key, for_update=True)
+                key: _select_row(conn, table, key, for_update=True, include_payload=False)
                 for key in SYNCED_STATE_KEYS
             }
             for key, row in rows.items():
@@ -1649,7 +1681,7 @@ def push_state(
                     error="Another device owns main-device synchronization.",
                 )
 
-            current_row = _select_row(conn, table, state_key, for_update=True)
+            current_row = _select_row(conn, table, state_key, for_update=True, include_payload=False)
             current_revision = int(current_row.revision or 1) if current_row else 0
             if current_revision != expected_revision:
                 return PushResult(
@@ -1684,15 +1716,14 @@ def push_state(
                         revision=current_revision,
                         error=f"Remote {state_key} changed during the save.",
                     )
-            written_row = _select_row(conn, table, state_key)
+            written_row = _select_row(conn, table, state_key, include_payload=False)
 
         if written_row is None:
             return PushResult(PUSH_ERROR, error=f"Remote {state_key} write disappeared.")
-        written = _remote_state_from_row(written_row, state_key)
         return PushResult(
             PUSH_WRITTEN,
-            revision=written.revision,
-            updated_at=written.updated_at,
+            revision=int(written_row.revision),
+            updated_at=written_row.updated_at,
         )
     except (SQLAlchemyError, ValueError, TypeError) as exc:
         logger.info("State sync push failed for %s: %s", state_key, exc)
@@ -1754,7 +1785,7 @@ def push_operator_controlled_settings(
                     error="Another device owns Operator Control.",
                 )
 
-            current_row = _select_row(conn, table, SETTINGS_KEY, for_update=True)
+            current_row = _select_row(conn, table, SETTINGS_KEY, for_update=True, include_payload=False)
             current_revision = int(current_row.revision or 1) if current_row else 0
             if current_revision != expected_revision:
                 return PushResult(
@@ -1791,15 +1822,14 @@ def push_operator_controlled_settings(
                         revision=current_revision,
                         error="Remote settings changed during the save.",
                     )
-            written_row = _select_row(conn, table, SETTINGS_KEY)
+            written_row = _select_row(conn, table, SETTINGS_KEY, include_payload=False)
 
         if written_row is None:
             return PushResult(PUSH_ERROR, error="Remote settings write disappeared.")
-        written = _remote_state_from_row(written_row, SETTINGS_KEY)
         return PushResult(
             PUSH_WRITTEN,
-            revision=written.revision,
-            updated_at=written.updated_at,
+            revision=int(written_row.revision),
+            updated_at=written_row.updated_at,
         )
     except (SQLAlchemyError, ValueError, TypeError) as exc:
         logger.info("Operator-controlled settings push failed: %s", exc)

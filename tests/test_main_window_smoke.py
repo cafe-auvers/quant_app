@@ -133,6 +133,7 @@ def test_main_window_constructs_and_closes_offscreen_without_external_io(monkeyp
     assert "TradingView Chart" not in tab_labels
     assert "Charts" not in tab_labels
     assert "Watchlist" not in tab_labels
+    assert "Journal" in tab_labels
     assert "Buy Dashboard" not in tab_labels
     daily_summary_index = tab_labels.index("Daily Summary")
     assert tab_labels[daily_summary_index + 1] == "Buy Board"

@@ -27,7 +27,7 @@ access confirmed from a mobile hotspot (genuinely off the home network).
 
 There are two deliberately separate database roles. PC MySQL is the canonical
 historical-data source. When `COORD_DB_*` is configured, the small canonical
-execution-coordination store lives in TiDB Cloud; without it, PC MySQL remains
+execution-coordination store lives in Supabase Cloud; without it, PC MySQL remains
 the legacy coordination fallback. The laptop's SQLite file is an offline
 market-data mirror rather than a peer authority. Normal historical
 synchronization is PC to laptop, and laptop market data is never promoted back
@@ -59,10 +59,10 @@ exact handoff and publishing rules, and
 [Current Order Logic](current_order_logic.md) for Buy Today submission,
 Entry Pending, and ORB replacement behavior.
 
-These execution roles do not move storage roles. With TiDB coordination
+These execution roles do not move storage roles. With Supabase coordination
 configured on both devices, powering off the PC removes only the historical
-source: the laptop mirror continues display while TiDB remains the writable execution
-authority. If TiDB is not configured, the legacy PC-hosted coordination path
+source: the laptop mirror continues display while Supabase remains the writable execution
+authority. If Supabase is not configured, the legacy PC-hosted coordination path
 still closes new entries and operator commands until PC MySQL returns.
 
 ### Connected web/PWA state propagation
@@ -348,7 +348,7 @@ non-secret overrides; `.env.pc` is only an initial credential setup copy.
 
 - **The laptop's `main.py` doesn't crash.** It falls back to
   `data/local_mirror.db`. Scanner and chart cache reads continue from the
-  mirror. TiDB-backed state synchronization and runtime coordination remain
+  mirror. Supabase-backed state synchronization and runtime coordination remain
   available; the legacy PC-hosted coordination path is disabled until MySQL
   returns.
 - **Staleness is explicit.** If the mirror is current through the latest
@@ -591,7 +591,7 @@ the wake time itself is harmless idle time either way.
   in KIS until coordination recovers.
 - The dashboard remote-shutdown button refuses to power off the PC during live
   trading only when that PC MySQL instance is still the selected legacy
-  coordination authority. With TiDB coordination online, PC shutdown affects
+  coordination authority. With Supabase coordination online, PC shutdown affects
   historical-data freshness but not ordinary execution authority.
 - `orders.json`/`event_journal.jsonl` stay local-only per device. Broker-truth
   discovery makes this a completeness gap for the PC's own order-history
@@ -605,3 +605,5 @@ the wake time itself is harmless idle time either way.
   via the retained `AtLogOn` fallback and the stale-heartbeat claim path
   rather than the clean-release path -- the less-clean of the two, but still
   fully gated by broker reconciliation before anything trades.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

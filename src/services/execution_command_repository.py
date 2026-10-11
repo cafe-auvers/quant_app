@@ -404,3 +404,56 @@ def record_command_response(
             broker_response=broker_response,
             expected_version=expected_version,
         )
+
+
+def reconcile_ambiguous_cancellations(engine: Engine, snapshot, orders) -> int:
+    """Resolve a cancel/fill race from exact, terminal broker identities."""
+    from src.core.execution_order_record import ExecutionOrderStatus
+    from src.core.account_broker_snapshot import ReconciliationAction
+    from src.core.order_state import OrderStatus
+    from src.utils.market_calendar import US_MARKET_ZONE
+
+    if not snapshot.completeness.allows(ReconciliationAction.TERMINAL_ORDER_CONCLUSION):
+        return 0
+    terminal = {OrderStatus.FILLED: ExecutionOrderStatus.FILLED,
+                OrderStatus.CANCELLED: ExecutionOrderStatus.CANCELLED,
+                OrderStatus.REJECTED: ExecutionOrderStatus.REJECTED}
+    table = ensure_execution_commands_table(engine)
+    resolved = 0
+    with engine.begin() as conn:
+        commands = conn.execute(select(table).where(
+            table.c.environment == snapshot.environment,
+            table.c.account_no == snapshot.account_no,
+            table.c.command_type == "cancel", table.c.status == "AMBIGUOUS",
+        )).fetchall()
+        for row in commands:
+            requested = row.requested_at.replace(tzinfo=timezone.utc) if row.requested_at.tzinfo is None else row.requested_at
+            if requested > snapshot.observed_at or requested.astimezone(US_MARKET_ZONE).date() != snapshot.session_date:
+                continue
+            matches = [order for order in orders if order.environment == row.environment
+                       and order.account_no == row.account_no and order.symbol == row.symbol
+                       and order.broker_order_id == row.target_broker_order_id]
+            if not row.target_broker_order_id or len(matches) != 1:
+                continue
+            local = matches[0]
+            evidence = [order for order in snapshot.orders
+                        if order.environment == row.environment and order.account_no == row.account_no
+                        and order.symbol == row.symbol and order.broker_order_id == row.target_broker_order_id
+                        and order.side == local.side and order.quantity_requested == local.submitted_quantity
+                        and order.status in terminal and terminal[order.status] == local.status]
+            if len(evidence) != 1:
+                continue
+            broker = evidence[0]
+            previous = _row_to_command(row).redacted_response
+            proof = _redact_broker_response({"original_response": previous,
+                "resolution": {"source": "AUTHORITATIVE_BROKER_HISTORY",
+                    "snapshot_id": snapshot.snapshot_id, "observed_at": snapshot.observed_at.isoformat(),
+                    "client_order_id": local.client_order_id, "broker_order_id": local.broker_order_id,
+                    "order_status": broker.status.value, "filled_quantity": broker.filled_quantity}},
+                account_no=row.account_no)
+            updated = conn.execute(table.update().where(
+                table.c.id == row.id, table.c.status == "AMBIGUOUS", table.c.version == row.version,
+            ).values(status="RECONCILED", version=row.version + 1,
+                redacted_response=json.dumps(proof, separators=(",", ":")), response_hash=hash_redacted_payload(proof)))
+            resolved += updated.rowcount
+    return resolved

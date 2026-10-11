@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -251,6 +252,7 @@ def _card(symbol: str = "AAPL", **overrides) -> TradeCardState:
         selected_orb_window="5m",
         planned_quantity=100,
         target_position_quantity=100,
+        orb_candidate_states={"5m": {"opening_volume": 6000, "opening_volume_minutes": 30}},
     )
     values.update(overrides)
     return TradeCardState(**values)
@@ -438,6 +440,31 @@ def test_pending_order_reads_are_coalesced_without_slowing_engine_heartbeat(
     clock[0] += execution_config.PENDING_ORDER_RECONCILIATION_SECONDS / 2 + 0.1
     assert lookup.find_open_entry_order(card) is not None
     assert len(list_calls) == 2
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_second_entry_preserves_first_pending_buy_and_counts_both_reservations(
+    tmp_path, monkeypatch
+):
+    runtime, broker, _gateway, engine, market_data = _make_runtime(tmp_path, monkeypatch)
+    first = _persist_owned_card(engine, _card("SVIA"))
+    second = _persist_owned_card(engine, _card("QMCO"))
+    _submit_guarded_entry(runtime, broker, market_data, first)
+    first_order = execution_order_repository.list_execution_orders_for_card(
+        engine, environment="PROD", account_no="1", symbol="SVIA"
+    )[0]
+    _submit_guarded_entry(runtime, broker, market_data, second)
+
+    assert len(broker.submit_calls) == 2
+    assert broker.cancel_calls == []
+    reservations = capital_reservation_repository.list_active_reservations(
+        engine, environment="PROD", account_no="1"
+    )
+    assert {reservation.symbol for reservation in reservations} == {"SVIA", "QMCO"}
+    unchanged_first = fetch_execution_order(engine, first_order.client_order_id)
+    assert unchanged_first.status == first_order.status
+    assert unchanged_first.capital_reservation_id == first_order.capital_reservation_id
+    assert first.board_status == second.board_status == BoardStatus.ENTRY_PENDING
 
 
 @pytest.mark.usefixtures("trading_enabled")
@@ -713,8 +740,16 @@ def test_closed_cycle_retires_attempt_group_before_next_cycle_and_old_history_is
     assert card.entry_attempt_group_id == ""
     assert card.exit_attempt_group_id == ""
 
-    card.board_status = BoardStatus.BUYLIST
-    card.board_status = BoardStatus.BUY_TODAY
+    trade_card_repository.update_trade_card(engine, card, expected_version=card.version)
+    from src.core.board_workflow import ActivateForToday, BoardActionContext
+    from src.services.execution_workflow_service import request_board_action
+
+    card = request_board_action(engine, ActivateForToday(
+        environment=card.environment, account_no=card.account_no, symbol=card.symbol,
+        expected_card_version=card.version,
+    ), context=BoardActionContext(), local_snapshot_path=tmp_path / "cards.json").card
+    assert card.board_status == BoardStatus.BUY_TODAY
+    assert card.entry_execution_price is None and card.planned_quantity == 0
     runtime.trading_engine._prepare_entry_attempt(card)
     cycle_two_group = card.entry_attempt_group_id
     assert cycle_two_group
@@ -800,6 +835,46 @@ def test_entry_uses_one_gateway_owned_reservation_and_common_result(
 
 
 @pytest.mark.usefixtures("trading_enabled")
+def test_explicit_reentry_waits_for_a_new_plan_then_submits_once_with_new_identity(
+    tmp_path, monkeypatch
+):
+    from src.core.board_workflow import ActivateForToday, BoardActionContext
+    from src.services.execution_workflow_service import request_board_action
+
+    runtime, broker, _gateway, engine, market_data = _make_runtime(tmp_path, monkeypatch)
+    card = _persist_owned_card(engine, _card(
+        board_status=BoardStatus.CLOSED, position_runtime_status=PositionRuntimeStatus.CLOSED,
+        entry_attempt_group_id="previous-cycle", entry_client_order_id="previous-buy",
+        average_entry_price=100.0,
+    ))
+    card = request_board_action(engine, ActivateForToday(
+        environment="PROD", account_no="1", symbol="AAPL", expected_card_version=card.version,
+    ), context=BoardActionContext(), local_snapshot_path=tmp_path / "cards.json").card
+    market_data.subscribe([card.symbol])
+    market_data.poll_once()
+    runtime.trading_engine.run_heartbeat([card])
+    assert broker.submit_calls == []
+    assert card.board_status == BoardStatus.BUY_TODAY
+
+    # A later verified ORB evaluation supplies geometry, independently of activation.
+    approved_plan = _card()
+    for name in (
+        "entry_runtime_status", "planned_quantity", "target_position_quantity",
+        "entry_trigger", "entry_execution_price", "entry_floor_price", "entry_breakout_trigger",
+        "entry_breakout_confirmed_at", "entry_range_closed_at", "entry_orb_high", "entry_orb_low",
+        "entry_orb_window", "selected_orb_window", "stop_adr", "orb_candidate_states",
+    ):
+        setattr(card, name, getattr(approved_plan, name))
+    trade_card_repository.update_trade_card(engine, card, expected_version=card.version)
+    _submit_guarded_entry(runtime, broker, market_data, card)
+    runtime.trading_engine.run_heartbeat([card])
+    assert len(broker.submit_calls) == 1
+    assert card.entry_attempt_group_id != "previous-cycle"
+    assert card.entry_client_order_id != "previous-buy"
+    assert fetch_execution_order(engine, card.entry_client_order_id) is not None
+
+
+@pytest.mark.usefixtures("trading_enabled")
 def test_insufficient_capital_rolls_back_the_atomic_submission(tmp_path, monkeypatch):
     runtime, broker, gateway, engine, market_data = _make_runtime(
         tmp_path, monkeypatch, buying_power=5_000.0
@@ -850,6 +925,55 @@ def test_canonical_portfolio_position_limit_rejects_entry_before_broker(
         engine, environment="PROD", account_no="1"
     ) == []
     assert entry.entry_runtime_status == EntryRuntimeStatus.RETRY_COOLDOWN
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_orb_refresh_during_broker_submission_preserves_the_submitted_generation(
+    tmp_path, monkeypatch
+):
+    from src.core.execution_queue import ExecutionQueueItem, OrbCandidate, OrbCandidateStatus
+    from src.services.trade_card_orb_bridge import TradeCardOrbEvaluator
+
+    runtime, broker, gateway, engine, market_data = _make_runtime(tmp_path, monkeypatch)
+    card = _persist_owned_card(engine, _card(entry_orb_window=None))
+    broker.queue_acceptance(broker_order_id="B-FROZEN-ORB")
+    market_data.subscribe([card.symbol])
+    market_data.poll_once()
+    original_submit = broker.submit_order
+    observed = []
+
+    def submit_with_concurrent_refresh(**kwargs):
+        current = trade_card_repository.get_trade_card(engine, "PROD", "1", card.symbol)
+        observed.append(current.to_dict())
+        candidate = OrbCandidate(symbol=card.symbol, window="30m", orb_high=110.0,
+            orb_low=96.0, breakout_price=card.breakout_price, entry_trigger=110.0,
+            execution_price=110.0, risk_percent=0.015, shares=100, score=80.6,
+            source_session_date=datetime.now(ZoneInfo("America/New_York")).date().isoformat(),
+            status=OrbCandidateStatus.WAITING_BREAKOUT, valid=True)
+        item = ExecutionQueueItem(symbol=card.symbol, environment="PROD", account_no="1",
+            breakout_price=card.breakout_price, selected_candidate=candidate,
+            selected_window="30m", candidates={"30m": candidate})
+        before = current.to_dict()
+        TradeCardOrbEvaluator().update_card(current, item)
+        if current.to_dict() != before:
+            trade_card_repository.update_trade_card(engine, current, expected_version=current.version)
+        return original_submit(**kwargs)
+
+    broker.submit_order = submit_with_concurrent_refresh
+    runtime.trading_engine.run_heartbeat([card])
+
+    stored = trade_card_repository.get_trade_card(engine, "PROD", "1", card.symbol)
+    assert stored.selected_orb_window == "5m"
+    assert observed[0]["entry_orb_window"] == "5m"
+    assert stored.entry_orb_window == "5m"
+    assert stored.entry_execution_price == 100.0
+    assert stored.entry_orb_low == 95.0
+    assert stored.risk_percent == 0.01
+    assert len(broker.submit_calls) == 1
+    assert broker.submit_calls[0]["limit_price"] == 100.0
+    assert card.board_status == BoardStatus.ENTRY_PENDING
+    trade_card_repository.update_trade_card(engine, card, expected_version=card.version)
+    assert trade_card_repository.get_trade_card(engine, "PROD", "1", card.symbol).entry_orb_window == "5m"
 
 
 @pytest.mark.usefixtures("trading_enabled")
@@ -1327,7 +1451,78 @@ def test_entry_limits_do_not_block_exits_cancellation_reconciliation_or_recovery
 
 
 @pytest.mark.usefixtures("trading_enabled")
-def test_guarded_sell_all_ttl_reprices_use_fresh_ids_and_consume_emergency_cap(
+def test_guarded_hard_stop_exits_gap_with_trade_only_feed_and_retries_until_flat(
+    tmp_path, monkeypatch
+):
+    runtime, broker, _gateway, engine, market_data = _make_runtime(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        broker, "get_positions", lambda **kwargs: {
+            "overseas": {"holdings": [{"symbol": "AAPL", "quantity": 12, "orderable_quantity": 12}]}
+        },
+    )
+    card = _persist_owned_card(engine, _card(
+        board_status=BoardStatus.OPEN_POSITION,
+        position_runtime_status=PositionRuntimeStatus.OPEN,
+        broker_quantity=12, orderable_quantity=12,
+        active_stop_price=301.19, market_data_last_trusted_price=304.52,
+    ))
+    market_data._quote_fetcher = lambda symbol: QuoteSnapshot(symbol=symbol, last_price=299.0)
+    market_data.subscribe([card.symbol])
+    market_data.poll_once()
+    monkeypatch.setattr(
+        market_data, "is_symbol_execution_ready",
+        lambda symbol, *, require_trade=True, require_quote=True, **kwargs: not require_quote,
+    )
+    runtime.trading_engine.evaluate_quote([card], market_data.latest_quote(card.symbol))
+    current_time = [datetime.now(timezone.utc)]
+    runtime.trading_engine._clock = lambda: current_time[0]
+    broker.queue_acceptance(broker_order_id="STOP-1")
+    runtime.trading_engine.run_heartbeat([card])
+    assert broker.submit_calls[0]["limit_price"] == pytest.approx(299.0 * 0.995)
+    assert fetch_execution_order(engine, card.exit_client_order_id).intent == OrderIntent.STOP_LOSS
+    assert trade_card_repository.get_trade_card(engine, "PROD", "1", "AAPL").stop_loss_triggered
+
+    # Feed loss after the breach cannot exhaust the old three-attempt cap.
+    monkeypatch.setattr(market_data, "is_symbol_execution_ready", lambda *args, **kwargs: False)
+    for number in (2, 3, 4, 5):
+        current_time[0] += timedelta(seconds=execution_config.SELL_ALL_ATTEMPT_TTL_SECONDS + 1)
+        broker.queue_cancel_confirmed()
+        broker.queue_acceptance(broker_order_id=f"STOP-{number}")
+        runtime.trading_engine.run_heartbeat([card])
+        assert len(broker.submit_calls) == number
+        assert card.exit_attempt_count == number
+        assert fetch_execution_order(engine, card.exit_client_order_id).intent == OrderIntent.STOP_LOSS
+    prices = [call["limit_price"] for call in broker.submit_calls]
+    assert all(later < earlier for earlier, later in zip(prices, prices[1:]))
+    assert card.exit_all_required is True
+
+    record = fetch_execution_order(engine, card.exit_client_order_id)
+    plan = reduce_account_reconciliation(
+        AccountBrokerSnapshot(
+            environment="PROD", account_no="1",
+            completeness=SnapshotCompleteness(
+                holdings_complete=True, open_orders_complete=True,
+                history_complete=True, reserved_orders_complete=True,
+                account_balance_complete=True,
+            ),
+            holdings=(), orders=(BrokerOrderStatusSnapshot(
+                environment="PROD", account_no="1", symbol="AAPL",
+                broker_order_id=record.broker_order_id, side=OrderSide.SELL,
+                status=OrderStatus.FILLED, quantity_requested=12,
+                filled_quantity=12, remaining_quantity=0, avg_fill_price=prices[-1],
+            ),), observed_at=current_time[0],
+        ),
+        AccountLocalState(cards=(card,), execution_orders=(record,)),
+    )
+    flat = plan.card_updates[0]
+    assert flat.board_status == BoardStatus.CLOSED
+    assert flat.broker_quantity == 0
+    assert flat.stop_loss_triggered is False
+    assert flat.exit_all_required is False
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_guarded_sell_all_ttl_reprices_use_fresh_ids_beyond_emergency_cap(
     tmp_path, monkeypatch
 ):
     monkeypatch.setattr(execution_config, "EMERGENCY_EXIT_MAX_REPRICE_ATTEMPTS", 3)
@@ -1395,23 +1590,54 @@ def test_guarded_sell_all_ttl_reprices_use_fresh_ids_and_consume_emergency_cap(
     assert [record.attempt_number for record in records] == [1, 2, 3]
     assert len({record.attempt_group_id for record in records}) == 1
 
-    # Cancelling attempt 3 leaves shares, but no fourth emergency submission
-    # may cross the broker boundary after the configured cap is consumed.
+    # A full liquidation must continue after the old three-attempt cutoff.
     current_time[0] += timedelta(
         seconds=execution_config.SELL_ALL_ATTEMPT_TTL_SECONDS + 1
     )
     broker.queue_cancel_confirmed()
+    broker.queue_acceptance(broker_order_id="B-EXIT-4")
     runtime.trading_engine.run_heartbeat([card])
 
-    assert len(broker.submit_calls) == 3
-    assert card.exit_attempt_count == 3
-    assert card.exit_client_order_id == ""
-    assert "retry limit reached" in card.last_exit_error
+    assert len(broker.submit_calls) == 4
+    assert card.exit_attempt_count == 4
+    assert card.exit_client_order_id not in submitted_ids
+    assert not card.last_exit_error
 
-    current_time[0] = card.next_exit_retry_at + timedelta(milliseconds=1)
     runtime.trading_engine.run_heartbeat([card])
-    assert len(broker.submit_calls) == 3
-    assert card.exit_attempt_count == 3
+    assert len(broker.submit_calls) == 4
+    assert card.exit_attempt_count == 4
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_guarded_sell_all_uses_fresh_broker_price_after_feed_loss(tmp_path, monkeypatch):
+    runtime, broker, _gateway, engine, market_data = _make_runtime(tmp_path, monkeypatch)
+    monkeypatch.setattr(broker, "get_positions", lambda **kwargs: {
+        "overseas": {"holdings": [{
+            "symbol": "AAPL", "quantity": 16, "available_quantity": 16,
+            "current_price": 198.21,
+        }]},
+    })
+    card = _persist_owned_card(engine, _card(
+        board_status=BoardStatus.SELL_ALL,
+        position_runtime_status=PositionRuntimeStatus.LIQUIDATING,
+        broker_quantity=16, orderable_quantity=16, exit_all_required=True,
+        exit_attempt_count=3, active_stop_price=201.3,
+        market_data_last_trusted_price=212.0,
+    ))
+    market_data.subscribe([card.symbol])
+    market_data.poll_once()
+    market_data._connected = False
+    broker.queue_acceptance(broker_order_id="FRESH-STOP")
+
+    runtime.trading_engine.run_heartbeat([card])
+
+    assert len(broker.submit_calls) == 1
+    assert broker.submit_calls[0]["quantity"] == 16
+    assert broker.submit_calls[0]["limit_price"] == pytest.approx(198.21 * 0.98)
+    assert card.market_data_last_trusted_price == 198.21
+    assert card.stop_loss_triggered is True
+    assert card.exit_attempt_count == 4
+    assert fetch_execution_order(engine, card.exit_client_order_id).intent == OrderIntent.STOP_LOSS
 
 
 @pytest.mark.usefixtures("trading_enabled")

@@ -34,3 +34,5 @@ processes and support termination/recovery reporting.
 Physical S3 wake/resume and credentialed post-resume recovery remain operational
 validation tasks. Test them with Live Trading off before relying on unattended
 operation.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](../opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

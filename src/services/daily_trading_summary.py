@@ -303,6 +303,16 @@ _SNAPSHOT_FIELDS = (
     "entry_orb_high",
     "entry_orb_low",
     "entry_trigger",
+    "entry_client_order_id",
+    "entry_attempt_group_id",
+    "entry_order_generation",
+    "entry_parent_intent_id",
+    "entry_range_closed_at",
+    "entry_breakout_confirmed_at",
+    "entry_execution_price",
+    "entry_orb_score",
+    "active_stop_price",
+    "is_ep",
     "broker_quantity",
     "orderable_quantity",
     "average_entry_price",
@@ -396,6 +406,21 @@ def _load_events(engine: Engine, *, through_date: dt.date) -> list[dict[str, Any
                 "payload": payload,
             }
         )
+    return events
+
+
+def load_trade_journal_events(engine: Engine, session_date: dt.date) -> list[dict[str, Any]]:
+    """Load one session's factual plan history for the private journal."""
+    table = ensure_daily_trading_events_table(engine)
+    with coordination_read_connection(engine) as conn:
+        rows = conn.execute(
+            select(table).where(table.c.session_date == session_date)
+            .order_by(table.c.occurred_at, table.c.id)
+        ).mappings().all()
+    events = []
+    for row in rows:
+        payload = json.loads(row["payload"] or "{}")
+        events.append({**dict(row), "payload": payload})
     return events
 
 

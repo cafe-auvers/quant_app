@@ -31,3 +31,5 @@
 | Standby ready | Dependencies are healthy and handoff-ready, but this runtime is not the active owner |
 | Unknown submission state | Broker outcome is ambiguous; never safe to retry blindly |
 | Watchlist | Passive persisted planning stage; no dedicated tab |
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](../opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

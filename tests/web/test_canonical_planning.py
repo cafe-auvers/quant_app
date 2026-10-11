@@ -3,16 +3,57 @@ from __future__ import annotations
 import datetime as dt
 import json
 from dataclasses import replace
+from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event, text
 
 from src.core.trade_card_state import BoardStatus, TradeCardState
+from src.core.exit_policy import market_session_date
 from src.utils.market_calendar import current_or_next_nyse_session_date
 from src.web.api import build_services, create_api_app
 from src.web.canonical_planning import CanonicalPlanningSource
+from src.web import canonical_planning
+
+
+from src.services.monitor_equity import publish_monitor_equity
 
 from .conftest import login
+
+
+def test_canonical_source_reports_supabase_or_unavailable():
+    engine = SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
+    source = CanonicalPlanningSource(enabled=True, engine=engine)
+    assert source.source_name == "CANONICAL_SUPABASE"
+    assert CanonicalPlanningSource(enabled=True).source_name == "CANONICAL_UNAVAILABLE"
+
+
+@pytest.mark.parametrize("read_only", [True, False])
+def test_web_coordination_rejects_retired_backend_before_connecting(
+    tmp_path, monkeypatch, read_only
+):
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "runtime.json").write_text(
+        json.dumps({
+            "COORD_DB_BACKEND": "mysql",
+            "COORD_DB_HOST": "retired.example",
+            "COORD_DB_NAME": "quant_coordination",
+        }),
+        encoding="utf-8",
+    )
+    (tmp_path / ".env").write_text(
+        "COORD_DB_USER=test\nCOORD_DB_PASSWORD=test\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        canonical_planning, "create_coordination_connection_engine",
+        lambda *_args, **_kwargs: pytest.fail("Retired web backend must not connect"),
+    )
+    with pytest.raises(ValueError, match="requires COORD_DB_BACKEND=postgresql"):
+        if read_only:
+            canonical_planning._build_read_engine(tmp_path)
+        else:
+            canonical_planning.build_canonical_write_engine(tmp_path)
 
 
 def canonical_source(tmp_path) -> CanonicalPlanningSource:
@@ -130,8 +171,159 @@ def test_canonical_projection_preserves_independent_memberships(tmp_path):
     source.close()
 
 
-def test_unchanged_board_checks_revision_without_redownloading_payloads(tmp_path):
+def test_board_details_project_only_public_card_facts(tmp_path):
     source = canonical_source(tmp_path)
+    now = dt.datetime.now(dt.timezone.utc)
+    card = TradeCardState(
+        environment="PROD", account_no="private-account", symbol="DETAIL", risk_percent=0.005,
+        board_status=BoardStatus.PARTIAL_SELL, broker_quantity=100,
+        orderable_quantity=75, average_entry_price=10, active_stop_price=9.5,
+        stop_quantity=100, pending_stop_price=9.8, pending_stop_quantity=100,
+        pending_partial_sell_quantity=25, reserved_sell_quantity=25,
+        entry_execution_price=10.1, entry_breakout_trigger=10.05,
+        entry_remaining_target_quantity=20, next_retry_at=now,
+        next_exit_retry_at=now, market_data_last_trusted_price=10.5,
+        market_data_last_trusted_at=now, entry_client_order_id="private-entry",
+        exit_client_order_id="private-exit",
+    )
+    row = source._project_board_card(card)
+    assert row["risk_percent"] == 0.005
+    assert row["last_reported_price"] == 10.5 and row["price_as_of"] == now.isoformat()
+    assert row["entry_execution_price"] == 10.1 and row["entry_breakout_trigger"] == 10.05
+    assert row["stop_quantity"] == row["pending_stop_quantity"] == 100
+    assert row["entry_remaining_target_quantity"] == 20
+    assert row["reserved_sell_quantity"] == row["pending_partial_sell_quantity"] == 25
+    assert row["next_retry_at"] == row["next_exit_retry_at"] == now.isoformat()
+    assert not any(value.startswith("private-") for value in row.values() if isinstance(value, str))
+    empty = source._project_board_card(TradeCardState(environment="PROD", account_no="a", symbol="EMPTY"))
+    assert empty["last_reported_price"] is None and empty["price_as_of"] is None
+    source.close()
+
+
+@pytest.mark.parametrize("stage,quantity,remaining,average,status", [
+    (BoardStatus.BUY_TODAY, 0, 10, 0, ""),
+    (BoardStatus.ENTRY_PENDING, 0, 10, 0, "ENTRY_PENDING"),
+    (BoardStatus.OPEN_POSITION, 3, 7, 12.5, "PARTIALLY_BOUGHT"),
+    (BoardStatus.OPEN_POSITION, 10, 0, 12.5, "BOUGHT"),
+    (BoardStatus.SELL_ALL, 10, 0, 12.5, "BOUGHT"),
+    (BoardStatus.CLOSED, 0, 0, 12.5, "SOLD"),
+    (BoardStatus.CLOSED, 0, 0, 0, ""),
+])
+def test_planning_purchase_status_requires_confirmed_shares(
+    tmp_path, stage, quantity, remaining, average, status
+):
+    source = canonical_source(tmp_path)
+    card = TradeCardState(
+        environment="PROD", account_no="private-account", symbol="FILL",
+        board_status=stage, session_date=current_or_next_nyse_session_date(),
+        broker_quantity=quantity, entry_remaining_target_quantity=remaining,
+        average_entry_price=average,
+    )
+    before = card.to_dict()
+    row = source._project(card)
+    assert row["purchase_status"] == status
+    assert row["broker_quantity"] == quantity
+    assert row["average_entry_price"] == (average or None)
+    assert row["buy_today_member"] == (stage == BoardStatus.BUY_TODAY)
+    assert "account_no" not in row and "environment" not in row
+    assert card.to_dict() == before
+    source.close()
+
+
+def test_buy_today_display_keeps_current_session_entries_without_execution_intent(tmp_path, monkeypatch):
+    source = canonical_source(tmp_path)
+    current = current_or_next_nyse_session_date()
+    cards = [
+        TradeCardState(
+            environment="PROD", account_no="a", symbol=symbol,
+            board_status=stage, session_date=session,
+            broker_quantity=quantity, average_entry_price=average,
+            entry_remaining_target_quantity=remaining,
+        )
+        for symbol, stage, session, quantity, remaining, average in (
+            ("WAIT", BoardStatus.BUY_TODAY, current, 0, 10, 0),
+            ("ENTRY", BoardStatus.ENTRY_PENDING, current, 0, 10, 0),
+            ("PART", BoardStatus.OPEN_POSITION, current, 3, 7, 12.5),
+            ("FILL", BoardStatus.OPEN_POSITION, current, 10, 0, 12.5),
+            ("SOLD", BoardStatus.CLOSED, current, 0, 0, 12.5),
+            ("OLDER", BoardStatus.OPEN_POSITION, current-dt.timedelta(days=1), 10, 0, 12.5),
+            ("NEVER", BoardStatus.CLOSED, current, 0, 0, 0),
+        )
+    ]
+    before = [card.to_dict() for card in cards]
+    monkeypatch.setattr(source, "_load_snapshot", lambda **_kwargs: SimpleNamespace(cards=cards, revision="test"))
+    rows = source.list_buy_today()["rows"]
+    assert [row["symbol"] for row in rows] == ["ENTRY", "FILL", "PART", "SOLD", "WAIT"]
+    assert [row["symbol"] for row in rows if row["buy_today_member"]] == ["WAIT"]
+    assert [row["symbol"] for row in source.list_plans("BUY_TODAY")["rows"]] == ["WAIT"]
+    assert source.get_plan("SOLD")["card"]["purchase_status"] == "SOLD"
+    assert [card.to_dict() for card in cards] == before
+    source.close()
+
+
+@pytest.mark.parametrize("case", ["fresh", "stale", "future", "wrong_account", "zero", "missing"])
+def test_board_nav_uses_only_the_matching_fresh_account_snapshot(case, tmp_path):
+    source = canonical_source(tmp_path)
+    source.equity_path = tmp_path / "monitor_equity.json"
+    now = dt.datetime.now(dt.timezone.utc)
+    if case != "missing":
+        publish_monitor_equity(source.equity_path, SimpleNamespace(
+            environment="PROD", account_no="other-account" if case == "wrong_account" else "account-a",
+            total_equity_usd=0 if case == "zero" else 10_000,
+            received_at=now + dt.timedelta(seconds=1_000 if case == "future" else -1_000 if case == "stale" else 0),
+        ))
+    result = source.list_board()
+    if case == "fresh":
+        assert result["account_nav_usd"] == 10_000
+        assert result["account_nav_as_of"] == now.isoformat()
+        assert result["account_nav_note"] == ""
+    else:
+        assert result["account_nav_usd"] is None and result["account_nav_as_of"] is None
+        assert result["account_nav_note"]
+    assert "account-a" not in json.dumps(result)
+    source.close()
+
+
+def test_board_nav_refreshes_without_changing_card_revisions(tmp_path):
+    source = canonical_source(tmp_path)
+    source.equity_path = tmp_path / "monitor_equity.json"
+    now = dt.datetime.now(dt.timezone.utc)
+    for amount in (10_000, 12_000):
+        publish_monitor_equity(source.equity_path, SimpleNamespace(
+            environment="PROD", account_no="account-a", total_equity_usd=amount, received_at=now,
+        ))
+        result = source.list_board()
+        assert result["account_nav_usd"] == amount
+        if amount == 10_000:
+            revision = result["revision"]
+        else:
+            assert result["revision"] == revision
+    source.close()
+
+
+def test_unchanged_board_checks_revision_without_redownloading_payloads(tmp_path, monkeypatch):
+    from src.services import coordination_snapshot as snapshots
+
+    source = canonical_source(tmp_path)
+    transfers = []
+    original_connection = snapshots.coordination_read_connection
+
+    class Connection:
+        def __init__(self, engine):
+            self.connection = original_connection(engine)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.connection.close()
+
+        def execute(self, statement):
+            rows = self.connection.execute(statement).fetchall()
+            transfers.append(rows)
+            return SimpleNamespace(fetchall=lambda: rows)
+
+    monkeypatch.setattr(snapshots, "coordination_read_connection", Connection)
     statements = []
     event.listen(source.engine, "before_cursor_execute", lambda _conn, _cursor, statement, *_args: statements.append(statement))
     original = source.list_plans()
@@ -145,10 +337,32 @@ def test_unchanged_board_checks_revision_without_redownloading_payloads(tmp_path
     statements.clear()
     changed = source.list_plans()
     assert changed["revision"] != original["revision"]
-    assert any("SELECT payload" in statement for statement in statements)
+    assert len(transfers[-1]) == 1
+    assert transfers[-1][0].symbol == "AAPL"
     statements.clear()
     source.list_plans(force=True)
-    assert any("SELECT payload" in statement for statement in statements)
+    assert len(statements) == 1  # forced reads still prove canonical freshness
+    assert transfers[-1] == []
+    source.close()
+
+
+def test_mobile_buylist_shows_current_session_rejection_without_stale_history(tmp_path):
+    source = canonical_source(tmp_path)
+    card = TradeCardState(
+        environment="PROD", account_no="account-a", symbol="ODD",
+        board_status=BoardStatus.BUYLIST,
+        buy_today_note="Buy Today rejected - all ORB plans invalid.",
+        last_buy_today_session_date=market_session_date(),
+    )
+    statements = []
+    event.listen(source.engine, "before_cursor_execute", lambda _c, _cur, sql, *_a: statements.append(sql))
+    assert source._project_board_card(card)["buy_today_note"] == card.buy_today_note
+    card.last_buy_today_session_date -= dt.timedelta(days=1)
+    assert source._project_board_card(card)["buy_today_note"] == ""
+    card.last_buy_today_session_date = market_session_date()
+    card.board_status = BoardStatus.BUY_TODAY
+    assert source._project_board_card(card)["buy_today_note"] == ""
+    assert statements == []
     source.close()
 
 
@@ -179,7 +393,34 @@ def test_connected_api_returns_canonical_rows_and_never_local_sandbox_rows(
     assert {row["symbol"] for row in planning["rows"]} == {"AAPL", "MSFT", "NVDA"}
     assert [row["symbol"] for row in buy_today["rows"]] == ["NVDA"]
     assert current["card"]["breakout_price"] == 520.0
-    assert current["card"]["source"] == "CANONICAL_TIDB"
+    assert current["card"]["source"] == "CANONICAL_LOCAL"
+
+
+def test_connected_buy_today_api_retains_bought_card_as_read_only_display(
+    web_config, tmp_path, monkeypatch
+):
+    connected = replace(web_config, mode="CONNECTED")
+    services = build_services(connected)
+    source = canonical_source(tmp_path)
+    services.canonical_planning = source
+    card = TradeCardState(
+        environment="PROD", account_no="private-account", symbol="FILL",
+        board_status=BoardStatus.OPEN_POSITION,
+        session_date=current_or_next_nyse_session_date(),
+        broker_quantity=10, average_entry_price=12.5,
+    )
+    monkeypatch.setattr(source, "_load_snapshot", lambda **_kwargs: SimpleNamespace(cards=[card], revision="test"))
+    services.auth.bootstrap_user("owner", "correct horse battery staple")
+    before = card.to_dict()
+    with TestClient(create_api_app(connected, services=services), base_url="http://localhost:8080") as client:
+        login(client)
+        rows = client.get("/api/v1/buy-today-drafts").json()["rows"]
+        selected = client.get("/api/v1/planning/FILL").json()["card"]
+    assert len(rows) == 1 and rows[0]["symbol"] == "FILL"
+    assert rows[0]["purchase_status"] == selected["purchase_status"] == "BOUGHT"
+    assert rows[0]["broker_quantity"] == 10 and rows[0]["average_entry_price"] == 12.5
+    assert rows[0]["buy_today_member"] is False and rows[0]["buy_today_display_member"] is True
+    assert "account_no" not in rows[0] and card.to_dict() == before
 
 
 def test_connected_buy_today_preview_is_shared_but_never_published(

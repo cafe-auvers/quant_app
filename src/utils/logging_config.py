@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
@@ -24,7 +25,7 @@ def configure_logging(
     target = Path(log_file or DEFAULT_LOG_FILE)
     target.parent.mkdir(parents=True, exist_ok=True)
 
-    console_handler = logging.StreamHandler()
+    console_handler = logging.StreamHandler(sys.stderr) if sys.stderr is not None else None
     file_handler = RotatingFileHandler(
         target,
         maxBytes=5 * 1024 * 1024,
@@ -32,11 +33,12 @@ def configure_logging(
         encoding="utf-8",
     )
     formatter = logging.Formatter(LOG_FORMAT)
-    console_handler.setFormatter(formatter)
+    if console_handler is not None:
+        console_handler.setFormatter(formatter)
     file_handler.setFormatter(formatter)
 
     logging.basicConfig(
         level=log_level,
-        handlers=[console_handler, file_handler],
+        handlers=[handler for handler in (console_handler, file_handler) if handler is not None],
         force=True,
     )

@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Protocol
 
 from src.api import kis_account_snapshot_dual, kis_order
+from src.core.broker_order_history import authoritative_order_history
 from src.core.order_state import (
     REGULAR_LIMIT_EXECUTION,
     RESERVED_MOO_EXECUTION,
@@ -198,6 +199,9 @@ class ReadOnlyBroker:
     def get_positions(self, **kwargs):
         return self._delegate.get_positions(**kwargs)
 
+    def get_buying_power(self, **kwargs):
+        return self._delegate.get_buying_power(**kwargs)
+
 
 class KisBroker:
     """``Broker`` implementation backed by the real KIS overseas order API."""
@@ -328,7 +332,9 @@ class KisBroker:
             if is_reserved
             else kis_order.query_overseas_order
         )
-        return query_fn(environment=environment, account_no=account_no, **kwargs)
+        return authoritative_order_history(
+            query_fn(environment=environment, account_no=account_no, **kwargs)
+        )
 
     @staticmethod
     def _authoritative_snapshots(
@@ -406,11 +412,17 @@ class KisBroker:
                 snapshot.remaining_quantity,
             )
             by_key[key] = snapshot
-        result.snapshots = list(by_key.values())
+        result.snapshots = authoritative_order_history(list(by_key.values()))
         result.open_orders_complete = regular_complete
         result.history_complete = regular_complete
         result.reserved_orders_complete = reserved_complete
         return result
+
+    def get_buying_power(self, *, environment: str, account_no: str, symbol: str,
+                         exchange: str, limit_price: float) -> Dict[str, Any]:
+        config = kis_account_snapshot_dual.load_config(kis_account_snapshot_dual.KisEnvironment(environment), account_no_override=account_no)
+        client = kis_account_snapshot_dual.KisAccountClient(config)
+        return client.get_overseas_buying_power(symbol=symbol, exchange=exchange, limit_price=limit_price)
 
     def get_positions(
         self,

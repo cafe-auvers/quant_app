@@ -23,6 +23,7 @@ from src.risk.orb_position import (
     validate_orb_position_values,
 )
 from src.strategy.orb.entry_policy import build_passive_pullback_plan
+from src.core.opening_liquidity import opening_liquidity_rejection
 
 
 ORB_RISK_CASES: Tuple[float, ...] = (
@@ -278,6 +279,17 @@ def build_orb_position_combinations(
             )
 
             invalid_reasons: list[str] = []
+            if status in {
+                OrbCandidateStatus.WAITING_BREAKOUT,
+                OrbCandidateStatus.VALID,
+                OrbCandidateStatus.EXECUTE_READY,
+            }:
+                liquidity_reason = opening_liquidity_rejection(
+                    getattr(candidate, "opening_volume", None),
+                    getattr(candidate, "opening_volume_minutes", 0),
+                )
+                if liquidity_reason:
+                    invalid_reasons.append(liquidity_reason)
             if snapshot_stale or window in stale_window_set:
                 status = OrbCandidateStatus.NOT_AVAILABLE
                 invalid_reasons.append(
@@ -347,14 +359,14 @@ def build_orb_position_combinations(
             ):
                 invalid_reasons.append("Execution/stop geometry is invalid")
             invalid_reasons.extend(
-                validate_orb_position_values(sizing, adr_percent)
+                validate_orb_position_values(sizing, adr_percent, is_ep=queue_item.is_ep)
             )
             # Preserve order while removing duplicate explanations.
             invalid_reasons = list(dict.fromkeys(invalid_reasons))
             valid = not invalid_reasons and is_orb_position_plan_valid(
-                sizing, adr_percent
+                sizing, adr_percent, is_ep=queue_item.is_ep
             )
-            score = score_orb_position_recommendation(sizing, risk_percent)
+            score = score_orb_position_recommendation(sizing, risk_percent, is_ep=queue_item.is_ep)
             reason = (
                 "; ".join(invalid_reasons)
                 if invalid_reasons

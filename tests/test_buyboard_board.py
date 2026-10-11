@@ -994,6 +994,7 @@ def test_dragging_partial_sell_to_open_dispatches_partial_withdrawal(tmp_path, m
 
 
 def test_drop_uses_rendered_projection_without_database_read(monkeypatch):
+    monkeypatch.setattr(board_module.dialogs, "prompt_buy_today_profile", lambda *_args: False)
     card = _card(board_status=BoardStatus.BUYLIST, version=4)
     projection = BoardCardProjection(card=card)
     window = _FakeMainWindow(engine=object(), cards=[card])
@@ -1207,6 +1208,21 @@ def test_equivalent_refresh_reuses_widget_and_updates_payload_and_quote():
     assert column.itemWidget(column.item(0)) is widget
     assert column.item(0).data(Qt.UserRole)["version"] == 8
     assert "+10.00%" in widget._info_label.text()
+
+
+def test_change_in_one_card_does_not_rebuild_the_other_cards():
+    _ensure_app()
+    column = BoardColumnList(BoardStatus.OPEN_POSITION, lambda *_args: None)
+    first = _card(symbol="AAPL", board_status=BoardStatus.OPEN_POSITION, broker_quantity=10)
+    second = _card(symbol="MSFT", board_status=BoardStatus.OPEN_POSITION, broker_quantity=10)
+    column.set_cards([first, second])
+    untouched = column.itemWidget(column.item(1))
+    refreshed = copy.deepcopy(first)
+    refreshed.version += 1
+    refreshed.active_stop_price = 99.0
+    assert column.set_cards([refreshed, second])
+    assert column.itemWidget(column.item(1)) is untouched
+    assert column.item(0).data(Qt.UserRole)["version"] == refreshed.version
 
 
 def test_card_width_tracks_column_without_horizontal_scrolling():

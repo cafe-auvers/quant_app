@@ -35,6 +35,7 @@ from .connected_operator import (
     ConnectedOperatorUnavailable,
 )
 from .market_data import MarketDataUnavailable, MarketDataSource, build_market_data_source
+from .hourly_source import build_pc_hourly_reader
 from .market_status import nyse_market_status
 from .live_updates import LiveUpdateHub
 from .intraday_monitor import IntradayMonitor
@@ -145,6 +146,10 @@ def build_services(config: WebConfig) -> WebServices:
     market = build_market_data_source(
         config.resolved_local_mirror_path,
         scanner_setups_path=scanner_setups_path,
+        hourly_reader=(
+            build_pc_hourly_reader(config.resolved_pc_repository)
+            if config.pc_hourly_reads else None
+        ),
     )
     cache = ChartBundleCache(
         config.cache_dir, max_symbols=config.chart_cache_max_symbols
@@ -207,6 +212,7 @@ class BuyTodayOperatorRequest(BaseModel):
     command_id: str = Field(min_length=32, max_length=40)
     expected_revision: int = Field(ge=1)
     enabled: bool
+    is_ep: bool = False
 
 
 class BoardOperatorRequest(BaseModel):
@@ -218,6 +224,7 @@ class BoardOperatorRequest(BaseModel):
     quantity: int | None = Field(default=None, ge=1)
     price: float | None = Field(default=None, gt=0)
     target_priority: int | None = None
+    is_ep: bool = False
 
 
 class PublishTodayPlanRequest(BaseModel):
@@ -240,6 +247,10 @@ class OrbSettingsUpdateRequest(BaseModel):
     stop_adr_min_percent: float = Field(ge=0, le=1000)
     stop_adr_ideal_percent: float = Field(ge=0, le=1000)
     stop_adr_max_percent: float = Field(ge=0, le=1000)
+    ep_stop_adr_min_percent: float = Field(default=50, ge=0, le=1000)
+    ep_stop_adr_ideal_percent: float = Field(default=100, ge=0, le=1000)
+    ep_stop_adr_max_percent: float = Field(default=150, ge=0, le=1000)
+    opening_min_shares_per_minute: float = Field(default=200, ge=0)
 
 
 class DrawingCreateRequest(BaseModel):
@@ -940,6 +951,7 @@ def register_api_routes(app: FastAPI, services: WebServices) -> None:
             "symbol": str(symbol or "").strip().upper(),
             "expected_revision": int(payload.expected_revision),
             "enabled": bool(payload.enabled),
+            "is_ep": payload.is_ep,
         }
         replay = await anyio.to_thread.run_sync(
             lambda: services.store.connected_command_replay(
@@ -955,6 +967,7 @@ def register_api_routes(app: FastAPI, services: WebServices) -> None:
                 symbol=symbol,
                 expected_revision=payload.expected_revision,
                 enabled=payload.enabled,
+                is_ep=payload.is_ep,
             )
         )
         recorded = await anyio.to_thread.run_sync(
@@ -1036,16 +1049,12 @@ def register_api_routes(app: FastAPI, services: WebServices) -> None:
         from src.risk.orb_position import OrbSettings
 
         settings_values = payload.model_dump(
-            exclude={"command_id", "expected_revision"}
+            exclude={"command_id", "expected_revision"}, exclude_unset=True
         )
-        try:
-            settings = OrbSettings(**settings_values)
-        except ValueError as exc:
-            raise ValidationError(str(exc)) from exc
         command_payload = {
             "operation": "update_orb_settings",
             "expected_revision": int(payload.expected_revision),
-            **settings.to_dict(),
+            **settings_values,
         }
         replay = await anyio.to_thread.run_sync(
             lambda: services.store.connected_command_replay(
@@ -1055,6 +1064,13 @@ def register_api_routes(app: FastAPI, services: WebServices) -> None:
         )
         if replay is not None:
             return replay
+        current = await anyio.to_thread.run_sync(
+            services.connected_operator.orb_settings_snapshot
+        )
+        try:
+            settings = OrbSettings(**{**current["settings"], **settings_values})
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
         result = await anyio.to_thread.run_sync(
             lambda: services.connected_operator.update_orb_settings(
                 expected_revision=payload.expected_revision,
@@ -1099,6 +1115,7 @@ def register_api_routes(app: FastAPI, services: WebServices) -> None:
                 quantity=payload.quantity,
                 price=payload.price,
                 target_priority=payload.target_priority,
+                is_ep=payload.is_ep,
             )
         )
         recorded = await anyio.to_thread.run_sync(
@@ -1240,6 +1257,8 @@ async def web_services_lifespan(app: FastAPI):
         services.monitor.close()
         services.connected_planning.close()
         services.canonical_planning.close()
+        if callable(getattr(services.market, "close", None)):
+            services.market.close()
 
 
 def create_api_app(

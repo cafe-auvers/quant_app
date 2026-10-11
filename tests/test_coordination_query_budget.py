@@ -1,12 +1,17 @@
 """Regression limits for routine shared-coordination reads.
 
-TiDB bills transaction work.  Read-only polling helpers must therefore use a
+Read-only polling helpers avoid transaction overhead by using a
 connection scope, not a committing transaction scope.  The safety-critical
 write paths keep their explicit transactions in their own repository tests.
 """
 from __future__ import annotations
 
+import datetime as dt
+import json
+
 from sqlalchemy import create_engine, event, inspect
+from sqlalchemy.exc import OperationalError
+import pytest
 
 from src.core import execution_config
 from src.core.runtime_readiness import RuntimeDeviceState
@@ -43,14 +48,14 @@ def test_cloud_coordination_poll_floors_preserve_monthly_budget():
     assert execution_config.COORDINATION_REMOTE_FALLBACK_SECONDS >= 3600.0
     assert execution_config.COORDINATION_RECONCILIATION_CACHE_SECONDS >= 900.0
     assert execution_config.EXTERNAL_WATCHDOG_HEARTBEAT_SECONDS <= 5.0
-    assert execution_config.EXTERNAL_WATCHDOG_TIDB_AUDIT_SECONDS >= 3600.0
+    assert execution_config.EXTERNAL_WATCHDOG_COORDINATION_AUDIT_SECONDS >= 3600.0
     assert execution_config.EXTERNAL_ALERT_ACK_REMINDER_SECONDS >= 3600.0
     assert execution_config.PENDING_ORDER_RECONCILIATION_SECONDS >= 2
     assert execution_config.UNKNOWN_ORDER_RECONCILIATION_SECONDS >= 1
     assert execution_config.DURABLE_ORDER_OBSERVATION_SECONDS >= 3600
 
 
-def test_typed_change_pulse_profile_has_large_headroom_below_nine_ru_per_second():
+def test_typed_change_pulse_profile_preserves_scheduled_request_envelope():
     """Lock the documented two-device scheduled-request envelope."""
 
     month_seconds = 30 * 24 * 60 * 60
@@ -70,13 +75,13 @@ def test_typed_change_pulse_profile_has_large_headroom_below_nine_ru_per_second(
             / execution_config.COORDINATION_REMOTE_FALLBACK_SECONDS,
             month_seconds
             / execution_config.COORDINATION_OWNERSHIP_PROOF_SECONDS,
-            # Two alert consumers plus hourly TiDB evidence for the fast
+            # Two alert consumers plus hourly audit evidence for the fast
             # external-webhook pulses.
             2 * month_seconds
             / execution_config.COORDINATION_ALERT_POLL_SECONDS,
             2
             * month_seconds
-            / execution_config.EXTERNAL_WATCHDOG_TIDB_AUDIT_SECONDS,
+            / execution_config.EXTERNAL_WATCHDOG_COORDINATION_AUDIT_SECONDS,
             # Two board projections plus five compact state-sync request
             # slots use the same missed-notification recovery fallback.
             7
@@ -86,12 +91,7 @@ def test_typed_change_pulse_profile_has_large_headroom_below_nine_ru_per_second(
             # remain in process until an actual local/remote DML pulse.
         )
     )
-    conservative_ru_per_second = (
-        scheduled_requests * 1.25 * 8.0 / month_seconds
-    )
-
     assert scheduled_requests <= 300_000
-    assert conservative_ru_per_second <= 1.2
 
 
 def test_idle_operator_command_poll_uses_covering_index_without_commit(tmp_path):
@@ -130,6 +130,51 @@ def test_idle_operator_command_poll_uses_covering_index_without_commit(tmp_path)
     )
     assert sum("FROM OPERATOR_COMMANDS" in statement for statement in statements) == 1
     assert commits == []
+
+
+def test_status_command_history_omits_payloads_and_remains_fresh(tmp_path, monkeypatch):
+    from src.services import operator_commands as commands
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'command_history.db'}")
+    table = commands.ensure_operator_commands_table(engine)
+    timestamp = dt.datetime(2026, 10, 8)
+    with engine.begin() as connection:
+        connection.execute(table.insert(), [dict(
+            command_id=str(index), idempotency_key=str(index),
+            command_type=commands.OperatorCommandType.ADD_BUY_TODAY.value,
+            symbol=f"S{index}", payload_json=json.dumps({"notes": "x" * 100_000}),
+            status=commands.OperatorCommandStatus.PENDING.value,
+            requested_by_device="laptop", requested_by_host="LAPTOP",
+            created_at=timestamp + dt.timedelta(seconds=index), error_message="",
+        ) for index in range(3)])
+    statements, commits = [], []
+    event.listen(engine, "before_cursor_execute", lambda _conn, _cursor, sql, *_args: statements.append(sql))
+    event.listen(engine, "commit", lambda _conn: commits.append(True))
+    history = commands.list_operator_command_summaries(engine, limit=2)
+    assert [item.command_id for item in history] == ["2", "1"]
+    assert history[0].created_at.tzinfo == dt.timezone.utc
+    assert not hasattr(history[0], "payload")
+    assert len(statements) == 1 and "payload_json" not in statements[0]
+    assert commits == []
+    peer = create_engine(engine.url)
+    with peer.begin() as connection:
+        connection.execute(table.update().where(table.c.command_id == "2").values(
+            status=commands.OperatorCommandStatus.COMPLETED.value,
+        ))
+        connection.execute(table.delete().where(table.c.command_id == "1"))
+    history = commands.list_operator_command_summaries(engine, limit=2)
+    assert [item.command_id for item in history] == ["2", "0"]
+    assert history[0].status == commands.OperatorCommandStatus.COMPLETED
+    assert len(commands.get_operator_command(engine, "2").payload["notes"]) == 100_000
+
+    def unavailable(_engine):
+        raise OperationalError("SELECT", {}, RuntimeError("unavailable"))
+
+    monkeypatch.setattr(commands, "coordination_read_connection", unavailable)
+    with pytest.raises(OperationalError):
+        commands.list_operator_command_summaries(engine)
+    peer.dispose()
+    engine.dispose()
 
 
 def test_routine_order_repository_reads_emit_no_commits(tmp_path):

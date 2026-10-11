@@ -108,6 +108,8 @@ class _Waiter:
     priority: int
     sequence: int
     released: bool = False
+    protective: bool = False
+    admission_released: bool = False
 
 
 class KisRequestScheduler:
@@ -128,6 +130,7 @@ class KisRequestScheduler:
         backoff_seconds: float = 0.25,
         monotonic: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
+        protective_parallelism: int = 0,
     ) -> None:
         self._policies = {
             RequestKind.READ: read_policy,
@@ -153,6 +156,9 @@ class KisRequestScheduler:
         self._queue: list[tuple[int, int, _Waiter]] = []
         self._sequence = 0
         self._active = False
+        self._protective_parallelism = max(0, min(8, int(protective_parallelism)))
+        self._ordinary_in_flight = 0
+        self._protective_in_flight = 0
         self._last_request_started_at: Optional[float] = None
         self._last_mutation_started_at: Optional[float] = None
         self._requests_not_before_at = 0.0
@@ -350,20 +356,44 @@ class KisRequestScheduler:
     def _acquire_turn(self, priority: RequestPriority) -> _Waiter:
         with self._condition:
             self._sequence += 1
-            waiter = _Waiter(int(priority), self._sequence)
+            protective = bool(self._protective_parallelism and priority in {
+                RequestPriority.EMERGENCY_EXIT, RequestPriority.EXIT_CANCEL_OR_RECONCILIATION,
+                RequestPriority.ENTRY_CANCEL})
+            waiter = _Waiter(int(priority), self._sequence, protective=protective)
             heapq.heappush(self._queue, (waiter.priority, waiter.sequence, waiter))
             self._refresh_queue_metrics_locked()
-            while self._active or self._queue[0][2] is not waiter:
+            def next_admissible():
+                eligible = [item for item in self._queue if (
+                    self._protective_in_flight < self._protective_parallelism if item[2].protective
+                    else self._ordinary_in_flight < 1)]
+                return min(eligible, default=None)
+            while self._active or next_admissible() is None or next_admissible()[2] is not waiter:
                 self._condition.wait()
-            heapq.heappop(self._queue)
+            self._queue.remove((waiter.priority, waiter.sequence, waiter))
+            heapq.heapify(self._queue)
             self._active = True
+            if protective:
+                self._protective_in_flight += 1
+            else:
+                self._ordinary_in_flight += 1
             waiter.released = True
             self._refresh_queue_metrics_locked()
             return waiter
 
-    def _release_turn(self) -> None:
+    def _release_admission(self, waiter) -> None:
         with self._condition:
             self._active = False
+            waiter.admission_released = True
+            self._condition.notify_all()
+
+    def _release_turn(self, waiter) -> None:
+        with self._condition:
+            if not waiter.admission_released:
+                self._active = False
+            if waiter.protective:
+                self._protective_in_flight -= 1
+            else:
+                self._ordinary_in_flight -= 1
             self._refresh_queue_metrics_locked()
             self._condition.notify_all()
 
@@ -411,6 +441,11 @@ class KisRequestScheduler:
         delay = max(0.0, required_at - now)
         if delay > 0:
             self._sleeper(delay)
+        # Another in-flight request can report a broker-wide throttle while
+        # this admission is pacing. Honor the newer deadline before starting.
+        while self._requests_not_before_at > required_at:
+            required_at = self._requests_not_before_at
+            self._sleeper(max(0.0, required_at - self._monotonic()))
         # A deterministic test sleeper need not advance its fake clock. Keep
         # the logical start monotonic while a real sleeper records real time.
         observed = self._monotonic()
@@ -424,7 +459,7 @@ class KisRequestScheduler:
         self._metrics = replace(
             self._metrics,
             queued_requests=len(self._queue),
-            active_requests=1 if self._active else 0,
+            active_requests=self._ordinary_in_flight + self._protective_in_flight,
             highest_waiting_priority=int(highest),
         )
 
@@ -442,7 +477,7 @@ class KisRequestScheduler:
         attempt = 0
         while True:
             attempt += 1
-            self._acquire_turn(priority)
+            waiter = self._acquire_turn(priority)
             try:
                 with self._condition:
                     bucket = self._bucket(RequestKind.READ, account_no, endpoint)
@@ -452,24 +487,27 @@ class KisRequestScheduler:
                         )
                     bucket.remaining -= 1
                 self._wait_for_request_spacing(RequestKind.READ)
+                self._release_admission(waiter)
                 result = operation()
             except Exception as exc:
                 self._defer_for_exception(exc)
                 if attempt >= self._max_read_attempts or not retry_if(exc):
                     raise
-                self._metrics = replace(
-                    self._metrics,
-                    read_retries=self._metrics.read_retries + 1,
-                )
+                with self._condition:
+                    self._metrics = replace(
+                        self._metrics,
+                        read_retries=self._metrics.read_retries + 1,
+                    )
                 delay = self._backoff_seconds * (2 ** (attempt - 1))
             else:
-                self._metrics = replace(
-                    self._metrics,
-                    completed_reads=self._metrics.completed_reads + 1,
-                )
+                with self._condition:
+                    self._metrics = replace(
+                        self._metrics,
+                        completed_reads=self._metrics.completed_reads + 1,
+                    )
                 return result
             finally:
-                self._release_turn()
+                self._release_turn(waiter)
             self._sleeper(delay)
 
     def execute_mutation(
@@ -493,7 +531,7 @@ class KisRequestScheduler:
         attempt = 0
         while True:
             attempt += 1
-            self._acquire_turn(priority)
+            waiter = self._acquire_turn(priority)
             try:
                 self.require_available(
                     command_type,
@@ -504,6 +542,7 @@ class KisRequestScheduler:
                     consume=True,
                 )
                 self._wait_for_request_spacing(RequestKind.MUTATION)
+                self._release_admission(waiter)
                 result = operation()
             except Exception as exc:
                 retry_after = self._defer_for_exception(exc)
@@ -513,32 +552,35 @@ class KisRequestScheduler:
                 except Exception:
                     confirmed = False
                 if not confirmed:
-                    self._metrics = replace(
-                        self._metrics,
-                        ambiguous_mutations_not_retried=(
-                            self._metrics.ambiguous_mutations_not_retried + 1
-                        ),
-                    )
+                    with self._condition:
+                        self._metrics = replace(
+                            self._metrics,
+                            ambiguous_mutations_not_retried=(
+                                self._metrics.ambiguous_mutations_not_retried + 1
+                            ),
+                        )
                     raise
                 if attempt >= self._max_confirmed_mutation_attempts:
                     raise
-                self._metrics = replace(
-                    self._metrics,
-                    confirmed_mutation_retries=(
-                        self._metrics.confirmed_mutation_retries + 1
-                    ),
-                )
+                with self._condition:
+                    self._metrics = replace(
+                        self._metrics,
+                        confirmed_mutation_retries=(
+                            self._metrics.confirmed_mutation_retries + 1
+                        ),
+                    )
                 delay = max(
                     retry_after, self._backoff_seconds * (2 ** (attempt - 1))
                 )
             else:
-                self._metrics = replace(
-                    self._metrics,
-                    completed_mutations=self._metrics.completed_mutations + 1,
-                )
+                with self._condition:
+                    self._metrics = replace(
+                        self._metrics,
+                        completed_mutations=self._metrics.completed_mutations + 1,
+                    )
                 return result
             finally:
-                self._release_turn()
+                self._release_turn(waiter)
             self._sleeper(delay)
 
     def metrics(self) -> SchedulerMetrics:

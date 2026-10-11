@@ -10,6 +10,14 @@ Watchlist records can carry symbol/name, planning price, structural breakout,
 source, notes, and timestamps. Adding a candidate does not create an order or
 arm monitoring.
 
+## Phone Monitor
+
+The bottom Watchlist button opens the Monitor table by default. It covers
+Watchlist-only stocks as well as Buylist and Buy Today, on the existing minute
+refresh. Best ORB requires price, position-bound, and opening-liquidity passes.
+The + button uses normal explicit promotion/publication permissions; reading
+the table does not authorize execution.
+
 ## Buylist
 
 Buylist represents a more committed planning/compatibility stage and supplies
@@ -37,3 +45,5 @@ not interchangeable with local planning labels.
   desktop pulses update the other running surfaces without a manual refresh.
 
 See [Buy Board and Kanban States](Buy-Board-and-Kanban-States).
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](../opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

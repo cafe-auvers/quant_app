@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -15,6 +15,63 @@ from src.core.capital_reservation import (
 from src.services import capital_allocator as allocator
 from src.services import capital_reservation_repository
 from src.risk.portfolio import PortfolioRiskReservationSpec
+
+
+@pytest.mark.parametrize("ack_before_query, exact_identity", [(True, True), (False, True), (True, False)])
+@pytest.mark.parametrize("replacement", [False, True])
+def test_kis_cash_does_not_double_deduct_confirmed_older_buys(tmp_path, ack_before_query, exact_identity, replacement):
+    from src.core.execution_order_record import BrokerIdentityStatus, ExecutionOrderRecord, ExecutionOrderStatus
+    from src.core.order_state import OrderIntent, OrderSide
+    from src.services import execution_order_repository
+
+    engine = _sqlite_engine(tmp_path)
+    capital_reservation_repository.ensure_capital_reservations_table(engine)
+    execution_order_repository.ensure_execution_orders_table(engine)
+    prior = CapitalReservation.create(environment="PROD", account_no="1", symbol="AAPL",
+        attempt_group_id="first", requested_notional=700.0)
+    order = ExecutionOrderRecord(environment="PROD", account_no="1", symbol="AAPL",
+        side=OrderSide.BUY, intent=OrderIntent.ENTRY, client_order_id="first-buy",
+        submitted_quantity=7, remaining_quantity=7, submitted_limit_price=100.0,
+        capital_reservation_id=prior.reservation_id,
+        status=ExecutionOrderStatus.ACKNOWLEDGED if exact_identity else ExecutionOrderStatus.UNKNOWN_SUBMISSION_STATE,
+        broker_identity_status=BrokerIdentityStatus.EXACT if exact_identity else BrokerIdentityStatus.AMBIGUOUS,
+        broker_order_id="confirmed-buy" if exact_identity else "")
+    query_started = datetime(2026, 10, 6, 15, 0)
+    with engine.begin() as conn:
+        capital_reservation_repository.insert_reservation(conn, prior)
+        execution_order_repository.insert_execution_order(conn, order)
+        conn.execute(text("UPDATE execution_orders SET updated_at=:at"),
+            {"at": query_started + timedelta(seconds=-1 if ack_before_query else 1)})
+    second = CapitalReservation.create(environment="PROD", account_no="1", symbol="MSFT",
+        attempt_group_id="second", requested_notional=300.0)
+    if replacement:
+        with engine.begin() as conn:
+            capital_reservation_repository.insert_reservation(conn, second)
+
+    def reserve(conn):
+        if not replacement:
+            return capital_reservation_repository.insert_reservation_if_available(conn, second,
+                buying_power=500.0, broker_observed_at=query_started)
+        spec = PortfolioRiskReservationSpec(environment="PROD", account_no="1", symbol="MSFT",
+            proposed_notional_usd=300.0, proposed_open_risk_usd=30.0, account_equity_usd=10_000.0,
+            baseline_position_symbols=(), baseline_open_risk_usd=0.0, baseline_gross_notional_usd=0.0,
+            baseline_symbol_notional_usd=0.0, max_simultaneous_positions=2,
+            max_total_open_risk_fraction=1.0, max_gross_notional_fraction=1.0,
+            max_single_position_notional_fraction=0.25, evaluated_at=datetime.now(timezone.utc))
+        return capital_reservation_repository.prepare_reservation_for_replacement(conn, second.reservation_id,
+            environment="PROD", account_no="1", symbol="MSFT", replacement_notional=300.0,
+            replacement_open_risk=30.0, buying_power=800.0, portfolio_risk_spec=spec, broker_observed_at=query_started)
+
+    if ack_before_query and exact_identity:
+        with engine.begin() as conn:
+            reserve(conn)
+        assert len(capital_reservation_repository.list_active_reservations(engine,
+            environment="PROD", account_no="1")) == 2
+    else:
+        with pytest.raises(capital_reservation_repository.InsufficientAvailableCapitalError):
+            with engine.begin() as conn:
+                reserve(conn)
+
 
 
 # --- CapitalReservation lifecycle -------------------------------------------

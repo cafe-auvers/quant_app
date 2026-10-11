@@ -32,6 +32,27 @@ from src.services.broker import (
 from src.services.trading_state import TradingDisabledError
 
 
+@pytest.mark.parametrize("price, wire_price", [(211.85, "211.85"), (389.8, "389.8"), (100.0, "100"), (0.3251, "0.3251")])
+def test_kis_buying_power_queries_exact_symbol_exchange_and_price(price, wire_price):
+    client = kis_account_snapshot_dual.KisAccountClient.__new__(kis_account_snapshot_dual.KisAccountClient)
+    client.config = SimpleNamespace(environment=kis_account_snapshot_dual.KisEnvironment.PROD,
+        cano="12345678", account_product_code="01", overseas_currency="USD")
+    calls = []
+    def read(endpoint, **kwargs):
+        calls.append((endpoint, kwargs))
+        return {"output": {"ovrs_ord_psbl_amt": "915.31", "ord_psbl_qty": "4", "tr_crcy_cd": "USD"}}
+    client._get = read
+    evidence = client.get_overseas_buying_power(symbol="ZS", exchange="NASD", limit_price=price)
+    assert evidence["available_usd"] == 915.31
+    assert evidence["orderable_quantity"] == 4
+    assert calls[0][0].endswith("/inquire-psamount")
+    assert calls[0][1]["tr_id"] == "TTTS3007R"
+    assert calls[0][1]["params"]["ITEM_CD"] == "ZS"
+    assert calls[0][1]["params"]["OVRS_ORD_UNPR"] == wire_price
+    with pytest.raises(ValueError):
+        client.get_overseas_buying_power(symbol="ZS", exchange="NASD", limit_price=float("nan"))
+
+
 def test_real_broker_submission_is_disarmed_by_default(monkeypatch):
     monkeypatch.setattr(
         kis_order,
@@ -270,16 +291,24 @@ def test_cancel_order_regular_vs_reserved_routes_to_different_endpoints(monkeypa
 
 
 def test_get_order_regular_vs_reserved_routes_to_different_endpoints(monkeypatch):
-    monkeypatch.setattr(kis_order, "query_overseas_order", lambda **kwargs: ["regular"])
-    monkeypatch.setattr(kis_order, "query_overseas_reserved_order", lambda **kwargs: ["reserved"])
+    regular = BrokerOrderStatusSnapshot(
+        environment="PROD", account_no="12345678-01", symbol="AAPL",
+        status=OrderStatus.WORKING,
+    )
+    reserved = BrokerOrderStatusSnapshot(
+        environment="PROD", account_no="12345678-01", symbol="MSFT",
+        status=OrderStatus.ACCEPTED,
+    )
+    monkeypatch.setattr(kis_order, "query_overseas_order", lambda **kwargs: [regular])
+    monkeypatch.setattr(kis_order, "query_overseas_reserved_order", lambda **kwargs: [reserved])
 
     broker = KisBroker()
     assert broker.get_order(
         environment="PROD", account_no="12345678-01", symbol="AAPL"
-    ) == ["regular"]
+    ) == [regular]
     assert broker.get_order(
         environment="PROD", account_no="12345678-01", is_reserved=True
-    ) == ["reserved"]
+    ) == [reserved]
 
 
 def test_discover_orders_requires_regular_and_reserved_sources(monkeypatch):

@@ -161,7 +161,9 @@ If one required check is missing, the correct outcome is no order.
 - [Current Order Logic](current_order_logic.md)
 - [Leadership and Market Context](market_alignment.md)
 - [Supervised Controlled-Live Pilot](controlled_live_pilot_runbook.md)
-- [TiDB Cloud Coordination Store](tidb_coordination_store.md)
+- [Supabase Coordination Store](supabase_coordination_migration.md)
 - [Database Architecture](database_architecture.md)
 - [Web/PWA Operator Synchronization](web_operator_sync.md)
 - [Main README](../README.md)
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

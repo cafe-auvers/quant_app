@@ -50,6 +50,15 @@ def _isolate_monitor_equity(monkeypatch, tmp_path):
     monkeypatch.setattr(monitor_equity, "MONITOR_EQUITY_FILE", tmp_path / "monitor_equity.json")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_private_trade_journal(monkeypatch, tmp_path):
+    from src.services import trade_journal
+
+    monkeypatch.setattr(trade_journal, "JOURNAL_ROOT", tmp_path / "trade_journal")
+    monkeypatch.setenv("TRADE_JOURNAL_DIR", "")
+    monkeypatch.setenv("TRADE_JOURNAL_CHART_NETWORK_ENABLED", "false")
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _resilient_windows_test_event_loop_policy():
     """Do not let transient Windows socket-pair creation fail the suite."""

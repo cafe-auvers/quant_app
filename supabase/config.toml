@@ -1,0 +1,2 @@
+[functions.coordination-backup]
+verify_jwt = true

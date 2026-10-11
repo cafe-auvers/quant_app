@@ -24,16 +24,16 @@ passive-limit and higher-score cancel-then-replace behavior is documented in
 
 The roles are stored in the shared coordination database as `__main_device__`
 and `__operator_control__`. When `COORD_DB_*` is configured, that authority is
-the TLS-connected TiDB Cloud SQL database; otherwise the legacy deployment
+the TLS-connected Supabase Cloud SQL database; otherwise the legacy deployment
 uses PC MySQL. A real app window never falls back to its private SQLite
 database for ownership. If the selected shared store is unavailable,
 ownership and live execution fail closed.
 
 Assigning **Execution Owner: Laptop** moves execution authority, not data
-storage. With TiDB coordination configured on both devices, the PC may be
+storage. With Supabase coordination configured on both devices, the PC may be
 powered off: historical reads move to the laptop mirror while ownership,
 commands, orders, and TradeCards remain online. See
-[TiDB Cloud Coordination Store](tidb_coordination_store.md).
+[Supabase Coordination Store](supabase_coordination_migration.md).
 
 Each running device also publishes an explicit `device_kind` (`PC` or
 `Laptop`) with its readiness record. On Windows this is derived from system
@@ -288,3 +288,5 @@ For an intraday Buy Today instruction:
 The global live-trading switch remains an emergency disable available from
 either physical device. Broker submissions retain the existing lease-token
 fence and re-read shared ownership at the broker boundary.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

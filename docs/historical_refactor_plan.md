@@ -312,3 +312,5 @@ optimistic UI hint — the source of truth is always whatever the child last
 wrote, and PID liveness. See `tests/test_historical_refresh_control.py` for
 the regression tests (`test_launch_refresh_does_not_overwrite_child_*`,
 `test_starting_with_live_pid_is_running_regardless_of_age`).
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

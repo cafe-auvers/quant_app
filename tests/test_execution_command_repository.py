@@ -14,6 +14,40 @@ from sqlalchemy.schema import CreateTable
 from src.services import execution_command_repository as repo
 
 
+@pytest.mark.parametrize("invalid", [None, "incomplete", "symbol", "quantity", "account", "working"])
+def test_cancel_fill_race_resolves_only_from_matching_terminal_broker_proof(tmp_path, invalid):
+    from datetime import datetime, timezone
+    from src.core.account_broker_snapshot import AccountBrokerSnapshot, SnapshotCompleteness
+    from src.core.execution_order_record import BrokerIdentityStatus, ExecutionOrderRecord, ExecutionOrderStatus
+    from src.core.order_state import BrokerOrderStatusSnapshot, OrderIntent, OrderSide, OrderStatus
+    from src.utils.market_calendar import US_MARKET_ZONE
+    engine = _make_engine(tmp_path)
+    now = datetime.now(timezone.utc)
+    command = _command(command_type="cancel", target_broker_order_id="B-EXACT", requested_at=now.isoformat())
+    repo.record_command(engine, command)
+    repo.record_command_response(engine, command.idempotency_key, status="AMBIGUOUS", broker_response={"error": "APBK0124"})
+    local = ExecutionOrderRecord(environment="PROD", account_no=command.account_no, symbol="AAPL",
+        client_order_id="CID-EXACT", broker_order_id="B-EXACT", side=OrderSide.BUY,
+        intent=OrderIntent.ENTRY,
+        broker_identity_status=BrokerIdentityStatus.EXACT,
+        status=ExecutionOrderStatus.FILLED, submitted_quantity=10, filled_quantity=10)
+    broker = BrokerOrderStatusSnapshot(environment="PROD", account_no=command.account_no,
+        symbol="OTHER" if invalid == "symbol" else "AAPL", broker_order_id="B-EXACT", side=OrderSide.BUY,
+        quantity_requested=11 if invalid == "quantity" else 10, filled_quantity=10,
+        status=OrderStatus.ACCEPTED if invalid == "working" else OrderStatus.FILLED)
+    snapshot = AccountBrokerSnapshot(environment="PROD", account_no="OTHER" if invalid == "account" else command.account_no,
+        completeness=SnapshotCompleteness(holdings_complete=True, open_orders_complete=True,
+            history_complete=invalid != "incomplete"), orders=(broker,), observed_at=now,
+        session_date=now.astimezone(US_MARKET_ZONE).date())
+    assert repo.reconcile_ambiguous_cancellations(engine, snapshot, [local]) == (1 if invalid is None else 0)
+    result = repo.get_command_by_idempotency_key(engine, command.idempotency_key)
+    assert result.status == ("RECONCILED" if invalid is None else "AMBIGUOUS")
+    if invalid is None:
+        assert result.redacted_response["original_response"]["error"] == "APBK0124"
+        assert result.redacted_response["resolution"]["order_status"] == "FILLED"
+        assert repo.reconcile_ambiguous_cancellations(engine, snapshot, [local]) == 0
+
+
 def _make_engine(tmp_path):
     return create_engine(
         f"sqlite:///{tmp_path / 'commands.db'}", future=True, poolclass=NullPool

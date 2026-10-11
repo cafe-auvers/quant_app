@@ -80,3 +80,5 @@ the lease and symbol, and pass every independent safety gate.
 The complete state and failure semantics are in
 [Current Order Logic](https://github.com/cafe-auvers/quant_app/blob/master/docs/current_order_logic.md)
 and [Order Lifecycle](Order-Lifecycle).
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](../opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

@@ -386,7 +386,8 @@ class TradingEngine:
         matching = [
             card
             for card in cards
-            if card.symbol == symbol and card.board_status in _TICK_REACTIVE_POSITION_STATUSES
+            if card.symbol == symbol
+            and card.board_status in _TICK_REACTIVE_POSITION_STATUSES | {BoardStatus.SELL_ALL}
         ]
         changed: List[TradeCardState] = []
         for card in matching:
@@ -426,7 +427,7 @@ class TradingEngine:
             not self.is_enabled()
             or not quote.regular_session
             or not quote.entry_trigger_eligible
-            or not quote.is_execution_fresh(now=now)
+            or not quote.is_entry_fresh(now=now)
         ):
             return []
         symbol = quote.symbol.upper()
@@ -553,9 +554,23 @@ class TradingEngine:
 
     def _evaluate_quote_for_card(self, card: TradeCardState, quote: QuoteSnapshot) -> bool:
         was_exit_required = card.exit_all_required
+        was_stop_triggered = card.stop_loss_triggered
         was_board_status = card.board_status
         was_warnings = list(card.warnings)
 
+        # Keep the latest accepted trade through liquidation. A stop breach
+        # must never be priced from an earlier entry-planning observation.
+        if (
+            quote.channel in {"", "TRADE", "HDFSCNT0"}
+            and math.isfinite(quote.last_price)
+            and quote.last_price > 0
+            and (
+                card.market_data_last_trusted_at is None
+                or quote.broker_event_at >= card.market_data_last_trusted_at
+            )
+        ):
+            card.market_data_last_trusted_price = quote.last_price
+            card.market_data_last_trusted_at = quote.broker_event_at
         self._clear_stale_warning(card)
         stop_override = dict(quote.stop_price_overrides).get(card.card_key)
         if stop_override is None:
@@ -587,6 +602,7 @@ class TradingEngine:
 
         return (
             card.exit_all_required != was_exit_required
+            or card.stop_loss_triggered != was_stop_triggered
             or card.board_status != was_board_status
             or card.warnings != was_warnings
         )
@@ -661,7 +677,7 @@ class TradingEngine:
 
     # --- Heartbeat (section 789-799) -----------------------------------
 
-    def run_heartbeat(self, cards: List[TradeCardState]) -> List[TradeCardState]:
+    def run_heartbeat(self, cards: List[TradeCardState], *, allow_entries: bool = True) -> List[TradeCardState]:
         if not self.is_enabled():
             return []
         changed: List[TradeCardState] = []
@@ -673,18 +689,20 @@ class TradingEngine:
         # later stage -- EOD cleanup, stale-quote flagging, Sell All
         # retries -- for every other card too.
         for stage in (
-            self._recover_retryable_cards,
-            self._evaluate_buy_today,
             self._reconcile_entry_orders,
-            self._process_entry_completion,
-            self._process_partial_sell_requests,
-            self._reconcile_partial_sell_fills,
             self._process_queued_market_open_sells,
             self._reconcile_sell_all_orders,
             self._retry_incomplete_sell_alls,
+            self._recover_retryable_cards,
+            self._evaluate_buy_today,
+            self._process_entry_completion,
+            self._process_partial_sell_requests,
+            self._reconcile_partial_sell_fills,
             self._detect_stale_position_quotes,
             self._run_eod_cleanup_if_due,
         ):
+            if not allow_entries and stage in (self._evaluate_buy_today, self._process_entry_completion):
+                continue
             try:
                 changed.extend(stage(cards))
             except Exception:
@@ -893,6 +911,11 @@ class TradingEngine:
                         "Fresh KIS WebSocket trade and quote events are required "
                         "before an automatic entry"
                     )
+                    explain = getattr(self._market_data, "entry_quote_unavailable_reason", None)
+                    if callable(explain):
+                        detail = explain(card.symbol, now=now)
+                        if detail:
+                            reason = f"{reason}: {detail}"
                     if (
                         card.entry_runtime_status != EntryRuntimeStatus.DATA_UNAVAILABLE
                         or card.entry_block_reason != reason
@@ -923,7 +946,11 @@ class TradingEngine:
                     or float(best_ask) <= price
                 ):
                     card.entry_runtime_status = EntryRuntimeStatus.ARMED
-                    card.entry_block_reason = "EXECUTION_LEVEL_ALREADY_REACHED"
+                    card.entry_block_reason = (
+                        "Waiting for a trade above the ORB execution level"
+                        if quote is None or quote.last_price <= price
+                        else "Waiting for a valid ask above the ORB execution level"
+                    )
                     changed.append(card)
                     continue
                 planned_quantity = self._target_plan_quantity(
@@ -1004,6 +1031,8 @@ class TradingEngine:
                     card.entry_runtime_status = _OUTCOME_TO_ENTRY_RUNTIME_STATUS.get(
                         result.outcome, card.entry_runtime_status
                     )
+                    if result.outcome == AttemptOutcome.REJECTED:
+                        card.entry_block_reason = result.detail or "Entry attempt rejected"
                     if result.outcome == AttemptOutcome.BROKER_ROUTING_REJECTED:
                         card.entry_block_reason = (
                             "KIS rejected the verified exchange route (APBK0656); "
@@ -1016,6 +1045,7 @@ class TradingEngine:
                     if result.outcome in {
                         AttemptOutcome.REJECTED,
                         AttemptOutcome.BROKER_ROUTING_REJECTED,
+                        AttemptOutcome.WAITING_FOR_CAPITAL,
                     }:
                         card.entry_client_order_id = ""
                         card.entry_pending_attempt_number = 0
@@ -1167,14 +1197,14 @@ class TradingEngine:
                     quote is None
                     or not quote.regular_session
                     or not quote.entry_trigger_eligible
-                    or not quote.is_execution_fresh(now=now)
+                    or not quote.is_entry_fresh(now=now)
                     or not self._market_data.entry_quote_ready(card.symbol, now=now)
                     or quote.last_price <= execution_price
                     or best_ask is None
                     or float(best_ask) <= execution_price
                 ):
                     pending["state"] = "UPGRADE_REJECTED"
-                    pending["reason"] = "EXECUTION_LEVEL_ALREADY_REACHED"
+                    pending["reason"] = "Waiting for current trade and ask above the ORB execution level"
                     card.pending_entry_replacement = pending
                     self._append_replacement_audit(
                         card,
@@ -1971,9 +2001,12 @@ class TradingEngine:
                         )
                         card.buy_today_note = card.entry_block_reason
                     card.next_retry_at = result.retry_at
+                    card.entry_attempt_group_id = result.attempt_group_id
+                    card.entry_attempt_count = result.attempt_count
                     if result.outcome in {
                         AttemptOutcome.REJECTED,
                         AttemptOutcome.BROKER_ROUTING_REJECTED,
+                        AttemptOutcome.WAITING_FOR_CAPITAL,
                     }:
                         card.entry_client_order_id = ""
                         card.entry_pending_attempt_number = 0
@@ -2216,6 +2249,13 @@ class TradingEngine:
         the broker still hasn't confirmed the cancel by then, so a stalled
         liquidation is visible rather than silently waiting forever.
         """
+        changed = False
+        if order.status == OrderStatus.CANCEL_REQUESTED and not card.exit_cancel_in_flight:
+            # The broker command can outlive a failed card-state write.
+            # Adopt its pending state instead of issuing a second cancel.
+            card.exit_cancel_in_flight = True
+            card.exit_cancel_requested_at = card.exit_cancel_requested_at or now
+            changed = True
         if card.exit_cancel_in_flight:
             requested_at = card.exit_cancel_requested_at
             if requested_at is not None:
@@ -2230,7 +2270,7 @@ class TradingEngine:
                     if _EXIT_CANCEL_STALLED_WARNING not in card.warnings:
                         card.warnings = [*card.warnings, _EXIT_CANCEL_STALLED_WARNING]
                         return True
-            return False
+            return changed
         if not force and not self._attempt_deadline_passed(order, now):
             return False
         self._position_callbacks.request_cancel(card, order.client_order_id, scope="EXIT")
@@ -2367,7 +2407,9 @@ class TradingEngine:
                     symbol=card.symbol,
                     quantity=remaining,
                     reason=(
-                        "sell_all"
+                        "stop_loss"
+                        if card.stop_loss_triggered
+                        else "sell_all"
                         if card.sell_all_at_market_open
                         else "sell_all_retry"
                     ),
@@ -2496,6 +2538,15 @@ class TradingEngine:
         illiquid symbols can be quiet without their feed being unavailable.
         """
         changed: List[TradeCardState] = []
+        if not self._market_is_open():
+            # The regular-session feed is not a protection outage while the
+            # exchange is closed. Existing stop/user liquidation stays sticky;
+            # a new outage timer starts only during the next trading session.
+            for card in cards:
+                if card.market_data_outage_started_at is not None:
+                    card.market_data_outage_started_at = None
+                    changed.append(card)
+            return changed
         now = self._clock()
         for card in cards:
             if card.board_status not in _TICK_REACTIVE_POSITION_STATUSES:

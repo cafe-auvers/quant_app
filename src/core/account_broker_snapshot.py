@@ -94,6 +94,7 @@ class AccountBrokerSnapshot:
     snapshot_id: str = field(default_factory=lambda: uuid4().hex)
     errors: Tuple[str, ...] = ()
     execution_notice_broker_order_ids: FrozenSet[str] = frozenset()
+    account_balance_observed_at: Optional[datetime] = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "environment", str(self.environment or "").upper())
@@ -102,6 +103,11 @@ class AccountBrokerSnapshot:
         if observed.tzinfo is None:
             observed = observed.replace(tzinfo=timezone.utc)
         object.__setattr__(self, "observed_at", observed.astimezone(timezone.utc))
+        if self.account_balance_observed_at is not None:
+            balance_time = self.account_balance_observed_at
+            if balance_time.tzinfo is None:
+                balance_time = balance_time.replace(tzinfo=timezone.utc)
+            object.__setattr__(self, "account_balance_observed_at", balance_time.astimezone(timezone.utc))
         object.__setattr__(self, "holdings", tuple(self.holdings or ()))
         object.__setattr__(self, "orders", tuple(self.orders or ()))
         object.__setattr__(self, "errors", tuple(str(error) for error in (self.errors or ())))

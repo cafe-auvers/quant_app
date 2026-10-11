@@ -41,6 +41,7 @@ from src.core.orb_entry_logic import (
     passive_entry_prices,
     score_strictly_higher,
 )
+from src.core.opening_liquidity import opening_liquidity_rejection
 from src.core.trade_card_state import BoardStatus, EntryRuntimeStatus, TradeCardState
 from src.utils.market_calendar import (
     is_nyse_trading_day,
@@ -86,6 +87,16 @@ _US_REGULAR_OPEN = time(9, 30)
 _ORB_WINDOW_MINUTES = {"1m": 1, "5m": 5, "30m": 30}
 
 
+def entry_plan_has_execution_identity(card: TradeCardState) -> bool:
+    """Freeze ORB geometry from durable attempt preparation through resolution."""
+    return bool(
+        card.entry_client_order_id
+        or card.entry_pending_attempt_number
+        or card.entry_submission_unresolved
+        or card.entry_cancel_in_flight
+    )
+
+
 def _positive_float(value) -> float | None:
     try:
         number = float(value)
@@ -112,6 +123,13 @@ def _complete_candidate_for_card(
     candidate,
 ) -> bool:
     """Validate one persisted candidate before a live event can select it."""
+    if card.is_ep != execution_queue_item.is_ep or card.is_ep != getattr(candidate, "is_ep", False):
+        return False
+    if opening_liquidity_rejection(
+        getattr(candidate, "opening_volume", None),
+        getattr(candidate, "opening_volume_minutes", 0),
+    ):
+        return False
 
     window = str(getattr(candidate, "window", "") or "").strip()
     execution_price = _positive_float(
@@ -150,6 +168,7 @@ def _complete_candidate_for_card(
     )
     return bool(
         window in SUPPORTED_ORB_WINDOWS
+        and bool(getattr(candidate, "valid", False))
         and getattr(candidate, "status", None)
         in {
             OrbCandidateStatus.WAITING_BREAKOUT,
@@ -317,20 +336,16 @@ def _display_candidate(
     *,
     excluded_windows: Iterable[str] = (),
 ):
-    """Return the plan the card should explain while no trigger is ready.
+    """Prefer confirmed entries over higher-scoring unconfirmed planning choices.
 
-    The queue deliberately reserves ``selected_candidate`` for an ORB that
-    can execute immediately. Before the trigger, however, the board still
-    needs to show the operator which risk-valid ORB plan is waiting. A manual
-    selection always wins; automatic display otherwise prefers a completed,
-    risk-valid plan, then a still-forming plan, then unavailable data, and only
-    shows an invalid plan after no viable/forming alternative remains.
+    Explicit window/order locks remain exact. Before any confirmation, keep
+    the queue's optimized selection and the forming/unavailable fallbacks.
     """
 
     excluded = {str(window or "").strip() for window in excluded_windows}
     selected = execution_queue_item.selected_candidate
-    if selected is not None and str(getattr(selected, "window", "")) not in excluded:
-        return selected
+    if selected is not None and str(getattr(selected, "window", "")) in excluded:
+        selected = None
 
     candidates = {
         window: candidate
@@ -346,9 +361,33 @@ def _display_candidate(
         getattr(execution_queue_item, "manual_window_lock", False)
         or getattr(execution_queue_item, "locked", False)
     ):
+        if selected is not None:
+            return selected
         manually_selected = candidates.get(selected_window)
         if manually_selected is not None:
             return manually_selected
+
+    confirmed_candidates = dict(candidates)
+    if selected is not None:
+        confirmed_candidates.setdefault(selected.window, selected)
+    confirmed = [
+        candidate
+        for candidate in confirmed_candidates.values()
+        if candidate.window in SUPPORTED_ORB_WINDOWS
+        and candidate.valid
+        and candidate.breakout_confirmed
+        and candidate.status == OrbCandidateStatus.EXECUTE_READY
+    ]
+    if confirmed:
+        return max(
+            confirmed,
+            key=lambda candidate: (
+                float(candidate.score or 0.0),
+                -SUPPORTED_ORB_WINDOWS.index(candidate.window),
+            ),
+        )
+    if selected is not None:
+        return selected
 
     waiting = [
         candidate
@@ -565,6 +604,29 @@ class TradeCardOrbEvaluator:
             if candidate.status in _BLOCKED_CANDIDATE_STATUSES
             else ""
         )
+        liquidity_reason = opening_liquidity_rejection(
+            getattr(candidate, "opening_volume", None),
+            getattr(candidate, "opening_volume_minutes", 0),
+        )
+        if candidate.status in {
+            OrbCandidateStatus.WAITING_BREAKOUT,
+            OrbCandidateStatus.VALID,
+            OrbCandidateStatus.EXECUTE_READY,
+        } and liquidity_reason:
+            card.entry_runtime_status = EntryRuntimeStatus.RISK_INVALID
+            card.entry_block_reason = liquidity_reason
+        candidates = dict(execution_queue_item.candidates or {})
+        if (
+            candidate.status in _BLOCKED_CANDIDATE_STATUSES
+            and len(candidates) > 1
+            and not execution_queue_item.manual_window_lock
+            and all(item.status in _BLOCKED_CANDIDATE_STATUSES for item in candidates.values())
+        ):
+            card.entry_block_reason = "; ".join(
+                f"{window}: {candidates[window].reason}"
+                for window in ("1m", "5m", "30m")
+                if window in candidates and candidates[window].reason
+            )
 
     def select_crossed_candidate(
         self,
@@ -585,12 +647,7 @@ class TradeCardOrbEvaluator:
             return False
         if card.entry_runtime_status not in _LIVE_SELECTION_CARD_STATUSES:
             return False
-        if (
-            card.entry_client_order_id
-            or card.entry_pending_attempt_number
-            or card.entry_submission_unresolved
-            or card.entry_cancel_in_flight
-        ):
+        if entry_plan_has_execution_identity(card):
             return False
         if queue_has_execution_order_lock(execution_queue_item):
             return False
@@ -880,6 +937,8 @@ class TradeCardOrbEvaluator:
         """Mutate a Buy Today card; all other lifecycle stages are no-ops."""
         if card.board_status not in _ORB_ACTIVE_STATUSES:
             return card
+        if entry_plan_has_execution_identity(card):
+            return card
 
         queue_account = str(
             getattr(execution_queue_item, "account_no", "") or ""
@@ -906,6 +965,11 @@ class TradeCardOrbEvaluator:
 
         if execution_queue_item.name and not card.name:
             card.name = execution_queue_item.name
+        if card.is_ep != execution_queue_item.is_ep:
+            _clear_entry_plan(card)
+            card.entry_runtime_status = EntryRuntimeStatus.DATA_UNAVAILABLE
+            card.entry_block_reason = "ORB execution blocked: waiting for the published stop/ADR profile"
+            return card
         canonical_breakout = _positive_float(card.breakout_price)
         queue_breakout = _positive_float(execution_queue_item.breakout_price)
         if (
@@ -1049,6 +1113,16 @@ class TradeCardOrbEvaluator:
             return card
 
         if prior_runtime_status == EntryRuntimeStatus.RETRY_COOLDOWN:
+            card.entry_runtime_status = prior_runtime_status
+            card.entry_block_reason = prior_block_reason
+        elif prior_runtime_status == EntryRuntimeStatus.DATA_UNAVAILABLE and candidate.status in {
+            OrbCandidateStatus.WAITING_BREAKOUT,
+            OrbCandidateStatus.VALID,
+            OrbCandidateStatus.EXECUTE_READY,
+        }:
+            # Only the live feed check may recover a data-blocked entry.
+            # Re-arming from a minute-bar refresh caused a no-op status write
+            # every cycle when the heartbeat immediately blocked it again.
             card.entry_runtime_status = prior_runtime_status
             card.entry_block_reason = prior_block_reason
 

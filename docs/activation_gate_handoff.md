@@ -180,3 +180,5 @@ passes on one compatible exact-commit evidence chain.
   different-commit session as qualifying evidence.
 - Any later tracked change requires exact-commit Gate 1 recertification and may
   invalidate the compatible evidence chain described in the specification.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

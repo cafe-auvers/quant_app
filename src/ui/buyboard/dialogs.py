@@ -43,6 +43,42 @@ _RISK_VALID_ORB_STATUSES = {
 }
 
 
+def prompt_buy_today_profile(parent, symbol: str) -> Optional[bool]:
+    """Return the chosen stop/ADR profile, or None when publication is cancelled."""
+    from src.risk.orb_position import get_orb_settings
+
+    settings = get_orb_settings()
+    normal = " / ".join(f"{value:g}%" for value in settings.stop_adr_bounds())
+    ep = " / ".join(f"{value:g}%" for value in settings.stop_adr_bounds(True))
+    dialog = QDialog(parent)
+    dialog.setWindowTitle("Operator action")
+    dialog.setMinimumWidth(540)
+    layout = QVBoxLayout(dialog)
+    title = QLabel(f"Publish {symbol} to Buy Today?")
+    title.setStyleSheet("font-weight: bold; font-size: 16px;")
+    layout.addWidget(title)
+    layout.addWidget(QLabel(f"Stop/ADR lower / ideal / upper\nNormal: {normal}\nEP: {ep}"))
+    actions = QHBoxLayout()
+    choice = [None]
+
+    def publish(is_ep: bool) -> None:
+        choice[0] = is_ep
+        dialog.accept()
+
+    cancel = QPushButton("Cancel")
+    cancel.setDefault(True)
+    cancel.clicked.connect(dialog.reject)
+    normal_button = QPushButton("Publish to Buy Today")
+    normal_button.clicked.connect(lambda: publish(False))
+    ep_button = QPushButton("Publish as EP")
+    ep_button.clicked.connect(lambda: publish(True))
+    for button in (cancel, normal_button, ep_button):
+        actions.addWidget(button)
+    layout.addLayout(actions)
+    dialog.exec_()
+    return choice[0]
+
+
 def _orb_plan_classification(candidate, *, stale: bool = False) -> str:
     """Return the trader-facing validity of one computed ORB plan."""
 

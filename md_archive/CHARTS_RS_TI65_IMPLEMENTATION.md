@@ -226,3 +226,5 @@ python -m compileall main.py src tests -q
 - Manually verify Charts tab interactions in `QWebEngineView`: pan, wheel zoom, bottom navigator, target set/drag/delete, draw/erase line, and future drawing up to 5 weekdays.
 - Consider moving more chart rendering into persistent JavaScript if further smoothness is needed.
 - Consider adding U.S. holiday awareness to the market-data freshness check.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](../docs/opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

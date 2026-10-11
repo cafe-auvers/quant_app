@@ -962,16 +962,9 @@ class WebStore:
                 "SELECT * FROM planning_cards WHERE symbol=?", (symbol,)
             ).fetchone()
             card = self._card(row)
-            if not row or row["stage"] != "BUYLIST":
-                connection.rollback()
-                raise ConflictError("Buy Today cancellation requires a Buylist card", card)
-            if int(row["version"]) != int(expected_revision):
-                connection.rollback()
-                raise ConflictError("Stale planning revision", card)
-
             removed = connection.execute(
-                "DELETE FROM buy_today_drafts WHERE symbol=? AND card_version=?",
-                (symbol, expected_revision),
+                "DELETE FROM buy_today_drafts WHERE symbol=?",
+                (symbol,),
             ).rowcount == 1
             if removed:
                 detail = {
@@ -1085,14 +1078,14 @@ class WebStore:
 
         symbol = normalize_symbol(card.get("symbol"))
         version = int(card.get("version") or 0)
-        if version != int(expected_revision):
-            raise ConflictError("Stale planning revision", card)
+        if int(expected_revision) < 1:
+            raise ValidationError("expected_revision must be positive")
         now = utc_now()
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             removed = connection.execute(
-                "DELETE FROM shared_buy_today_drafts WHERE symbol=? AND card_version=?",
-                (symbol, version),
+                "DELETE FROM shared_buy_today_drafts WHERE symbol=?",
+                (symbol,),
             ).rowcount == 1
             if removed:
                 detail = {

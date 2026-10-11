@@ -44,6 +44,7 @@ from src.services.state_sync import (
     get_main_device,
     get_synced_state_revisions,
     pull_state,
+    pull_states,
     publish_planning_snapshot,
     push_state,
     push_operator_controlled_settings,
@@ -1089,7 +1090,12 @@ def reconcile_state_with_remote(
             return result
 
         sync_entries = _read_sync_entries(metadata_path)
-        remote_revisions = get_synced_state_revisions(engine)
+        pulled_states = pull_states(engine, SYNCED_STATE_KEYS)
+        remote_revisions = {
+            key: pulled.state.revision if pulled.state is not None else 0
+            for key, pulled in pulled_states.items()
+            if pulled.status != PULL_ERROR
+        }
         result.state_revisions = dict(remote_revisions)
         metadata_updates: Dict[str, Dict[str, Any]] = {}
         key_to_file = _synced_key_to_file()
@@ -1102,10 +1108,15 @@ def reconcile_state_with_remote(
             has_base, base_revision, base_hash = _base_sync_values(base_entry)
             local_dirty = has_base and local_hash != base_hash
 
-            # The four planning payloads can be large. A single compact
-            # revision query proves an unchanged pull-only row needs no JSON
-            # transfer. Main-device local changes still follow the guarded
-            # push path below.
+            pulled = pulled_states[state_key]
+            if pulled.status == PULL_ERROR:
+                result.errors.append(
+                    f"Could not read remote {state_key}: {pulled.error or 'unknown error'}"
+                )
+                continue
+
+            # The batch verifies all keys coherently, transferring only
+            # changed payloads. Local changes retain the guarded push path.
             if (
                 not is_main
                 and has_base
@@ -1113,12 +1124,6 @@ def reconcile_state_with_remote(
             ):
                 continue
 
-            pulled = pull_state(engine, state_key)
-            if pulled.status == PULL_ERROR:
-                result.errors.append(
-                    f"Could not read remote {state_key}: {pulled.error or 'unknown error'}"
-                )
-                continue
             remote = pulled.state if pulled.status == PULL_OK else None
 
             if not is_main:
@@ -1550,7 +1555,7 @@ def publish_trading_plan(
     # The local metadata records the last remote revision absorbed from the
     # previously active coordination store.  It can legitimately outlive the
     # remote rows themselves -- for example when moving coordination to a new
-    # TiDB database or restoring an empty branch.  Ordinary background saves
+    # coordination database or restoring an empty branch. Ordinary background saves
     # must continue treating that as a conflict, but an explicit, market-closed
     # full-plan publish by the Operator Control owner is the recovery boundary.
     # Read the current compact revision projection so missing rows use an

@@ -809,3 +809,5 @@ SEC-001 through SEC-008—KIS application key/secret, account/product identifier
 - The original audit confirmed `settings.json` and `scanner_setups.json` were absent from `SYNCED_STATE_KEYS`; remediation added both to the live revisioned key set and full-plan publication.
 - Confirmed database schema contains scanner/cache fields but no separate relational defaults/constraints for these trade-risk settings.
 - Confirmed only this Markdown audit was added. No Python source, runtime JSON, environment file, database schema, test, or production behavior was changed.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](../opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

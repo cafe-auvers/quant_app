@@ -8,6 +8,7 @@
   const standaloneLayout = window.matchMedia('(display-mode: standalone)');
   const DEFAULT_VISIBLE_BARS = 63;
   const BUY_BOARD_FALLBACK_MS = 15_000;
+  const PLANNING_LIST_MODES = new Set(['watchlist', 'buylist', 'buy_today']);
   const KANBAN_COLUMNS = Object.freeze([
     {key: 'BUYLIST', title: 'Buylist', short: 'Buylist', kicker: 'Planning'},
     {key: 'BUY_TODAY', title: 'Buy Today', short: 'Today', kicker: 'Monitoring'},
@@ -34,7 +35,11 @@
     capital_max_percent: 30,
     stop_adr_min_percent: 15,
     stop_adr_ideal_percent: 65,
-    stop_adr_max_percent: 66,
+    stop_adr_max_percent: 90,
+    ep_stop_adr_min_percent: 50,
+    ep_stop_adr_ideal_percent: 100,
+    ep_stop_adr_max_percent: 150,
+    opening_min_shares_per_minute: 200,
   });
 
   function loadDisplayPreferences() {
@@ -70,6 +75,9 @@
     buyTodayRows: [],
     buyBoardRows: [],
     buyBoardRevision: '',
+    buyBoardNav: null,
+    buyBoardNavAt: null,
+    buyBoardNavNote: '',
     buyBoardColumn: 'BUYLIST',
     buyBoardLoading: false,
     buyBoardEpoch: 0,
@@ -86,6 +94,9 @@
     historyError: '',
     historyRequestToken: 0,
     visibleRows: [],
+    listOrders: new Map(),
+    listCursor: null,
+    listScrollPositions: new Map(),
     manualRows: [],
     listMode: 'monitor',
     symbol: null,
@@ -105,6 +116,7 @@
     breakoutDraftPrice: null,
     breakoutDragging: null,
     breakoutSaving: false,
+    breakoutFollowup: null,
     drawings: [],
     drawMode: false,
     drawAnchor: null,
@@ -205,7 +217,7 @@
   }
 
   function lockPageDragging() {
-    const interactiveSurfaces = '.chart-surface, .rs-surface, .mobile-page, .mobile-board-list, .mobile-list-items, .mobile-symbol-search-results, .display-settings-scroll, .stock-list, .planning-panel';
+    const interactiveSurfaces = '.chart-surface, .rs-surface, .mobile-page, .mobile-board-list, .mobile-list-items, .mobile-symbol-search-results, .display-settings-scroll, .mobile-navigation-popover, .stock-list, .planning-panel';
     const shouldLock = () => compactLayout.matches || standaloneLayout.matches;
     document.addEventListener('touchmove', event => {
       if (!shouldLock()) return;
@@ -257,6 +269,10 @@
     const target = byId('plan-message');
     target.textContent = message;
     target.className = `panel-message ${kind}`.trim();
+    const quick = byId('quick-plan-message');
+    quick.textContent = message;
+    quick.className = `quick-plan-message ${kind}`.trim();
+    quick.hidden = !message;
   }
 
   async function api(path, options = {}) {
@@ -296,8 +312,46 @@
     if (tone) dot.classList.add(tone);
   }
 
+  let marketClockSchedule = null;
+  let marketClockTimer = null;
+
+  function renderMarketCountdown(market = null) {
+    if (market?.as_of) {
+      const schedule = {
+        asOf: Date.parse(market.as_of),
+        open: Date.parse(market.session_open),
+        close: Date.parse(market.session_close),
+        nextOpen: Date.parse(market.next_session_open),
+        nextClose: Date.parse(market.next_session_close),
+        receivedAt: performance.now(),
+      };
+      marketClockSchedule = [schedule.asOf, schedule.open, schedule.close].every(Number.isFinite)
+        ? schedule : null;
+    }
+    const now = marketClockSchedule
+      ? marketClockSchedule.asOf + performance.now() - marketClockSchedule.receivedAt
+      : Date.now();
+    let open = marketClockSchedule?.open;
+    let close = marketClockSchedule?.close;
+    if (now >= close) {
+      open = marketClockSchedule.nextOpen;
+      close = marketClockSchedule.nextClose;
+    }
+    const hasSchedule = Number.isFinite(open) && Number.isFinite(close) && now < close;
+    const minutesUntil = boundary => Math.max(1, Math.ceil((boundary - now) / 60_000));
+    const label = hasSchedule
+      ? (now < open ? `Open in ${minutesUntil(open)}m` : `Close in ${minutesUntil(close)}m`)
+      : 'Market —';
+    const countdown = byId('market-countdown');
+    if (countdown.textContent !== label) countdown.textContent = label;
+    countdown.title = hasSchedule
+      ? `NYSE regular session · Open ${new Date(open).toLocaleString('en-GB', {timeZone: 'Asia/Seoul'})} KST · Close ${new Date(close).toLocaleString('en-GB', {timeZone: 'Asia/Seoul'})} KST`
+      : 'Waiting for the NYSE session schedule';
+  }
+
   function renderStatusStrip(payload = {}) {
     const market = payload.market_status || state.session?.market_status || {};
+    renderMarketCountdown(market);
     const longLabel = market.label || 'Market Status: Checking';
     const compactLabel = market.compact_label || 'Market Checking';
     byId('market-status-long').textContent = longLabel;
@@ -419,6 +473,10 @@
     stop_adr_min_percent: 'orb-stop-adr-min',
     stop_adr_ideal_percent: 'orb-stop-adr-ideal',
     stop_adr_max_percent: 'orb-stop-adr-max',
+    ep_stop_adr_min_percent: 'orb-ep-stop-adr-min',
+    ep_stop_adr_ideal_percent: 'orb-ep-stop-adr-ideal',
+    ep_stop_adr_max_percent: 'orb-ep-stop-adr-max',
+    opening_min_shares_per_minute: 'orb-opening-volume-min',
   });
 
   function canEditOrbSettings() {
@@ -455,6 +513,9 @@
     if (!Object.values(values).every(Number.isFinite)) {
       throw new Error('Enter a number in every ORB setting.');
     }
+    if (values.opening_min_shares_per_minute < 0) {
+      throw new Error('Minimum opening volume cannot be negative.');
+    }
     if (values.capital_min_percent < 0 || values.capital_max_percent > 100) {
       throw new Error('Capital allocation bounds must be between 0% and 100%.');
     }
@@ -463,11 +524,13 @@
       || values.capital_min_percent === values.capital_max_percent) {
       throw new Error('Capital ideal must be between distinct lower and upper bounds.');
     }
-    if (values.stop_adr_min_percent < 0
-      || !(values.stop_adr_min_percent <= values.stop_adr_ideal_percent
-        && values.stop_adr_ideal_percent <= values.stop_adr_max_percent)
-      || values.stop_adr_min_percent === values.stop_adr_max_percent) {
-      throw new Error('Stop / ADR ideal must be between distinct non-negative bounds.');
+    for (const prefix of ['', 'ep_']) {
+      const lower = values[`${prefix}stop_adr_min_percent`];
+      const ideal = values[`${prefix}stop_adr_ideal_percent`];
+      const upper = values[`${prefix}stop_adr_max_percent`];
+      if (lower < 0 || !(lower <= ideal && ideal <= upper) || lower === upper) {
+        throw new Error(`${prefix ? 'EP' : 'Normal'} Stop / ADR ideal must be between distinct non-negative bounds.`);
+      }
     }
     return values;
   }
@@ -486,7 +549,7 @@
     renderOrbSettingsAccess();
     try {
       const result = await api('/api/v1/operator/orb-settings');
-      state.orbSettings = {...result.settings};
+      state.orbSettings = {...ORB_SETTINGS_DEFAULTS, ...result.settings};
       state.orbSettingsRevision = Number(result.revision || 0);
       setOrbSettingsInputs(state.orbSettings);
       status.textContent = canEditOrbSettings()
@@ -654,6 +717,160 @@
     return breakout === null ? 'No breakout' : `Breakout ${breakout.toFixed(2)}`;
   }
 
+  function boardNumber(value) {
+    if (value === null || value === undefined || value === '') return null;
+    const number = Number(value);
+    return Number.isFinite(number) && number > 0 ? number : null;
+  }
+
+  function boardMoney(value) {
+    const number = boardNumber(value);
+    return number === null ? '—' : `$${number.toFixed(number < 1 ? 4 : 2)}`;
+  }
+
+  function boardShares(value, unknownWhenZero = false) {
+    const number = Math.max(0, Math.trunc(Number(value) || 0));
+    return unknownWhenZero && !number ? 'Not sized' : `${number.toLocaleString()} sh`;
+  }
+
+  function boardAccountNav() {
+    const nav = boardNumber(state.buyBoardNav);
+    const age = (Date.now() - Date.parse(state.buyBoardNavAt || '')) / 1000;
+    return nav !== null && Number.isFinite(age) && age >= -5 && age <= 900 ? nav : null;
+  }
+
+  function boardNavMetric(amount) {
+    if (amount === null || !Number.isFinite(amount) || amount < 0) return 'Not sized';
+    const nav = boardAccountNav();
+    const percent = nav === null ? 'NAV unavailable' : `${(amount / nav * 100).toFixed(2)}% NAV`;
+    const dollars = amount.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+    return `${percent} · $${dollars}`;
+  }
+
+  function boardRiskBudget(row) {
+    const value = row.risk_percent;
+    const fraction = value === null || value === undefined ? NaN : Number(value);
+    return Number.isFinite(fraction) && fraction >= 0 && fraction <= 1
+      ? `${(fraction * 100).toFixed(2)}% NAV` : 'Unavailable';
+  }
+
+  function boardTarget(row) {
+    return Math.max(0, Number(row.broker_quantity) || 0,
+      Number(row.target_position_quantity || row.planned_quantity) || 0);
+  }
+
+  function boardTime(value) {
+    const time = Date.parse(value || '');
+    return Number.isFinite(time) ? `${new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'Asia/Seoul', hour: '2-digit', minute: '2-digit', second: '2-digit',
+    }).format(time)} KST` : 'Time unavailable';
+  }
+
+  function boardPrice(row) {
+    // Reuse observations already loaded by Monitor; never request broker quotes.
+    const monitor = state.monitorRows.find(item => item.symbol === row.symbol);
+    const candidates = [
+      {price: boardNumber(row.last_reported_price), at: row.price_as_of, source: 'PC reported'},
+      {price: boardNumber(monitor?.current_price), at: monitor?.quote_as_of,
+        source: 'Yahoo · indicative', stale: Boolean(state.monitorError) || monitor?.quote_status !== 'CURRENT'},
+    ].filter(item => item.price !== null);
+    candidates.sort((a, b) => (Date.parse(b.at || '') || 0) - (Date.parse(a.at || '') || 0));
+    if (!candidates.length) return {price: null, fresh: false, note: 'Price not reported yet'};
+    const quote = candidates[0];
+    const age = (Date.now() - Date.parse(quote.at || '')) / 1000;
+    const fresh = Number.isFinite(age) && age >= -5
+      && age <= state.monitorStaleSeconds && !quote.stale;
+    const elapsed = Number.isFinite(age) && age >= 0
+      ? age < 60 ? `${Math.floor(age)}s ago` : `${Math.floor(age / 60)}m ago`
+      : 'Age unavailable';
+    return {...quote, fresh, note: `${quote.source} · ${boardTime(quote.at)} · ${elapsed}${fresh ? '' : ' · stale'}`};
+  }
+
+  function boardDetails(row) {
+    const price = boardPrice(row);
+    if (row.board_status === 'BUYLIST') {
+      return {price, facts: [['Price', boardMoney(price.price)], ['Breakout', boardMoney(row.breakout_price)],
+        ['Risk budget', boardRiskBudget(row)], ['Planned allocation', 'Not sized']]};
+    }
+    const held = Math.max(0, Number(row.broker_quantity) || 0);
+    const target = boardTarget(row);
+    const position = ['OPEN_POSITION', 'PARTIAL_SELL', 'SELL_ALL'].includes(row.board_status);
+    const stop = boardNumber(row.active_stop_price);
+    const facts = [['Price', boardMoney(price.price)],
+      [position ? 'Held' : 'Target shares', position ? boardShares(held) : boardShares(target, true)],
+      [position ? 'Active stop' : 'Planned stop', position
+        ? stop === null ? 'Not set' : boardMoney(stop)
+        : boardMoney(row.entry_orb_low)]];
+    if (!position) {
+      facts.push(
+        ['Risk budget', boardRiskBudget(row)],
+        ['Breakout', boardMoney(row.breakout_price)],
+        ['Entry plan', boardMoney(row.entry_execution_price || row.entry_trigger)],
+        ['ORB', row.entry_orb_window || row.selected_orb_window || 'Not selected'],
+      );
+      if (row.entry_breakout_trigger) facts.push(['Entry trigger', boardMoney(row.entry_breakout_trigger)]);
+      if (row.board_status === 'ENTRY_PENDING') {
+        facts.push(['Held / target', `${held.toLocaleString()} / ${target > 0 ? target.toLocaleString() : '—'} sh`]);
+        if (held > 0) facts.push(['Average fill', boardMoney(row.average_entry_price)]);
+      }
+      const entry = boardNumber(row.entry_execution_price || row.entry_trigger);
+      const plannedStop = boardNumber(row.entry_orb_low);
+      facts.push(['Planned allocation', boardNavMetric(entry !== null && target > 0 ? entry * target : null)]);
+      if (entry !== null && plannedStop !== null && entry > plannedStop && target > 0) {
+        facts.push(['Planned risk', boardNavMetric((entry - plannedStop) * target)]);
+      }
+      if (held > 0) {
+        const average = boardNumber(row.average_entry_price);
+        facts.push(['Allocated', boardNavMetric(average !== null ? average * held : null)]);
+      }
+      if (row.next_retry_at) facts.push(['Retry after', boardTime(row.next_retry_at)]);
+    } else {
+      facts.push(['Average entry', boardMoney(row.average_entry_price)],
+        ['Sellable', boardShares(row.orderable_quantity)],
+        ['Stop coverage', stop === null ? 'Not active'
+          : `${Math.max(0, Number(row.stop_quantity) || 0).toLocaleString()} / ${held.toLocaleString()} sh`]);
+      const average = boardNumber(row.average_entry_price);
+      facts.push(['Allocated', boardNavMetric(average !== null && held > 0 ? average * held : null)],
+        ['Risk at stop', stop !== null && held > 0
+          && Number(row.stop_quantity || 0) >= held
+          ? average !== null ? boardNavMetric(Math.max(0, average - stop) * held) : 'Unavailable'
+          : 'Not fully covered']);
+      if (price.price !== null && average !== null && held > 0) {
+        const pnl = (price.price - average) * held;
+        const percent = (price.price / average - 1) * 100;
+        facts.push(['Est. P&L', `${pnl >= 0 ? '+' : '−'}$${Math.abs(pnl).toFixed(2)} (${percent >= 0 ? '+' : ''}${percent.toFixed(2)}%)${price.fresh ? '' : ' · stale'}`]);
+      } else {
+        facts.push(['Est. P&L', '—']);
+      }
+      if (price.price !== null && stop !== null) {
+        facts.push(['To stop', `${((price.price - stop) / price.price * 100).toFixed(2)}%${price.fresh ? '' : ' · stale'}`]);
+      }
+      if (row.pending_stop_price) facts.push(['Pending stop',
+        `${boardMoney(row.pending_stop_price)} · ${boardShares(row.pending_stop_quantity)}`]);
+      if (row.board_status === 'PARTIAL_SELL') {
+        facts.push(['Sell requested', boardShares(row.pending_partial_sell_quantity)]);
+      }
+      if (['PARTIAL_SELL', 'SELL_ALL'].includes(row.board_status)) {
+        facts.push(['Working sell', row.exit_order_pending
+          ? row.reserved_sell_quantity > 0 ? boardShares(row.reserved_sell_quantity) : 'Quantity syncing'
+          : 'Not submitted']);
+        if (row.next_exit_retry_at) facts.push(['Retry after', boardTime(row.next_exit_retry_at)]);
+      }
+      if (row.entry_remaining_target_quantity > 0) {
+        facts.push(['Still to buy', boardShares(row.entry_remaining_target_quantity)]);
+      }
+    }
+    return {facts, price};
+  }
+
+  function boardWarning(row) {
+    const reason = ['PARTIAL_SELL', 'SELL_ALL'].includes(row.board_status)
+      ? row.last_exit_error
+      : ['BUY_TODAY', 'ENTRY_PENDING'].includes(row.board_status) ? row.entry_block_reason
+        : row.board_status === 'BUYLIST' ? row.buy_today_note : '';
+    return [reason, ...(row.warnings || [])].find(value => String(value || '').trim()) || '';
+  }
+
   function mobileKanbanCard(row) {
     const button = document.createElement('button');
     button.type = 'button';
@@ -664,6 +881,7 @@
     top.className = 'mobile-kanban-card-top';
     const symbol = document.createElement('strong');
     symbol.textContent = row.symbol;
+    if (row.is_ep) symbol.textContent += ' · EP';
     const priority = document.createElement('small');
     priority.textContent = row._pendingAction ? 'SYNCING' : `P${Number(row.kanban_priority || 0)}`;
     top.append(symbol, priority);
@@ -678,8 +896,16 @@
     metric.textContent = boardMetric(row);
     facts.append(status, metric);
     button.append(top, name, facts);
-    const warning = [...(row.warnings || []), row.entry_block_reason, row.last_exit_error]
-      .find(value => String(value || '').trim());
+    const details = boardDetails(row);
+    const grid = document.createElement('span');
+    grid.className = 'mobile-kanban-card-details';
+    grid.append(...details.facts.map(([label, value]) => boardFact(label, value)));
+    const priceNote = document.createElement('span');
+    priceNote.className = 'mobile-kanban-price-note';
+    priceNote.dataset.stale = String(!details.price.fresh);
+    priceNote.textContent = details.price.note;
+    button.append(grid, priceNote);
+    const warning = boardWarning(row);
     if (warning) {
       const alert = document.createElement('span');
       alert.className = 'mobile-kanban-card-warning';
@@ -736,6 +962,15 @@
     byId('buy-board-column-kicker').textContent = column.kicker;
     byId('buy-board-column-title').textContent = column.title;
     byId('buy-board-column-count').textContent = String(rows.length);
+    const position = ['OPEN_POSITION', 'PARTIAL_SELL', 'SELL_ALL'].includes(column.key);
+    const shares = rows.reduce((sum, row) => sum + (position
+      ? Math.max(0, Number(row.broker_quantity) || 0) : boardTarget(row)), 0);
+    const unsized = !position ? rows.filter(row => boardTarget(row) === 0).length : 0;
+    byId('buy-board-column-summary').textContent = `${rows.length} stock${rows.length === 1 ? '' : 's'}${column.key === 'BUYLIST' ? '' : ` · ${shares.toLocaleString()} ${position ? 'held' : 'target'} shares${unsized ? ` · ${unsized} not sized` : ''}`}`;
+    const nav = boardAccountNav();
+    byId('buy-board-nav').textContent = nav === null
+      ? state.buyBoardNavNote || 'Account NAV stale or unavailable'
+      : `Account NAV $${nav.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
     const cards = document.createDocumentFragment();
     rows.forEach(row => cards.appendChild(mobileKanbanCard(row)));
     if (!rows.length) {
@@ -795,6 +1030,9 @@
       if (epoch !== state.buyBoardEpoch) return;
       state.buyBoardRows = mergeBuyBoardOptimistic(result.rows || []);
       state.buyBoardRevision = String(result.revision || '');
+      state.buyBoardNav = boardNumber(result.account_nav_usd);
+      state.buyBoardNavAt = result.account_nav_as_of || null;
+      state.buyBoardNavNote = String(result.account_nav_note || '');
       state.buyBoardError = '';
     } catch (error) {
       if (epoch === state.buyBoardEpoch) {
@@ -879,31 +1117,31 @@
     byId('buy-board-action-symbol').textContent = row.symbol;
     byId('buy-board-action-name').textContent = row.name || row.symbol;
     const facts = byId('buy-board-action-facts');
-    const factRows = [
-      boardFact('Status', boardStatusLabel(row)),
-      boardFact('Breakout', normalizeBreakoutPrice(row.breakout_price)?.toFixed(2) || '—'),
-    ];
-    if (['OPEN_POSITION', 'PARTIAL_SELL', 'SELL_ALL'].includes(row.board_status)) {
-      factRows.push(
-        boardFact('Quantity', String(Number(row.broker_quantity || 0))),
-        boardFact('Average', Number(row.average_entry_price || 0) > 0 ? Number(row.average_entry_price).toFixed(2) : '—'),
-        boardFact('Stop', Number(row.active_stop_price || 0) > 0 ? Number(row.active_stop_price).toFixed(2) : '—'),
-      );
-    }
+    const details = boardDetails(row);
+    const factRows = [boardFact('Status', boardStatusLabel(row)),
+      ...details.facts.map(([label, value]) => boardFact(label, value))];
     facts.replaceChildren(...factRows);
+    byId('buy-board-action-price-note').textContent = details.price.note;
+    byId('buy-board-action-warning').textContent = boardWarning(row);
     const actions = byId('buy-board-action-buttons');
     const fragment = document.createDocumentFragment();
     const pending = state.buyBoardPendingActions.has(row.symbol);
+    const cancellingEntry = row.entry_block_reason === 'cancel_requested' || row.entry_cancel_in_flight;
     if (row.board_status === 'BUYLIST') {
       fragment.append(
         boardActionButton('Activate Buy Today', 'activate_buy_today', {disabled: pending || !row.breakout_price}),
         boardActionButton('Remove from Buylist', 'remove_buylist', {secondary: true, disabled: pending}),
       );
     } else if (row.board_status === 'BUY_TODAY') {
-      fragment.append(boardActionButton('Return to Buylist', 'deactivate_buy_today', {secondary: true, disabled: pending}));
+      fragment.append(boardActionButton(cancellingEntry ? 'Cancelling…' : 'Return to Buylist', 'deactivate_buy_today', {secondary: true, disabled: pending || cancellingEntry}));
     } else if (row.board_status === 'ENTRY_PENDING') {
-      fragment.append(boardActionButton('Cancel Entry', 'cancel_entry', {danger: true, disabled: pending}));
+      fragment.append(boardActionButton(cancellingEntry ? 'Cancelling…' : 'Cancel Entry', 'cancel_entry', {danger: true, disabled: pending || cancellingEntry}));
     } else if (row.board_status === 'OPEN_POSITION') {
+      if (Number(row.entry_remaining_target_quantity) > 0) {
+        fragment.append(boardActionButton(cancellingEntry ? 'Cancelling…' : 'Cancel remaining buy', 'cancel_entry', {
+          secondary: true, disabled: pending || cancellingEntry,
+        }));
+      }
       fragment.append(
         boardActionButton('Partial Sell', 'request_partial_sell', {
           disabled: pending,
@@ -916,8 +1154,8 @@
     } else if (row.board_status === 'SELL_ALL') {
       fragment.append(boardActionButton('Cancel Sell All', 'cancel_sell_all', {
         secondary: true,
-        disabled: pending || !row.sell_all_at_market_open || row.exit_order_pending,
-        title: row.sell_all_at_market_open ? '' : 'Only a queued, unsubmitted market-open Sell All can be cancelled.',
+        disabled: pending || !row.can_cancel_sell_all || row.exit_order_pending,
+        title: row.can_cancel_sell_all ? '' : 'Only an unsubmitted Sell All can be cancelled. Reconcile any pending SELL first.',
       }));
     }
     if (['OPEN_POSITION', 'PARTIAL_SELL'].includes(row.board_status)) {
@@ -959,6 +1197,7 @@
 
   function optimisticBoardAction(row, action, payload) {
     const next = {...row, _pendingAction: action};
+    if (action === 'activate_buy_today') next.is_ep = Boolean(payload.is_ep);
     const target = {
       activate_buy_today: 'BUY_TODAY',
       deactivate_buy_today: 'BUYLIST',
@@ -1031,7 +1270,11 @@
       request_partial_sell: [`Request a partial sell for ${symbol}?`, `Request ${payload.quantity} share${Number(payload.quantity) === 1 ? '' : 's'} as durable exit intent.`, 'Request partial sell'],
       request_sell_all: [`Sell all of ${symbol}?`, 'This records durable liquidation intent. The Execution Owner may submit it only after the workflow gates pass.', 'Request Sell All'],
     };
-    if (confirmations[action]) {
+    if (action === 'activate_buy_today') {
+      const choice = await confirmBuyTodayPublication(symbol, confirmations[action][1]);
+      if (!choice) return;
+      payload = {...payload, is_ep: choice === 'ep'};
+    } else if (confirmations[action]) {
       const accepted = await confirmOperatorAction(...confirmations[action]);
       if (!accepted) return;
     }
@@ -1095,8 +1338,13 @@
     }
   }
 
+  function closeMobileNavigation() {
+    byId('mobile-navigation-popover').hidden = true;
+    byId('mobile-navigation-menu').setAttribute('aria-expanded', 'false');
+  }
+
   function setMobilePage(page) {
-    const next = ['summary', 'chart', 'buy-board'].includes(page)
+    const next = ['summary', 'settings', 'chart', 'buy-board'].includes(page)
       ? page : 'chart';
     state.mobilePage = next;
     byId('mobile-workspace').dataset.mobilePage = next;
@@ -1111,6 +1359,8 @@
     });
     byId('mobile-list-popover').hidden = true;
     byId('mobile-menu-popover').hidden = true;
+    closeMobileNavigation();
+    byId('mobile-navigation-menu').classList.toggle('active', ['summary', 'settings'].includes(next));
     byId('mobile-list-menu').setAttribute('aria-expanded', 'false');
     if (next === 'buy-board' && state.session) startBuyBoardPolling();
     else stopBuyBoardPolling();
@@ -1132,16 +1382,29 @@
     byId('operator-confirm-dialog').hidden = true;
     const resolve = operatorConfirmResolve;
     operatorConfirmResolve = null;
-    if (resolve) resolve(Boolean(accepted));
+    if (resolve) resolve(accepted);
   }
 
-  function confirmOperatorAction(title, copy, confirmLabel = 'Confirm') {
+  function confirmOperatorAction(title, copy, confirmLabel = 'Confirm', epChoice = false) {
     if (operatorConfirmResolve) closeOperatorConfirm(false);
     byId('operator-confirm-title').textContent = title;
     byId('operator-confirm-copy').textContent = copy;
     byId('operator-confirm-submit').textContent = confirmLabel;
+    byId('operator-confirm-ep').hidden = !epChoice;
+    byId('operator-confirm-ep').parentElement.classList.toggle('has-ep-choice', epChoice);
     byId('operator-confirm-dialog').hidden = false;
     return new Promise(resolve => { operatorConfirmResolve = resolve; });
+  }
+
+  function confirmBuyTodayPublication(symbol, copy) {
+    const settings = {...ORB_SETTINGS_DEFAULTS, ...state.orbSettings};
+    const bounds = prefix => ['min', 'ideal', 'max']
+      .map(bound => `${Number(settings[`${prefix}stop_adr_${bound}_percent`])}%`).join(' / ');
+    return confirmOperatorAction(
+      `Publish ${symbol} to Buy Today?`,
+      `${copy}\n\nStop/ADR lower / ideal / upper\nNormal: ${bounds('')}\nEP: ${bounds('ep_')}`,
+      'Publish to Buy Today', true,
+    );
   }
 
   async function refreshStatusStrip() {
@@ -1288,6 +1551,8 @@
     refreshStatusStrip();
     if (state.statusTimer !== null) window.clearInterval(state.statusTimer);
     state.statusTimer = window.setInterval(refreshStatusStrip, 10_000);
+    if (marketClockTimer !== null) window.clearInterval(marketClockTimer);
+    marketClockTimer = window.setInterval(renderMarketCountdown, 1_000);
   }
 
   function createPane(containerId, rsContainerId, overlayId, timeframe) {
@@ -1741,20 +2006,31 @@
   function closeBreakoutPricePopup() {
     const popup = byId('breakout-price-popup');
     if (popup) popup.hidden = true;
+    state.breakoutFollowup = null;
   }
 
-  function openBreakoutPricePopup(price = breakoutVisualPrice()) {
+  function openBreakoutPricePopup(price = breakoutVisualPrice(), followup = null) {
     const normalized = normalizeBreakoutPrice(price);
-    if (!state.breakoutMode || normalized === null || state.breakoutSaving) return;
+    if ((!followup && (!state.breakoutMode || normalized === null)) || state.breakoutSaving) return;
     setBreakoutMode(false, false);
     const popup = byId('breakout-price-popup');
     const input = byId('breakout-price-popup-input');
-    input.value = normalized.toFixed(2);
+    state.breakoutFollowup = followup;
+    byId('breakout-price-title').textContent = followup
+      ? `Set ${followup.symbol} breakout for ${followup.target === 'buy_today' ? 'Buy Today' : 'Buylist'}`
+      : 'Set exact price';
+    input.value = normalized === null ? '' : normalized.toFixed(2);
+    input.setCustomValidity('');
     popup.hidden = false;
     requestAnimationFrame(() => {
       input.focus({preventScroll: true});
       input.select();
     });
+  }
+
+  function requestBreakoutForList(target) {
+    setPanel(`Set a breakout price for ${state.symbol} before adding it to ${target === 'buy_today' ? 'Buy Today' : 'Buylist'}.`, 'error');
+    openBreakoutPricePopup(null, {symbol: state.symbol, target});
   }
 
   function updateBreakoutModeUi() {
@@ -2459,6 +2735,12 @@
     const startedAt = performance.now();
     closeBreakoutPricePopup();
     state.symbol = symbol.toUpperCase();
+    rememberListCursor();
+    state.plan = state.optimisticPlans.get(state.symbol)
+      || state.planningRows.find(row => row.symbol === state.symbol)
+      || state.buyTodayRows.find(row => row.symbol === state.symbol)
+      || null;
+    setPanel('');
     const chartCacheHit = state.bundleCache.has(`${state.symbol}:${state.timeframe}`);
     state.planningBusy = planningPending(state.symbol);
     state.selectionToken += 1;
@@ -2489,6 +2771,7 @@
     Object.values(state.panes).forEach(pane => pane?.breakoutHandle.classList.remove('dragging'));
     updateBreakoutModeUi();
     updateActiveStockRow();
+    renderPlan(true);
     const chartRequest = loadCharts(state.symbol, token);
     const contextRequest = fetchPlanAndDrawings(state.symbol, token);
     const [chartOutcome] = await Promise.allSettled([chartRequest]);
@@ -2519,6 +2802,45 @@
     }, 650);
   }
 
+  function purchaseDisplay(row) {
+    if (!row) return null;
+    const quantity = Math.max(0, Number(row.broker_quantity) || 0);
+    const remaining = Math.max(0, Number(row.entry_remaining_target_quantity) || 0);
+    const status = quantity > 0 ? (remaining > 0 ? 'PARTIALLY_BOUGHT' : 'BOUGHT')
+      : row.purchase_status === 'SOLD' ? 'SOLD'
+      : (row.canonical_stage || row.board_status) === 'ENTRY_PENDING' ? 'ENTRY_PENDING' : '';
+    const labels = {BOUGHT: 'Bought', PARTIALLY_BOUGHT: 'Partially bought', SOLD: 'Bought · sold', ENTRY_PENDING: 'Entry pending'};
+    if (!labels[status]) return null;
+    const average = Number(row.average_entry_price);
+    const title = quantity > 0
+      ? `${labels[status]} · ${quantity} ${quantity === 1 ? 'share' : 'shares'}${average > 0 ? ` at $${average.toFixed(average < 1 ? 4 : 2)} average` : ''}`
+      : status === 'SOLD' ? 'Bought earlier this session; position is now closed' : 'Entry submitted; no confirmed shares bought yet';
+    return {status, label: labels[status], title};
+  }
+
+  function renderPurchaseStatus() {
+    const badge = byId('chart-purchase-status');
+    const row = state.plan?.symbol === state.symbol ? state.plan
+      : state.buyTodayRows.find(item => item.symbol === state.symbol);
+    const purchase = purchaseDisplay(row);
+    badge.hidden = !purchase;
+    badge.textContent = purchase
+      ? compactLayout.matches && purchase.status === 'PARTIALLY_BOUGHT' ? 'Part bought' : purchase.label
+      : '';
+    badge.dataset.status = purchase?.status || '';
+    badge.title = purchase?.title || '';
+    badge.setAttribute('aria-label', purchase?.title || '');
+  }
+
+  function renderListMetric(metric, row) {
+    const purchase = PLANNING_LIST_MODES.has(state.listMode) && purchaseDisplay(row);
+    metric.textContent = purchase?.label || (Number.isFinite(row.score) ? row.score.toFixed(1) : (row.stage || ''));
+    if (purchase) {
+      metric.dataset.purchaseStatus = purchase.status;
+      metric.title = purchase.title;
+    }
+  }
+
   function stockRow(row, index) {
     const button = document.createElement('button');
     button.className = `stock-row${row.symbol === state.symbol ? ' active' : ''}`;
@@ -2538,7 +2860,7 @@
     identity.append(symbol, name);
     const metric = document.createElement('span');
     metric.className = 'stock-metric';
-    metric.textContent = Number.isFinite(row.score) ? row.score.toFixed(1) : (row.stage || '');
+    renderListMetric(metric, row);
     button.append(rank, identity, metric);
     button.addEventListener('click', () => selectSymbol(row.symbol));
     return button;
@@ -2564,8 +2886,52 @@
       empty.textContent = listEmptyMessage();
       fragment.appendChild(empty);
     }
-    list.replaceChildren(fragment);
+    replaceStockListRows(list, fragment);
     renderMobileStockList();
+  }
+
+  function replaceStockListRows(list, fragment) {
+    const key = `${state.listMode}:${list.id}`;
+    const scrollTop = state.listScrollPositions.get(key) || 0;
+    list.replaceChildren(fragment);
+    list.scrollTop = scrollTop;
+  }
+
+  function rememberListCursor() {
+    const index = state.visibleRows.findIndex(row => row.symbol === state.symbol);
+    state.listCursor = index < 0 || !PLANNING_LIST_MODES.has(state.listMode) ? null : {
+      mode: state.listMode,
+      symbol: state.symbol,
+      index,
+      symbols: state.visibleRows.map(row => row.symbol),
+    };
+  }
+
+  function listContinuationSymbol(direction) {
+    const cursor = state.listCursor;
+    if (!cursor || cursor.mode !== state.listMode || cursor.symbol !== state.symbol) return null;
+    const available = new Set(state.visibleRows.map(row => row.symbol));
+    const after = cursor.symbols.slice(cursor.index + 1);
+    const before = cursor.symbols.slice(0, cursor.index).reverse();
+    const neighbors = direction < 0 ? [...before, ...after] : [...after, ...before];
+    return neighbors.find(symbol => available.has(symbol))
+      || state.visibleRows[Math.min(cursor.index, state.visibleRows.length - 1)]?.symbol;
+  }
+
+  function preservePlanningListOrder(mode, rows) {
+    const order = state.listOrders.get(mode) || [];
+    const known = new Set(order);
+    rows.forEach(row => {
+      if (!known.has(row.symbol)) {
+        order.push(row.symbol);
+        known.add(row.symbol);
+      }
+    });
+    // Keep removed symbols' slots so a rejected optimistic edit restores its order.
+    state.listOrders.set(mode, order);
+    const current = new Map(rows.map(row => [row.symbol, row]));
+    return order.filter(symbol => current.has(symbol))
+      .map((symbol, index) => ({...current.get(symbol), rank: index + 1}));
   }
 
   function listEmptyMessage() {
@@ -2594,7 +2960,7 @@
     identity.append(symbol, name);
     const metric = document.createElement('span');
     metric.className = 'mobile-list-metric';
-    metric.textContent = Number.isFinite(row.score) ? row.score.toFixed(1) : (row.stage || '');
+    renderListMetric(metric, row);
     button.append(rank, identity, metric);
     button.addEventListener('click', () => {
       byId('mobile-list-popover').hidden = true;
@@ -2619,23 +2985,72 @@
       const age = quote.quote_as_of ? (Date.now() - new Date(quote.quote_as_of).getTime()) / 1000 : Infinity;
       const stale = Boolean(state.monitorError) || quote.quote_status === 'STALE' || (active && age > state.monitorStaleSeconds);
       if (stale) result.quote_status = quote.current_price ? 'STALE' : 'UNAVAILABLE';
-      if (changedLevel || stale) {
+      if (changedLevel) {
         result.breakout_status = normalizeBreakoutPrice(card.breakout_price) === null ? 'NO_LEVEL' : 'UNKNOWN';
         result.broke_out_today = null;
         result.orb = [];
+      } else if (stale) {
+        result.breakout_status = normalizeBreakoutPrice(card.breakout_price) === null ? 'NO_LEVEL' : 'UNKNOWN';
+        result.broke_out_today = null;
+        const sessionDay = new Intl.DateTimeFormat('en-CA', {timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit'}).format(new Date());
+        result.orb = quote.orb_session_date === sessionDay ? (quote.orb || []).map(orb =>
+          orb.price_status === 'PASS' ? {...orb} : {...orb, price_status: 'UNKNOWN', price_reason: 'Quote is stale'}) : [];
       }
       return result;
     }).filter(row => {
       if (state.monitorQuery && !`${row.symbol} ${row.name || ''}`.toLowerCase().includes(state.monitorQuery)) return false;
       if (state.monitorFilter === 'breakouts') return row.broke_out_today === true;
-      if (state.monitorFilter === 'orb') return (row.orb || []).some(orb => orb.price_status === 'PASS' && orb.position_status === 'PASS');
+      if (state.monitorFilter === 'orb') return Boolean(bestMonitorOrb(row));
       if (state.monitorFilter === 'today') return Boolean(row.buy_today_member);
       return true;
     }).sort((a, b) => (
       Number(Boolean(b.broke_out_today)) - Number(Boolean(a.broke_out_today))
-      || Number(Boolean(b.buy_today_member)) - Number(Boolean(a.buy_today_member))
+      || Number(Boolean(bestMonitorOrb(b))) - Number(Boolean(bestMonitorOrb(a)))
+      || (monitorNumber(b.change_percent) ?? -Infinity) - (monitorNumber(a.change_percent) ?? -Infinity)
       || a.symbol.localeCompare(b.symbol)
     ));
+  }
+
+  function monitorNumber(value) {
+    if (value === null || value === undefined || value === '') return null;
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+  }
+
+  function bestMonitorOrb(row) {
+    if (monitorMarketClosed()) return null;
+    return (row.orb || []).filter(orb => orb.price_status === 'PASS'
+      && orb.position_status === 'PASS' && orb.liquidity_status === 'PASS')
+      .sort((a, b) => (monitorNumber(b.score) ?? 0) - (monitorNumber(a.score) ?? 0)
+        || ['1m', '5m', '30m'].indexOf(a.window) - ['1m', '5m', '30m'].indexOf(b.window))[0] || null;
+  }
+
+  function monitorOrbSummary(row) {
+    const best = bestMonitorOrb(row);
+    if (best) {
+      const stale = row.quote_status === 'STALE';
+      const risk = boardNumber(best.risk_percent);
+      const riskLabel = risk === null ? '—' : String(Number(risk.toFixed(2)));
+      return {text: `${best.window} · ${riskLabel}%${stale ? '*' : ''}`,
+        status: stale ? 'STALE' : 'PASS',
+        title: `${stale ? 'Passed earlier · latest quote stale. ' : ''}Best ORB: ${best.window}, risk ${riskLabel}%, capital ${best.capital_percent}%, stop/ADR ${best.stop_adr_percent}%. Price, position bounds and opening liquidity passed.`};
+    }
+    if (!normalizeBreakoutPrice(row.breakout_price)) return {text: '—', title: 'Set a breakout level to check ORB'};
+    if (monitorMarketClosed()) return {text: '—', title: 'ORB checks resume next session'};
+    if (row.quote_status === 'STALE') return {text: 'Stale', status: 'STALE', title: 'Latest quote stale'};
+    const windows = row.orb || [];
+    const completed = windows.filter(orb => ['PASS', 'WAITING'].includes(orb.price_status));
+    if (completed.some(orb => orb.liquidity_status === 'FAIL')) {
+      return {text: 'Low vol', status: 'FAIL', title: row.liquidity_reason || completed.find(orb => orb.liquidity_status === 'FAIL').liquidity_reason};
+    }
+    if (completed.some(orb => orb.position_status === 'PASS' && orb.liquidity_status === 'PASS')) {
+      return {text: 'Waiting', title: completed.map(orb => `${orb.window}: Range complete · waiting above $${Number(orb.breakout_trigger).toFixed(2)}`).join('; ')};
+    }
+    if (completed.some(orb => orb.position_status === 'FAIL')) {
+      return {text: 'No pass', status: 'FAIL', title: completed.filter(orb => orb.position_status === 'FAIL').map(orb => `${orb.window}: ${orb.position_reason}`).join('; ')};
+    }
+    if (windows.some(orb => orb.price_status === 'FORMING')) return {text: 'Forming', title: 'Opening range still forming'};
+    return {text: '—', title: row.liquidity_reason || completed[0]?.position_reason || windows[0]?.price_reason || 'Awaiting data'};
   }
 
   function monitorMarketClosed() {
@@ -2644,65 +3059,71 @@
   }
 
   function mobileMonitorRow(row) {
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = `mobile-monitor-row${row.symbol === state.symbol ? ' active' : ''}`;
-    button.dataset.mobileSymbol = row.symbol;
-    button.setAttribute('role', 'option');
-    button.setAttribute('aria-selected', String(row.symbol === state.symbol));
-    const add = (parent, tag, text, className = '') => {
-      const node = document.createElement(tag);
+    const line = document.createElement('tr');
+    line.className = `mobile-monitor-row${row.symbol === state.symbol ? ' active' : ''}`;
+    line.dataset.mobileSymbol = row.symbol;
+    line.setAttribute('aria-selected', String(row.symbol === state.symbol));
+    const cell = (text, className = '', title = '') => {
+      const node = document.createElement('td');
       node.textContent = text;
       node.className = className;
-      parent.appendChild(node);
+      node.title = title;
+      line.appendChild(node);
       return node;
     };
-    const top = add(button, 'span', '', 'mobile-monitor-top');
-    add(top, 'strong', row.symbol);
-    const labels = {ABOVE: 'Broken out', PULLED_BACK: 'Broke out · pulled back', WAITING: 'Waiting', NO_LEVEL: 'Set breakout', PRE_MARKET: 'Pre-market', CLOSED: 'Market closed', UNKNOWN: 'Awaiting data'};
-    const status = add(top, 'small', labels[row.breakout_status] || 'Awaiting data', 'mobile-monitor-breakout');
+    const identity = cell('', 'mobile-monitor-stock');
+    const stock = document.createElement('button');
+    stock.type = 'button';
+    stock.textContent = row.symbol;
+    stock.title = `${row.name || row.symbol} · ${row.current_price ? `$${row.current_price}` : 'Price unavailable'} · ${row.quote_status || 'UNAVAILABLE'}${row.quote_as_of ? ` · ${new Date(row.quote_as_of).toLocaleTimeString('en-US', {timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit'})} ET` : ''}`;
+    stock.setAttribute('aria-label', `Open ${row.symbol} chart — ${row.name || row.symbol}`);
+    identity.appendChild(stock);
+    const percent = (key, title) => {
+      const value = monitorNumber(row[key]);
+      const node = cell(value === null ? '—' : `${value >= 0 ? '+' : ''}${value.toFixed(1)}%`, 'mobile-monitor-percent', title);
+      node.dataset.tone = value === null ? 'neutral' : value >= 0 ? 'positive' : 'negative';
+      if (row.quote_status === 'STALE') { node.classList.add('stale'); node.title += ' · cached quote is stale'; }
+    };
+    percent('change_percent', 'Change from the previous regular-session close');
+    const labels = {ABOVE: 'Yes', PULLED_BACK: 'Pullback', WAITING: 'Waiting', NO_LEVEL: '—', PRE_MARKET: 'Pre-mkt', CLOSED: 'Closed', UNKNOWN: '—'};
+    const status = cell(labels[row.breakout_status] || '—', 'mobile-monitor-breakout',
+      row.breakout_status === 'PULLED_BACK' ? `Broke out today · pulled back below $${row.breakout_price}`
+        : row.breakout_price ? `Breakout level $${row.breakout_price}` : 'No breakout level set');
     status.dataset.status = row.breakout_status || 'UNKNOWN';
-    const prices = add(button, 'span', '', 'mobile-monitor-prices');
-    const closed = monitorMarketClosed() || row.quote_status === 'CLOSED';
-    const price = add(prices, 'span', closed ? 'Latest price' : 'Current price', 'mobile-monitor-price-block');
-    const currentPrice = Number(row.current_price);
-    add(price, 'b', Number.isFinite(currentPrice) && currentPrice > 0 ? currentPrice.toFixed(currentPrice < 1 ? 4 : 2) : '—');
-    const level = add(prices, 'span', 'Breakout price', 'mobile-monitor-price-block');
-    add(level, 'b', normalizeBreakoutPrice(row.breakout_price)?.toFixed(2) || 'Not set');
-    const distance = normalizeBreakoutPrice(row.current_price) && normalizeBreakoutPrice(row.breakout_price)
-      ? (row.current_price / row.breakout_price - 1) * 100 : null;
-    const meta = add(button, 'span', '', 'mobile-monitor-meta');
-    const quoted = row.quote_as_of ? new Date(row.quote_as_of) : null;
-    const quoteDay = quoted?.toLocaleDateString('en-US', {timeZone: 'America/New_York', weekday: 'short', month: 'short', day: 'numeric'});
-    const today = new Date().toLocaleDateString('en-US', {timeZone: 'America/New_York', weekday: 'short', month: 'short', day: 'numeric'});
-    const quoteTime = quoted ? `${quoteDay === today ? '' : `${quoteDay} · `}${quoted.toLocaleTimeString('en-US', {timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false})}` : '';
-    const sourceLabel = row.quote_source === 'DAILY_CLOSE' ? 'Last close' : closed ? 'Last price' : '';
-    add(meta, 'small', !quoteTime ? state.monitorAsOf ? 'Quote unavailable' : 'Fetching latest price…'
-      : `${sourceLabel ? `${sourceLabel} · ` : ''}${quoteTime} ET${row.quote_status === 'STALE' ? ' · stale' : ''}`, `mobile-monitor-quote ${row.quote_status === 'STALE' ? 'stale' : ''}`);
-    add(meta, 'small', distance === null ? '' : `${Math.abs(distance).toFixed(2)}% ${distance > 0 ? 'above' : 'below'} breakout`, 'mobile-monitor-distance');
-    if (!closed) {
-      const table = add(button, 'span', '', 'mobile-monitor-orb');
-      ['1m', '5m', '30m'].forEach(window => {
-        const orb = (row.orb || []).find(item => item.window === window) || {};
-        const line = add(table, 'span', '', 'mobile-monitor-orb-line');
-        add(line, 'b', window);
-        const cell = (value, reason) => {
-          const names = {PASS: '✓ Passed', FAIL: '✕ Failed', WAITING: 'Waiting', FORMING: 'Forming', UNKNOWN: 'Unavailable'};
-          const node = add(line, 'span', names[value] || 'Unavailable', 'mobile-monitor-result');
-          node.dataset.status = value || 'UNKNOWN';
-          node.title = reason || '';
-        };
-        cell(orb.price_status, orb.price_reason);
-        cell(orb.position_status, orb.position_reason);
-        if (orb.position_status === 'FAIL' && orb.position_reason) add(table, 'small', `${window}: ${orb.position_reason}`, 'mobile-monitor-reason');
-      });
-    }
-    button.addEventListener('click', () => {
+    const summary = monitorOrbSummary(row);
+    const orb = cell(summary.text, 'mobile-monitor-result', summary.title || '');
+    orb.dataset.status = summary.status || 'UNKNOWN';
+    percent('return_1m', '1-month return · 21 trading sessions');
+    percent('return_3m', '3-month return · 63 trading sessions');
+    const action = cell('', 'mobile-monitor-action');
+    const addToday = document.createElement('button');
+    addToday.type = 'button';
+    const active = Boolean(row.buy_today_member) || canonicalBuyTodayActive(row);
+    const pending = planningPending(row.symbol) || operatorPending(row.symbol);
+    const owned = Number(row.broker_quantity) > 0 || row.canonical_stage === 'ENTRY_PENDING';
+    addToday.textContent = active ? '✓' : pending ? '…' : '+';
+    addToday.disabled = active || pending || owned;
+    addToday.title = active ? 'Already in Buy Today' : owned ? 'Entry active or shares already owned' : 'Add to Buy Today';
+    addToday.setAttribute('aria-label', `${addToday.title}: ${row.symbol}`);
+    addToday.addEventListener('click', async event => {
+      event.stopPropagation();
+      addToday.disabled = true;
+      byId('mobile-list-popover').hidden = true;
+      byId('mobile-list-menu').setAttribute('aria-expanded', 'false');
+      try {
+        await selectSymbol(row.symbol);
+        if (state.symbol === row.symbol && !canonicalBuyTodayActive() && !hasCurrentBuyTodayDraft()) await toggleBuyTodayDraft();
+      } finally {
+        renderMobileStockList();
+      }
+    });
+    action.appendChild(addToday);
+    stock.addEventListener('click', () => {
       byId('mobile-list-popover').hidden = true;
       byId('mobile-list-menu').setAttribute('aria-expanded', 'false');
       void selectSymbol(row.symbol);
     });
-    return button;
+    return line;
   }
 
   async function loadIntradayMonitor() {
@@ -2728,6 +3149,8 @@
       window.clearTimeout(timeout);
       state.monitorLoading = false;
       if (state.listMode === 'monitor') applyListMode('monitor');
+      renderBuyBoardPage();
+      if (!byId('buy-board-action-sheet').hidden) renderBuyBoardActionSheet();
       // Poll only the shared snapshot while its first quote batch is loading.
       if (!state.monitorAsOf && state.monitorEnabled === true && !state.monitorError) {
         state.monitorRetryTimer = window.setTimeout(loadIntradayMonitor, 5_000);
@@ -2748,26 +3171,45 @@
       return;
     }
     const fragment = document.createDocumentFragment();
-    state.visibleRows.forEach((row, index) => {
-      fragment.appendChild(state.listMode === 'monitor' ? mobileMonitorRow(row) : mobileStockRow(row, index));
-    });
+    const monitor = state.listMode === 'monitor';
+    list.classList.toggle('monitor-table-scroll', monitor);
+    byId('mobile-list-popover').classList.toggle('monitor-view', monitor);
+    list.setAttribute('role', monitor ? 'region' : 'listbox');
+    if (monitor) {
+      const table = document.createElement('table');
+      table.className = 'mobile-monitor-table';
+      table.setAttribute('aria-label', 'Watchlist breakout monitor');
+      const header = table.createTHead().insertRow();
+      ['Stock', 'Today %', 'Breakout', 'Best ORB', '1M %', '3M %', '+'].forEach((label, index) => {
+        const cell = document.createElement('th');
+        cell.scope = 'col';
+        cell.textContent = label;
+        if (index === 6) cell.setAttribute('aria-label', 'Add to Buy Today');
+        header.appendChild(cell);
+      });
+      const body = table.createTBody();
+      state.visibleRows.forEach(row => body.appendChild(mobileMonitorRow(row)));
+      fragment.appendChild(table);
+    } else {
+      state.visibleRows.forEach((row, index) => fragment.appendChild(mobileStockRow(row, index)));
+    }
     if (!state.visibleRows.length) {
       const empty = document.createElement('div');
       empty.className = 'mobile-list-empty';
       empty.textContent = listEmptyMessage();
       fragment.appendChild(empty);
     }
-    list.replaceChildren(fragment);
+    const scrollLeft = list.scrollLeft;
+    replaceStockListRows(list, fragment);
+    list.scrollLeft = monitor ? scrollLeft : 0;
     byId('mobile-list-count').textContent = String(state.visibleRows.length);
-    const monitor = state.listMode === 'monitor';
     byId('mobile-monitor-controls').hidden = !monitor;
     byId('mobile-monitor-status').hidden = !monitor;
-    byId('mobile-monitor-legend').hidden = monitorMarketClosed();
     byId('mobile-monitor-status').textContent = state.monitorError || (state.monitorEnabled === false
       ? 'Sandbox · intraday quotes are available in Connected mode'
       : state.monitorAsOf ? monitorMarketClosed()
         ? 'Market closed · showing latest available prices. ORB checks resume next session.'
-        : `Yahoo 1m · checks every minute · quotes may be delayed${state.monitorPositionError ? ` · ${state.monitorPositionError}` : ''}`
+        : `All watchlists · checks every minute · Yahoo quotes may be delayed. 1M / 3M = months. Swipe for all columns. * = earlier pass, stale quote.${state.monitorPositionError ? ` ${state.monitorPositionError}` : ''}`
       : 'Checking prices · Watchlist + Buylist + Buy Today');
   }
 
@@ -2809,6 +3251,10 @@
     const revision = planningResult.revision || buyTodayResult.revision;
     if (revision) state.planningRevision = String(revision);
     if (buyTodayResult.draft_revision) state.buyTodayDraftRevision = String(buyTodayResult.draft_revision);
+    const selected = state.planningRows.find(row => row.symbol === state.symbol)
+      || state.buyTodayRows.find(row => row.symbol === state.symbol);
+    if (selected && !planningPending() && !operatorPending()
+      && Number(selected.version || 0) >= Number(state.plan?.version || 0)) state.plan = selected;
     if (state.listMode !== 'scanner') applyListMode(state.listMode);
     renderPlan();
     renderMobileWorkspace();
@@ -2816,6 +3262,7 @@
   }
 
   function applyListMode(mode, render = true) {
+    if (state.listMode !== mode) state.listCursor = null;
     state.listMode = mode;
     document.querySelectorAll('.list-tab').forEach(button => button.classList.toggle('active', button.dataset.list === mode));
     const listLabels = {monitor: 'Intraday watch', scanner: 'Scanner', history: 'History', watchlist: 'Watchlist', buylist: 'Buylist', buy_today: 'Buy Today'};
@@ -2855,7 +3302,21 @@
     } else {
       state.visibleRows = state.planningRows.filter(row => row.buylist_member === true || row.stage === 'BUYLIST').map((row, index) => ({...row, rank: index + 1, name: row.name || row.stage}));
     }
+    if (PLANNING_LIST_MODES.has(mode)) {
+      state.visibleRows = preservePlanningListOrder(mode, state.visibleRows);
+    }
     if (render) renderStockList();
+    if (state.visibleRows.some(row => row.symbol === state.symbol)) {
+      rememberListCursor();
+    } else if (!planningPending() && !operatorPending()) {
+      const nextSymbol = listContinuationSymbol(1);
+      if (nextSymbol) void selectSymbol(nextSymbol, 'list-continuation');
+      else state.listCursor = null;
+    }
+  }
+
+  function refreshActivePlanningList() {
+    if (PLANNING_LIST_MODES.has(state.listMode)) applyListMode(state.listMode);
   }
 
   async function loadWatchlistHistory(startDate, endDate) {
@@ -2924,6 +3385,7 @@
   function hasCurrentBuyTodayDraft() {
     return state.buyTodayRows.some(row => (
       row.symbol === state.symbol && row.card_version === state.plan?.version
+      && !row.buy_today_display_member && !row.purchase_status
     ));
   }
 
@@ -3028,12 +3490,11 @@
   }
 
   function renderPlan(fast = false) {
+    renderPurchaseStatus();
     const card = state.plan;
     const busy = planningPending() || operatorPending();
     const hasBuyTodayDraft = hasCurrentBuyTodayDraft();
-    const canonicalBuyToday = Boolean(
-      card?.buy_today_member || (card?.canonical_stage || card?.stage) === 'BUY_TODAY'
-    );
+    const canonicalBuyToday = canonicalBuyTodayActive(card);
     const hasBuyToday = canonicalBuyToday || hasBuyTodayDraft;
     const connectedReadOnly = state.session?.mode === 'CONNECTED' && !state.session?.planning_writable;
     const watchlistMember = card?.watchlist_member ?? (card?.stage === 'WATCHLIST' || card?.stage === 'BUYLIST');
@@ -3046,9 +3507,15 @@
       state.session?.operator?.delegated
       && operatorOperations.has(canonicalBuyToday ? 'deactivate_buy_today' : 'activate_buy_today')
     );
-    const buyTodayActionEligible = hasBuyToday || buyTodayDraftEligible;
+    const buyTodayActionEligible = hasBuyToday || buyTodayDraftEligible || (
+      !connectedReadOnly && (card?.canonical_stage || card?.stage) === 'WATCHLIST'
+    ) || (
+      (card?.canonical_stage || card?.stage) === 'CLOSED'
+      && Boolean(card?.breakout_price) && operatorBuyTodayEnabled
+    );
     const displayStage = card?.display_stage || card?.canonical_stage || card?.stage || 'NOT PLANNED';
-    byId('plan-stage').textContent = displayStage;
+    byId('plan-stage').textContent = `${displayStage}${card?.is_ep ? ' · EP' : ''}`;
+    byId('chart-entry-profile').hidden = !card?.is_ep;
     byId('plan-revision').textContent = operatorPending()
       ? `Revision ${card?.version || 0} · Queued`
       : busy || state.breakoutSaving
@@ -3064,7 +3531,7 @@
     byId('clear-breakout').disabled = connectedReadOnly || !card || !card.breakout_price || busy || state.breakoutSaving;
     byId('place-breakout').disabled = connectedReadOnly || !state.symbol || busy || state.breakoutSaving;
     const previewButton = byId('buy-today-preview');
-    previewButton.disabled = busy || !card || !buyTodayActionEligible;
+    previewButton.disabled = busy || !card || !buyTodayActionEligible || Boolean(card?.entry_cancellation_pending);
     previewButton.textContent = hasBuyToday
       ? 'Remove from Buy Today'
       : operatorBuyTodayEnabled ? 'Publish to Buy Today' : 'Create Buy Today draft';
@@ -3085,10 +3552,11 @@
       ? 'Add to Buylist'
       : 'Set a breakout price before adding to Buylist';
     const quickBuyToday = byId('quick-buy-today');
-    quickBuyToday.disabled = busy || !buyTodayActionEligible;
-    quickBuyToday.textContent = hasBuyToday ? 'Cancel Today' : 'Buy Today';
+    quickBuyToday.disabled = busy || !buyTodayActionEligible || Boolean(card?.entry_cancellation_pending);
+    quickBuyToday.textContent = card?.entry_cancellation_pending
+      ? 'Cancelling…' : hasBuyToday ? 'Cancel Today' : 'Buy Today';
     quickBuyToday.title = hasBuyToday
-      ? canonicalBuyToday ? 'Remove this unsubmitted card from Buy Today' : 'Cancel the shared Buy Today draft'
+      ? canonicalBuyToday ? 'Cancel the remaining buy intent; confirmed fills are preserved' : 'Cancel the shared Buy Today draft'
       : operatorBuyTodayEnabled ? 'Publish executable Buy Today intent after confirmation' : 'Create a shared, non-executable Buy Today draft';
     byId('buy-today-safety').textContent = operatorBuyTodayEnabled
       ? 'Confirmed Buy Today intent is written through verified Operator Control. The browser never places an order.'
@@ -3113,15 +3581,29 @@
     return crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-0000-4000-8000-${Math.random().toString(16).slice(2).padEnd(12, '0').slice(0, 12)}`;
   }
 
-  async function sendPlanningCommand(symbol, operation, breakoutPrice, expectedRevision) {
-    return api(`/api/v1/planning/${encodeURIComponent(symbol)}/commands`, {
-      method: 'POST',
-      body: JSON.stringify({
-        command_id: commandId(), operation,
-        expected_revision: expectedRevision,
-        breakout_price: breakoutPrice,
-      }),
-    });
+  async function sendPlanningCommand(symbol, operation, breakoutPrice, expectedRevision, previousPlan = null) {
+    let revision = expectedRevision;
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      try {
+        return await api(`/api/v1/planning/${encodeURIComponent(symbol)}/commands`, {
+          method: 'POST',
+          body: JSON.stringify({
+            command_id: commandId(), operation,
+            expected_revision: revision,
+            breakout_price: breakoutPrice,
+          }),
+        });
+      } catch (error) {
+        const current = error.current;
+        const observationConflict = operation === 'set_breakout'
+          && error.status === 409 && error.message.includes('Stale planning revision')
+          && current?.symbol === symbol && Number(current.version) > Number(revision)
+          && current.breakout_price === previousPlan?.breakout_price
+          && (current.canonical_stage || current.stage) === (previousPlan?.canonical_stage || previousPlan?.stage);
+        if (!observationConflict || attempt === 3) throw error;
+        revision = current.version;
+      }
+    }
   }
 
   async function planningCommand(operation, breakoutPrice = null, successMessage = '') {
@@ -3142,7 +3624,7 @@
     setPanel('Saving to canonical store…');
     try {
       const result = await sendPlanningCommand(
-        actionSymbol, operation, breakoutPrice, expectedRevision
+        actionSymbol, operation, breakoutPrice, expectedRevision, previousPlan
       );
       state.optimisticPlans.delete(actionSymbol);
       syncOptimisticPlanningRow(result.card, actionSymbol);
@@ -3172,6 +3654,7 @@
       bumpPlanningEpoch(actionSymbol);
       state.planningPendingSymbols.delete(actionSymbol);
       state.planningBusy = planningPending();
+      refreshActivePlanningList();
       if (state.symbol === actionSymbol) renderPlan();
     }
   }
@@ -3190,7 +3673,9 @@
 
   function canonicalBuyTodayActive(card = state.plan) {
     return Boolean(
-      card?.buy_today_member || (card?.canonical_stage || card?.stage) === 'BUY_TODAY'
+      card?.buy_today_member
+      || ['BUY_TODAY', 'ENTRY_PENDING'].includes(card?.canonical_stage || card?.stage)
+      || ((card?.canonical_stage || card?.stage) === 'OPEN_POSITION' && Number(card?.entry_remaining_target_quantity) > 0)
     );
   }
 
@@ -3259,21 +3744,27 @@
     if (!state.symbol || planningPending() || operatorPending() || !state.plan) return;
     const actionSymbol = state.symbol;
     const previousPlan = {...state.plan};
+    const previousBuyTodayRow = state.buyTodayRows.find(row => row.symbol === actionSymbol);
     const enabled = !canonicalBuyTodayActive(previousPlan);
+    let isEp = false;
     const operation = enabled ? 'activate_buy_today' : 'deactivate_buy_today';
     if (!operatorOperationEnabled(operation)) {
       setPanel('Mobile operator control is not available for this action.', 'error');
       return;
     }
     if (enabled) {
-      const confirmed = await confirmOperatorAction(
-        `Publish ${actionSymbol} to Buy Today?`,
-        'This creates executable intent on the shared Buy Board. It does not place an order now, but the Execution Owner may act later when every runtime, risk, market-data, and broker gate passes.',
-        'Publish to Buy Today',
+      const reentry = (previousPlan.canonical_stage || previousPlan.stage) === 'CLOSED';
+      const confirmed = await confirmBuyTodayPublication(
+        actionSymbol,
+        reentry
+          ? `Re-enter ${actionSymbol}: This starts a new trade cycle after a fully reconciled exit. The Execution Owner may buy again when current ORB, fresh market data, risk, capital and broker checks pass. It does not automatically repeat after another stop.`
+          : 'This creates executable intent on the shared Buy Board. It does not place an order now, but the Execution Owner may act later when every runtime, risk, market-data, and broker gate passes.',
       );
       if (!confirmed) return;
+      isEp = confirmed === 'ep';
     }
     const optimistic = optimisticBuyTodayPlan(previousPlan, enabled, actionSymbol);
+    if (enabled) optimistic.is_ep = isEp;
     const requestId = commandId();
     state.planningPendingSymbols.add(actionSymbol);
     bumpPlanningEpoch(actionSymbol);
@@ -3291,6 +3782,7 @@
           command_id: requestId,
           expected_revision: previousPlan.version,
           enabled,
+          is_ep: isEp,
         }),
       });
       queued = Boolean(result.queued);
@@ -3312,6 +3804,9 @@
       state.optimisticPlans.delete(actionSymbol);
       state.optimisticBuyToday.delete(actionSymbol);
       syncOptimisticPlanningRow(previousPlan, actionSymbol);
+      state.buyTodayRows = state.buyTodayRows.filter(row => row.symbol !== actionSymbol);
+      if (previousBuyTodayRow) state.buyTodayRows.push(previousBuyTodayRow);
+      if (state.listMode === 'buy_today') applyListMode('buy_today');
       if (state.symbol === actionSymbol) {
         state.plan = error.status === 409 && error.current
           ? (Object.keys(error.current).length ? error.current : null)
@@ -3322,6 +3817,7 @@
       bumpPlanningEpoch(actionSymbol);
       state.planningPendingSymbols.delete(actionSymbol);
       state.planningBusy = planningPending();
+      refreshActivePlanningList();
       if (state.symbol === actionSymbol) renderPlan();
       if (!queued) renderMobileWorkspace();
     }
@@ -3367,8 +3863,22 @@
 
   async function toggleBuyTodayDraft() {
     if (!state.symbol || planningPending() || operatorPending()) return;
+    const actionSymbol = state.symbol;
     const canonicalActive = canonicalBuyTodayActive();
     const hasDraft = hasCurrentBuyTodayDraft() && !canonicalActive;
+    if ((state.plan?.canonical_stage || state.plan?.stage) === 'CLOSED'
+        && operatorOperationEnabled('activate_buy_today')) {
+      await toggleCanonicalBuyToday();
+      return;
+    }
+    if (!canonicalActive && !hasDraft && !state.plan?.buylist_member) {
+      if (!state.plan?.breakout_price) {
+        requestBreakoutForList('buy_today');
+        return;
+      }
+      const promoted = await moveToList('buylist');
+      if (!promoted || state.symbol !== actionSymbol) return;
+    }
     if (
       canonicalActive
       || (!hasDraft && operatorOperationEnabled('activate_buy_today'))
@@ -3380,7 +3890,6 @@
       await moveToList('buy_today');
       return;
     }
-    const actionSymbol = state.symbol;
     const previousRow = state.buyTodayRows.find(row => row.symbol === actionSymbol);
     const expectedRevision = state.plan.version;
     state.planningPendingSymbols.add(actionSymbol);
@@ -3401,6 +3910,7 @@
       state.optimisticBuyToday.delete(actionSymbol);
       state.buyTodayRows = state.buyTodayRows.filter(row => row.symbol !== actionSymbol);
       if (previousRow) state.buyTodayRows.unshift(previousRow);
+      if (state.listMode === 'buy_today') applyListMode('buy_today');
       if (state.symbol === actionSymbol) {
         if (error.status === 409 && error.current) {
           state.plan = Object.keys(error.current).length ? error.current : null;
@@ -3411,12 +3921,13 @@
       bumpPlanningEpoch(actionSymbol);
       state.planningPendingSymbols.delete(actionSymbol);
       state.planningBusy = planningPending();
+      refreshActivePlanningList();
       if (state.symbol === actionSymbol) renderPlan();
     }
   }
 
   async function moveToList(target) {
-    if (!state.symbol || planningPending()) return;
+    if (!state.symbol || planningPending()) return false;
     const actionSymbol = state.symbol;
     const previousPlan = state.plan ? {...state.plan} : null;
     const previousBuyTodayRow = state.buyTodayRows.find(
@@ -3433,8 +3944,8 @@
       && !buylistMember
       && !previousPlan?.breakout_price
     ) {
-      setPanel('Set a breakout price before adding this symbol to Buylist.', 'error');
-      return;
+      requestBreakoutForList(target);
+      return false;
     }
     let optimisticOperation = '';
     if (target === 'watchlist') {
@@ -3516,6 +4027,7 @@
         setPanel(successMessage, 'success');
       }
       void refreshPlanningLists().catch(() => {});
+      return true;
     } catch (error) {
       state.optimisticPlans.delete(actionSymbol);
       state.optimisticBuyToday.delete(actionSymbol);
@@ -3531,10 +4043,12 @@
         setPanel(`UNAVAILABLE - ${error.message}`, 'error');
       }
       void refreshPlanningLists().catch(() => {});
+      return false;
     } finally {
       bumpPlanningEpoch(actionSymbol);
       state.planningPendingSymbols.delete(actionSymbol);
       state.planningBusy = planningPending();
+      refreshActivePlanningList();
       if (state.symbol === actionSymbol) renderPlan();
     }
   }
@@ -3618,6 +4132,13 @@
   function stepSymbol(direction) {
     if (!state.visibleRows.length) return;
     const current = state.visibleRows.findIndex(row => row.symbol === state.symbol);
+    if (current < 0) {
+      const continuation = listContinuationSymbol(direction);
+      if (continuation) {
+        void selectSymbol(continuation, direction < 0 ? 'previous-stock' : 'next-stock');
+        return;
+      }
+    }
     const next = current < 0
       ? (direction < 0 ? state.visibleRows.length - 1 : 0)
       : (current + direction + state.visibleRows.length) % state.visibleRows.length;
@@ -3671,11 +4192,21 @@
   }
 
   function wireEvents() {
+    ['stock-list', 'mobile-list-items'].forEach(id => {
+      const list = byId(id);
+      list.addEventListener('scroll', () => {
+        if (list.clientHeight) {
+          state.listScrollPositions.set(`${state.listMode}:${id}`, list.scrollTop);
+        }
+      }, {passive: true});
+    });
     document.addEventListener('click', cancelDrawingModeForOtherControl, true);
     document.querySelectorAll('.list-tab').forEach(button => button.addEventListener('click', () => activateListMode(button.dataset.list)));
     const mobileListMenu = byId('mobile-list-menu');
     const mobileListPopover = byId('mobile-list-popover');
     const mobileMenuPopover = byId('mobile-menu-popover');
+    const navigationMenu = byId('mobile-navigation-menu');
+    const navigationPopover = byId('mobile-navigation-popover');
     const closeMobileListPopover = () => {
       mobileListPopover.hidden = true;
       mobileListMenu.setAttribute('aria-expanded', 'false');
@@ -3686,12 +4217,21 @@
     document.querySelectorAll('.mobile-workspace-tab').forEach(button => {
       button.addEventListener('click', () => setMobilePage(button.dataset.mobilePage));
     });
+    navigationMenu.addEventListener('click', () => {
+      const opening = navigationPopover.hidden;
+      closeMobileListPopover();
+      closeMobileMenuPopover();
+      navigationPopover.hidden = !opening;
+      navigationMenu.setAttribute('aria-expanded', String(opening));
+      if (opening) navigationPopover.querySelector('[aria-current="page"], button').focus();
+    });
     byId('pulse-open-chart').addEventListener('click', () => setMobilePage('chart'));
     byId('summary-open-lists').addEventListener('click', () => {
       setMobilePage('chart');
       mobileListMenu.click();
     });
-    byId('summary-open-settings').addEventListener('click', () => {
+    byId('settings-open-chart').addEventListener('click', () => {
+      closeMobileNavigation();
       closeMobileListPopover();
       mobileMenuPopover.hidden = false;
       syncDisplaySettingInputs();
@@ -3735,19 +4275,26 @@
     });
     byId('buy-board-action-value').addEventListener('input', event => event.target.setCustomValidity(''));
     byId('operator-confirm-cancel').addEventListener('click', () => closeOperatorConfirm(false));
+    byId('desktop-orb-settings').addEventListener('click', () => {
+      setMobilePage('settings');
+      void loadOrbSettings();
+    });
+    byId('desktop-orb-settings-close').addEventListener('click', () => setMobilePage('chart'));
     byId('operator-confirm-submit').addEventListener('click', () => closeOperatorConfirm(true));
+    byId('operator-confirm-ep').addEventListener('click', () => closeOperatorConfirm('ep'));
     byId('operator-confirm-dialog').addEventListener('pointerdown', event => {
       if (event.target === byId('operator-confirm-dialog')) closeOperatorConfirm(false);
     });
     mobileListMenu.addEventListener('click', () => {
       const opening = mobileListPopover.hidden;
+      closeMobileNavigation();
       closeMobileMenuPopover();
       if (opening && state.mobilePage !== 'chart') setMobilePage('chart');
       mobileListPopover.hidden = !opening;
       mobileListMenu.setAttribute('aria-expanded', String(opening));
       if (opening) {
-        applyListMode('monitor');
-        void loadIntradayMonitor();
+        applyListMode(state.listMode);
+        if (state.listMode === 'monitor') void loadIntradayMonitor();
         renderMobileStockList();
         requestAnimationFrame(() => {
           const selected = mobileListPopover.querySelector('.mobile-list-row.active');
@@ -3797,7 +4344,8 @@
     }));
     document.addEventListener('pointerdown', event => {
       if (!mobileListPopover.hidden && !event.target.closest('.mobile-list-control')) closeMobileListPopover();
-      if (!mobileMenuPopover.hidden && !event.target.closest('#mobile-menu-popover, #summary-open-settings')) closeMobileMenuPopover();
+      if (!mobileMenuPopover.hidden && !event.target.closest('#mobile-menu-popover, #settings-open-chart')) closeMobileMenuPopover();
+      if (!navigationPopover.hidden && !event.target.closest('.mobile-navigation-control')) closeMobileNavigation();
       const breakoutPopup = byId('breakout-price-popup');
       if (!breakoutPopup.hidden && event.target === breakoutPopup) closeBreakoutPricePopup();
     });
@@ -3864,7 +4412,7 @@
     byId('breakout-input').addEventListener('keydown', event => {
       if (event.key === 'Enter') saveManualBreakout();
     });
-    byId('breakout-price-form').addEventListener('submit', event => {
+    byId('breakout-price-form').addEventListener('submit', async event => {
       event.preventDefault();
       const input = byId('breakout-price-popup-input');
       const value = Number(input.value);
@@ -3874,8 +4422,13 @@
         return;
       }
       input.setCustomValidity('');
+      const actionSymbol = state.symbol;
+      const followup = state.breakoutFollowup;
       closeBreakoutPricePopup();
-      commitBreakoutPrice(value, `Breakout set to ${value.toFixed(2)} — saved locally.`);
+      const saved = await commitBreakoutPrice(value, `Breakout set to ${value.toFixed(2)} — saved.`);
+      if (!saved || state.symbol !== actionSymbol || followup?.symbol !== actionSymbol) return;
+      if (followup.target === 'buy_today') await toggleBuyTodayDraft();
+      else await moveToList('buylist');
     });
     byId('breakout-price-popup-input').addEventListener('input', event => event.target.setCustomValidity(''));
     byId('breakout-price-cancel').addEventListener('click', closeBreakoutPricePopup);
@@ -3994,6 +4547,12 @@
     bindSymbolSearch('mobile-symbol-search', 'mobile-symbol-search-results', closeMobileSymbolSearch);
 
     document.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && !navigationPopover.hidden) {
+        event.preventDefault();
+        closeMobileNavigation();
+        navigationMenu.focus();
+        return;
+      }
       if (event.key === 'Escape' && !byId('buy-board-action-sheet').hidden) {
         event.preventDefault();
         closeBuyBoardActionSheet();

@@ -11,7 +11,7 @@ from src.risk.orb_position import OrbSettings
 from src.utils.market_calendar import US_MARKET_ZONE
 from src.web.intraday_monitor import (
     IntradayMonitor, MonitorContext, YahooMonitorProvider, daily_adr,
-    evaluate_monitor_row, merge_monitor_rows, latest_daily_close,
+    evaluate_monitor_row, merge_monitor_rows, latest_daily_close, apply_daily_performance,
 )
 from src.services.monitor_equity import publish_monitor_equity, read_monitor_equity
 
@@ -42,6 +42,94 @@ def test_monitor_price_and_position_checks_pass_independently():
     assert len(row["orb"]) == 3
     assert all(window["price_status"] == window["position_status"] == "PASS" for window in row["orb"])
     assert row["orb"][0]["risk_percent"] in (0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2)
+    assert all(window["liquidity_status"] == "PASS" and isinstance(window["score"], float) for window in row["orb"])
+
+
+def test_monitor_uses_shared_opening_liquidity_without_later_volume():
+    frame = bars()
+    frame.loc[frame.index < moment("10:00"), "Volume"] = 100
+    frame.loc[frame.index >= moment("10:00"), "Volume"] = 1_000_000
+    row = evaluate(frame)
+    assert row["opening_volume"] == 3000
+    assert row["opening_volume_minutes"] == 30
+    assert row["liquidity_status"] == "FAIL"
+    assert "100.00 shares/min" in row["liquidity_reason"]
+    assert all(orb["price_status"] == orb["position_status"] == "PASS" for orb in row["orb"])
+    assert all(orb["liquidity_status"] == "FAIL" for orb in row["orb"])
+    row = evaluate(frame, context=MonitorContext(settings=OrbSettings(opening_min_shares_per_minute=90), equity=100_000))
+    assert row["liquidity_status"] == "PASS"
+
+
+def test_monitor_missing_volume_cannot_pass_liquidity_unless_disabled():
+    frame = bars().drop(columns="Volume")
+    assert evaluate(frame)["liquidity_status"] == "UNKNOWN"
+    context = MonitorContext(settings=OrbSettings(opening_min_shares_per_minute=0), equity=100_000)
+    assert evaluate(frame, context=context)["liquidity_status"] == "PASS"
+
+
+def test_monitor_liquidity_can_pass_before_30_minutes():
+    row = evaluate(bars(until="09:36"), now=moment("09:36"))
+    assert row["opening_volume"] == 6000
+    assert row["opening_volume_minutes"] == 6
+    assert row["liquidity_status"] == "PASS"
+
+
+def performance_history():
+    frame = pd.DataFrame({"Close": 100.0, "High": 103.0, "Low": 100.0},
+                         index=pd.bdate_range(end="2026-10-01", periods=70))
+    frame.iloc[-21, frame.columns.get_loc("Close")] = 80
+    frame.iloc[-63, frame.columns.get_loc("Close")] = 50
+    return frame
+
+
+@pytest.mark.parametrize("utc", [False, True])
+def test_daily_and_monthly_changes_use_live_price_and_completed_history(utc):
+    frame = performance_history()
+    frame.loc[pd.Timestamp("2026-10-02")] = [9999, 9999, 9999]
+    if utc:
+        frame.index = frame.index.tz_localize(US_MARKET_ZONE).tz_convert("UTC")
+    row = {"current_price": 110, "quote_as_of": moment().isoformat()}
+    apply_daily_performance(row, frame, moment())
+    assert row["change_percent"] == pytest.approx(10)
+    assert row["return_1m"] == pytest.approx(37.5)
+    assert row["return_3m"] == pytest.approx(120)
+
+
+@pytest.mark.parametrize("price, expected", [(100, 0), (90, -10)])
+def test_daily_change_supports_flat_and_negative_prices(price, expected):
+    row = {"current_price": price, "quote_as_of": moment().isoformat()}
+    apply_daily_performance(row, performance_history(), moment())
+    assert row["change_percent"] == pytest.approx(expected)
+
+
+def test_monthly_returns_missing_history_and_old_quotes_are_explicit():
+    row = {"current_price": 110, "quote_as_of": moment().isoformat()}
+    apply_daily_performance(row, performance_history().tail(10), moment())
+    assert row["change_percent"] == pytest.approx(10)
+    assert row["return_1m"] is row["return_3m"] is None
+    apply_daily_performance(row, performance_history(), moment(day="2026-10-04"))
+    assert row["change_percent"] is None
+    assert row["return_1m"] == pytest.approx(37.5)
+    apply_daily_performance(row, performance_history().iloc[:-1], moment())
+    assert row["change_percent"] is row["return_1m"] is row["return_3m"] is None
+
+
+def test_worker_reuses_daily_history_for_watchlist_performance_each_minute():
+    class HistoryProvider(Provider):
+        def fetch(self, symbols, *, interval, period=None):
+            self.calls.append((list(symbols), interval))
+            return {s: performance_history() if interval == "1d" else bars(close=110) for s in symbols}
+    provider = HistoryProvider()
+    monitor = IntradayMonitor(lambda: MonitorContext(rows=[{"symbol": "AAA", "watchlist_member": True}]),
+                              enabled=False, provider=provider, now=moment)
+    monitor.refresh_once()
+    monitor.refresh_once()
+    row = monitor.snapshot()["rows"][0]
+    assert row["change_percent"] == pytest.approx(10)
+    assert row["return_1m"] == pytest.approx(37.5)
+    assert row["return_3m"] == pytest.approx(120)
+    assert row["breakout_status"] == "NO_LEVEL"
+    assert provider.calls == [(["AAA"], "1m"), (["AAA"], "1d"), (["AAA"], "1m")]
 
 
 def test_price_pass_does_not_hide_stop_adr_failure():
@@ -76,12 +164,17 @@ def test_pulled_back_breakout_and_orb_confirmation_are_retained():
     assert all(window["price_status"] == "PASS" for window in row["orb"])
 
 
-@pytest.mark.parametrize("inputs", [
-    {"fetch_failed": True}, {"now": moment("10:10")},
-    {"frame": bars(day="2026-10-01")},
-])
-def test_failed_old_or_previous_day_data_never_reports_current_passes(inputs):
+@pytest.mark.parametrize("inputs", [{"fetch_failed": True}, {"now": moment("10:10")}])
+def test_stale_quote_preserves_observed_session_pass_without_claiming_current_quote(inputs):
     row = evaluate(**inputs)
+    assert row["quote_status"] == "STALE"
+    assert row["broke_out_today"] is None
+    assert all(window["price_status"] == "PASS" for window in row["orb"])
+    assert row["orb_session_date"] == "2026-10-02"
+
+
+def test_previous_day_data_never_reports_current_passes():
+    row = evaluate(frame=bars(day="2026-10-01"))
     assert row["quote_status"] == "STALE"
     assert row["broke_out_today"] is None
     assert all(window["price_status"] == "UNKNOWN" for window in row["orb"])
@@ -119,6 +212,22 @@ def test_breakout_equal_to_orh_fails_passive_position_geometry_only():
     assert row["orb"][0]["price_status"] == "PASS"
     assert row["orb"][0]["position_status"] == "FAIL"
     assert "execution zone" in row["orb"][0]["position_reason"]
+
+
+def test_be_breakout_edit_recalculates_zone_using_the_same_observed_range():
+    frame = bars(high=290.241, low=284.775, close=291.85)
+    card = {"symbol": "BE", "breakout_price": 293.19, "buylist_member": True}
+    rejected = evaluate(frame, card=card, adr=6)
+    first = rejected["orb"][0]
+    assert first["position_status"] == "FAIL"
+    assert "breakout $293.19, range high $290.241" in first["position_reason"]
+    card["breakout_price"] = 289
+    rebuilt = evaluate(frame, card=card, adr=6)["orb"][0]
+    assert rebuilt["high"] == first["high"] == 290.241
+    assert rebuilt["low"] == first["low"] == 284.775
+    assert rebuilt["breakout_trigger"] == 290.241
+    assert "execution zone" not in rebuilt["position_reason"]
+    assert rebuilt["position_status"] == "PASS"
 
 
 def test_premarket_does_not_confirm_regular_session_breakouts():
@@ -164,7 +273,14 @@ def test_worker_caches_daily_inputs_and_adds_new_stocks_next_cycle():
     assert provider.calls[-2:] == [(["AAA", "BBB"], "1m"), (["BBB"], "1d")]
     provider.failed = True
     monitor.refresh_once()
-    assert monitor.snapshot()["rows"][0]["quote_status"] == "STALE"
+    stale = monitor.snapshot()["rows"][0]
+    assert stale["quote_status"] == "STALE"
+    assert stale["current_price"] == 103
+    assert stale["quote_as_of"] == moment().isoformat()
+    assert stale["broke_out_today"] is None
+    provider.failed = False
+    monitor.refresh_once()
+    assert monitor.snapshot()["rows"][0]["quote_status"] == "CURRENT"
 
 
 def test_snapshot_reads_never_download_or_start_multiple_workers():
@@ -403,7 +519,7 @@ def test_shared_bounds_failure_preserves_price_monitoring_membership(web_config,
     assert context.position_error == "Shared ORB settings unavailable"
 
 
-def test_cached_reads_do_not_recalculate_orb_and_stale_or_next_day_signals_clear(monkeypatch):
+def test_cached_reads_keep_session_history_but_clear_it_next_day(monkeypatch):
     clock = [moment()]
     monitor = IntradayMonitor(lambda: MonitorContext(rows=[{"symbol": "AAA", "breakout_price": 101, "watchlist_member": True}],
                                                    settings=OrbSettings(), equity=100_000),
@@ -414,7 +530,7 @@ def test_cached_reads_do_not_recalculate_orb_and_stale_or_next_day_signals_clear
     clock[0] = moment("10:10")
     row = monitor.snapshot()["rows"][0]
     assert row["quote_status"] == "STALE"
-    assert row["orb"][0]["price_status"] == "UNKNOWN"
+    assert row["orb"][0]["price_status"] == "PASS"
     clock[0] = moment("10:05", "2026-10-04")
     row = monitor.snapshot()["rows"][0]
     assert row["quote_status"] == "CLOSED"

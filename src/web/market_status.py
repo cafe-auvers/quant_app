@@ -8,6 +8,7 @@ from src.utils.market_calendar import (
     US_MARKET_ZONE,
     current_or_next_nyse_session_date,
     is_nyse_trading_day,
+    next_nyse_trading_day,
     nyse_regular_session_close_time,
 )
 
@@ -46,12 +47,22 @@ def nyse_market_status(now: dt.datetime | None = None) -> dict[str, Any]:
             compact_label = "Market Closed · AH"
             state = "CLOSED"
 
+    session_day = current_or_next_nyse_session_date(moment)
+    next_session_day = next_nyse_trading_day(session_day + dt.timedelta(days=1))
+
+    def session_bound(day: dt.date, time: dt.time) -> str:
+        return dt.datetime.combine(day, time, tzinfo=US_MARKET_ZONE).isoformat()
+
     return {
         "state": state,
         "phase": phase,
         "label": label,
         "compact_label": compact_label,
-        "watchlist_session_date": current_or_next_nyse_session_date(moment).isoformat(),
+        "watchlist_session_date": session_day.isoformat(),
+        "session_open": session_bound(session_day, US_MARKET_OPEN_TIME),
+        "session_close": session_bound(session_day, nyse_regular_session_close_time(session_day)),
+        "next_session_open": session_bound(next_session_day, US_MARKET_OPEN_TIME),
+        "next_session_close": session_bound(next_session_day, nyse_regular_session_close_time(next_session_day)),
         "as_of": moment.isoformat(timespec="seconds"),
         "timezone": "America/New_York",
     }

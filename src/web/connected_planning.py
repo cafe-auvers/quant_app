@@ -48,7 +48,7 @@ class ConnectedPlanningUnavailable(RuntimeError):
 
 
 class _MemoryWatchlist:
-    """Small compatibility adapter; canonical TiDB remains the authority."""
+    """Small compatibility adapter; canonical coordination remains the authority."""
 
     def __init__(self, card=None) -> None:
         self.active_session_date = current_or_next_nyse_session_date()
@@ -325,7 +325,12 @@ class ConnectedPlanningService:
                 )
         except ConflictError:
             raise
-        except (TradeCardVersionConflictError, TradeCardNotFoundError) as exc:
+        except TradeCardVersionConflictError as exc:
+            current = self.source.get_plan(
+                symbol, force=True, include_inactive=True
+            ).get("card")
+            raise ConflictError("Stale planning revision", current) from exc
+        except TradeCardNotFoundError as exc:
             current = self.source.get_plan(
                 symbol, force=True, include_inactive=True
             ).get("card")

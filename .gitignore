@@ -63,11 +63,14 @@ config/web.publisher.local.json
 data/*.csv
 data/*.json
 data/*.json.bak
+data/.*.json.*.tmp
 data/*.jsonl
 data/*.lock
 data/cache/
 data/coordination_backups/
 data/web/
+data/trade_journal/
+data/breakout_replay/
 data/pre_restore_backup_*/
 
 # Historical refresh process runtime state (historical.py / historical_refresh_control.py)
@@ -91,6 +94,7 @@ logs/
 .coverage
 htmlcov/
 /artifacts/
+/supabase/.temp/
 
 # Application specific
 *.db

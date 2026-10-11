@@ -199,6 +199,7 @@ class SubmitExecutionRequest:
     pre_trade_risk_decision: Any = None
     risk_strategy_id: str = ""
     risk_plan_id: str = ""
+    entry_freshness_validator: Any = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "client_order_id", str(self.client_order_id or "").strip())
@@ -275,6 +276,7 @@ class ReplaceExecutionRequest:
     pre_trade_risk_decision: Any = None
     risk_strategy_id: str = ""
     risk_plan_id: str = ""
+    entry_freshness_validator: Any = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "client_order_id", str(self.client_order_id or "").strip())

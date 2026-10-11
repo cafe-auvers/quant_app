@@ -263,3 +263,5 @@ separately approved path for supervised trading. It requires the matching
 approved release, reviewed capability/risk envelope and current live readiness,
 and starts disarmed. It does not close Gates 2–5. Do not make full unattended
 qualification a prerequisite to evaluating that already-defined supervised path.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

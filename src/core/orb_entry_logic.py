@@ -6,7 +6,7 @@ so price-zone validation and timeframe upgrades cannot drift apart.
 
 from __future__ import annotations
 
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 from typing import Any, Optional
 
 
@@ -46,8 +46,9 @@ def passive_entry_prices(
 ) -> tuple[Optional[Decimal], Optional[Decimal], Optional[Decimal], str]:
     """Return ``(floor, breakout_trigger, execution, reason)``.
 
-    Automated candidates default to ORH. A non-null execution price is
-    treated as already configured and is never silently changed.
+    Automated candidates use the highest legal BUY tick at or below ORH.
+    The raw range still determines the breakout trigger and execution zone.
+    A non-null execution price is already configured and is never changed.
     """
 
     breakout = precise_decimal(breakout_price)
@@ -60,6 +61,10 @@ def passive_entry_prices(
     assert execution is not None
     if low > high:
         return None, None, execution, "ORB low cannot exceed ORB high"
+    if execution_price is None:
+        tick = us_equity_tick(high)
+        assert tick is not None
+        execution = high.quantize(tick, rounding=ROUND_FLOOR)
     floor = max(breakout, low)
     trigger = max(breakout, high)
     if floor >= high:

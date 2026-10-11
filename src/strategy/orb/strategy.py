@@ -12,6 +12,11 @@ from datetime import time
 from typing import Optional
 
 import pandas as pd
+from src.core.intraday_coverage import (
+    has_verified_opening_coverage,
+    kis_history_has_invalid_rows,
+    kis_market_timezone,
+)
 
 from src.strategy.base import (
     MarketSnapshot,
@@ -35,7 +40,9 @@ def finite_float(value: object) -> Optional[float]:
     return number if math.isfinite(number) else None
 
 
-def market_local_index(index: pd.Index) -> Optional[pd.DatetimeIndex]:
+def market_local_index(
+    index: pd.Index, *, naive_timezone: Optional[str] = None
+) -> Optional[pd.DatetimeIndex]:
     """Normalize source bars to U.S. market time without changing legacy rules."""
     try:
         timestamps = pd.DatetimeIndex(index)
@@ -45,6 +52,8 @@ def market_local_index(index: pd.Index) -> Optional[pd.DatetimeIndex]:
         return None
     if timestamps.tz is not None:
         return timestamps.tz_convert(US_MARKET_TIMEZONE)
+    if naive_timezone is not None:
+        return timestamps.tz_localize(naive_timezone).tz_convert(US_MARKET_TIMEZONE)
 
     local_open = time(9, 30)
     if any(timestamp.time() == local_open for timestamp in timestamps):
@@ -79,9 +88,13 @@ def calculate_orb_range(
         return None
     if "High" not in intraday.columns or "Low" not in intraday.columns:
         return None
+    if kis_history_has_invalid_rows(intraday):
+        return None
 
     bars = intraday.sort_index()
-    local_index = market_local_index(bars.index)
+    local_index = market_local_index(
+        bars.index, naive_timezone=kis_market_timezone(bars, symbol=symbol)
+    )
     if local_index is None:
         return None
     try:
@@ -95,7 +108,11 @@ def calculate_orb_range(
 
     session_mask = local_index.normalize() == start.normalize()
     session_index = local_index[session_mask]
-    if session_index.empty or not (session_index == start).any():
+    if session_index.empty:
+        return None
+    if not (session_index == start).any() and not has_verified_opening_coverage(
+        intraday, start, end, symbol=symbol
+    ):
         return None
     if require_complete and session_index[-1] < end:
         return None

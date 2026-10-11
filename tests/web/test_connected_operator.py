@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import platform
 import uuid
+import pytest
 from dataclasses import replace
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 
-from src.core.trade_card_state import BoardStatus, StopType, TradeCardState
+from src.core.trade_card_state import BoardStatus, PositionRuntimeStatus, StopType, TradeCardState
 from src.core.runtime_readiness import RuntimeDeviceState
 from src.core.execution_ownership import ExecutionOwner
 from src.services import trade_card_repository
@@ -95,6 +96,135 @@ def _buylist_card(engine):
             breakout_price=201.25,
         ),
     )
+
+
+@pytest.mark.parametrize("same_executor", [True, False])
+@pytest.mark.parametrize("endpoint", ["planning", "board"])
+def test_ep_publication_api_persists_on_shared_card_and_replay_checks_profile(
+    web_config, services, tmp_path, monkeypatch, same_executor, endpoint
+):
+    engine, _role, operator = _service(web_config, tmp_path, same_executor=same_executor)
+    monkeypatch.setattr(trade_card_repository, "LOCAL_TRADE_CARDS_FILE", tmp_path / "cards.json")
+    card = _buylist_card(engine)
+    services.config = operator.config
+    services.canonical_planning = operator.source
+    services.connected_planning = operator.planning
+    services.connected_operator = operator
+    with TestClient(create_api_app(operator.config, services=services), base_url="http://localhost:8080") as phone:
+        session = login(phone)
+        phone.headers.update({"Origin": "http://localhost:8080", "X-CSRF-Token": session["csrf_token"]})
+        assert phone.post("/api/v1/operator/control", json={"target": "mobile"}).status_code == 200
+        payload = {"command_id": str(uuid.uuid4()), "expected_revision": card.version, "is_ep": True}
+        if endpoint == "planning":
+            path = "/api/v1/planning/AAPL/activate-buy-today"
+            payload["enabled"] = True
+        else:
+            path = "/api/v1/operator/board-actions"
+            payload.update(action="activate_buy_today", symbol="AAPL")
+        response = phone.post(path, json=payload)
+        assert response.status_code == 200, response.text
+        assert response.json()["card"]["is_ep"] is True
+        assert response.json()["broker_order_placed"] is False
+        stored = trade_card_repository.get_trade_card(engine, "PROD", "account-a", "AAPL")
+        assert stored.is_ep and stored.board_status == BoardStatus.BUY_TODAY
+        assert phone.get("/api/v1/planning/AAPL").json()["card"]["is_ep"]
+        board = phone.get("/api/v1/buyboard").json()
+        assert board["rows"][0]["is_ep"] and "EP" not in board["columns"]
+        assert phone.post(path, json=payload).status_code == 200
+        assert phone.post(path, json={**payload, "is_ep": False}).status_code == 409
+
+
+def test_custom_ep_settings_survive_old_client_normal_settings_save(web_config, services, tmp_path):
+    engine, _role, operator = _service(web_config, tmp_path)
+    services.config = operator.config
+    services.canonical_planning = operator.source
+    services.connected_planning = operator.planning
+    services.connected_operator = operator
+    with TestClient(create_api_app(operator.config, services=services), base_url="http://localhost:8080") as phone:
+        session = login(phone)
+        phone.headers.update({"Origin": "http://localhost:8080", "X-CSRF-Token": session["csrf_token"]})
+        phone.post("/api/v1/operator/control", json={"target": "mobile"})
+        initial = phone.get("/api/v1/operator/orb-settings").json()
+        payload = {**initial["settings"], "command_id": str(uuid.uuid4()), "expected_revision": initial["revision"],
+            "ep_stop_adr_min_percent": 40, "ep_stop_adr_ideal_percent": 90, "ep_stop_adr_max_percent": 140}
+        response = phone.put("/api/v1/operator/orb-settings", json=payload)
+        assert response.status_code == 200, response.text
+        legacy_payload = {key: value for key, value in response.json()["settings"].items() if not key.startswith("ep_")}
+        legacy_payload.update(command_id=str(uuid.uuid4()), expected_revision=response.json()["revision"], stop_adr_max_percent=90)
+        saved = phone.put("/api/v1/operator/orb-settings", json=legacy_payload)
+        assert saved.status_code == 200, saved.text
+        assert saved.json()["settings"]["ep_stop_adr_max_percent"] == 140
+        assert saved.json()["settings"]["ep_stop_adr_ideal_percent"] == 90
+        assert saved.json()["settings"]["ep_stop_adr_min_percent"] == 40
+        assert saved.json()["settings"]["stop_adr_max_percent"] == 90
+        invalid = {**payload, "command_id": str(uuid.uuid4()), "expected_revision": saved.json()["revision"], "ep_stop_adr_ideal_percent": 160}
+        assert phone.put("/api/v1/operator/orb-settings", json=invalid).status_code == 422
+
+
+@pytest.mark.parametrize("same_executor", [True, False])
+def test_mobile_reactivates_a_fully_closed_stock_with_original_breakout(
+    web_config, tmp_path, monkeypatch, same_executor
+):
+    engine, _role, service = _service(web_config, tmp_path, same_executor=same_executor)
+    monkeypatch.setattr(trade_card_repository, "LOCAL_TRADE_CARDS_FILE", tmp_path / "cards.json")
+    card = _buylist_card(engine)
+    card.board_status = BoardStatus.CLOSED
+    card.position_runtime_status = PositionRuntimeStatus.CLOSED
+    card.average_entry_price = 200.0
+    card = trade_card_repository.update_trade_card(engine, card, expected_version=card.version)
+    service.set_operator_control_target("mobile")
+    result = service.set_buy_today(command_id=str(uuid.uuid4()), symbol="AAPL",
+        expected_revision=card.version, enabled=True)
+    assert result["queued"] is False
+    assert result["card"]["canonical_stage"] == "BUY_TODAY"
+    assert result["card"]["breakout_price"] == 201.25
+    stored = trade_card_repository.get_trade_card(engine, "PROD", "account-a", "AAPL")
+    assert stored.position_runtime_status == PositionRuntimeStatus.NONE
+    assert stored.average_entry_price == 0 and stored.planned_quantity == 0
+
+
+@pytest.mark.parametrize("same_executor", [True, False])
+def test_mobile_withdraws_unsubmitted_regular_exit_directly_and_preserves_stop(
+    web_config, tmp_path, monkeypatch, same_executor
+):
+    engine, _role, service = _service(web_config, tmp_path, same_executor=same_executor)
+    monkeypatch.setattr(trade_card_repository, "LOCAL_TRADE_CARDS_FILE", tmp_path / "cards.json")
+    card = trade_card_repository.create_trade_card(engine, TradeCardState(
+        environment="PROD", account_no="account-a", symbol="SVIA",
+        board_status=BoardStatus.SELL_ALL, position_runtime_status=PositionRuntimeStatus.LIQUIDATING,
+        broker_quantity=643, orderable_quantity=643, average_entry_price=4.35,
+        stop_type=StopType.ORB_LOW, active_stop_price=4.24, stop_quantity=643,
+        exit_all_required=True, exit_attempt_count=3, last_exit_error="retry limit reached",
+    ))
+    before = service.board_snapshot(force=True)["rows"][0]
+    assert before["can_cancel_sell_all"] is True and before["sell_all_at_market_open"] is False
+    result = service.apply_board_action(
+        command_id=str(uuid.uuid4()), action="cancel_sell_all", symbol="SVIA",
+        expected_revision=card.version,
+    )
+    assert result["queued"] is False and result["command_status"] == "COMPLETED"
+    assert result["broker_order_placed"] is False
+    assert result["card"]["board_status"] == "OPEN_POSITION"
+    stored = trade_card_repository.get_trade_card(engine, "PROD", "account-a", "SVIA")
+    assert stored.broker_quantity == stored.stop_quantity == 643 and stored.active_stop_price == 4.24
+    assert stored.exit_attempt_count == 0 and stored.last_exit_error == ""
+
+
+def test_mobile_cannot_withdraw_reserved_sell_all(web_config, tmp_path, monkeypatch):
+    from src.web.store import ConflictError
+
+    engine, _role, service = _service(web_config, tmp_path, same_executor=False)
+    monkeypatch.setattr(trade_card_repository, "LOCAL_TRADE_CARDS_FILE", tmp_path / "cards.json")
+    card = trade_card_repository.create_trade_card(engine, TradeCardState(
+        environment="PROD", account_no="account-a", symbol="SVIA",
+        board_status=BoardStatus.SELL_ALL, broker_quantity=643,
+        exit_all_required=True, reserved_sell_quantity=643,
+    ))
+    assert service.board_snapshot(force=True)["rows"][0]["can_cancel_sell_all"] is False
+    with pytest.raises(ConflictError, match="unsubmitted Sell All"):
+        service.apply_board_action(command_id=str(uuid.uuid4()), action="cancel_sell_all",
+                                   symbol="SVIA", expected_revision=card.version)
+    assert trade_card_repository.get_trade_card(engine, "PROD", "account-a", "SVIA").version == card.version
 
 
 def test_operator_change_pulse_notifies_pc_listener(
@@ -184,6 +314,113 @@ def test_mobile_operator_commits_buy_today_intent_with_a_separate_execution_owne
     assert result["command_status"] == "COMPLETED"
     stored = trade_card_repository.get_trade_card(engine, "PROD", "account-a", "AAPL")
     assert stored.board_status == BoardStatus.BUY_TODAY
+
+
+@pytest.mark.parametrize("action", ["deactivate_buy_today", "cancel_entry"])
+def test_entry_cancellation_uses_current_revision_and_retries_runtime_race(
+    web_config, tmp_path, monkeypatch, action
+):
+    from src.services import execution_workflow_service
+
+    engine, _role, service = _service(web_config, tmp_path, same_executor=False)
+    monkeypatch.setattr(trade_card_repository, "LOCAL_TRADE_CARDS_FILE", tmp_path / "cards.json")
+    original = _buylist_card(engine)
+    card = replace(original, board_status=BoardStatus.BUY_TODAY)
+    card = trade_card_repository.update_trade_card(engine, card, expected_version=card.version)
+    request = execution_workflow_service.request_board_action
+    attempts = []
+
+    def racing_request(engine, command, **kwargs):
+        attempts.append(command.expected_card_version)
+        if len(attempts) == 1:
+            live = trade_card_repository.get_trade_card(engine, "PROD", "account-a", "AAPL")
+            live.entry_block_reason = "live ORB observation"
+            trade_card_repository.update_trade_card(engine, live, expected_version=live.version)
+        return request(engine, command, **kwargs)
+
+    monkeypatch.setattr(execution_workflow_service, "request_board_action", racing_request)
+    result = service.apply_board_action(command_id=str(uuid.uuid4()), action=action,
+        symbol="AAPL", expected_revision=original.version)
+    assert attempts == [card.version, card.version + 1]
+    assert result["queued"] is False and result["broker_order_placed"] is False
+    stored = trade_card_repository.get_trade_card(engine, "PROD", "account-a", "AAPL")
+    assert stored.board_status == BoardStatus.BUYLIST
+    assert stored.breakout_price == original.breakout_price
+
+
+@pytest.mark.parametrize("stage,filled_quantity", [
+    (BoardStatus.ENTRY_PENDING, 0), (BoardStatus.ENTRY_PENDING, 3), (BoardStatus.OPEN_POSITION, 3),
+])
+def test_mobile_cancels_remaining_entry_and_preserves_confirmed_fills(
+    web_config, tmp_path, monkeypatch, filled_quantity, stage
+):
+    engine, _role, service = _service(web_config, tmp_path, same_executor=False)
+    monkeypatch.setattr(trade_card_repository, "LOCAL_TRADE_CARDS_FILE", tmp_path / "cards.json")
+    card = trade_card_repository.create_trade_card(engine, TradeCardState(
+        environment="PROD", account_no="account-a", symbol="AAPL", buylist_member=True,
+        board_status=stage, breakout_price=201.25,
+        entry_client_order_id="working-buy", entry_remaining_target_quantity=7,
+        broker_quantity=filled_quantity, orderable_quantity=filled_quantity,
+        average_entry_price=202 if filled_quantity else 0,
+        stop_quantity=filled_quantity, active_stop_price=199, stop_type=StopType.ORB_LOW,
+    ))
+    result = service.set_buy_today(command_id=str(uuid.uuid4()), symbol="AAPL",
+        expected_revision=card.version - 1, enabled=False)
+    assert result["queued"] is False and result["broker_order_placed"] is False
+    assert result["status"] == "ENTRY CANCELLATION REQUESTED"
+    assert result["card"]["entry_cancellation_pending"] is True
+    stored = trade_card_repository.get_trade_card(engine, "PROD", "account-a", "AAPL")
+    assert stored.board_status == stage
+    assert stored.entry_block_reason == "cancel_requested"
+    assert stored.broker_quantity == stored.stop_quantity == filled_quantity
+    assert stored.active_stop_price == 199 and stored.entry_client_order_id == "working-buy"
+    again = service.set_buy_today(command_id=str(uuid.uuid4()), symbol="AAPL",
+        expected_revision=card.version, enabled=False)
+    assert again["status"] == "ENTRY CANCELLATION REQUESTED"
+    assert trade_card_repository.get_trade_card(engine, "PROD", "account-a", "AAPL").version == stored.version
+
+
+def test_mobile_cancels_unsubmitted_completion_without_removing_position_protection(
+    web_config, tmp_path, monkeypatch
+):
+    engine, _role, service = _service(web_config, tmp_path)
+    monkeypatch.setattr(trade_card_repository, "LOCAL_TRADE_CARDS_FILE", tmp_path / "cards.json")
+    card = trade_card_repository.create_trade_card(engine, TradeCardState(
+        environment="PROD", account_no="account-a", symbol="AAPL", buylist_member=True,
+        board_status=BoardStatus.OPEN_POSITION, position_runtime_status=PositionRuntimeStatus.ENTRY_COMPLETING,
+        breakout_price=201.25, entry_remaining_target_quantity=7,
+        broker_quantity=3, orderable_quantity=3, average_entry_price=202,
+        stop_quantity=3, active_stop_price=199, stop_type=StopType.ORB_LOW,
+    ))
+    result = service.set_buy_today(command_id=str(uuid.uuid4()), symbol="AAPL",
+        expected_revision=0, enabled=False)
+    assert result["card"]["entry_cancellation_pending"] is False
+    stored = trade_card_repository.get_trade_card(engine, "PROD", "account-a", "AAPL")
+    assert stored.board_status == BoardStatus.OPEN_POSITION and stored.entry_remaining_target_quantity == 0
+    assert stored.position_runtime_status == PositionRuntimeStatus.OPEN
+    assert stored.broker_quantity == stored.stop_quantity == 3 and stored.active_stop_price == 199
+
+
+def test_mobile_cancellation_is_idempotent_and_does_not_sell_a_completed_entry(
+    web_config, tmp_path, monkeypatch
+):
+    from src.web.store import ConflictError
+
+    engine, _role, service = _service(web_config, tmp_path)
+    monkeypatch.setattr(trade_card_repository, "LOCAL_TRADE_CARDS_FILE", tmp_path / "cards.json")
+    card = _buylist_card(engine)
+    result = service.set_buy_today(command_id=str(uuid.uuid4()), symbol="AAPL",
+        expected_revision=0, enabled=False)
+    assert result["status"] == "REMOVED FROM TODAY"
+    assert trade_card_repository.get_trade_card(engine, "PROD", "account-a", "AAPL").version == card.version
+    card.board_status = BoardStatus.OPEN_POSITION
+    card.broker_quantity = card.stop_quantity = 10
+    card.active_stop_price = 199
+    card = trade_card_repository.update_trade_card(engine, card, expected_version=card.version)
+    with pytest.raises(ConflictError, match="confirmed holdings are preserved"):
+        service.set_buy_today(command_id=str(uuid.uuid4()), symbol="AAPL",
+            expected_revision=0, enabled=False)
+    assert trade_card_repository.get_trade_card(engine, "PROD", "account-a", "AAPL").version == card.version
 
 
 def test_mobile_can_select_mobile_pc_and_laptop_operator_control(
@@ -479,6 +716,7 @@ def test_mobile_orb_settings_api_round_trip_is_revision_safe(
         initial = phone.get("/api/v1/operator/orb-settings")
         assert initial.status_code == 200
         assert initial.json()["settings"]["capital_max_percent"] == 30.0
+        assert initial.json()["settings"]["opening_min_shares_per_minute"] == 200.0
 
         payload = {
             "command_id": str(uuid.uuid4()),
@@ -489,18 +727,32 @@ def test_mobile_orb_settings_api_round_trip_is_revision_safe(
             "stop_adr_min_percent": 15.0,
             "stop_adr_ideal_percent": 65.0,
             "stop_adr_max_percent": 66.0,
+            "opening_min_shares_per_minute": 350.0,
         }
         saved = phone.put("/api/v1/operator/orb-settings", json=payload)
         assert saved.status_code == 200, saved.text
         assert saved.json()["revision"] == 1
         assert saved.json()["settings"]["capital_max_percent"] == 35.0
+        assert saved.json()["settings"]["opening_min_shares_per_minute"] == 350.0
+
+        invalid = phone.put(
+            "/api/v1/operator/orb-settings",
+            json={**payload, "command_id": str(uuid.uuid4()), "opening_min_shares_per_minute": -1},
+        )
+        assert invalid.status_code == 422
+
+        legacy_payload = {key: value for key, value in payload.items() if key != "opening_min_shares_per_minute"}
+        legacy_payload.update(command_id=str(uuid.uuid4()), expected_revision=saved.json()["revision"])
+        legacy_saved = phone.put("/api/v1/operator/orb-settings", json=legacy_payload)
+        assert legacy_saved.status_code == 200
+        assert legacy_saved.json()["settings"]["opening_min_shares_per_minute"] == 350.0
 
         stale = phone.put(
             "/api/v1/operator/orb-settings",
             json={**payload, "command_id": str(uuid.uuid4())},
         )
         assert stale.status_code == 409
-        assert stale.json()["current"]["revision"] == 1
+        assert stale.json()["current"]["revision"] == legacy_saved.json()["revision"]
         assert ss.pull_state(engine, ss.SETTINGS_KEY).state.payload[
             "orb_settings"
         ]["capital_max_percent"] == 35.0

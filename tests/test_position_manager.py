@@ -115,8 +115,11 @@ def test_stop_trigger_is_sticky_after_price_recovery():
     manager = PositionManager()
     manager.evaluate_tick(card, 90.0)
     assert card.exit_all_required is True
+    assert card.stop_loss_triggered is True
+    card = TradeCardState.from_dict(card.to_dict())
     manager.evaluate_tick(card, 150.0)  # price recovers well above the stop
     assert card.exit_all_required is True  # must still be triggered
+    assert card.stop_loss_triggered is True
 
 
 # --- First fill / partial exit stop management (section 606-620, 596-603) --
@@ -275,12 +278,16 @@ def test_confirm_flat_requires_zero_broker_quantity():
 def test_confirm_flat_closes_card_and_clears_stop():
     card = _open_card(broker_quantity=0, stop_type=StopType.BREAKEVEN, active_stop_price=101.0)
     card.board_status = BoardStatus.SELL_ALL
+    card.stop_loss_triggered = True
+    card.warnings = ["EXIT_CANCEL_STALLED"]
     PositionManager().confirm_flat(card)
     assert card.board_status == BoardStatus.CLOSED
     assert card.position_runtime_status == PositionRuntimeStatus.CLOSED
     assert card.stop_type is None
     assert card.active_stop_price is None
     assert card.exit_all_required is False
+    assert card.stop_loss_triggered is False
+    assert "EXIT_CANCEL_STALLED" not in card.warnings
 
 
 # --- Manual purchase/sale discovery (spec section 14) -----------------------

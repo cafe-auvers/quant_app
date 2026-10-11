@@ -100,3 +100,5 @@ ORB upgrades additionally require a later timeframe, a strictly higher score,
 zero fills, unchanged quantity, current passive quote conditions, and
 authoritative cancellation before the linked submit. See
 [Current Order Logic](current_order_logic.md).
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

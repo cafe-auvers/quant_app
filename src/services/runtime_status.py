@@ -119,7 +119,7 @@ def record_runtime_heartbeat(
     # touch; multi-statement lifecycle transitions keep explicit transactions.
     with coordination_autocommit_connection(engine) as conn:
         # The steady heartbeat changes one timestamp only.  Including pid,
-        # active, and the CASE expression in every UPDATE made TiDB rewrite
+        # active, and the CASE expression in every UPDATE made the database rewrite
         # and plan fields whose values almost never change.  The exact pid and
         # active predicates make a restarted/stopped process miss this lean
         # path and fall through to the full lifecycle update below.

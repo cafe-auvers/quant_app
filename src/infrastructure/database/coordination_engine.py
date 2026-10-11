@@ -1,7 +1,7 @@
 """TLS-only engine for the small shared trading-coordination database.
 
-Historical bars remain on the PC/local mirror. MySQL/TiDB or PostgreSQL/Supabase
-is used only for leases, control state, commands, cards, and execution journals.
+Historical bars remain on PC MySQL/local mirrors. Shared coordination uses
+PostgreSQL for leases, control state, commands, cards, and execution journals.
 """
 from __future__ import annotations
 
@@ -36,30 +36,30 @@ def get_coordination_database_config() -> Dict[str, object]:
 
 
 def normalize_coordination_database_config(values: Mapping[str, object]) -> Dict[str, object]:
-    """Validate either supported store without changing the default MySQL path."""
+    """Validate the PostgreSQL coordination connection."""
 
-    backend = str(values.get("COORD_DB_BACKEND") or "mysql").strip().lower()
-    if backend not in {"mysql", "postgresql"}:
-        raise ValueError("COORD_DB_BACKEND must be mysql or postgresql")
+    backend = str(values.get("COORD_DB_BACKEND") or "postgresql").strip().lower()
+    if backend != "postgresql":
+        raise ValueError("Shared coordination requires COORD_DB_BACKEND=postgresql")
 
     host = str(values.get("COORD_DB_HOST") or "").strip()
     user = str(values.get("COORD_DB_USER") or "").strip()
     password = str(values.get("COORD_DB_PASSWORD") or "")
     database = validate_mysql_identifier(
-        str(values.get("COORD_DB_NAME") or ("postgres" if backend == "postgresql" else "quant_coordination")),
+        str(values.get("COORD_DB_NAME") or "postgres"),
         label="coordination database name",
     )
     if host and (len(host) > 255 or any(ch.isspace() for ch in host)):
         raise ValueError("Invalid COORD_DB_HOST")
     if user and (len(user) > 128 or any(ord(ch) < 32 for ch in user)):
         raise ValueError("Invalid COORD_DB_USER")
-    schema = str(values.get("COORD_DB_SCHEMA") or "").strip()
-    if backend == "postgresql":
-        schema = validate_private_coordination_schema(schema or "quant_coordination")
+    schema = validate_private_coordination_schema(
+        str(values.get("COORD_DB_SCHEMA") or "quant_coordination").strip()
+    )
     return {
         "backend": backend,
         "host": host,
-        "port": validate_mysql_port(values.get("COORD_DB_PORT") or ("5432" if backend == "postgresql" else "4000")),
+        "port": validate_mysql_port(values.get("COORD_DB_PORT") or "5432"),
         "user": user,
         "password": password,
         "database": database,
@@ -77,21 +77,19 @@ def validate_private_coordination_schema(schema: str) -> str:
 
 
 def coordination_database_configured() -> bool:
-    """A partial configuration is unavailable, never silently downgraded."""
+    """Keep partial or retired configurations on the fail-closed shared route."""
 
-    try:
-        config = get_coordination_database_config()
-    except (TypeError, ValueError):
-        return False
-    return all(
-        str(config.get(key) or "").strip()
-        for key in ("host", "user", "password", "database")
+    backend = str(get_env_value("COORD_DB_BACKEND") or "postgresql").strip().lower()
+    return backend != "postgresql" or any(
+        str(get_env_value(key) or "").strip()
+        for key in ("COORD_DB_HOST", "COORD_DB_USER", "COORD_DB_PASSWORD")
     )
 
 
 def get_coordination_connection_url() -> URL:
     config = get_coordination_database_config()
-    if not coordination_database_configured():
+    required = ("host", "user", "password", "database")
+    if not all(str(config.get(key) or "").strip() for key in required):
         raise ValueError(
             "Set COORD_DB_HOST, COORD_DB_USER, COORD_DB_PASSWORD, and COORD_DB_NAME"
         )
@@ -99,15 +97,15 @@ def get_coordination_connection_url() -> URL:
 
 
 def coordination_connection_url(config: Mapping[str, object]) -> URL:
-    postgres = config.get("backend") == "postgresql"
+    if config.get("backend") != "postgresql":
+        raise ValueError("Shared coordination requires PostgreSQL")
     return URL.create(
-        drivername="postgresql+psycopg" if postgres else "mysql+pymysql",
+        drivername="postgresql+psycopg",
         username=str(config["user"]),
         password=str(config["password"]),
         host=str(config["host"]),
         port=int(config["port"]),
         database=str(config["database"]),
-        query={} if postgres else {"charset": "utf8mb4"},
     )
 
 
@@ -116,39 +114,24 @@ def coordination_store_id() -> str:
 
     config = get_coordination_database_config()
     public = f"{config['host']}:{config['port']}/{config['database']}"
-    if config.get("backend") == "postgresql":
-        public += f"/{config['schema']}"
+    public += f"/{config['schema']}"
     return hashlib.sha256(public.encode("utf-8")).hexdigest()[:16]
 
 
 def _coordination_connect_args(config: Dict[str, object]) -> Dict[str, object]:
-    if config.get("backend") == "postgresql":
-        import certifi
+    if config.get("backend") != "postgresql":
+        raise ValueError("Shared coordination requires PostgreSQL")
+    import certifi
 
-        raw_ca = str(config.get("ssl_ca") or "").strip()
-        ca_path = resolve_repo_path(raw_ca) if raw_ca else Path(certifi.where())
-        if not ca_path.is_file():
-            raise ValueError(f"COORD_DB_SSL_CA does not exist: {ca_path}")
-        return {
-            "connect_timeout": 5,
-            "sslmode": "verify-full",
-            "sslrootcert": str(ca_path.resolve()),
-        }
-    args: Dict[str, object] = {
-        "connect_timeout": 5,
-        "read_timeout": 10,
-        "write_timeout": 10,
-        # TiDB Cloud public endpoints require an authenticated TLS session.
-        "ssl_verify_cert": True,
-        "ssl_verify_identity": True,
-    }
     raw_ca = str(config.get("ssl_ca") or "").strip()
-    if raw_ca:
-        ca_path = resolve_repo_path(raw_ca)
-        if not ca_path.is_file():
-            raise ValueError(f"COORD_DB_SSL_CA does not exist: {ca_path}")
-        args["ssl_ca"] = str(Path(ca_path).resolve())
-    return args
+    ca_path = resolve_repo_path(raw_ca) if raw_ca else Path(certifi.where())
+    if not ca_path.is_file():
+        raise ValueError(f"COORD_DB_SSL_CA does not exist: {ca_path}")
+    return {
+        "connect_timeout": 5,
+        "sslmode": "verify-full",
+        "sslrootcert": str(ca_path.resolve()),
+    }
 
 
 def configure_postgresql_session(engine: Engine, config: Mapping[str, object]) -> None:
@@ -202,7 +185,7 @@ def coordination_autocommit_connection(engine: Engine) -> Connection:
     pool.  Keeping that pool separate matters: changing isolation level on a
     transactional pool checkout sends two additional ``SET autocommit``
     requests.  The reader also omits ``pool_pre_ping`` because recycling at
-    240 seconds is already below TiDB Cloud's public-endpoint idle timeout.
+    240 seconds keeps idle pooled connections short-lived.
     Consequently a routine read emits the SELECT itself -- no ping, COMMIT,
     ROLLBACK, or isolation-toggle request.  Non-coordination engines retain
     their normal connection behavior for unit tests and local stores.
@@ -248,9 +231,8 @@ def init_coordination_engine(
         configure_postgresql_session(engine, config)
         # SQLAlchemy 2.0.43 added ``skip_autocommit_rollback`` specifically
         # for this case.  Without it, closing a read-only AUTOCOMMIT
-        # connection still called DBAPI.rollback(), which TiDB billed as a
-        # standalone request.  A dedicated pool avoids per-checkout
-        # isolation toggles and makes every ordinary read exactly one SQL
+        # connection still called DBAPI.rollback(). A dedicated pool avoids
+        # per-checkout isolation toggles and makes every ordinary read one SQL
         # request.
         read_engine = create_engine(
             connection_url,
@@ -295,8 +277,7 @@ def init_coordination_engine(
         if engine is not None:
             engine.dispose()
         logger.debug(
-            "Shared coordination database unavailable (%s): %s",
-            coordination_store_id() if coordination_database_configured() else "unconfigured",
+            "Shared PostgreSQL coordination database unavailable (%s)",
             type(exc).__name__,
         )
         if raise_on_error:

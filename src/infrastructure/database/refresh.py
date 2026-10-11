@@ -167,7 +167,13 @@ def refresh_universe_history_to_db(
     recent_days: int = 45,
     progress_callback: Optional[Callable[[str, int, int, int, str], None]] = None,
     log_callback: Optional[Callable[[str], None]] = None,
+    study_start_date: Optional[dt.date] = None,
 ) -> List[str]:
+    if interval.strip().lower() == "1d" and study_start_date is not None:
+        from .repositories.study_history import refresh_study_history
+
+        return refresh_study_history(tickers, engine, study_start_date, log_callback, progress_callback,
+            chunk_size=min(chunk_size, 40), threads=threads, batch_sleep=batch_sleep)
     symbols = _clean_symbols(tickers)
     if not symbols:
         return []

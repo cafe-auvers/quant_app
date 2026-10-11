@@ -340,7 +340,10 @@ def test_rollback_allowed_before_any_post_migration_broker_mutation(
     assert manager.state.phase == MigrationPhase.NOT_STARTED
 
 
-def test_direct_rollback_restores_datetime_rows_exactly(tmp_path, monkeypatch):
+@pytest.mark.parametrize("reuse_stamp", [False, True])
+def test_direct_rollback_restores_datetime_rows_exactly(tmp_path, monkeypatch, reuse_stamp):
+    from src.services.coordination_snapshot import read_versioned_rows
+
     engine = _engine(tmp_path)
     ensure_trade_cards_table(engine)
     create_trade_card(engine, TradeCardState("PROD", "1", "AAPL"))
@@ -356,10 +359,18 @@ def test_direct_rollback_restores_datetime_rows_exactly(tmp_path, monkeypatch):
     with manager.engine.begin() as conn:
         conn.execute(
             migrated_table.update().values(
-                updated_at=datetime(2030, 6, 7, 8, 9, 10),
+                updated_at=original_updated_at if reuse_stamp else datetime(2030, 6, 7, 8, 9, 10),
                 payload='{"mutated":true}',
             )
         )
+
+    def read_payload():
+        return read_versioned_rows(
+            manager.engine, migrated_table, cache_key=("rollback-test",),
+            key_columns=("environment", "account_no", "symbol"), revision_column="version",
+        )[0].payload
+
+    assert read_payload() == '{"mutated":true}'
 
     manager.rollback_direct(
         device_id="pc-main", lease_token="token-8", lease_epoch=8
@@ -370,6 +381,7 @@ def test_direct_rollback_restores_datetime_rows_exactly(tmp_path, monkeypatch):
         restored = dict(conn.execute(select(restored_table)).one()._mapping)
     assert restored == original
     assert restored["updated_at"] == original_updated_at
+    assert read_payload() == original["payload"]
 
 
 def test_direct_rollback_drops_tables_that_were_absent_before_migration(

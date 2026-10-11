@@ -126,3 +126,5 @@ Last verified watchlist result:
 - Confirm the correct overseas `TR_ID` for your KIS account if overseas holdings return a TR_ID error.
 - After SIM works, add PROD credentials and test PROD from the command line before using the dashboard.
 - Decide whether KIS overseas daily data should replace yfinance for the Charts tab, or only act as a fallback/verification source.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](../docs/opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

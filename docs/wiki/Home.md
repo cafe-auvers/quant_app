@@ -35,3 +35,5 @@ control remain independent gates.
 Canonical repository documentation remains in
 [README.md](https://github.com/cafe-auvers/quant_app/blob/master/README.md) and
 [PROJECT_ARCHITECTURE.md](https://github.com/cafe-auvers/quant_app/blob/master/PROJECT_ARCHITECTURE.md).
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](../opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

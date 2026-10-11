@@ -2,6 +2,11 @@
 
 Current disposition: **NOT READY / DO NOT START THE SOAK**
 
+For passive observations alongside trading, use the
+[live latency diagnostics](live_latency_diagnostics.md) to distinguish
+regular-session receive delay, parser delay, and actual engine-drain delay.
+Passive diagnostics do not certify Gate 2 or alter the limits below.
+
 The normative Gate-2 predicate, activation snapshot, metrics, and evidence
 identity are defined in the
 [Activation Gate Specification](activation_gate_specification.md). This file
@@ -341,3 +346,5 @@ reviewer's real identity and independence through the referenced GitHub
 review, signed attestation, or documented dual-control record. Until that
 external control exists, the bundle is not independently reviewed even if a
 locally supplied string passes schema validation.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

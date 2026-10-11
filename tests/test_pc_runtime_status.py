@@ -661,7 +661,7 @@ def test_pc_change_pulse_stays_at_five_seconds_when_peer_is_online():
     assert window.pc_status_timer.interval() == 5_000
 
 
-def test_peer_offline_pauses_tidb_projection_fallback_timers():
+def test_peer_offline_pauses_coordination_projection_fallback_timers():
     window = MainWindow.__new__(MainWindow)
     window.state_sync_timer = _TimerStub()
     window._buyboard_projection_timer = _TimerStub()
@@ -688,7 +688,7 @@ def test_peer_offline_pauses_tidb_projection_fallback_timers():
     assert window._buyboard_projection_timer.interval() == expected
 
 
-def test_split_operator_executor_uses_five_second_tidb_sync():
+def test_split_operator_executor_uses_five_second_coordination_sync():
     window = MainWindow.__new__(MainWindow)
     window.state_sync_timer = _TimerStub()
     window._buyboard_projection_timer = _TimerStub()
@@ -708,7 +708,7 @@ def test_split_operator_executor_uses_five_second_tidb_sync():
     assert window._buyboard_projection_timer.interval() == expected
 
 
-def test_same_device_or_locked_operator_stops_tidb_sync():
+def test_same_device_or_locked_operator_stops_coordination_sync():
     window = MainWindow.__new__(MainWindow)
     window.state_sync_timer = _TimerStub()
     window._buyboard_projection_timer = _TimerStub()

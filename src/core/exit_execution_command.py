@@ -47,14 +47,16 @@ def marketable_exit_limit_price(
     last_price: float | None = None,
     last_trusted_price: float | None = None,
     quote_is_execution_ready: bool = True,
+    trade_is_execution_ready: bool | None = None,
     emergency_reprice_attempt: int = 0,
+    hard_stop: bool = False,
 ) -> float | None:
     """Derive the shared bounded SELL limit from normalized market state.
 
     Frontends provide observations, never their own pricing policy.  A fresh
     bid receives the normal collar.  When only a last/trusted observation is
-    available, retries may widen the collar up to the existing five-percent
-    hard bound.
+    available, retries widen the collar. Hard stops keep widening instead
+    of imposing a price floor that requires a recovery before liquidation.
     """
 
     def positive(value: float | None) -> float | None:
@@ -69,15 +71,22 @@ def marketable_exit_limit_price(
         discount = execution_config.SELL_MARKETABLE_DISCOUNT_PCT
         return max(0.01, bid * (1.0 - discount))
 
-    reference = positive(last_trusted_price)
-    if reference is None and quote_is_execution_ready:
-        reference = positive(last_price)
+    trade_ready = (
+        quote_is_execution_ready
+        if trade_is_execution_ready is None
+        else trade_is_execution_ready
+    )
+    reference = positive(last_price) if trade_ready else None
+    if reference is None:
+        reference = positive(last_trusted_price)
     if reference is None:
         return None
     discount = execution_config.SELL_MARKETABLE_DISCOUNT_PCT * max(
         1, int(emergency_reprice_attempt or 0) + 1
     )
-    return max(0.01, reference * (1.0 - min(discount, 0.05)))
+    maximum_discount = 1.0 if hard_stop else 0.05
+    minimum_tick = 0.0001 if reference < 1.0 else 0.01
+    return max(minimum_tick, reference * (1.0 - min(discount, maximum_discount)))
 
 
 @dataclass(frozen=True)

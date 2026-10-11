@@ -34,6 +34,7 @@ def test_orb_settings_dialog_shows_defaults_and_restores_them():
         stop_adr_min_percent=25.0,
         stop_adr_ideal_percent=55.0,
         stop_adr_max_percent=80.0,
+        opening_min_shares_per_minute=350.0,
     )
     dialog = OrbSettingsDialog(custom)
 
@@ -59,6 +60,41 @@ def test_orb_settings_dialog_rejects_ideal_outside_bounds(monkeypatch):
     assert warnings
 
 
+def test_ep_settings_dialog_has_independent_customizable_bounds(monkeypatch):
+    _app()
+    dialog = OrbSettingsDialog()
+    dialog.spins["ep_stop_adr_min_percent"].setValue(40)
+    dialog.spins["ep_stop_adr_ideal_percent"].setValue(90)
+    dialog.spins["ep_stop_adr_max_percent"].setValue(140)
+    assert dialog.orb_settings().stop_adr_bounds(True) == (40, 90, 140)
+    assert dialog.orb_settings().stop_adr_bounds() == (15, 65, 90)
+    warnings = []
+    monkeypatch.setattr("src.ui.orb_settings_dialog.QMessageBox.warning", lambda *args: warnings.append(args))
+    dialog.spins["ep_stop_adr_ideal_percent"].setValue(160)
+    dialog._accept_if_valid()
+    assert warnings and dialog.result() != QDialog.Accepted
+
+
+def test_desktop_publication_dialog_returns_normal_ep_or_cancel():
+    from PyQt5.QtCore import QTimer
+    from PyQt5.QtWidgets import QPushButton
+    from src.ui.buyboard.dialogs import prompt_buy_today_profile
+
+    app = _app()
+    for label, expected in (("Publish to Buy Today", False), ("Publish as EP", True), ("Cancel", None)):
+        observed = []
+
+        def choose():
+            message = next(widget for widget in app.topLevelWidgets() if isinstance(widget, QDialog) and widget.windowTitle() == "Operator action" and widget.isVisible())
+            buttons = message.findChildren(QPushButton)
+            observed.append([button.text() for button in buttons])
+            next(button for button in buttons if button.text() == label).click()
+
+        QTimer.singleShot(0, choose)
+        assert prompt_buy_today_profile(None, "EPX") is expected
+        assert set(observed[0]) == {"Cancel", "Publish to Buy Today", "Publish as EP"}
+
+
 def test_main_window_saves_and_applies_accepted_orb_settings(monkeypatch):
     custom = OrbSettings(
         capital_min_percent=12.0,
@@ -67,6 +103,7 @@ def test_main_window_saves_and_applies_accepted_orb_settings(monkeypatch):
         stop_adr_min_percent=20.0,
         stop_adr_ideal_percent=50.0,
         stop_adr_max_percent=75.0,
+        opening_min_shares_per_minute=300.0,
     )
     published = {}
     log_messages = []

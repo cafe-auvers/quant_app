@@ -55,19 +55,39 @@ def publish_monitor_equity(path: Path, snapshot) -> None:
         document[key] = {"equity_usd": value[0], "received_at": value[1]}
         save_json(path, document)
         _published[identity] = value
+    try:
+        from src.services.journal_context import record_journal_nav
+        from src.utils.config import get_env_value
+
+        if str(get_env_value("TRADE_JOURNAL_ENABLED", "true")).lower() in {"true", "1", "yes"}:
+            record_journal_nav(snapshot)
+    except Exception:
+        # The journal must never interfere with the live monitor or account cache.
+        logging.getLogger(__name__).warning("Journal NAV archive unavailable", exc_info=True)
 
 
 def read_monitor_equity(
     path: Path, environment: str, account_no: str, now: dt.datetime,
     *, max_age_seconds: float = 900,
 ) -> tuple[float | None, str]:
+    equity, _received_at, reason = read_monitor_equity_snapshot(
+        path, environment, account_no, now, max_age_seconds=max_age_seconds,
+    )
+    return equity, reason
+
+
+def read_monitor_equity_snapshot(
+    path: Path, environment: str, account_no: str, now: dt.datetime,
+    *, max_age_seconds: float = 900,
+) -> tuple[float | None, str | None, str]:
+    """Return value and true fetch time from the same account-matched read."""
     try:
         row = json.loads(path.read_text(encoding="utf-8"))[_account_key(environment, account_no)]
         equity = float(row["equity_usd"])
         fetched = dt.datetime.fromisoformat(row["received_at"])
         age = (now - fetched).total_seconds()
         if not math.isfinite(equity) or equity <= 0 or not 0 <= age <= max_age_seconds:
-            return None, "Account equity is stale or unavailable; refresh the desktop account"
-        return equity, ""
+            return None, None, "Account equity is stale or unavailable; refresh the desktop account"
+        return equity, fetched.isoformat(), ""
     except (OSError, ValueError, KeyError, TypeError):
-        return None, "Account equity unavailable; open or refresh the desktop account"
+        return None, None, "Account equity unavailable; open or refresh the desktop account"

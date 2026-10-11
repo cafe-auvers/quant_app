@@ -199,6 +199,33 @@ def test_kis_exchange_routing_rejection_preserves_a_cooldown_retry(tmp_path):
     )
 
 
+def test_kis_funds_rejection_waits_then_consumes_a_new_attempt_identity(tmp_path):
+    now = [dt.datetime(2026, 10, 6, 15, 0, tzinfo=dt.timezone.utc)]
+    calls = []
+
+    def submit(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise GuardedSubmissionRejectedError("localized cash rejection", broker_code="APBK0952")
+        return _order(status=OrderStatus.ACCEPTED)
+
+    manager, path = _manager(tmp_path, submit, clock=lambda: now[0])
+    first = manager.attempt_entry(_trigger())
+    assert first.outcome == AttemptOutcome.WAITING_FOR_CAPITAL
+    assert first.attempt_count == 1
+    assert manager.attempt_entry(_trigger()).outcome == AttemptOutcome.COOLDOWN
+    assert len(calls) == 1
+    assert all(not r.is_open() for r in capital_allocator.load_reservations(path))
+    now[0] = first.retry_at + dt.timedelta(seconds=1)
+    second = manager.attempt_entry(_trigger())
+    assert second.outcome == AttemptOutcome.SUBMITTED
+    assert second.attempt_count == 2
+    assert second.attempt_group_id == first.attempt_group_id
+    assert calls[0]["attempt_number"] == 1
+    assert calls[1]["attempt_number"] == 2
+
+
+
 def test_guarded_rejection_preserves_structured_broker_metadata():
     source = KisApiError(
         "localized rejection",

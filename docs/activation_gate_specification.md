@@ -535,3 +535,5 @@ Workstream 14 is complete only when:
 - [Controlled-live pilot runbook](controlled_live_pilot_runbook.md)
 - [Portfolio risk operating profiles](portfolio_risk_operations.md)
 - [Kanban architecture](kanban_architecture.md)
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

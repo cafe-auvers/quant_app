@@ -15,6 +15,11 @@ from enum import Enum
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 import pandas as pd
+from src.core.intraday_coverage import (
+    has_verified_opening_coverage,
+    kis_history_has_invalid_rows,
+    kis_market_timezone,
+)
 
 from src.risk.orb_position import (
     calculate_orb_position_values,
@@ -23,6 +28,7 @@ from src.risk.orb_position import (
     validate_orb_position_values,
 )
 from src.core.orb_entry_logic import ORB_SCORE_VERSION, passive_entry_prices
+from src.core.opening_liquidity import opening_liquidity_rejection, opening_volume_totals
 from src.strategy import MarketSnapshot, PortfolioSnapshot
 from src.strategy.orb import ORBStrategy, ORBStrategyConfig, market_local_index
 
@@ -247,6 +253,11 @@ class OrbCandidate:
     terminal_rejection: bool = False
     warnings: List[str] = field(default_factory=list)
     reason: str = ""
+    is_ep: bool = False
+
+    # Completed minutes since the session open, capped at the first 30 minutes.
+    opening_volume: Optional[float] = None
+    opening_volume_minutes: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -293,6 +304,7 @@ class ExecutionQueueItem:
     order_id: Optional[str] = None
     last_updated: datetime = field(default_factory=_utc_now)
     warnings: List[str] = field(default_factory=list)
+    is_ep: bool = False
 
     def __post_init__(self) -> None:
         self.environment = _require_production_environment(self.environment)
@@ -302,6 +314,7 @@ class ExecutionQueueItem:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "symbol": self.symbol,
+            "is_ep": self.is_ep,
             "environment": self.environment,
             "account_no": self.account_no,
             "name": self.name,
@@ -347,6 +360,7 @@ class ExecutionQueueItem:
             last_updated = _utc_now()
         return cls(
             symbol=str(data.get("symbol", "")).upper(),
+            is_ep=data.get("is_ep") is True,
             environment=str(data.get("environment") or PRODUCTION_ENVIRONMENT).upper(),
             account_no=str(data.get("account_no") or "").strip(),
             name=str(data.get("name", "")),
@@ -565,10 +579,12 @@ def _candidate_unavailable(
     reason: str,
     *,
     source_session_date: Optional[str] = None,
+    is_ep: bool = False,
 ) -> OrbCandidate:
     return OrbCandidate(
         symbol=symbol.upper(),
         window=window,
+        is_ep=is_ep,
         source_session_date=source_session_date,
         status=status,
         valid=False,
@@ -595,7 +611,9 @@ def _intraday_source_session_date(intraday: pd.DataFrame) -> Optional[str]:
     """
 
     try:
-        local_index = market_local_index(intraday.sort_index().index)
+        local_index = market_local_index(
+            intraday.sort_index().index, naive_timezone=kis_market_timezone(intraday)
+        )
         if local_index is None or local_index.empty:
             return None
         return local_index[-1].date().isoformat()
@@ -606,18 +624,20 @@ def _intraday_source_session_date(intraday: pd.DataFrame) -> Optional[str]:
 def _missing_orb_range_state(
     intraday: pd.DataFrame,
     window: str,
+    symbol: str = "",
 ) -> tuple[OrbCandidateStatus, str]:
     """Explain why a supported ORB range could not be calculated.
 
-    A completed window with later current-session bars but no 09:30 bar is a
-    data failure, not a window that is still forming.  Keeping those cases
-    separate prevents a missing opening bar from leaving the 1m plan in
-    ``FORMING`` for the rest of the session.
+    An elapsed window never stays FORMING because its opening bar is absent.
+    Verified sparse history distinguishes an empty window from missing data;
+    an unproven download retains the conservative unavailable state.
     """
 
     window_minutes = {"1m": 1, "5m": 5, "30m": 30}.get(window)
     if window_minutes is None:
         return OrbCandidateStatus.NOT_AVAILABLE, f"unsupported ORB window {window}"
+    if kis_history_has_invalid_rows(intraday):
+        return OrbCandidateStatus.NOT_AVAILABLE, "KIS minute history contains invalid rows"
     if "High" not in intraday.columns or "Low" not in intraday.columns:
         return (
             OrbCandidateStatus.NOT_AVAILABLE,
@@ -625,7 +645,10 @@ def _missing_orb_range_state(
         )
 
     try:
-        local_index = market_local_index(intraday.sort_index().index)
+        local_index = market_local_index(
+            intraday.sort_index().index,
+            naive_timezone=kis_market_timezone(intraday, symbol=symbol),
+        )
         if local_index is None or local_index.empty:
             raise ValueError("invalid intraday timestamp index")
         session_start = local_index[-1].normalize() + pd.Timedelta(
@@ -641,6 +664,18 @@ def _missing_orb_range_state(
     if session_index.empty or session_index[-1] < window_end:
         return OrbCandidateStatus.FORMING, "ORB window has not completed"
     if not (session_index == session_start).any():
+        if has_verified_opening_coverage(intraday, session_start, window_end, symbol=symbol):
+            opening_rows = session_index[
+                (session_index >= session_start) & (session_index < window_end)
+            ]
+            if opening_rows.empty:
+                later_rows = session_index[session_index >= window_end]
+                first = later_rows[0].strftime("%H:%M") if len(later_rows) else "unavailable"
+                return (
+                    OrbCandidateStatus.NOT_AVAILABLE,
+                    f"KIS returned no bars in the {window} opening window "
+                    f"(09:30–{window_end.strftime('%H:%M')} ET); first available bar is {first} ET",
+                )
         return (
             OrbCandidateStatus.NOT_AVAILABLE,
             f"09:30 opening bar is unavailable for the completed {window} ORB window",
@@ -676,13 +711,13 @@ def calculate_position_values(
 
 
 def validate_position_values(
-    sizing: Dict[str, Any], adr_percent: Optional[float]
+    sizing: Dict[str, Any], adr_percent: Optional[float], *, is_ep: bool = False
 ) -> List[str]:
-    return validate_orb_position_values(sizing, adr_percent)
+    return validate_orb_position_values(sizing, adr_percent, is_ep=is_ep)
 
 
-def score_orb_candidate(sizing: Dict[str, Any], risk_percent: float) -> float:
-    return score_orb_position_recommendation(sizing, risk_percent)
+def score_orb_candidate(sizing: Dict[str, Any], risk_percent: float, *, is_ep: bool = False) -> float:
+    return score_orb_position_recommendation(sizing, risk_percent, is_ep=is_ep)
 
 
 def build_orb_candidate(
@@ -701,6 +736,8 @@ def build_orb_candidate(
     lock_risk_percent: bool = False,
     execution_price: Optional[float] = None,
     execution_price_manual: bool = False,
+    is_ep: bool = False,
+    liquidity_intraday: Optional[pd.DataFrame] = None,
 ) -> OrbCandidate:
     symbol = str(symbol or "").upper()
     has_sizing_equity = _has_known_positive_sizing_equity(account_size)
@@ -710,10 +747,11 @@ def build_orb_candidate(
             window,
             OrbCandidateStatus.NOT_AVAILABLE,
             f"unsupported ORB window {window}",
+            is_ep=is_ep,
         )
     if intraday is None or intraday.empty:
         return _candidate_unavailable(
-            symbol, window, OrbCandidateStatus.NOT_AVAILABLE, "intraday data missing"
+            symbol, window, OrbCandidateStatus.NOT_AVAILABLE, "intraday data missing", is_ep=is_ep
         )
 
     source_session_date = _intraday_source_session_date(intraday)
@@ -736,13 +774,14 @@ def build_orb_candidate(
     )
     orb_range = strategy_evaluation.orb_range
     if orb_range is None:
-        status, reason = _missing_orb_range_state(intraday, window)
+        status, reason = _missing_orb_range_state(intraday, window, symbol)
         return _candidate_unavailable(
             symbol,
             window,
             status,
             reason,
             source_session_date=source_session_date,
+            is_ep=is_ep,
         )
 
     orb_high = float(orb_range.high)
@@ -750,12 +789,28 @@ def build_orb_candidate(
     candidate_stop = _optional_float(stop_loss) or orb_low
     warnings: List[str] = []
     range_closed_at = orb_range.end.isoformat()
+    bars = (liquidity_intraday if liquidity_intraday is not None else intraday).sort_index()
+    local_index = market_local_index(
+        bars.index, naive_timezone=kis_market_timezone(bars, symbol=symbol)
+    )
+    if local_index is None:
+        opening_volume, opening_minutes = None, 0
+    else:
+        opening_start = pd.Timestamp.combine(orb_range.start.date(), orb_range.start.time())
+        if local_index.tz is not None:
+            opening_start = opening_start.tz_localize(local_index.tz)
+        opening_volume, opening_minutes = opening_volume_totals(bars, local_index, opening_start)
+    liquidity_fields = {
+        "opening_volume": opening_volume,
+        "opening_volume_minutes": opening_minutes,
+    }
 
     if breakout is None or breakout <= 0:
         warnings.append("Manual breakout price is required")
         return OrbCandidate(
             symbol=symbol,
             window=window,
+            is_ep=is_ep,
             orb_high=orb_high,
             orb_low=orb_low,
             breakout_price=breakout,
@@ -770,6 +825,7 @@ def build_orb_candidate(
             valid=False,
             warnings=warnings,
             reason=warnings[0],
+            **liquidity_fields,
         )
 
     # A working earlier generation must not suppress later-window candidate
@@ -799,6 +855,7 @@ def build_orb_candidate(
         return OrbCandidate(
             symbol=symbol,
             window=window,
+            is_ep=is_ep,
             orb_high=orb_high,
             orb_low=orb_low,
             breakout_price=breakout,
@@ -818,6 +875,7 @@ def build_orb_candidate(
             ),
             warnings=[reason],
             reason=reason,
+            **liquidity_fields,
         )
 
     assert resolved_execution is not None
@@ -855,8 +913,8 @@ def build_orb_candidate(
                 stop_price=candidate_stop,
                 adr_percent=adr_percent,
             )
-            if is_orb_position_plan_valid(_s, adr_percent):
-                _sc = score_orb_candidate(_s, _rc)
+            if is_orb_position_plan_valid(_s, adr_percent, is_ep=is_ep):
+                _sc = score_orb_candidate(_s, _rc, is_ep=is_ep)
                 if _sc > _best_score:
                     _best_score = _sc
                     _best_sizing = _s
@@ -874,16 +932,20 @@ def build_orb_candidate(
         )
     )
     risk_percent = _best_risk
-    warnings.extend(validate_position_values(sizing, adr_percent))
-    score = score_orb_candidate(sizing, risk_percent)
+    warnings.extend(validate_position_values(sizing, adr_percent, is_ep=is_ep))
+    score = score_orb_candidate(sizing, risk_percent, is_ep=is_ep)
+    liquidity_reason = opening_liquidity_rejection(opening_volume, opening_minutes)
+    if liquidity_reason:
+        warnings.append(liquidity_reason)
 
     if warnings:
         terminal_rejection = (
-            has_sizing_equity
+            has_sizing_equity and not liquidity_reason
         )
         return OrbCandidate(
             symbol=symbol,
             window=window,
+            is_ep=is_ep,
             orb_high=orb_high,
             orb_low=orb_low,
             breakout_price=breakout,
@@ -907,11 +969,13 @@ def build_orb_candidate(
             terminal_rejection=terminal_rejection,
             warnings=warnings,
             reason="; ".join(warnings),
+            **liquidity_fields,
         )
 
     return OrbCandidate(
         symbol=symbol,
         window=window,
+        is_ep=is_ep,
         orb_high=orb_high,
         orb_low=orb_low,
         breakout_price=breakout,
@@ -934,6 +998,7 @@ def build_orb_candidate(
         valid=True,
         warnings=[],
         reason="Opening range finalized; waiting for a confirmed breakout",
+        **liquidity_fields,
     )
 
 
@@ -1074,6 +1139,31 @@ class ExecutionQueueManager:
         item.order_id = None
         item.warnings = []
 
+    def retire_completed_order_for_fresh_activation(
+        self, card: Any, *, has_active_order: bool
+    ) -> bool:
+        """Retire a completed legacy lock only after a clean canonical activation."""
+        from src.core.trade_card_state import BoardStatus, has_durable_execution_evidence
+
+        item = self.get_item(card.symbol, card.environment)
+        if (
+            item is None
+            or has_active_order
+            or card.board_status != BoardStatus.BUY_TODAY
+            or has_durable_execution_evidence(card)
+            or card.entry_block_reason == "cancel_requested"
+            or not str(card.account_no or "").strip()
+            or item.account_no != card.account_no
+            or not item.locked
+            or item.manual_window_lock
+            or str(item.order_status or "").upper() != "FILLED"
+        ):
+            return False
+        # Discard previous confirmations as well as the lock. The new entry
+        # must receive newly built candidates and a fresh post-range trade.
+        self._reset_for_account_reassignment(item)
+        return True
+
     def upsert_item(
         self,
         *,
@@ -1085,6 +1175,7 @@ class ExecutionQueueManager:
         current_price: Optional[float] = None,
         candidates: Optional[Dict[str, OrbCandidate]] = None,
         warnings: Optional[Iterable[str]] = None,
+        is_ep: bool = False,
     ) -> ExecutionQueueItem:
         symbol_key = str(symbol or "").upper()
         environment_key = _require_production_environment(environment)
@@ -1115,6 +1206,7 @@ class ExecutionQueueManager:
                 self._reset_for_account_reassignment(existing)
                 existing.account_no = requested_account
         existing.name = name or existing.name
+        existing.is_ep = is_ep
         existing.breakout_price = breakout_price
         existing.current_price = current_price
         if candidates is not None:
@@ -1137,6 +1229,7 @@ class ExecutionQueueManager:
                         "breakout_price",
                         "execution_price",
                         "score_version",
+                        "is_ep",
                     )
                 )
                 if not same_generation:
@@ -1145,7 +1238,8 @@ class ExecutionQueueManager:
                 if prior.breakout_confirmed:
                     refreshed.breakout_confirmed = True
                     refreshed.breakout_confirmed_at = prior.breakout_confirmed_at
-                    refreshed.status = OrbCandidateStatus.EXECUTE_READY
+                    if refreshed.valid:
+                        refreshed.status = OrbCandidateStatus.EXECUTE_READY
             existing.candidates = refreshed_candidates
         existing.warnings = list(warnings or [])
         existing.last_updated = _utc_now()
@@ -1192,6 +1286,7 @@ class ExecutionQueueManager:
         buffer_pct: float = DEFAULT_ORB_BUFFER_PCT,
         duplicate_pending_order: bool = False,
         force_buffer_pct: bool = False,
+        is_ep: bool = False,
     ) -> ExecutionQueueItem:
         symbol = str(getattr(item, "symbol", "")).upper()
         previous = self.get_item(symbol, environment)
@@ -1212,6 +1307,9 @@ class ExecutionQueueManager:
             selected_risk_percent = None
             selected_buffer_pct = None
         candidates = {}
+        liquidity_bars = intraday_by_window.get("1m")
+        if liquidity_bars is not None and liquidity_bars.empty:
+            liquidity_bars = None
         for window in SUPPORTED_ORB_WINDOWS:
             use_saved_selection = window == selected_window
             candidates[window] = build_orb_candidate(
@@ -1242,6 +1340,8 @@ class ExecutionQueueManager:
                 lock_risk_percent=(
                     use_saved_selection and selected_risk_percent is not None
                 ),
+                is_ep=is_ep,
+                liquidity_intraday=liquidity_bars,
             )
         queue_item = self.upsert_item(
             symbol=symbol,
@@ -1251,6 +1351,7 @@ class ExecutionQueueManager:
             breakout_price=breakout_price,
             current_price=current_price,
             candidates=candidates,
+            is_ep=is_ep,
         )
         if selected_window:
             selected_candidate = queue_item.candidates.get(selected_window)

@@ -422,6 +422,7 @@ class ScannerWorker(QThread):
     def run(self) -> None:
         try:
             from src.infrastructure.database.repositories.scanner import (
+                ensure_scanner_metrics_for_rules,
                 get_universe_stock_metrics_from_db,
                 query_scanner_metrics_with_funnel,
             )
@@ -450,6 +451,11 @@ class ScannerWorker(QThread):
                 def query_setups(query_engine):
                     results_by_setup = {}
                     funnels_by_setup = {}
+                    ensure_scanner_metrics_for_rules(
+                        self.tickers, query_engine,
+                        [rule for rules in self.scanner_rules_by_setup.values() for rule in (rules or [])],
+                        log_callback=self.log_message.emit,
+                    )
                     for setup_name, rules in self.scanner_rules_by_setup.items():
                         if self.isInterruptionRequested():
                             return None

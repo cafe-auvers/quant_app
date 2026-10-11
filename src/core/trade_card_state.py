@@ -232,6 +232,7 @@ class TradeCardState:
     # allows the execution owner to materialize a missing local key safely.
     kis_ws_symbol_key: str = ""
     breakout_price: Optional[float] = None
+    is_ep: bool = False
     selected_orb_window: Optional[str] = None
     buffer_pct: float = 0.001
     # Canonical account-risk *fraction*: 0.01 means 1%.  The historical name
@@ -317,6 +318,7 @@ class TradeCardState:
 
     # Exit state (sections 17-18)
     exit_all_required: bool = False
+    stop_loss_triggered: bool = False
     sell_all_at_market_open: bool = False
     # User-requested partial-sell quantity (section 15), stashed on the card
     # when a RequestPartialSell command moves it into PARTIAL_SELL so the
@@ -492,6 +494,7 @@ class TradeCardState:
             else None
         )
         self.exit_all_required = bool(self.exit_all_required)
+        self.stop_loss_triggered = bool(self.stop_loss_triggered)
         self.sell_all_at_market_open = bool(self.sell_all_at_market_open)
         self.pending_partial_sell_quantity = int(self.pending_partial_sell_quantity or 0)
         self.reserved_sell_quantity = int(self.reserved_sell_quantity or 0)
@@ -604,6 +607,7 @@ class TradeCardState:
             "rejected_orb_snapshot": self.rejected_orb_snapshot,
             "kis_ws_symbol_key": self.kis_ws_symbol_key,
             "breakout_price": self.breakout_price,
+            "is_ep": self.is_ep,
             "selected_orb_window": self.selected_orb_window,
             "buffer_pct": self.buffer_pct,
             "risk_percent": self.risk_percent,
@@ -679,6 +683,7 @@ class TradeCardState:
                 else None
             ),
             "exit_all_required": self.exit_all_required,
+            "stop_loss_triggered": self.stop_loss_triggered,
             "sell_all_at_market_open": self.sell_all_at_market_open,
             "pending_partial_sell_quantity": self.pending_partial_sell_quantity,
             "reserved_sell_quantity": self.reserved_sell_quantity,
@@ -738,6 +743,7 @@ class TradeCardState:
             rejected_orb_snapshot=dict(data.get("rejected_orb_snapshot") or {}),
             kis_ws_symbol_key=str(data.get("kis_ws_symbol_key", "")),
             breakout_price=data.get("breakout_price"),
+            is_ep=data.get("is_ep") is True,
             selected_orb_window=data.get("selected_orb_window"),
             buffer_pct=data.get("buffer_pct", 0.001),
             risk_percent=_persisted_risk_fraction(data),
@@ -804,6 +810,7 @@ class TradeCardState:
             pending_stop_command_id=str(data.get("pending_stop_command_id", "")),
             pending_stop_requested_at=data.get("pending_stop_requested_at"),
             exit_all_required=bool(data.get("exit_all_required", False)),
+            stop_loss_triggered=bool(data.get("stop_loss_triggered", False)),
             sell_all_at_market_open=bool(data.get("sell_all_at_market_open", False)),
             pending_partial_sell_quantity=int(
                 data.get("pending_partial_sell_quantity", 0) or 0
@@ -834,6 +841,28 @@ class TradeCardState:
             updated_at=data.get("updated_at") or _utc_now(),
             warnings=list(data.get("warnings", []) or []),
         )
+
+
+def can_withdraw_sell_all_intent(card: TradeCardState) -> bool:
+    """Allow only a held position whose SELL lifecycle has not started.
+
+    A regular-session liquidation objective is not evidence of a broker
+    order. Working orders are checked separately by the workflow service.
+    """
+
+    return bool(
+        card.board_status == BoardStatus.SELL_ALL
+        and card.broker_quantity > 0
+        and not (
+            card.exit_client_order_id
+            or card.exit_pending_attempt_number
+            or card.reserved_sell_quantity
+            or card.exit_submission_unresolved
+            or card.exit_cancel_in_flight
+            or card.exit_cancel_command_id
+            or card.exit_cancel_requested_at is not None
+        )
+    )
 
 
 def has_durable_execution_evidence(card: TradeCardState) -> bool:

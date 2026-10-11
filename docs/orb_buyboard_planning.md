@@ -1,5 +1,19 @@
 # Buy Board ORB Planning
 
+Buy Today publication offers **Cancel**, **Publish to Buy Today**, and
+**Publish as EP**. Both publication choices use the same card and workflow.
+The EP label selects only the stop/ADR validity bounds and scoring ideal:
+normal defaults are 15% / 65% / 90%, and EP defaults are 50% / 100% / 150%.
+Both profiles can be edited in shared ORB settings on desktop and web/mobile.
+The ADR measurement, stop placement, position-sizing formula, and other entry
+and exit checks are unchanged. Previously saved cards use the normal profile.
+
+Buy Board prices are indicative observations, labelled with their source, timestamp,
+and age. When Yahoo is delayed or a refresh fails, the last available price remains
+visible. Estimated P&L and distance to the active stop also remain visible, marked
+`stale` until a later quote replaces them through the normal minute refresh.
+These display estimates do not satisfy automatic entry freshness requirements.
+
 The Buy Board is the only operator-facing ORB planning surface. The former
 Watchlist tab, its AI analysis, snapshots, bulk scoring table, and embedded ORB
 matrix are not part of the active UI. Watchlist membership itself remains a
@@ -35,6 +49,15 @@ Add, move, and remove actions require the shared coordination database and an
 explicitly selected production account. If either is unavailable, the action
 leaves both the canonical card and local Watchlist/Buylist mirrors unchanged;
 there is no offline promotion that can later overwrite a newer device change.
+
+## Shared opening liquidity
+
+The shared ORB settings also contain Minimum opening volume, defaulting to
+200 shares per completed minute from 09:30 New York through at most 10:00.
+Every 1m/5m/30m candidate uses that same minimum and existing minute-volume
+evidence. Exactly the threshold passes; zero disables it. Missing evidence or
+low opening activity blocks new buys and replacements. Protective sells are
+exempt. On mobile, edit it through Menu → Settings and Save shared settings.
 
 ## Buffer %
 
@@ -123,6 +146,43 @@ this dialog is not a second market-hours planning path.
 Any permitted pre-market refresh still uses the plan's persisted buffer, never
 the current local header default.
 
+## Sparse KIS opening history
+
+The verified KIS `xymd`/`xhms` timestamps carry explicit New York provenance,
+including through the cache. A late local 13:30 or 14:30 bar is never interpreted
+as a UTC opening bar. Arbitrary configured field mappings cannot establish this
+provenance. Invalid downloaded rows prevent sparse-range authorization.
+
+Some KIS minute-chart responses have no bar at exactly 09:30. This does not
+move the opening window: 1m remains 09:30–09:31 ET, 5m remains 09:30–09:35,
+and 30m remains 09:30–10:00. Bars are never filled or borrowed from a later
+minute to manufacture a missing short-window range.
+
+A longer window may use its actual KIS bars when a backward-paged download
+reaches before the session open and through the window end. The planner binds
+that coverage to a digest of the opening rows. The PC historical cache stores
+bars and the optional `intraday_history_coverage` record in the same transaction;
+the record is keyed by symbol, interval and source. This table is local MySQL
+cache metadata, separate from Supabase coordination. Older caches continue
+using the original exact-09:30 check until refreshed. Truncated downloads,
+malformed broker rows, wrong symbols/sessions, unfinished windows, changed
+cached opening rows, and non-KIS fallback data cannot use the sparse-history
+permission. The proof is also rebound when 1m bars are resampled to 5m.
+
+An empty completed window explains its exact time bounds and the first
+available bar. When every automatic candidate is blocked, the Buy Today card
+shows the reasons for all windows; an explicit manual window keeps its own
+reason. Price-zone, sizing, fresh WebSocket, broker, ownership and live-switch
+checks remain enforced.
+
+CURV diagnostic on 2026-10-05: direct KIS NYS responses paged into the previous
+session and still began at 09:43 ET. No 1m/5m opening bars were returned. Its
+actual 30m range was $2.51/$2.48, while the saved breakout was $2.52; that
+calculated plan is rejected because there is no passive entry zone above the
+breakout and at or below ORH. This is a dated data/plan diagnosis, not an entry
+recommendation or authorization to change the breakout. No live card or order
+was changed by the diagnostic replay.
+
 Locking a window or returning to automatic selection saves only this device's
 local execution-queue planning state. It is **not** a cross-device handoff.
 After either change, the Operator Control owner must click **Publish Today's
@@ -199,3 +259,93 @@ The hidden `WATCHLIST` lifecycle value and synchronized `watchlist.json` remain
 the user-managed passive candidate stage. Watchlist items are accessible in the
 sidebar and can be promoted to Buylist, but they do not create a dedicated tab,
 visible board column, live subscription, or alternate execution path.
+
+## Mobile Buy Board risk and NAV allocation
+
+The card and its detail sheet show the selected risk budget as a percentage
+of NAV. Today and Entry also show estimated planned risk and planned allocation
+as both percentages and dollars. Planned risk is target shares multiplied by
+the difference between execution price and the planned stop; planned allocation
+is target shares multiplied by execution price. An unsized plan stays labelled
+`Not sized`.
+
+Filled Entry cards and Open, Partial and Sell All cards show `Allocated` using
+the broker-confirmed remaining shares multiplied by average fill price. A sell
+request does not reduce this amount before the shares actually leave the
+holding. Positions show `Risk at stop` using the positive entry-to-active-stop
+loss and remaining shares; a stop above entry implies zero estimated loss from
+entry. Incomplete stop coverage is labelled rather than assigned zero risk.
+These estimates exclude fees and slippage.
+
+The denominator is the account-matched USD equity snapshot already published
+by the PC. Its actual fetch time accompanies the value. Snapshots older than
+15 minutes, missing, invalid, or from another account cannot supply NAV
+percentages. The browser also expires a previously received NAV during a
+failed/offline poll; known dollar amounts remain visible. The NAV header shows
+the current usable denominator. Rendering makes no broker calls and adds no
+canonical database query for NAV.
+
+## Explicit re-entry after a completed exit
+
+Mobile Cancel Today withdraws the latest entry intent for the selected symbol.
+Runtime observation revisions do not invalidate cancellation; each attempt still
+locks and validates the current canonical card. Repeated cancellation is harmless.
+An unsubmitted entry returns to Buylist immediately. A working or partially filled
+entry remains pending until the executor confirms cancellation; filled shares and
+their protective stops remain in Open Positions. The chart shows Cancelling while
+broker reconciliation is pending, and a partially completed position exposes
+Cancel remaining buy.
+
+Editing an unsubmitted breakout rebuilds its entry qualification, sizing and
+breakout confirmation from the revised target. Opening-range high and low remain
+the observed first 1, 5 or 30 minutes. Passive execution still requires an entry
+above both the breakout and opening-range low, and at or below the opening-range
+high; a breakout above that high has no execution zone. Mobile rejection feedback
+includes these prices. An unrelated observation revision can be retried, while a
+concurrent change to the breakout or lifecycle requires reviewing the current card.
+
+A stop hit starts liquidation. A new entry cannot start while the stock remains
+held or its exit is pending. Once broker reconciliation confirms zero shares and
+the completed cycle is Closed, select the stock and confirm Buy Today again on
+mobile, or use Re-enter on the PC chart. The original breakout price and risk
+budget are retained; editing the breakout price is no longer required.
+
+Each explicit activation starts a fresh planning cycle. Previous entry/exit
+identities, frozen ORB execution values, stop state and retry projections are
+retired, while the immutable order history remains available. The PC calculates
+a current-session ORB plan and creates a new broker-order identity. There is no
+one-entry-per-symbol-per-day lock and no automatic reactivation after another
+stop. Repeated same-day attempts still require a new user activation each time,
+current ORB qualification, fresh KIS trade/quote data, account equity/buying power,
+portfolio risk, execution ownership, Live Trading and broker-boundary checks.
+Existing attempt-rate limits and cooldowns remain in force.
+
+Queue refresh also retires an old FILLED compatibility lock when the canonical
+card is a fresh Buy Today activation, broker-flat, and carries no durable execution
+evidence. Account identity must match, and broker/open-order and canonical-order
+checks must show no active order. Old candidates and breakout confirmations are
+discarded together, so the next entry requires rebuilt geometry and fresh market
+data. Working, ambiguous, partial and currently held execution remains fenced.
+
+Re-entry rejects nonzero held/sellable shares, nonterminal position/entry/exit
+state, pending stop changes, reserved capital, active owned/external orders and
+unresolved broker commands. These checks run again before the canonical update.
+Closed remains outside the ordinary drag graph; only a validated new-cycle
+command can reopen it.
+
+A Closed card can retain a historical reservation ID. The new-cycle check reads
+the canonical reservation ledger and retires that reference only when its
+environment/account/symbol match, its status is Consumed/Released/Expired and
+both remaining reserved money and projected risk are zero. Missing, mismatched,
+active or inconsistent reservations still block; an active reservation for the
+symbol also blocks even if its card reference is missing. No reservation is
+released by a re-entry request.
+
+An ambiguous historical cancel stops blocking only when its exact target order
+has a unique matching account/symbol identity, zero remaining quantity and a
+Filled/Cancelled/Expired broker observation reconciled after that cancel was
+requested. Missing, earlier or inconsistent evidence still blocks. An unresolved
+submit, replace or in-flight requested cancel always blocks. This check retains
+the original command and order records; it does not retry or send a cancel.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

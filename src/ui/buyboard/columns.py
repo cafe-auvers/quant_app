@@ -298,6 +298,36 @@ class BoardColumnList(QListWidget):
                         self._set_item_widget_size(item, widget)
             return False
 
+        # A version change in one card should not rebuild every widget in a
+        # large column. Reuse rows when their identities and order are stable.
+        reusable = bool(signature and len(signature) == len(self._render_signature or ())
+            and self.count() == len(signature)
+            and all(not isinstance(value, BoardCardProjection) or not (value.unlinked_owned_orders or value.external_orders)
+                    for value, _fingerprint, _identity in prepared)
+            and all(new[:2] == old[:2] and new[0] == "CARD"
+                    for new, old in zip(signature, self._render_signature)))
+        if reusable:
+            for index, (value, fingerprint, identity) in enumerate(prepared):
+                card_state = state(value)
+                item = self.item(index)
+                current_price = quote_lookup(card_state.symbol) if quote_lookup else None
+                account_equity = account_equity_lookup(card_state.environment, card_state.account_no) if account_equity_lookup else None
+                if identity != self._render_signature[index]:
+                    widget = TradeCardWidget(value, current_price=current_price, account_equity=account_equity)
+                    widget.set_pending(card_state.card_key in self._pending_card_keys)
+                    self.setItemWidget(item, widget)
+                    item.setData(Qt.UserRole, card_drag_payload(value, state_fingerprint=fingerprint))
+                    if item.data(Qt.UserRole).get("recovery_snapshot", False):
+                        item.setFlags(item.flags() & ~Qt.ItemIsDragEnabled)
+                    else:
+                        item.setFlags(item.flags() | Qt.ItemIsDragEnabled)
+                    self._set_item_widget_size(item, widget)
+                else:
+                    widget = self.itemWidget(item)
+                    if isinstance(widget, TradeCardWidget) and widget.update_live_metrics(card_state, current_price, account_equity):
+                        self._set_item_widget_size(item, widget)
+            self._render_signature = signature
+            return True
         self.clear()
         for card, fingerprint, _identity in prepared:
             if isinstance(card, BoardExternalOrderProjection):

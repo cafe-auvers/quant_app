@@ -8,6 +8,7 @@ from enum import Enum
 from typing import List
 
 import pandas as pd
+from src.core.intraday_coverage import rebind_kis_coverage_after_resample
 
 
 class IntradayProviderName(str, Enum):
@@ -135,7 +136,7 @@ def resample_ohlcv_bars(
         return normalized
     if interval_value != IntradayInterval.FIVE_MINUTE.value:
         raise ValueError(f"Unsupported provider interval: {interval_value}")
-    return (
+    result = (
         normalized.resample("5min")
         .agg(
             {
@@ -148,6 +149,8 @@ def resample_ohlcv_bars(
         )
         .dropna(how="any")
     )
+    rebind_kis_coverage_after_resample(normalized, result)
+    return result
 
 
 def _interval_value(value: IntradayInterval | str) -> str:

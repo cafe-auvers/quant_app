@@ -59,3 +59,5 @@ The active broker path uses immutable ORB order generations: a fresh confirmed
 breakout submits a passive limit, and a later higher-score generation can be
 submitted only after the prior zero-fill order is authoritatively cancelled.
 See [Current Order Logic](https://github.com/cafe-auvers/quant_app/blob/master/docs/current_order_logic.md).
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](../opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

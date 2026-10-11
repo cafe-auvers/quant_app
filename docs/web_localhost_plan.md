@@ -90,11 +90,11 @@ remain Python-side and are not copied into browser code.
 
 - Read-only real market/scanner data comes from the explicitly configured PC
   SQLite mirror. Canonical Watchlist/Buylist/Buy Today/breakout state is read
-  from TiDB with authenticated invalidation/change-pulse updates, a bounded
+  from Supabase with authenticated invalidation/change-pulse updates, a bounded
   revision fallback, and no schema bootstrap.
 - Non-executable Buy Today drafts remain available when guarded operator
   operations are not enabled.
-- Canonical TiDB planning writes default off. This workstation's local config
+- Canonical Supabase planning writes default off. This workstation's local config
   explicitly enables only Watchlist add/remove, Watchlist/Buylist movement,
   and breakout Set/Clear through existing typed services with authenticated
   actor, account/environment, command ID, expected revision, lifecycle checks,
@@ -196,3 +196,5 @@ does not rewrite or extend historical gate evidence.
   session had no attached `iab` browser instance. Supabase and real-iPhone
   visual inspection remain explicitly blocked; real mirror, two-session
   invalidation/conflict, and canonical passive-write checks passed.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

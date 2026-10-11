@@ -195,4 +195,7 @@ def restore_coordination_snapshot(engine: Engine, snapshot: dict) -> dict:
                         text("SELECT setval(CAST(:sequence AS regclass), :value, :called)"),
                         {"sequence": sequence, "value": maximum or 1, "called": maximum is not None},
                     )
+    from src.services.coordination_snapshot import invalidate_versioned_rows
+
+    invalidate_versioned_rows(engine)
     return {"verified": True, "sha256": snapshot["sha256"], "rows": {name: len(rows) for name, rows in tables.items()}}

@@ -6,10 +6,10 @@ main.py). Accepts three plaintext commands over TCP, one per line:
   PING              -> replies PONG v3 plus a non-secret change token and
                        affected-table scope. Used
                        by the laptop dashboard for status and to trigger one
-                       TiDB reconcile only after PC state actually changes.
+                       coordination database reconcile only after PC state actually changes.
   CHANGE <token> <event-id> [table-1,table-2]
                     -> records a local-file token for main.py; it performs no
-                       database I/O. Used by the laptop after its TiDB write.
+                       database I/O. Used by the laptop after its coordination database write.
   SHUTDOWN <token>  -> if <token> matches REMOTE_CONTROL_TOKEN from .env,
                        triggers Invoke-GuardedShutdown.ps1 (the same safety
                        guard the scheduled 10:00 shutdown uses -- won't kill

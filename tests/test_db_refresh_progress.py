@@ -308,7 +308,7 @@ def test_every_catalog_filter_compiles_for_sqlite_and_mysql():
     profiles_table = _get_stock_profiles_table(metadata)
     overrides = {"name": profiles_table.c.company_name}
 
-    assert len(FILTER_CATALOG) == 51
+    assert len(FILTER_CATALOG) == 57
     for _category, attribute, *_rest in FILTER_CATALOG:
         if attribute == "symbol":
             threshold = "AAPL"

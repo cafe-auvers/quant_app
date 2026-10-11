@@ -66,3 +66,5 @@ Snapshot rows include the requested metrics plus row status, error detail, and t
 - Data availability and symbol continuity depend on Yahoo Finance. Delisted or renamed ETFs remain visible as unavailable until configuration is updated.
 - There is no configuration editor; edit the tracked JSON file and restart the application.
 - The current application theme is light-only, so the page follows that existing theme rather than introducing a separate dark-theme system.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.

@@ -9,10 +9,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import BigInteger, Column, DateTime, MetaData, String, Table, Text, text
 from sqlalchemy.engine import Engine
 
-from src.core.trade_card_state import BoardStatus, TradeCardState
+from src.core.trade_card_state import BoardStatus, TradeCardState, can_withdraw_sell_all_intent
+from src.core.buy_today_feedback import buy_today_feedback_is_current
+from src.services.monitor_equity import read_monitor_equity_snapshot
 from src.infrastructure.database.coordination_engine import (
     create_coordination_connection_engine,
     normalize_coordination_database_config,
@@ -129,6 +131,7 @@ class CanonicalPlanningSource:
         engine: Engine | None = None,
         unavailable_reason: str = "Canonical planning reads are disabled",
         cache_seconds: float = 2.0,
+        equity_path: Path | None = None,
     ) -> None:
         self.enabled = bool(enabled)
         self.environment = str(environment or "PROD").strip().upper()
@@ -136,6 +139,7 @@ class CanonicalPlanningSource:
         self.engine = engine
         self.unavailable_reason = str(unavailable_reason or "Canonical planning unavailable")
         self.cache_seconds = max(0.0, float(cache_seconds))
+        self.equity_path = equity_path
         self._resolved_account_no = ""
         self._snapshot: _Snapshot | None = None
         self._lock = threading.RLock()
@@ -166,6 +170,7 @@ class CanonicalPlanningSource:
             environment=config.canonical_environment,
             account_no=config.canonical_account_no,
             engine=engine,
+            equity_path=repository / "data" / "monitor_equity.json",
         )
 
     @property
@@ -176,7 +181,7 @@ class CanonicalPlanningSource:
     def source_name(self) -> str:
         if self.engine is not None and self.engine.dialect.name == "postgresql":
             return "CANONICAL_SUPABASE"
-        return "CANONICAL_TIDB"
+        return "CANONICAL_LOCAL" if self.engine is not None else "CANONICAL_UNAVAILABLE"
 
     def close(self) -> None:
         if self.engine is not None:
@@ -251,14 +256,25 @@ class CanonicalPlanningSource:
                         if revision == self._snapshot.revision:
                             self._snapshot = _Snapshot(self._snapshot.cards, revision, now)
                             return self._snapshot
-                    rows = connection.execute(
-                        text(
-                            "SELECT payload, version, updated_at FROM trade_cards "
-                            "WHERE environment=:environment AND account_no=:account_no "
-                            "ORDER BY board_status, symbol"
-                        ),
-                        parameters,
-                    ).all()
+                from src.services.coordination_snapshot import read_versioned_rows
+
+                table = Table(
+                    "trade_cards", MetaData(),
+                    Column("environment", String(10)),
+                    Column("account_no", String(32)),
+                    Column("symbol", String(20)),
+                    Column("board_status", String(32)),
+                    Column("payload", Text),
+                    Column("version", BigInteger),
+                    Column("updated_at", DateTime),
+                )
+                rows = read_versioned_rows(
+                    self.engine, table,
+                    cache_key=("web_trade_cards", self.environment, account_no),
+                    key_columns=("environment", "account_no", "symbol"),
+                    revision_column="version",
+                    conditions=(table.c.environment == self.environment, table.c.account_no == account_no),
+                )
             except CanonicalPlanningUnavailable:
                 raise
             except Exception as exc:
@@ -277,6 +293,11 @@ class CanonicalPlanningSource:
 
     @staticmethod
     def _revision(count, version_sum, newest) -> str:
+        if isinstance(newest, str):
+            try:
+                newest = dt.datetime.fromisoformat(newest)
+            except ValueError:
+                pass
         newest_text = newest.isoformat() if newest is not None and hasattr(newest, "isoformat") else str(newest or "")
         return f"{int(count)}:{int(version_sum)}:{newest_text}"
 
@@ -308,6 +329,24 @@ class CanonicalPlanningSource:
             }
         )
         buy_today_member = card.board_status == BoardStatus.BUY_TODAY
+        quantity = max(0, int(card.broker_quantity or 0))
+        remaining = max(0, int(card.entry_remaining_target_quantity or 0))
+        purchase_status = (
+            "PARTIALLY_BOUGHT"
+            if quantity and remaining
+            else "BOUGHT"
+            if quantity
+            else "SOLD"
+            if card.board_status == BoardStatus.CLOSED
+            and card.session_date == active_session and card.average_entry_price > 0
+            else "ENTRY_PENDING"
+            if card.board_status == BoardStatus.ENTRY_PENDING
+            else ""
+        )
+        # Display completed entries without restoring executable Buy Today intent.
+        buy_today_display_member = buy_today_member or bool(
+            card.session_date == active_session and purchase_status
+        )
         breakout_price = self._positive_number(card.breakout_price)
         stage = (
             "BUYLIST"
@@ -331,7 +370,17 @@ class CanonicalPlanningSource:
             "watchlist_member": watchlist_member,
             "buylist_member": buylist_member,
             "buy_today_member": buy_today_member,
+            "buy_today_display_member": buy_today_display_member,
+            "entry_cancellation_pending": bool(
+                card.entry_block_reason == "cancel_requested"
+                or card.entry_cancel_in_flight
+            ),
+            "purchase_status": purchase_status,
+            "broker_quantity": quantity,
+            "entry_remaining_target_quantity": remaining,
+            "average_entry_price": self._positive_number(card.average_entry_price),
             "breakout_price": breakout_price,
+            "is_ep": card.is_ep,
             "version": int(card.version),
             "card_version": int(card.version),
             "updated_at": card.updated_at.isoformat(),
@@ -355,6 +404,7 @@ class CanonicalPlanningSource:
             if row["watchlist_member"]
             or row["buylist_member"]
             or row["buy_today_member"]
+            or row["buy_today_display_member"]
         ]
         if stage:
             stage_key = str(stage).strip().upper()
@@ -368,8 +418,11 @@ class CanonicalPlanningSource:
         return {"rows": rows, "revision": snapshot.revision}
 
     def list_buy_today(self) -> dict[str, Any]:
-        result = self.list_plans("BUY_TODAY")
-        return {"rows": result["rows"], "revision": result["revision"]}
+        snapshot = self._load_snapshot()
+        rows = [self._project(card) for card in snapshot.cards]
+        rows = [row for row in rows if row["buy_today_display_member"]]
+        rows.sort(key=lambda row: row["symbol"])
+        return {"rows": rows, "revision": snapshot.revision}
 
     def orb_monitor_inputs(self) -> dict[str, Any]:
         """Read account scope and shared settings without write authority or bootstrap."""
@@ -411,7 +464,9 @@ class CanonicalPlanningSource:
             "previous_board_status": self._enum_value(card.previous_board_status),
             "version": int(card.version),
             "kanban_priority": int(card.kanban_priority or 0),
+            "risk_percent": float(card.risk_percent),
             "breakout_price": self._positive_number(card.breakout_price),
+            "is_ep": card.is_ep,
             "buffer_pct": float(card.buffer_pct or 0.0),
             "session_date": self._date_value(card.session_date),
             "selected_orb_window": card.selected_orb_window,
@@ -419,14 +474,27 @@ class CanonicalPlanningSource:
             "entry_orb_high": card.entry_orb_high,
             "entry_orb_low": card.entry_orb_low,
             "entry_trigger": card.entry_trigger,
+            "entry_execution_price": card.entry_execution_price,
+            "entry_breakout_trigger": card.entry_breakout_trigger,
+            "entry_remaining_target_quantity": max(
+                0, int(card.entry_remaining_target_quantity or 0)
+            ),
+            "next_retry_at": self._date_value(card.next_retry_at),
             "entry_runtime_status": self._enum_value(card.entry_runtime_status),
             "entry_block_reason": str(card.entry_block_reason or ""),
+            "buy_today_note": (
+                str(card.buy_today_note or "")
+                if card.board_status == BoardStatus.BUYLIST
+                and buy_today_feedback_is_current(card)
+                else ""
+            ),
             "entry_order_pending": bool(
                 card.entry_client_order_id
                 or card.entry_pending_attempt_number
                 or card.entry_submission_unresolved
             ),
             "entry_cancel_in_flight": bool(card.entry_cancel_in_flight),
+            "entry_remaining_target_quantity": max(0, int(card.entry_remaining_target_quantity or 0)),
             "planned_quantity": max(0, int(card.planned_quantity or 0)),
             "target_position_quantity": max(
                 0, int(card.target_position_quantity or 0)
@@ -439,13 +507,16 @@ class CanonicalPlanningSource:
             "average_entry_price": float(card.average_entry_price or 0.0),
             "stop_type": self._enum_value(card.stop_type),
             "active_stop_price": card.active_stop_price,
+            "stop_quantity": max(0, int(card.stop_quantity or 0)),
             "pending_stop_type": self._enum_value(card.pending_stop_type),
             "pending_stop_price": card.pending_stop_price,
+            "pending_stop_quantity": max(0, int(card.pending_stop_quantity or 0)),
             "pending_partial_sell_quantity": max(
                 0, int(card.pending_partial_sell_quantity or 0)
             ),
             "reserved_sell_quantity": max(0, int(card.reserved_sell_quantity or 0)),
             "sell_all_at_market_open": bool(card.sell_all_at_market_open),
+            "can_cancel_sell_all": can_withdraw_sell_all_intent(card),
             "exit_all_required": bool(card.exit_all_required),
             "exit_order_pending": bool(
                 card.exit_client_order_id
@@ -454,6 +525,9 @@ class CanonicalPlanningSource:
             ),
             "exit_cancel_in_flight": bool(card.exit_cancel_in_flight),
             "last_exit_error": str(card.last_exit_error or ""),
+            "next_exit_retry_at": self._date_value(card.next_exit_retry_at),
+            "last_reported_price": self._positive_number(card.market_data_last_trusted_price),
+            "price_as_of": self._date_value(card.market_data_last_trusted_at),
             "warnings": [str(item) for item in card.warnings if str(item).strip()],
             "updated_at": card.updated_at.isoformat(),
             "source": self.source_name,
@@ -482,7 +556,18 @@ class CanonicalPlanningSource:
                 str(row["symbol"]),
             )
         )
-        return {"rows": rows, "revision": snapshot.revision}
+        nav, nav_as_of, nav_note = None, None, "Account NAV unavailable; refresh the PC account"
+        account_no = self._resolved_account_no or self.configured_account_no
+        if self.equity_path is not None and account_no:
+            nav, nav_as_of, nav_note = read_monitor_equity_snapshot(
+                self.equity_path, self.environment, account_no,
+                dt.datetime.now(dt.timezone.utc),
+            )
+        return {
+            "rows": rows, "revision": snapshot.revision,
+            "account_nav_usd": nav, "account_nav_as_of": nav_as_of,
+            "account_nav_note": nav_note,
+        }
 
     def get_plan(
         self,
@@ -498,7 +583,7 @@ class CanonicalPlanningSource:
         if projected is not None and not include_inactive and not (
             any(
                 projected[key]
-                for key in ("watchlist_member", "buylist_member", "buy_today_member")
+                for key in ("watchlist_member", "buylist_member", "buy_today_display_member")
             )
             or projected["breakout_price"] is not None
         ):

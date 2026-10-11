@@ -472,7 +472,12 @@ class ChartsNavigationMixin:
         common = _command_kwargs(payload)
         card = projection.card
         if card.board_status == BoardStatus.BUYLIST:
-            command = ActivateForToday(**common)
+            from src.ui.buyboard.dialogs import prompt_buy_today_profile
+
+            is_ep = prompt_buy_today_profile(self, symbol)
+            if is_ep is None:
+                return
+            command = ActivateForToday(is_ep=is_ep, **common)
             message = f"[Chart] Requested Buy Today activation for {symbol}."
         elif card.board_status in {BoardStatus.BUY_TODAY, BoardStatus.ENTRY_PENDING}:
             command = CancelEntry(**common)

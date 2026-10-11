@@ -8,6 +8,63 @@ import pytest
 from src.utils.env_sync import synchronize_environment_files
 from src.utils.config import load_runtime_config
 from src.utils import env_sync as env_sync_module
+from src.utils import config as config_module
+
+
+@pytest.mark.parametrize("source", ["env", "local"])
+def test_retired_audit_setting_migrates_without_losing_overrides(tmp_path, source):
+    old_key = "EXTERNAL_WATCHDOG_TIDB_AUDIT_SECONDS"
+    new_key = "EXTERNAL_WATCHDOG_COORDINATION_AUDIT_SECONDS"
+    template = tmp_path / ".env.example"
+    env = tmp_path / ".env"
+    pc_env = tmp_path / ".env.pc"
+    defaults = tmp_path / "runtime.json"
+    local = tmp_path / "runtime.local.json"
+    template.write_text("COORD_DB_PASSWORD=\nMYSQL_PASSWORD=\n", encoding="utf-8")
+    defaults.write_text(json.dumps({new_key: 3600}), encoding="utf-8")
+    env.write_text(
+        "COORD_DB_PASSWORD=keep-coordination-secret\nMYSQL_PASSWORD=keep-history-secret\n"
+        + (f"{old_key}=7200\n" if source == "env" else ""),
+        encoding="utf-8",
+    )
+    if source == "local":
+        local.write_text(json.dumps({old_key: 7200}), encoding="utf-8")
+
+    assert load_runtime_config(defaults, local)[new_key] == (
+        "7200" if source == "local" else "3600"
+    )
+    synchronize_environment_files(template, env, pc_env, defaults, local)
+    assert str(json.loads(local.read_text(encoding="utf-8"))[new_key]) == "7200"
+    assert old_key not in local.read_text(encoding="utf-8")
+    assert _values(env) == {
+        "COORD_DB_PASSWORD": "keep-coordination-secret",
+        "MYSQL_PASSWORD": "keep-history-secret",
+    }
+    assert _values(pc_env)["MYSQL_PASSWORD"] == ""
+    assert _values(pc_env)["COORD_DB_PASSWORD"] == "keep-coordination-secret"
+    assert not synchronize_environment_files(
+        template, env, pc_env, defaults, local
+    ).runtime_local_changed
+
+
+def test_current_audit_setting_wins_over_retired_alias(tmp_path):
+    new_key = "EXTERNAL_WATCHDOG_COORDINATION_AUDIT_SECONDS"
+    old_key = "EXTERNAL_WATCHDOG_TIDB_AUDIT_SECONDS"
+    defaults = tmp_path / "runtime.json"
+    local = tmp_path / "runtime.local.json"
+    defaults.write_text(json.dumps({new_key: 3600}), encoding="utf-8")
+    local.write_text(json.dumps({old_key: 7200, new_key: 10800}), encoding="utf-8")
+    assert load_runtime_config(defaults, local)[new_key] == "10800"
+
+
+def test_retired_process_audit_setting_preserves_override(monkeypatch):
+    new_key = "EXTERNAL_WATCHDOG_COORDINATION_AUDIT_SECONDS"
+    old_key = "EXTERNAL_WATCHDOG_TIDB_AUDIT_SECONDS"
+    monkeypatch.delenv(new_key, raising=False)
+    monkeypatch.setenv(old_key, "7200")
+    assert config_module.get_env_value(new_key) == "7200"
+    monkeypatch.setenv(new_key, "10800")
+    assert config_module.get_env_value(new_key) == "10800"
 
 
 def _values(path: Path) -> dict[str, str]:

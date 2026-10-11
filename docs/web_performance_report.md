@@ -61,10 +61,12 @@ the user's real browser and iPhone remains part of UAT.
 ## Interpretation and limits
 
 - DEMO measures deterministic local generation and is not a prediction of
-  LAN, TiDB, Supabase, Tailscale, or phone-network latency.
+  LAN, Supabase, Tailscale, or phone-network latency.
 - PC-mirror values measure a local read-only SQLite mirror, not provider or
-  TiDB planning-write latency.
+  Supabase planning-write latency.
 - HTTP values use an authenticated in-process ASGI transport, so they include
   routing/auth/serialization but not TCP, TLS, browser parsing, or paint.
 - Nearby prefetch remains bounded to the other current timeframe plus one
   previous and one next stock. The browser bundle cache remains capped at 36.
+
+Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.
