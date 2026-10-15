@@ -303,6 +303,69 @@ def _reservation(reservation_id="R-1", symbol="AAPL"):
     )
 
 
+@pytest.mark.parametrize("intent", [OrderIntent.PARTIAL_EXIT, OrderIntent.PARTIAL_TAKE_PROFIT])
+@pytest.mark.parametrize("status", [OrderStatus.ACCEPTED, OrderStatus.FILLED, OrderStatus.CANCELLED])
+def test_reserved_partial_exit_never_becomes_a_full_liquidation(intent, status):
+    terminal = status != OrderStatus.ACCEPTED
+    filled = 3 if status == OrderStatus.FILLED else 0
+    card = _card(
+        board_status=BoardStatus.PARTIAL_SELL, broker_quantity=7,
+        orderable_quantity=7, pending_partial_sell_quantity=3,
+        exit_client_order_id="C-1", average_entry_price=100.0,
+    )
+    order = _order(
+        side=OrderSide.SELL, intent=intent, execution_policy=RESERVED_MOO_EXECUTION,
+        submitted_quantity=3, remaining_quantity=3 - filled,
+        status=(ExecutionOrderStatus.ACKNOWLEDGED if not terminal else ExecutionOrderStatus(status.value)),
+        filled_quantity=filled,
+        capital_reservation_id="",
+    )
+    observed = BrokerOrderStatusSnapshot(
+        environment="PROD", account_no="1", symbol="AAPL", broker_order_id="B-1",
+        side=OrderSide.SELL, status=status, quantity_requested=3,
+        filled_quantity=filled, remaining_quantity=0 if terminal else 3,
+    )
+    plan = reduce_account_reconciliation(
+        _snapshot(orders=(observed,), holdings=(_holding(7 - filled),)),
+        AccountLocalState(cards=(card,), execution_orders=(order,)),
+    )
+    updated = plan.card_updates[0]
+    assert updated.board_status == (BoardStatus.OPEN_POSITION if terminal else BoardStatus.PARTIAL_SELL)
+    assert updated.exit_all_required is False
+    assert updated.sell_all_at_market_open is False
+    assert updated.broker_quantity == 7 - filled
+    assert updated.pending_partial_sell_quantity == (0 if terminal else 3)
+    assert plan.commands == ()
+
+
+@pytest.mark.parametrize("status", [OrderStatus.ACCEPTED, OrderStatus.FILLED])
+def test_reserved_partial_reconciliation_preserves_a_later_full_exit(status):
+    filled = 3 if status == OrderStatus.FILLED else 0
+    card = _card(
+        board_status=BoardStatus.SELL_ALL, exit_all_required=True,
+        stop_loss_triggered=True, broker_quantity=7, pending_partial_sell_quantity=3,
+        exit_client_order_id="C-1",
+    )
+    order = _order(
+        side=OrderSide.SELL, intent=OrderIntent.PARTIAL_EXIT,
+        execution_policy=RESERVED_MOO_EXECUTION, submitted_quantity=3,
+        remaining_quantity=3 - filled, capital_reservation_id="",
+    )
+    observed = BrokerOrderStatusSnapshot(
+        environment="PROD", account_no="1", symbol="AAPL", broker_order_id="B-1",
+        side=OrderSide.SELL, status=status, quantity_requested=3,
+        filled_quantity=filled, remaining_quantity=3 - filled,
+    )
+    plan = reduce_account_reconciliation(
+        _snapshot(orders=(observed,), holdings=(_holding(7 - filled),)),
+        AccountLocalState(cards=(card,), execution_orders=(order,)),
+    )
+    updated = plan.card_updates[0]
+    assert updated.board_status == BoardStatus.SELL_ALL
+    assert updated.exit_all_required is True
+    assert updated.stop_loss_triggered is True
+
+
 def test_action_completeness_is_per_source_not_one_global_flag():
     completeness = _completeness(reserved_orders_complete=False)
     assert completeness.allows(ReconciliationAction.NEW_ENTRY) is True

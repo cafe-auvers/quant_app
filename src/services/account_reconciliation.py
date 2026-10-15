@@ -458,6 +458,11 @@ def classify_execution_order(
         return ReconciliationCategory.UNKNOWN_SUBMISSION
     if order.status in _TERMINAL_EXECUTION_STATUSES:
         return ReconciliationCategory.TERMINAL_ORDER
+    if order.side == OrderSide.SELL and order.intent in (
+        OrderIntent.PARTIAL_EXIT,
+        OrderIntent.PARTIAL_TAKE_PROFIT,
+    ):
+        return ReconciliationCategory.PARTIAL_SELL
     if order.execution_policy == RESERVED_MOO_EXECUTION:
         return ReconciliationCategory.RESERVED_MOO_SELL
     if order.side == OrderSide.BUY and order.intent == OrderIntent.ENTRY:
@@ -470,11 +475,6 @@ def classify_execution_order(
     if order.side == OrderSide.SELL:
         if order.intent == OrderIntent.STOP_LOSS:
             return ReconciliationCategory.STOP_LOSS_SELL
-        if order.intent in (
-            OrderIntent.PARTIAL_EXIT,
-            OrderIntent.PARTIAL_TAKE_PROFIT,
-        ):
-            return ReconciliationCategory.PARTIAL_SELL
         if card is not None and card.board_status == BoardStatus.SELL_ALL:
             return ReconciliationCategory.SELL_ALL
     return ReconciliationCategory.UNRECOGNIZED
@@ -989,6 +989,11 @@ def _operational_category(
     """Retain the order's behavioral branch after it becomes terminal."""
     if classified != ReconciliationCategory.TERMINAL_ORDER:
         return classified
+    if order.side == OrderSide.SELL and order.intent in (
+        OrderIntent.PARTIAL_EXIT,
+        OrderIntent.PARTIAL_TAKE_PROFIT,
+    ):
+        return ReconciliationCategory.PARTIAL_SELL
     if order.execution_policy == RESERVED_MOO_EXECUTION:
         return ReconciliationCategory.RESERVED_MOO_SELL
     if order.side == OrderSide.BUY and order.intent == OrderIntent.ENTRY:
@@ -1000,8 +1005,6 @@ def _operational_category(
     if order.side == OrderSide.SELL:
         if order.intent == OrderIntent.STOP_LOSS:
             return ReconciliationCategory.STOP_LOSS_SELL
-        if order.intent in (OrderIntent.PARTIAL_EXIT, OrderIntent.PARTIAL_TAKE_PROFIT):
-            return ReconciliationCategory.PARTIAL_SELL
         return ReconciliationCategory.SELL_ALL
     return classified
 
@@ -1318,9 +1321,18 @@ def _project_exact_order_to_card(
         return
 
     if operational == ReconciliationCategory.PARTIAL_SELL:
+        liquidating = bool(
+            card.exit_all_required
+            or card.stop_loss_triggered
+            or card.board_status == BoardStatus.SELL_ALL
+        )
         if open_at_broker:
-            card.board_status = BoardStatus.PARTIAL_SELL
-            card.position_runtime_status = PositionRuntimeStatus.PARTIAL_EXIT_PENDING
+            card.board_status = BoardStatus.SELL_ALL if liquidating else BoardStatus.PARTIAL_SELL
+            card.position_runtime_status = (
+                PositionRuntimeStatus.LIQUIDATING
+                if liquidating
+                else PositionRuntimeStatus.PARTIAL_EXIT_PENDING
+            )
             card.reserved_sell_quantity = max(0, broker_snapshot.remaining_quantity)
             card.exit_client_order_id = order.client_order_id
             card.exit_pending_attempt_number = max(
@@ -1362,6 +1374,13 @@ def _project_exact_order_to_card(
             )
             card.board_status = BoardStatus.OPEN_POSITION
             card.position_runtime_status = PositionRuntimeStatus.OPEN
+        if remaining > 0 and liquidating:
+            # A working partial order may have been superseded by a stop or
+            # explicit Sell All. Its terminal result cannot withdraw that exit.
+            card.board_status = BoardStatus.SELL_ALL
+            card.exit_all_required = True
+            card.sell_all_at_market_open = False
+            card.position_runtime_status = PositionRuntimeStatus.LIQUIDATING
         return
 
     if operational in (

@@ -1397,6 +1397,42 @@ def test_cancel_confirmed_reaches_cancelled(tmp_path):
 
 
 @pytest.mark.usefixtures("trading_enabled")
+def test_reserved_cancel_uses_actual_submission_date_in_seoul(tmp_path):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    _submit_and_acknowledge(gateway, broker)
+    record = fetch_execution_order(engine, "CID-1")
+    record.execution_policy = "RESERVED_MOO"
+    record.prepared_at = "2026-10-14T14:59:59+00:00"
+    record.submission_started_at = "2026-10-14T15:00:01+00:00"
+    save_execution_order(engine, record, expected_version=record.version)
+    broker.queue_cancel_confirmed()
+
+    gateway.cancel_guarded(_cancel_request())
+
+    assert broker.cancel_calls[0]["is_reserved"] is True
+    assert broker.cancel_calls[0]["reservation_date"] == "20261015"
+    assert fetch_execution_order(engine, "CID-1").status == ExecutionOrderStatus.CANCELLED
+
+
+@pytest.mark.usefixtures("trading_enabled")
+@pytest.mark.parametrize("submitted_at", [None, "", "invalid"])
+def test_reserved_cancel_without_submission_date_stays_pre_broker(tmp_path, submitted_at):
+    gateway, broker, engine = _guarded_gateway(tmp_path)
+    _submit_and_acknowledge(gateway, broker)
+    record = fetch_execution_order(engine, "CID-1")
+    record.execution_policy = "RESERVED_MOO"
+    record.submission_started_at = submitted_at
+    save_execution_order(engine, record, expected_version=record.version)
+
+    with pytest.raises(CancelNotPermittedError, match="original submission date"):
+        gateway.cancel_guarded(_cancel_request())
+
+    assert broker.cancel_calls == []
+    assert fetch_execution_order(engine, "CID-1").status == ExecutionOrderStatus.ACKNOWLEDGED
+    assert get_command_by_idempotency_key(engine, "CANCEL:CANCEL-1") is None
+
+
+@pytest.mark.usefixtures("trading_enabled")
 def test_external_fence_inserted_after_cancel_pending_commit_blocks_broker_cancel(
     tmp_path, monkeypatch
 ):

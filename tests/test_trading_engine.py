@@ -2228,6 +2228,31 @@ def test_sell_all_cancels_stuck_order_once_ttl_passes(tmp_path):
     assert len(tracker.cancel_calls) == 1
 
 
+@pytest.mark.parametrize("intent", [OrderIntent.PARTIAL_EXIT, OrderIntent.PARTIAL_TAKE_PROFIT])
+def test_reserved_partial_waits_for_open_but_can_be_explicitly_withdrawn(tmp_path, intent):
+    working = _working_sell_order(intent=intent)
+    working.execution_policy = "RESERVED_MOO"
+    tracker = _StatefulOrderTracker(working)
+    engine = _make_engine(tmp_path)
+    engine._position_callbacks = PositionActionCallbacks(
+        cancel_order=tracker.cancel_order,
+        submit_sell_order=lambda **kw: pytest.fail("must not submit another sell"),
+        refresh_orderable_quantity=lambda *a: 300,
+        find_open_sell_order=tracker.find,
+        reconcile_sell_order=tracker.reconcile,
+    )
+    card = _open_card(board_status=BoardStatus.PARTIAL_SELL, pending_partial_sell_quantity=100)
+    engine.run_heartbeat([card])
+    assert tracker.cancel_calls == []
+    assert card.board_status == BoardStatus.PARTIAL_SELL
+    assert card.exit_cancel_in_flight is False
+
+    card.pending_partial_sell_quantity = 0
+    engine.run_heartbeat([card])
+    assert tracker.cancel_calls == [working.client_order_id]
+    assert card.exit_cancel_in_flight is True
+
+
 def test_sell_all_resubmits_remainder_once_prior_ttl_cancel_is_gone_from_open_orders(tmp_path):
     """Once a TTL-cancelled Sell All order is confirmed and no longer
     reported "open" by the broker/ledger, the remainder is resubmitted --
@@ -2362,10 +2387,13 @@ def test_user_withdrawal_cancels_working_partial_before_ttl_then_returns_open(tm
     assert card.exit_client_order_id == ""
 
 
-def test_sell_all_upgrade_cancels_working_partial_before_submitting_full_remainder(tmp_path):
+@pytest.mark.parametrize("policy", ["REGULAR_LIMIT", "RESERVED_MOO"])
+@pytest.mark.parametrize("intent", [OrderIntent.PARTIAL_EXIT, OrderIntent.PARTIAL_TAKE_PROFIT])
+def test_sell_all_upgrade_cancels_working_partial_before_submitting_full_remainder(tmp_path, policy, intent):
     working = _working_sell_order(
-        deadline_seconds_ago=-30, intent=OrderIntent.PARTIAL_EXIT
+        deadline_seconds_ago=-30, intent=intent
     )
+    working.execution_policy = policy
     tracker = _StatefulOrderTracker(working)
     submitted = []
 

@@ -58,7 +58,7 @@ from typing import Any, Callable, Dict, List, Optional
 from src.core import execution_config
 from src.core.execution_config import is_buyboard_engine_enabled
 from src.core.execution_result import UnifiedExecutionStatus
-from src.core.order_state import BrokerOrder, OrderIntent, OrderStatus
+from src.core.order_state import RESERVED_MOO_EXECUTION, BrokerOrder, OrderIntent, OrderStatus
 from src.core.orb_entry_logic import passive_entry_prices
 from src.core.trade_card_state import (
     BoardStatus,
@@ -2271,6 +2271,10 @@ class TradingEngine:
                         card.warnings = [*card.warnings, _EXIT_CANCEL_STALLED_WARNING]
                         return True
             return changed
+        # A broker-held next-open reservation is not a working limit attempt.
+        # Only an explicit withdrawal or liquidation upgrade may cancel it.
+        if not force and order.execution_policy == RESERVED_MOO_EXECUTION:
+            return changed
         if not force and not self._attempt_deadline_passed(order, now):
             return False
         self._position_callbacks.request_cancel(card, order.client_order_id, scope="EXIT")
@@ -2309,7 +2313,10 @@ class TradingEngine:
                         card,
                         refreshed,
                         now,
-                        force=refreshed.intent == OrderIntent.PARTIAL_EXIT,
+                        force=refreshed.intent in (
+                            OrderIntent.PARTIAL_EXIT,
+                            OrderIntent.PARTIAL_TAKE_PROFIT,
+                        ),
                     ):
                         changed.append(card)
                     continue

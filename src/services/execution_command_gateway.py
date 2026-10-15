@@ -51,6 +51,7 @@ import math
 import threading
 import time
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 import weakref
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
@@ -2789,6 +2790,22 @@ class ExecutionCommandGateway:
                 f"origin={record.origin.value})"
             )
 
+        reservation_kwargs: Dict[str, Any] = {}
+        if record.execution_policy == RESERVED_MOO_EXECUTION:
+            try:
+                submitted = datetime.fromisoformat(
+                    str(record.submission_started_at or "").replace("Z", "+00:00")
+                )
+                if submitted.tzinfo is None:
+                    submitted = submitted.replace(tzinfo=timezone.utc)
+                reservation_kwargs["reservation_date"] = submitted.astimezone(
+                    ZoneInfo("Asia/Seoul")
+                ).strftime("%Y%m%d")
+            except (TypeError, ValueError) as exc:
+                raise CancelNotPermittedError(
+                    "Reserved-order cancellation requires its original submission date"
+                ) from exc
+
         cancel_idempotency_key = f"CANCEL:{request.cancel_command_id}"
         command = ExecutionCommand(
             idempotency_key=cancel_idempotency_key, command_type="cancel", environment=record.environment,
@@ -2876,6 +2893,7 @@ class ExecutionCommandGateway:
                         quantity=quantity,
                         side=record.side.value,
                         exchange=record.exchange or "NASD",
+                        **reservation_kwargs,
                     )
                 ),
                 command_type=CommandType.CANCEL,

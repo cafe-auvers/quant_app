@@ -264,6 +264,10 @@ def test_cancel_order_regular_vs_reserved_routes_to_different_endpoints(monkeypa
             is_reserved=True,
             broker_order_id="RSV-1",
             reservation_date="20260101",
+            symbol="AAPL",
+            quantity=3,
+            side="SELL",
+            exchange="NASD",
         )
         audit_snapshot = audit.snapshot()
 

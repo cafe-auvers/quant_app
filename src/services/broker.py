@@ -313,7 +313,10 @@ class KisBroker:
         )
         if is_reserved:
             return kis_order.cancel_overseas_reserved_order(
-                environment=environment, account_no=account_no, **kwargs
+                environment=environment,
+                account_no=account_no,
+                broker_order_id=kwargs["broker_order_id"],
+                reservation_date=kwargs["reservation_date"],
             )
         return kis_order.cancel_overseas_order(
             environment=environment, account_no=account_no, **kwargs
