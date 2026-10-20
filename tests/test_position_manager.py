@@ -1,11 +1,14 @@
 """Tests for src.services.position_manager."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import pytest
 
 from src.core.order_state import BrokerOrder, OrderIntent, OrderSide, OrderStatus
 from src.core.trade_card_state import (
     BoardStatus,
+    EntryRuntimeStatus,
     PositionRuntimeStatus,
     StopType,
     TradeCardState,
@@ -288,6 +291,25 @@ def test_confirm_flat_closes_card_and_clears_stop():
     assert card.exit_all_required is False
     assert card.stop_loss_triggered is False
     assert "EXIT_CANCEL_STALLED" not in card.warnings
+
+
+def test_confirm_flat_retires_entry_retry_state():
+    card = _open_card(
+        broker_quantity=0,
+        orderable_quantity=0,
+        board_status=BoardStatus.SELL_ALL,
+        entry_runtime_status=EntryRuntimeStatus.RETRY_COOLDOWN,
+        next_retry_at=datetime(2026, 10, 12, 13, 37, tzinfo=timezone.utc),
+        entry_block_reason="Entry retry cooldown",
+    )
+
+    PositionManager().confirm_flat(card)
+    restored = TradeCardState.from_dict(card.to_dict())
+
+    assert restored.board_status == BoardStatus.CLOSED
+    assert restored.next_retry_at is None
+    assert restored.entry_runtime_status is None
+    assert restored.entry_block_reason == ""
 
 
 # --- Manual purchase/sale discovery (spec section 14) -----------------------

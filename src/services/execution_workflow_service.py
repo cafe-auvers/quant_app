@@ -568,9 +568,10 @@ def _closed_card_cycle_blockers(card, *, reservation_retired: bool = False) -> t
         PositionRuntimeStatus.CLOSED,
     }:
         blockers.append("position reconciliation is not terminal")
+    # Older flat confirmations retained the entry cooldown. It is scheduling
+    # metadata, not unresolved broker work; restart retires it after all guards.
     if (
-        card.next_retry_at is not None
-        or card.entry_submission_unresolved
+        card.entry_submission_unresolved
         or card.entry_cancel_in_flight
         or card.entry_cancel_command_id
         or card.entry_remaining_target_quantity

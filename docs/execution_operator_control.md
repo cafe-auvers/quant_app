@@ -75,12 +75,22 @@ cap will not be submitted. `Live Trading: Enabled` is not sufficient by
 itself; confirm the mode, symbol scope, and cap shown beside it.
 
 Live Trading has two layers. `TRADING_ENABLED` in each machine's private
-`.env` is a one-way local administrative lock. If it is false on the laptop,
-that laptop must show **LOCKED OFF** even when the shared switch is ON. If it
+`config/runtime.local.json` is a one-way local administrative lock. If it is
+false on the laptop, that laptop must show **LOCKED OFF** even when the shared switch is ON. If it
 is true on the PC, the PC may display the shared switch, but it still cannot
 submit unless it is the Execution Owner and every runtime/broker gate passes.
-The durable ON/OFF switch itself is shared; the local `.env` locks are
+The durable ON/OFF switch itself is shared; the local runtime locks are
 intentionally not synchronized.
+
+An explicit toolbar ON action stores `persist_across_sessions: true` in the
+shared Live Trading control. It remains ON after restarts, Execution Owner
+handoffs, and New York session changes until an operator switches it OFF.
+Authorization still applies only to the same approved release; deployment of
+a different release requires a new ON action. Database outages and all other
+execution gates continue to block ordinary broker mutations. Older controls
+without the persistence field retain their original session expiry until the
+operator explicitly enables persistent trading. Supervised tooling can request
+`persist_across_sessions=False` to retain a session-limited authorization.
 
 ## Buy Today: pre-market versus market-open
 

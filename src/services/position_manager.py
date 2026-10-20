@@ -413,6 +413,9 @@ class PositionManager:
         card.entry_cancel_reason = ""
         card.entry_cancel_command_id = ""
         card.entry_remaining_target_quantity = 0
+        card.next_retry_at = None
+        card.entry_runtime_status = None
+        card.entry_block_reason = ""
         card.exit_attempt_group_id = ""
         card.exit_attempt_count = 0
         card.exit_client_order_id = ""

@@ -3840,8 +3840,9 @@ class MainWindow(
                 self,
                 "Enable Live Trading",
                 "This turns guarded KIS order submission ON for this Kanban "
-                "operational store for the current/next NYSE session and this "
-                "approved release. Only its current Execution Owner can execute. "
+                "operational store until you turn it OFF, including after "
+                "restarts and on later trading days with this approved release. "
+                "Only its current Execution Owner can execute. "
                 "Continue?",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
@@ -3902,15 +3903,19 @@ class MainWindow(
 
         self._refresh_trading_enabled_widget()
         reason = live_trading_control_block_reason(result.control)
-        session_text = (
-            result.control.session_date.isoformat()
-            if result.control.session_date is not None
-            else "unscoped"
-        )
+        if result.control.persist_across_sessions:
+            scope_text = "until switched OFF for this approved release"
+        else:
+            session_text = (
+                result.control.session_date.isoformat()
+                if result.control.session_date is not None
+                else "unscoped"
+            )
+            scope_text = f"for NYSE session {session_text}"
         self.append_log(
             f"Live trading {'ENABLED' if effective else 'DISABLED'} "
             f"in the Kanban store by {self.state_sync_role.hostname} "
-            f"for NYSE session {session_text} "
+            f"{scope_text} "
             f"(revision {result.control.revision})."
             + (f" Reason: {reason}." if reason else "")
         )

@@ -678,6 +678,51 @@ def test_background_balance_retains_response_time_instead_of_request_or_apply_ti
     worker._account_reader.close()
 
 
+@pytest.mark.parametrize("error_type", [KisTransientApiError, KisRateLimitError])
+def test_background_balance_transient_failure_retries_and_recovers(
+    tmp_path, monkeypatch, caplog, error_type
+):
+    from concurrent.futures import Future
+    from src.services.background_account_reader import AccountReadRequest
+
+    worker, _ = _worker(tmp_path)
+    worker.runtime = SimpleNamespace(broker=_FakeBroker())
+    now = dt.datetime.now(dt.timezone.utc)
+    request = AccountReadRequest("1", False, now, worker._account_read_generation([]))
+    failed = Future()
+    failed.set_exception(error_type("Temporary KIS balance query failure"))
+    completed = [(request, failed)]
+    submissions = []
+    worker._balance_reader = SimpleNamespace(
+        busy=False,
+        take_completed=lambda: completed.pop(0) if completed else None,
+        submit=lambda *args: submissions.append(args),
+    )
+    recorded = []
+    monkeypatch.setattr(worker, "_record_buying_power", lambda *a, **kw: recorded.append(a))
+
+    worker._refresh_background_balance([], ["1"], now)
+
+    assert submissions == []
+    assert recorded == []
+    assert "1" not in worker._account_balance_refreshed_at
+    warning = next(r for r in caplog.records if "temporarily unavailable" in r.message)
+    assert warning.levelno == logging.WARNING
+    assert warning.exc_info is None
+    retry_at = worker._balance_refresh_retry_not_before["1"]
+    worker._refresh_background_balance([], ["1"], retry_at)
+    assert len(submissions) == 1
+
+    recovered = Future()
+    recovered.set_result(({}, retry_at))
+    completed.append((request, recovered))
+    worker._refresh_background_balance([], ["1"], retry_at)
+
+    assert recorded == [("1", {})]
+    assert "1" not in worker._balance_refresh_retry_not_before
+    assert worker._account_balance_refreshed_at["1"] == retry_at
+
+
 def test_same_device_mode_disables_elapsed_card_fallback(
     tmp_path, monkeypatch
 ):

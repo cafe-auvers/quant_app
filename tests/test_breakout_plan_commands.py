@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.pool import NullPool
 
 from src.core.board_workflow import (
+    ActivateForToday,
     BoardActionContext,
     ClearBreakoutPrice,
     MoveToBuylist,
@@ -353,6 +354,39 @@ def test_flat_closed_card_breakout_starts_a_fresh_buylist_cycle(
     assert result.card.warnings == []
 
 
+@pytest.mark.parametrize("command_type", [SetBreakoutPrice, MoveToBuylist, ActivateForToday])
+@pytest.mark.parametrize("retry_offset", [-timedelta(days=8), timedelta(minutes=1)])
+def test_flat_closed_card_with_stale_retry_timer_starts_a_new_cycle(
+    engine, command_type, retry_offset
+):
+    card = _seed(
+        engine,
+        board_status=BoardStatus.CLOSED,
+        position_runtime_status=PositionRuntimeStatus.CLOSED,
+        breakout_price=100.0,
+        next_retry_at=datetime.now(timezone.utc) + retry_offset,
+    )
+    command = (
+        _set(card, price=102.0)
+        if command_type is SetBreakoutPrice
+        else command_type(
+            environment=card.environment,
+            account_no=card.account_no,
+            symbol=card.symbol,
+            expected_card_version=card.version,
+        )
+    )
+
+    result = request_board_action(engine, command, context=_context())
+
+    expected = BoardStatus.BUY_TODAY if command_type is ActivateForToday else BoardStatus.BUYLIST
+    assert result.card.board_status == expected
+    assert result.card.next_retry_at is None
+    stored = card_repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert stored.board_status == expected
+    assert stored.next_retry_at is None
+
+
 def test_completed_cycle_fill_does_not_lock_later_breakout_revision(engine):
     card = _seed(
         engine,
@@ -503,6 +537,7 @@ def test_closed_card_with_unresolved_cycle_state_cannot_restart(engine, evidence
         engine,
         board_status=BoardStatus.CLOSED,
         breakout_price=100.0,
+        next_retry_at=datetime(2026, 10, 12, tzinfo=timezone.utc),
         **evidence,
     )
 
@@ -523,6 +558,7 @@ def test_closed_card_with_active_owned_order_cannot_restart(engine):
         engine,
         board_status=BoardStatus.CLOSED,
         breakout_price=100.0,
+        next_retry_at=datetime(2026, 10, 12, tzinfo=timezone.utc),
     )
     record_execution_order(
         engine,

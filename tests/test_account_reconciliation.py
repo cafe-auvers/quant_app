@@ -1097,6 +1097,33 @@ def test_zero_fill_cancel_history_resolves_working_entry_without_false_partial_f
     assert not any(a.code == "BROKER_STATUS_CONTRADICTION" for a in plan.alerts)
 
 
+def test_overnight_cancel_history_clears_remaining_entry_without_false_alert():
+    original = BrokerOrderStatusSnapshot(
+        environment="PROD", account_no="1", symbol="AAPL", broker_order_id="B-1",
+        side=OrderSide.BUY, status=OrderStatus.PARTIALLY_FILLED, quantity_requested=10,
+        raw_response={"rvse_cncl_dvsn": "00", "ord_dt": "20261007", "ord_tmd": "231828",
+                      "dmst_ord_dt": "20261007", "thco_ord_tmd": "231828"},
+    )
+    cancel = BrokerOrderStatusSnapshot(
+        environment="PROD", account_no="1", symbol="AAPL", broker_order_id="B-1",
+        side=OrderSide.BUY, status=OrderStatus.CANCELLED, quantity_requested=10,
+        raw_response={"rvse_cncl_dvsn": "02", "ord_dt": "20261007", "ord_tmd": "015526",
+                      "dmst_ord_dt": "20261008", "thco_ord_tmd": "015526"},
+    )
+    plan = reduce_account_reconciliation(
+        _snapshot(orders=(original, cancel)),
+        AccountLocalState(cards=(_card(),), execution_orders=(_order(),)),
+    )
+
+    assert plan.order_updates[0].status == ExecutionOrderStatus.CANCELLED
+    assert plan.order_updates[0].filled_quantity == 0
+    assert plan.order_updates[0].remaining_quantity == 0
+    assert plan.order_updates[0].recovery_state == OrderRecoveryState.NONE
+    assert plan.card_updates[0].board_status == BoardStatus.BUYLIST
+    assert not any(alert.code == "BROKER_STATUS_CONTRADICTION" for alert in plan.alerts)
+    assert plan.commands == ()
+
+
 def test_definitive_entry_rejection_without_broker_id_clears_pending_card():
     card = _card(
         entry_client_order_id="C-1",

@@ -2976,9 +2976,18 @@ class BuyboardRuntimeWorker(QThread):
                     self._account_balance_refreshed_at[request.account_no] = max(
                         self._account_balance_refreshed_at.get(request.account_no, received_at), received_at)
                     self._balance_refresh_retry_not_before.pop(request.account_no, None)
-            except Exception:
-                logger.exception("Background account-value read failed")
-                self._balance_refresh_retry_not_before[request.account_no] = now + timedelta(seconds=5)
+            except Exception as exc:
+                cooldown = self._ACCOUNT_REFRESH_FAILURE_COOLDOWN_SECONDS
+                self._balance_refresh_retry_not_before[request.account_no] = (
+                    now + timedelta(seconds=cooldown)
+                )
+                if isinstance(exc, (KisRateLimitError, KisTransientApiError)):
+                    logger.warning(
+                        "Background account-value read temporarily unavailable; "
+                        "retrying in %.0fs: %s", cooldown, exc,
+                    )
+                else:
+                    logger.exception("Background account-value read failed")
         if reader.busy or self._stop_requested:
             return
         ordered_accounts = list(accounts)
