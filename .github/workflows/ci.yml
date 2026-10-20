@@ -36,6 +36,15 @@ jobs:
           cache: "pip"
           cache-dependency-path: requirements.lock
 
+      - name: Create isolated test environment
+        shell: pwsh
+        run: |
+          $TaskCiVenv = Join-Path $env:RUNNER_TEMP "quant-app-ci-venv"
+          python -m venv $TaskCiVenv
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          (Join-Path $TaskCiVenv "Scripts") | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "VIRTUAL_ENV=$TaskCiVenv" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Install dependencies
         run: |
           python -m pip install --require-hashes -r requirements.lock
@@ -106,6 +115,15 @@ jobs:
           python-version: "3.12"
           cache: "pip"
           cache-dependency-path: requirements.lock
+
+      - name: Create isolated test environment
+        shell: pwsh
+        run: |
+          $TaskCiVenv = Join-Path $env:RUNNER_TEMP "quant-app-ci-venv"
+          python -m venv $TaskCiVenv
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          (Join-Path $TaskCiVenv "Scripts") | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "VIRTUAL_ENV=$TaskCiVenv" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Install dependencies
         run: |
