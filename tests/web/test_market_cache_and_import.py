@@ -278,6 +278,40 @@ def test_active_chart_requests_survive_parallel_cache_eviction(tmp_path):
     asyncio.run(run())
 
 
+def test_request_starting_after_eviction_snapshot_is_still_pinned(tmp_path):
+    import threading
+
+    first_snapshot = threading.Event()
+    second_written = threading.Event()
+    first_evicted = threading.Event()
+
+    class RacingCache(ChartBundleCache):
+        def evict(self, *, pinned_symbols, **kwargs):
+            if 'AAPL' in pinned_symbols and not first_snapshot.is_set():
+                first_snapshot.set()
+                assert second_written.wait(10)
+                result = super().evict(pinned_symbols=pinned_symbols, **kwargs)
+                first_evicted.set()
+                return result
+            second_written.set()
+            assert first_evicted.wait(10)
+            return super().evict(pinned_symbols=pinned_symbols, **kwargs)
+
+    async def run():
+        coordinator = ChartLoadCoordinator(
+            DemoMarketDataSource(), RacingCache(tmp_path, max_symbols=1),
+            daily_bars=50, hourly_months=1)
+        first = asyncio.create_task(coordinator.get_compressed('AAPL', '1D'))
+        assert await asyncio.to_thread(first_snapshot.wait, 10)
+        second = asyncio.create_task(coordinator.get_compressed('MSFT', '1D'))
+        values = await asyncio.gather(first, second)
+        assert [json.loads(gzip.decompress(value[0].content))['symbol']
+                for value in values] == ['AAPL', 'MSFT']
+        assert not coordinator._request_pins
+
+    asyncio.run(run())
+
+
 def test_concurrent_chart_load_is_deduplicated(tmp_path):
     class CountingSource(DemoMarketDataSource):
         def __init__(self):

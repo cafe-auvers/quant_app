@@ -252,8 +252,15 @@ class ChartBundleCache:
                 self._atomic_replace(manifest_path, manifest_bytes)
         return PublicationArtifact(compressed, manifest)
 
-    def evict(self, *, pinned_symbols: set[str]) -> list[str]:
+    def evict(
+        self, *, pinned_symbols: set[str],
+        pinned_symbols_provider: Callable[[], set[str]] | None = None,
+    ) -> list[str]:
         with self._lock:
+            if pinned_symbols_provider is not None:
+                # Sample active requests under the same lock as cache writes.
+                # A request that starts later cannot publish before eviction.
+                pinned_symbols = pinned_symbols | pinned_symbols_provider()
             return self._evict_locked(pinned_symbols=pinned_symbols)
 
     def _evict_locked(self, *, pinned_symbols: set[str]) -> list[str]:
@@ -475,10 +482,8 @@ class ChartLoadCoordinator:
                 )
                 await anyio.to_thread.run_sync(
                     lambda: self.cache.evict(
-                        pinned_symbols={
-                            *self._all_pins(),
-                            symbol,
-                        }
+                        pinned_symbols={symbol},
+                        pinned_symbols_provider=self._all_pins,
                     )
                 )
             except Exception as exc:
