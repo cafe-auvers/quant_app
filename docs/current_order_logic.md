@@ -76,23 +76,35 @@ breakout_trigger = max(breakout_price, orb_high)
 The configured passive execution price must satisfy:
 
 ```python
-floor_price < execution_price <= orb_high
+breakout_price <= execution_price <= breakout_trigger
+orb_low < execution_price
 ```
 
 Therefore:
 
-- `orb_high` must be strictly above both the structural breakout price and the
-  ORB low; otherwise no passive execution zone exists.
-- The automatic BUY execution price is the highest legal tick at or below that
-  candidate's raw `orb_high`. Fractional-cent market highs are rounded down,
-  never above the range. The raw high remains the breakout confirmation trigger.
-  If rounding leaves no price strictly above the floor, the plan is rejected.
-- A manual execution price may be below `orb_high`, but it must remain strictly
-  above both `breakout_price` and `orb_low`.
+- The structural breakout does not have to occur during the first 1, 5, or
+  30 minutes. A completed range whose high is below or equal to the daily
+  breakout remains eligible while waiting for a fresh post-range breakout.
+- The automatic BUY execution price is the highest legal tick at or below
+  `max(breakout_price, orb_high)`. When ORH is higher, it remains the entry
+  reference; otherwise the daily breakout price is the entry reference.
+  Rounding never permits execution below the daily breakout or at/below ORL.
+  If there is no legal tick satisfying these bounds, the plan is rejected.
+- A manual execution price must be at or above `breakout_price`, strictly
+  above `orb_low`, and no higher than `max(breakout_price, orb_high)`.
 - A manual price is never silently changed.
 - U.S. equity ticks are `$0.0001` below `$1` and `$0.01` at or above `$1`.
 - ORB high, ORB low, score, execution price, range-close time, and confirmation
   time are frozen for each submitted order generation.
+- Position size, capital allocation, and stop/ADR are calculated from the
+  actual execution price and candidate stop. The selected ORB-low protection
+  and all existing risk, liquidity, freshness, and authorization gates remain.
+
+For example, with a daily breakout of $100, a 30m ORH of $99.80, and ORL of
+$98, the plan waits at a $100 trigger and execution price. A fresh trade above
+$100 at 10:20 New York time can confirm it. The passive limit remains $100;
+it is never placed at the old $99.80 high below the structural breakout.
+The fixed opening ranges are entry references, not breakout deadlines.
 
 The runtime persists the selected ORB window with the entry identity before
 broker I/O. From that point through order resolution, observation refreshes
@@ -146,8 +158,8 @@ following still hold:
 - no existing or ambiguous entry identity already blocks the symbol.
 
 The broker request is a regular-session BUY limit at the **exact configured
-execution price**. It is never changed to the current trade, ask, breakout
-price, or another timeframe's ORB high.
+execution price**. It is never repriced to the current trade, ask, or another
+timeframe's entry level after the generation is frozen.
 
 If the last trade or ask is already at or below the limit, the ordinary passive
 order is not submitted. The card remains monitored with

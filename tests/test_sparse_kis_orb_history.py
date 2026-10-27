@@ -88,13 +88,23 @@ def test_sparse_history_waits_until_actual_window_end():
     assert _candidate(bars).status == OrbCandidateStatus.FORMING
 
 
-def test_calculated_later_range_still_rejects_breakout_above_its_high():
-    result = build_orb_candidate(symbol="CURV", window="30m", intraday=_sparse_bars(),
+@pytest.mark.parametrize("volume, valid", [(10.0, False), (1000.0, True)])
+def test_calculated_sparse_range_allows_later_breakout_subject_to_liquidity(volume, valid):
+    bars = _sparse_bars()
+    bars["Volume"] = volume
+    annotate_kis_history_coverage(bars, "CURV")
+    result = build_orb_candidate(symbol="CURV", window="30m", intraday=bars,
         breakout_price=2.52, current_price=2.50, account_size=14_154.80,
         risk_percent=0.0025, adr_percent=5.0)
     assert result.orb_high == 2.51 and result.orb_low == 2.48
-    assert result.status == OrbCandidateStatus.REJECTED and not result.valid
-    assert "No valid passive-pullback execution zone" in result.reason
+    assert result.execution_price == result.breakout_trigger == 2.52
+    assert result.valid is valid
+    assert not result.terminal_rejection
+    if valid:
+        assert result.status == OrbCandidateStatus.WAITING_BREAKOUT
+    else:
+        assert result.status == OrbCandidateStatus.RISK_INVALID
+        assert "Low opening liquidity" in result.reason
 
 
 def test_invalid_broker_row_cannot_prove_absent_opening_trade(monkeypatch):

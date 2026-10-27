@@ -590,6 +590,41 @@ def test_passive_submission_blocks_when_trade_or_ask_reaches_execution_limit(
     )
 
 
+@pytest.mark.parametrize("opening_high", [99.8, 100.0])
+def test_late_daily_breakout_submits_at_breakout_above_old_orh(tmp_path, opening_high):
+    now = dt.datetime(2026, 8, 19, 14, 20, tzinfo=dt.timezone.utc)
+    submitted = []
+    engine = _entry_event_engine(tmp_path, now, submitted)
+    card = _buy_today_card(
+        breakout_price=100.0,
+        entry_orb_high=opening_high,
+        entry_orb_low=98.0,
+        entry_execution_price=100.0,
+        entry_trigger=100.0,
+        entry_floor_price=100.0,
+        entry_breakout_trigger=100.0,
+        entry_range_closed_at=now - dt.timedelta(minutes=20),
+        entry_breakout_confirmed_at=None,
+        entry_runtime_status=EntryRuntimeStatus.WAITING_BREAKOUT,
+    )
+
+    def quote(price):
+        return QuoteSnapshot(
+            symbol="AAPL", last_price=price, bid=price - 0.01, ask=price + 0.01,
+            broker_event_at=now, received_at=now, processed_at=now,
+        )
+
+    assert engine.evaluate_entry_quote([card], quote(100.0)) == []
+    assert submitted == []
+    engine.evaluate_entry_quote([card], quote(100.1))
+    assert len(submitted) == 1
+    assert submitted[0]["limit_price"] == 100.0
+    assert card.board_status == BoardStatus.ENTRY_PENDING
+    assert card.entry_orb_high == opening_high
+    assert card.entry_orb_low == 98.0
+    assert card.broker_quantity == 0
+
+
 def test_waiting_orb_does_not_submit_before_confirmed_breakout(tmp_path):
     now = dt.datetime(2026, 8, 16, 14, 30, tzinfo=dt.timezone.utc)
     submitted = []

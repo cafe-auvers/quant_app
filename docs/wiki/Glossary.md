@@ -10,7 +10,7 @@
 | Change pulse | Small typed invalidation token that tells another process which canonical scope to refetch; not state or authority itself |
 | Controlled live | Restricted live envelope for canonical active Trade Cards and entry notional |
 | Entry Pending | System-owned state for a durable unresolved/submitted entry |
-| Execution price | Exact resting BUY-limit price; ORB high by default, never the current market price |
+| Execution price | Exact resting BUY-limit price; default reference is the higher of daily breakout and ORH, rounded to a legal tick without falling below breakout; never derived from the current market quote |
 | Execution Owner | Device/process allowed to hold the fenced execution lease |
 | Gate 1 | Deterministic simulation certification |
 | Gate 2 | Credentialed read-only KIS soak/evidence stage |

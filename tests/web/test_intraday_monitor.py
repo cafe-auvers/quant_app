@@ -207,25 +207,27 @@ def test_shared_settings_and_small_account_rounding_are_used():
     assert row["orb"][0]["position_status"] == "FAIL"
 
 
-def test_breakout_equal_to_orh_fails_passive_position_geometry_only():
+def test_breakout_equal_to_orh_passes_at_daily_breakout_price():
     row = evaluate(card={"symbol": "AAA", "breakout_price": 102})
     assert row["orb"][0]["price_status"] == "PASS"
-    assert row["orb"][0]["position_status"] == "FAIL"
-    assert "execution zone" in row["orb"][0]["position_reason"]
+    assert row["orb"][0]["position_status"] == "PASS"
+    assert row["orb"][0]["execution_price"] == 102
 
 
 def test_be_breakout_edit_recalculates_zone_using_the_same_observed_range():
     frame = bars(high=290.241, low=284.775, close=291.85)
     card = {"symbol": "BE", "breakout_price": 293.19, "buylist_member": True}
-    rejected = evaluate(frame, card=card, adr=6)
-    first = rejected["orb"][0]
-    assert first["position_status"] == "FAIL"
-    assert "breakout $293.19, range high $290.241" in first["position_reason"]
+    waiting = evaluate(frame, card=card, adr=6)
+    first = waiting["orb"][0]
+    assert first["position_status"] == "PASS"
+    assert first["price_status"] == "WAITING"
+    assert first["execution_price"] == first["breakout_trigger"] == 293.19
     card["breakout_price"] = 289
     rebuilt = evaluate(frame, card=card, adr=6)["orb"][0]
     assert rebuilt["high"] == first["high"] == 290.241
     assert rebuilt["low"] == first["low"] == 284.775
     assert rebuilt["breakout_trigger"] == 290.241
+    assert rebuilt["execution_price"] == 290.24
     assert "execution zone" not in rebuilt["position_reason"]
     assert rebuilt["position_status"] == "PASS"
 

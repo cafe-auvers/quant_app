@@ -589,7 +589,7 @@ class BuylistItem:
         None  # optional full-confirmation level above breakout
     )
     breakout_method: str = ""  # e.g. "manual_trendline", "manual_pivot_high"
-    # Legacy planning metadata; PASSIVE_PULLBACK_V1 does not use it to alter
+    # Legacy planning metadata; the passive entry policy does not use it to alter
     # the confirmation trigger or execution price.
     buffer_pct: float = 0.001
     auto_order_block_reason: str = ""

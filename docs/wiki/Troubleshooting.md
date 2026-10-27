@@ -98,7 +98,8 @@ readiness tooltip, then verify all of the following:
 - the fresh last trade and best ask are still strictly above the passive limit
   when submission is attempted;
 - the limit satisfies
-  `max(breakout_price, orb_low) < execution_price <= orb_high`;
+  `breakout_price <= execution_price <= max(breakout_price, orb_high)` and
+  `orb_low < execution_price`;
 - the regular session is open and ownership, reconciliation, risk, capital,
   quote-freshness, route, mutation-budget, and Live Trading gates pass.
 

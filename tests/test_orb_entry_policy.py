@@ -32,11 +32,11 @@ def test_breakout_price_above_orh_becomes_the_confirmation_trigger():
         execution_price=104.0,
     )
 
-    assert plan is None  # floor 106 cannot be below an execution at/below ORH 105
+    assert plan is None  # A manual execution below the daily breakout stays invalid.
 
 
-@pytest.mark.parametrize("execution_price", [100.0, 105.01, 0.0])
-def test_execution_price_outside_open_floor_closed_orh_interval_is_rejected(
+@pytest.mark.parametrize("execution_price", [99.99, 105.01, 0.0])
+def test_execution_price_outside_breakout_and_trigger_bounds_is_rejected(
     execution_price,
 ):
     assert (
@@ -60,6 +60,16 @@ def test_missing_execution_price_defaults_to_orh_for_automated_candidates():
 
     assert plan is not None
     assert plan.execution_price == 105.0
+
+
+def test_automatic_plan_allows_daily_breakout_above_completed_opening_range():
+    plan = build_passive_pullback_plan(
+        orb_high=99.8, orb_low=98.0, breakout_price=100.0, execution_price=None,
+    )
+    assert plan is not None
+    assert plan.execution_price == plan.breakout_trigger == 100.0
+    assert not breakout_trade_confirms(trade_price=100.0, breakout_trigger=100.0)
+    assert breakout_trade_confirms(trade_price=100.01, breakout_trigger=100.0)
 
 
 def test_execution_price_equal_to_orh_is_valid():

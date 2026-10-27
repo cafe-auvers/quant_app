@@ -73,7 +73,7 @@ below the market:
 ```text
 1m/5m/30m opening range closes
   -> fresh KIS trade moves above both ORB high and breakout price
-  -> submit BUY limit at the selected execution price (ORB high by default)
+  -> submit BUY limit at the selected execution price (higher of breakout and ORH by default)
   -> card moves to Entry Pending
   -> wait for a broker-confirmed pullback fill
   -> card moves to Open Position and uses that order generation's ORB low

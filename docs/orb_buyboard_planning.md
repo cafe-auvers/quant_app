@@ -50,6 +50,16 @@ explicitly selected production account. If either is unavailable, the action
 leaves both the canonical card and local Watchlist/Buylist mirrors unchanged;
 there is no offline promotion that can later overwrite a newer device change.
 
+## Later daily breakouts
+
+The daily breakout need not occur during the opening range. Each completed
+1m/5m/30m range waits for a fresh trade above the higher of its ORH and the
+saved daily breakout. Automatic plans use that higher level as their passive
+entry reference, rounded down to a legal tick without falling below the daily
+breakout or reaching ORL. Position bounds use that execution price and the
+candidate stop. Old ORHs below the daily breakout are never automatic entry
+prices. See [Current Order Logic](current_order_logic.md) for the exact bounds.
+
 ## Shared opening liquidity
 
 The shared ORB settings also contain Minimum opening volume, defaulting to
@@ -237,7 +247,8 @@ execution-grade KIS trade strictly above
 mode chooses the highest-scoring eligible crossed 1m/5m/30m candidate; an equal
 score favors the earlier timeframe, while a manual window lock remains exact.
 The runtime immediately submits a passive BUY limit at the configured
-execution price (ORB high by default) only while both last trade and best ask
+execution price (referenced to the higher of daily breakout and ORH) only while
+both last trade and best ask
 remain above that limit. It does not wait for a pullback before submission, and
 it never treats the breakout event as a fill. A daily-breakout level by itself,
 or a missing current-session ORB, never arms an entry.

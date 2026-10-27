@@ -366,8 +366,8 @@ def test_orb_entry_signal_confirmed_when_trade_strictly_clears_trigger():
     assert result.execution_price == 102.5
 
 
-def test_orb_entry_signal_rejects_geometry_when_breakout_is_above_orb_high():
-    """No execution can be above the floor and at or below ORH in this shape."""
+def test_orb_entry_signal_rejects_execution_above_both_breakout_and_orb_high():
+    """A later daily breakout does not authorize an execution above its trigger."""
     result = evaluate_orb_entry_signal(
         orb_high=100.0,
         orb_low=95.0,

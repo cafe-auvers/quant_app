@@ -316,8 +316,8 @@ def build_orb_position_combinations(
                 invalid_reasons.append("Daily breakout price is missing")
             if plan is None:
                 invalid_reasons.append(
-                    "Passive entry must satisfy max(breakout price, ORL) "
-                    "< execution price <= ORH"
+                    "Passive entry must satisfy breakout price <= execution price "
+                    "<= max(breakout price, ORH), with execution price > ORL"
                 )
             else:
                 if (

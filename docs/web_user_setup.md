@@ -306,8 +306,10 @@ requires all three checks; the **ORB passed** filter applies the same rule:
   completed opening range, trades strictly above both the saved breakout and
   the opening-range high. Confirmation remains visible after a pullback; the
   Breakout cell then says **Pullback** when below the saved level.
-- **Position bounds** checks the existing passive entry geometry, uses ORH as
-  the execution level and ORL as the stop, and evaluates the desktop's eight
+- **Position bounds** checks the existing passive entry geometry, uses the
+  higher of the daily breakout and ORH as the execution reference (rounded
+  down to a legal tick without falling below breakout), ORL as the stop,
+  and evaluates the desktop's eight
   risk cases (0.25%–2%) against shared capital and stop/ADR bounds. A valid case
   passes independently of the price test. Failed bounds show **No pass**, with
   the reason in the cell tooltip.

@@ -18,7 +18,7 @@ US_MARKET_TIMEZONE = "America/New_York"
 @dataclass(frozen=True)
 class ORBStrategyConfig:
     window: str = "5m"
-    # Retained for persisted-plan/API compatibility. PASSIVE_PULLBACK_V1 does
+    # Retained for persisted-plan/API compatibility. The passive policy does
     # not use a percentage buffer or probe entry to authorize execution.
     buffer_pct: float = 0.001
     market_open: time = time(9, 30)

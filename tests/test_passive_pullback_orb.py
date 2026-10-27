@@ -56,10 +56,14 @@ def test_tick_rounding_does_not_widen_a_collapsed_passive_zone():
     [
         (99.0, 95.0, 100.0, 100.0, True),
         (99.0, 95.0, 99.5, 100.0, True),
-        (99.0, 95.0, 99.0, 100.0, False),
+        (99.0, 95.0, 99.0, 100.0, True),
+        (99.0, 95.0, 98.99, 100.0, False),
         (99.0, 99.5, 99.5, 100.0, False),
         (99.0, 95.0, 100.01, 100.0, False),
-        (100.0, 95.0, 100.0, 100.0, False),
+        (100.0, 95.0, 100.0, 100.0, True),
+        (101.0, 95.0, 101.0, 100.0, True),
+        (101.0, 95.0, 100.0, 100.0, False),
+        (100.0, 100.0, 100.0, 100.0, False),
     ],
 )
 def test_passive_execution_zone_relationships(breakout, orl, execution, orh, valid):
@@ -70,6 +74,24 @@ def test_passive_execution_zone_relationships(breakout, orl, execution, orh, val
         execution_price=execution,
     )
     assert (not reason) is valid
+
+
+@pytest.mark.parametrize("high", [99.8, 100.0])
+def test_automatic_entry_uses_daily_breakout_when_opening_high_is_not_above_it(high):
+    floor, trigger, execution, reason = passive_entry_prices(
+        breakout_price=100.0, orb_high=high, orb_low=98.0,
+    )
+    assert reason == ""
+    assert floor == trigger == execution == Decimal("100.0")
+
+
+def test_fractional_daily_breakout_cannot_be_rounded_into_an_entry_below_it():
+    _, trigger, execution, reason = passive_entry_prices(
+        breakout_price="100.005", orb_high="99.80", orb_low="98.00",
+    )
+    assert trigger == Decimal("100.005")
+    assert execution == Decimal("100.00")
+    assert reason
 
 
 def _candidate(window: str, score: float, *, high: float, low: float) -> OrbCandidate:

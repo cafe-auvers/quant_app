@@ -44,9 +44,11 @@ a completed current-session ORB and a fresh KIS trade strictly above:
 max(orb_high, breakout_price)
 ```
 
-That confirmation submits a passive limit at ORB high by default; it does not
-mean fill. A manual execution price is valid only when
-`max(breakout_price, orb_low) < execution_price <= orb_high`.
+That confirmation submits a passive limit referenced to the higher of the
+daily breakout and ORH; it does not mean fill. The daily breakout may occur
+after the opening range. Execution must satisfy
+`breakout_price <= execution_price <= max(breakout_price, orb_high)` and
+`orb_low < execution_price`, including legal-tick validation.
 
 The 24-case comparison is read-only. The optimized pre-market selector can
 publish one plan when authority and timing rules permit; regular-session

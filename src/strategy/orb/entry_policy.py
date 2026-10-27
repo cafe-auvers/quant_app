@@ -19,7 +19,7 @@ from src.core.orb_entry_logic import (
 
 
 SUPPORTED_ENTRY_WINDOWS = ("1m", "5m", "30m")
-ORB_ENTRY_POLICY_VERSION = "PASSIVE_PULLBACK_V1"
+ORB_ENTRY_POLICY_VERSION = "PASSIVE_PULLBACK_V2"
 
 
 @dataclass(frozen=True)
@@ -52,7 +52,12 @@ def build_passive_pullback_plan(
 
         floor = max(breakout_price, ORL)
         trigger = max(breakout_price, ORH)
-        floor < execution_price <= ORH
+        breakout_price <= execution_price <= trigger
+        ORL < execution_price
+
+    The daily breakout may occur after the opening range. Automatic execution
+    uses the highest legal tick at/below the trigger, without falling below the
+    daily breakout. Manual prices are validated without changing them.
     """
 
     floor, trigger, execution, reason = passive_entry_prices(

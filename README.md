@@ -33,7 +33,7 @@ use the [Activation Gate Handoff](docs/activation_gate_handoff.md).
 - Chart-based `breakout_price` planning independent of today's Watchlist membership; Buylist requires a positive breakout before the explicit Buylist -> Buy Today progression.
 - Authenticated web/PWA operator synchronization with immediate optimistic feedback, canonical rollback on failure, authenticated browser invalidations, and typed desktop change pulses. Routine Watchlist, Buylist, breakout, Buy Today, readiness, and writability changes do not require a manual refresh.
 - A read-only Buy Today `ORB Combinations...` comparison covering all 24 risk/window cases, kept separate from the optimized pre-market `Refresh / Select ORB Plans...` selector; the optimized view is read-only during regular market hours.
-- Confirmed-breakout passive-pullback entries: after a fresh post-range trade clears both the structural breakout and ORB high, submit a resting BUY limit at the candidate's configured execution price (ORB high by default).
+- Confirmed-breakout passive-pullback entries: after a fresh post-range trade clears both the structural breakout and ORB high, submit a resting BUY limit referenced to the higher of those levels. The daily breakout may occur after the opening range.
 - Strict zero-fill ORB upgrades: a later, strictly higher-scoring 5m/30m candidate can replace an earlier working order only after authoritative cancellation and full post-cancel revalidation.
 - A strategy-neutral `MarketSnapshot -> Strategy -> Signal` interface, with the existing ORB behavior as the first plugin.
 - An append-only, redacted trading event journal and a read-only Health tab for KIS, MySQL, mirror freshness, and reconciliation status.
@@ -53,7 +53,8 @@ The app does not use fixed profit targets or R/R-based take-profit levels for th
 
 - `breakout_price` is the user-entered daily structural breakout level.
 - Breakout confirmation is a fresh post-range trade strictly above `max(orb_high, breakout_price)`.
-- Passive execution must satisfy `max(breakout_price, orb_low) < execution_price <= orb_high`; automatic plans use `execution_price = orb_high`.
+- Passive execution must satisfy `breakout_price <= execution_price <= max(breakout_price, orb_high)` and `orb_low < execution_price`; automatic plans use the highest legal tick at/below the higher of breakout and ORH, provided it stays at/above breakout and above ORL.
+- Opening ranges below or equal to the daily breakout remain eligible for a later breakout. Their entry reference is the daily breakout price, with sizing recalculated from that entry and the candidate stop.
 - The breakout submits the resting limit immediately while both last trade and best ask remain above the limit. It does not mean the order filled.
 - New passive entry orders do not use the legacy 15-second cancel/reprice deadline. They remain Entry Pending until broker fill/cancel/expiry/rejection, safe ORB replacement, or EOD cleanup.
 - Legacy saved JSON that contains `target_price` and no `breakout_price` is migrated into `breakout_price`.

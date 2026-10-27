@@ -273,6 +273,7 @@ def evaluate_monitor_row(
             breakout_price=breakout, orb_high=high, orb_low=low,
         )
         result.update(high=high, low=low, breakout_trigger=max(breakout, high),
+                      execution_price=float(execution) if execution is not None else None,
                       range_closed_at=end.isoformat())
         # Separate the observed price test from the passive entry/position geometry.
         post_range = session[session.index >= end]
@@ -284,7 +285,8 @@ def evaluate_monitor_row(
             if reason == "No valid passive-pullback execution zone":
                 reason += (
                     f": breakout ${breakout:g}, range high ${high:g}, range low ${low:g}; "
-                    "entry must be above breakout and range low, and at or below range high"
+                    "entry must be at or above breakout, above range low, "
+                    "and at or below the higher of breakout and range high"
                 )
             result.update(position_status="FAIL", position_reason=reason)
             continue

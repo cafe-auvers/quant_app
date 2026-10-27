@@ -109,12 +109,13 @@ def test_changed_be_breakout_rebuilds_zone_and_retires_previous_confirmation():
         return manager.build_or_update_from_watchlist_item(plan, {"1m": frame},
             current_price=292, account_size=100000, risk_percent=.0075, account_no="account-a",
             adr_percent=6).candidates["1m"]
-    rejected = build()
-    assert rejected.status == OrbCandidateStatus.REJECTED
+    waiting = build()
+    assert waiting.status == OrbCandidateStatus.WAITING_BREAKOUT
+    assert waiting.valid and waiting.execution_price == waiting.breakout_trigger == 293.19
     plan.breakout_price = 289
     rebuilt = build()
     assert rebuilt.valid and rebuilt.floor_price == 289 and rebuilt.execution_price == 290.24
-    assert rebuilt.orb_high == rejected.orb_high and rebuilt.orb_low == rejected.orb_low
+    assert rebuilt.orb_high == waiting.orb_high and rebuilt.orb_low == waiting.orb_low
     rebuilt.breakout_confirmed = True
     plan.breakout_price = 289.5
     changed = build()
@@ -645,7 +646,7 @@ def test_missing_current_price_keeps_structural_candidate_waiting():
     assert candidate.terminal_rejection is False
 
 
-def test_structural_rejection_with_known_equity_is_terminal():
+def test_manual_execution_below_daily_breakout_with_known_equity_is_terminal():
     candidate = build_orb_candidate(
         symbol="AAPL",
         window="1m",
@@ -655,6 +656,7 @@ def test_structural_rejection_with_known_equity_is_terminal():
         account_size=100_000.0,
         risk_percent=0.005,
         adr_percent=5.0,
+        execution_price=99.0,
     )
 
     assert candidate.status == OrbCandidateStatus.REJECTED

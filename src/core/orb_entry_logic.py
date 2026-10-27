@@ -46,8 +46,9 @@ def passive_entry_prices(
 ) -> tuple[Optional[Decimal], Optional[Decimal], Optional[Decimal], str]:
     """Return ``(floor, breakout_trigger, execution, reason)``.
 
-    Automated candidates use the highest legal BUY tick at or below ORH.
-    The raw range still determines the breakout trigger and execution zone.
+    Automated candidates use the highest legal BUY tick at or below the higher
+    of the daily breakout and ORH. Entries cannot fall below the daily breakout
+    or reach the ORL. An opening range below the daily breakout remains usable.
     A non-null execution price is already configured and is never changed.
     """
 
@@ -61,13 +62,13 @@ def passive_entry_prices(
     assert execution is not None
     if low > high:
         return None, None, execution, "ORB low cannot exceed ORB high"
-    if execution_price is None:
-        tick = us_equity_tick(high)
-        assert tick is not None
-        execution = high.quantize(tick, rounding=ROUND_FLOOR)
     floor = max(breakout, low)
     trigger = max(breakout, high)
-    if floor >= high:
+    if execution_price is None:
+        tick = us_equity_tick(trigger)
+        assert tick is not None
+        execution = trigger.quantize(tick, rounding=ROUND_FLOOR)
+    if low >= trigger:
         return floor, trigger, execution, "No valid passive-pullback execution zone"
     if not is_legal_execution_price(execution):
         return (
@@ -76,12 +77,13 @@ def passive_entry_prices(
             execution,
             "Execution price is not on a valid U.S. equity tick",
         )
-    if not floor < execution <= high:
+    if not (breakout <= execution <= trigger and low < execution):
         return (
             floor,
             trigger,
             execution,
-            "Execution price must be strictly above the breakout/ORL floor and at or below ORH",
+            "Execution price must be at or above the daily breakout, strictly above ORL, "
+            "and at or below max(breakout price, ORH)",
         )
     return floor, trigger, execution, ""
 

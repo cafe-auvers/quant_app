@@ -50,7 +50,8 @@ restrictions without waiting for a card revision or manual refresh.
 
 Buy Today is monitoring intent, not an order. After a current-session ORB
 closes, a fresh KIS trade strictly above both ORB high and breakout confirms the
-candidate. The system then submits a passive BUY limit at ORB high by default
+candidate. The daily breakout may occur after the opening range. The system
+then submits a passive BUY limit referenced to the higher of breakout and ORH
 while last trade and ask remain above that limit.
 
 Entry Pending means a durable submitted/discovered/ambiguous BUY identity

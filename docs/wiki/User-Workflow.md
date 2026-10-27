@@ -39,8 +39,9 @@ only the `ACTIVE` Execution Owner can cross the broker boundary.
 
 No fixed profit target is used for active ORB management. Confirmation is a
 fresh trade strictly above `max(orb_high, breakout_price)`; the passive order
-rests at ORB high by default and fills only on broker evidence. A later,
-strictly higher-scoring ORB may replace a completely unfilled working order
+uses the higher of breakout and ORH as its default price reference and fills
+only on broker evidence. The daily breakout may occur after the opening range.
+A later, strictly higher-scoring ORB may replace a completely unfilled working order
 through strict cancel-then-replace. Exits follow the rulebook and
 broker-confirmed state.
 
