@@ -349,6 +349,39 @@ Stale observations cannot show a green condition. After close, labels describe
 closing conditions for review. Tap the condition for specific reasons.
 These bands are unvalidated heuristics; the scoring weights and rank order are unchanged.
 
+The additional **Sector pp**, **vs VWAP**, and **ER 30m** columns refine the
+Condition badge without changing score weights or relative ranking. Swipe the
+table to see the extra columns, or tap Condition for three colored metric cards.
+
+- **Sector pp:** stock return minus its broad sector ETF return, from the same
+  09:30 ET open to the exact completed-minute endpoint used for RS/SPY. ETF
+  ticker is shown in the cell. Green ≥ +0.5 pp, white 0 to < +0.5 pp, red < 0 pp.
+  Classifications come from read-only `stock_profiles` in the existing SQLite
+  mirror. Unknown classifications stay unknown; there is no SPY substitution.
+  The broad proxies are XLK, XLV, XLF, XLY, XLP, XLC, XLE, XLI, XLB, XLU and
+  XLRE. [State Street's sector ETF list](https://www.ssga.com/us/en/individual/capabilities/equities/sector-investing/select-sector-etfs)
+  identifies these exposures. Shared ETFs are downloaded once per worker cycle,
+  never added to watchlist membership. A sector outage does not erase SPY ranks.
+- **vs VWAP:** `(completed stock close / session VWAP - 1) × 100`. Green above,
+  white exactly at VWAP, red below or more than 0.5 daily ADR above it. A large
+  positive distance can mean chasing a stretched price. The session VWAP uses
+  volume-weighted minute typical prices, not tick executions; `~` marks sparse-bar
+  estimates. The current displayed after-hours quote is not mixed with RTH VWAP.
+- **ER 30m:** signed net price change divided by summed absolute one-minute
+  close changes over the last 30 completed minutes, from −1 to +1. This is a
+  signed adaptation of [Kaufman's efficiency ratio](https://chartschool.stockcharts.com/table-of-contents/technical-indicators-and-overlays/technical-overlays/kaufmans-adaptive-moving-average-kama).
+  Smooth rises approach +1; smooth declines approach −1; flat/no-net-progress
+  paths are 0. Green ≥ +0.40, white +0.20 to < +0.40, red < +0.20. Before 30
+  minutes are available, use the session open and at least five completed bars,
+  mark `~`, and show the actual window in details. Missing minute closes stay
+  unknown because skipping them could make the path look falsely smooth.
+
+Strong additionally requires green sector excess and efficiency, no VWAP
+stretch, and a full efficiency window. Sector underperformance or weak recent
+price action yields Weak; excessive VWAP distance yields Extended. Missing new
+metrics cannot yield Strong. Existing score/rank remains visible, including
+when sector or efficiency data is missing. All thresholds remain heuristics.
+
 Tap Momentum for the score components, VWAP distance, session-range position,
 entry distance in ADR, data time, and reasons. Leading candidates sort first,
 then Watch candidates, by score within each group; unavailable/stale evidence

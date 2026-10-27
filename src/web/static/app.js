@@ -3068,11 +3068,31 @@
     byId('mobile-momentum-heading').textContent = `${row.symbol} · ${score === null ? labels[momentum.status] || 'Data unavailable' : `${momentum.candidate ? 'Leading' : 'Watch'} · #${momentum.rank} · ${score.toFixed(1)}/100${quality}${momentum.session_closed ? ' · Session ended' : ''}`}`;
     const conditionNode = byId('mobile-momentum-condition');
     conditionNode.dataset.rating = condition.tone;
-    conditionNode.textContent = `${condition.label}: ${condition.reasons.join('; ')}${condition.data_uncertain ? ' · Estimated or incomplete data' : ''}${momentum.session_closed ? ' · Closing conditions for review' : ''}`;
+    conditionNode.textContent = `${condition.label}: ${condition.reasons.join('; ')}${condition.data_uncertain ? ' · Estimated, incomplete or early-session data' : ''}${momentum.session_closed ? ' · Closing conditions for review' : ''}`;
     const format = (value, suffix = '', signed = false) => {
       const number = monitorNumber(value);
       return number === null ? '—' : `${signed && number >= 0 ? '+' : ''}${number.toFixed(2)}${suffix}`;
     };
+    const signals = byId('mobile-momentum-signals');
+    signals.replaceChildren();
+    signals.hidden = score === null;
+    if (score !== null) {
+      for (const [label, value, rating, title] of [
+        [`Sector · ${momentum.sector_symbol || '?'}`, format(momentum.rs_sector_pp, ' pp', true), condition.metrics.sector, momentum.sector_reason || `${momentum.sector_name}: stock minus sector ETF, 09:30 ET to the identical completed minute`],
+        ['Price vs VWAP', `${momentum.bar_coverage_percent < 100 ? '~' : ''}${format(momentum.vwap_distance_percent, '%', true)}`, condition.metrics.vwap, `Price ${format(momentum.signal_price, '')} / VWAP ${format(momentum.vwap, '')}; distance ${format(momentum.vwap_distance_adr, ' ADR', true)}`],
+        [`Efficiency · ${momentum.efficiency_minutes || 30}m`, `${momentum.efficiency_warming_up ? '~' : ''}${format(momentum.directional_efficiency, '', true)}`, condition.metrics.efficiency, momentum.efficiency_reason || 'Signed efficiency unavailable'],
+      ]) {
+        const card = document.createElement('div');
+        card.title = title;
+        const name = document.createElement('span');
+        name.textContent = label;
+        const number = document.createElement('strong');
+        number.textContent = value;
+        number.dataset.rating = rating || 'UNKNOWN';
+        card.append(name, number);
+        signals.appendChild(card);
+      }
+    }
     byId('mobile-momentum-metrics').textContent = score === null ? '' : [
       `RS vs SPY ${format(momentum.rs_open_pp, ' pp', true)} (${condition.metrics.rs || 'UNKNOWN'})`,
       `RVOL ${momentum.rvol_estimated ? '~' : ''}${format(momentum.rvol, 'x')} (${momentum.rvol_sessions} sessions) · ${condition.metrics.rvol || 'UNKNOWN'}`,
@@ -3081,7 +3101,10 @@
       `Entry ${format(momentum.entry_extension_adr, ' ADR', true)} (${momentum.entry_window})`,
       ...(momentum.bar_coverage_percent === undefined ? [] : [`Reported minutes ${format(momentum.bar_coverage_percent, '%')}`]),
     ].join(' · ');
-    byId('mobile-momentum-reason').textContent = `${momentum.reason || ''}${momentum.as_of ? ` · Completed bars through ${new Date(momentum.as_of).toLocaleTimeString('en-US', {timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit'})} ET` : ''}`;
+    byId('mobile-momentum-reason').textContent = [momentum.reason, momentum.sector_reason,
+      momentum.directional_efficiency === null || momentum.efficiency_warming_up ? momentum.efficiency_reason : '',
+      momentum.as_of ? `Completed bars through ${new Date(momentum.as_of).toLocaleTimeString('en-US', {timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit'})} ET` : '',
+    ].filter(Boolean).join(' · ');
     const components = momentum.components;
     byId('mobile-momentum-components').textContent = components && score !== null
       ? `Components / 100: RS ${components.relative_strength ?? '—'} · Volume ${components.relative_volume ?? '—'} · Trend ${components.trend ?? '—'} · Entry ${components.entry ?? '—'}${momentum.quality === 'PARTIAL' ? '. Available weights rescaled; missing metrics are not zero.' : ''}` : '';
@@ -3193,6 +3216,18 @@
       volume.dataset.rating = condition.metrics.rvol || 'UNKNOWN';
       volume.title += ' · Green ≥ 1.5x; white 1 to < 1.5x; red < 1x. 1x = usual volume; 1.8x = 80% above usual.';
       volume.setAttribute('aria-label', `Relative volume: ${volume.textContent}, ${condition.metrics.rvol || 'unknown'}${momentum.rvol_estimated ? ', estimated' : ''}`);
+      const extra = (key, suffix, className, rating, title, prefix = '') => {
+        const number = monitorNumber(momentum[key]);
+        const node = cell(score === null || number === null ? '—' : `${prefix}${number >= 0 ? '+' : ''}${number.toFixed(2)}${suffix}`, className, title);
+        node.dataset.rating = condition.metrics[rating] || 'UNKNOWN';
+        node.setAttribute('aria-label', `${title}: ${node.textContent}, ${node.dataset.rating}`);
+      };
+      extra('rs_sector_pp', momentum.sector_symbol ? ` ${momentum.sector_symbol}` : '', 'mobile-monitor-sector', 'sector',
+        momentum.sector_reason || `Stock minus ${momentum.sector_name} ETF ${momentum.sector_symbol}, same 09:30 ET open and completed minute as RS/SPY. Green ≥ +0.5 pp; white 0 to < +0.5; red < 0.`);
+      extra('vwap_distance_percent', '%', 'mobile-monitor-vwap', 'vwap',
+        'Completed stock price versus regular-session VWAP. Green above; white at VWAP; red below or > 0.5 ADR above VWAP.', momentum.bar_coverage_percent < 100 ? '~' : '');
+      extra('directional_efficiency', '', 'mobile-monitor-efficiency', 'efficiency',
+        `${momentum.efficiency_reason || 'Signed efficiency unavailable'}. Green ≥ +0.40; white +0.20 to < +0.40; red < +0.20, including negative/downward action.`, momentum.efficiency_warming_up ? '~' : '');
     }
     const percent = (key, title) => {
       const value = monitorNumber(row[key]);
@@ -3298,7 +3333,7 @@
       table.classList.toggle('momentum-table', ranked);
       table.setAttribute('aria-label', 'Watchlist breakout monitor');
       const header = table.createTHead().insertRow();
-      const columns = ranked ? ['Stock', 'Condition', 'Momentum', 'RS/SPY pp', 'RVOL', 'Today %', 'Breakout', 'Best ORB', '1M %', '3M %', '+']
+      const columns = ranked ? ['Stock', 'Condition', 'Momentum', 'RS/SPY pp', 'RVOL', 'Sector pp', 'vs VWAP', 'ER 30m', 'Today %', 'Breakout', 'Best ORB', '1M %', '3M %', '+']
         : ['Stock', 'Today %', 'Breakout', 'Best ORB', '1M %', '3M %', '+'];
       columns.forEach((label, index) => {
         const cell = document.createElement('th');

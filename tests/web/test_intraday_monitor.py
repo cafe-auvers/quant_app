@@ -635,3 +635,66 @@ def test_authenticated_monitor_serves_shared_cached_worker_result(authenticated,
     assert result["rows"][0]["orb"][0]["price_status"] == "PASS"
     assert len(monitor.provider.calls) == 2
     assert result["advisory"] is True
+
+
+def test_sector_classification_batch_is_read_only_and_unknown_does_not_fall_back_to_spy(tmp_path):
+    import sqlite3
+    from src.web.monitor_source import load_monitor_sectors
+
+    mirror = tmp_path / "profiles.db"
+    with sqlite3.connect(mirror) as connection:
+        connection.execute("CREATE TABLE stock_profiles (symbol TEXT PRIMARY KEY,sector_name TEXT)")
+        connection.executemany("INSERT INTO stock_profiles VALUES (?,?)", [
+            ("AAA", "Technology"), ("BBB", "Health Care"), ("CCC", "Unclassified"),
+        ])
+    before = mirror.read_bytes()
+    rows = [{"symbol": symbol} for symbol in ("AAA", "BBB", "CCC", "MISSING")]
+    load_monitor_sectors(rows, str(mirror))
+    assert [row["sector_symbol"] for row in rows] == ["XLK", "XLV", None, None]
+    assert rows[1]["sector_name"] == "Health Care"
+    assert mirror.read_bytes() == before
+    load_monitor_sectors(rows, tmp_path / "missing.db")
+    assert all(row["sector_symbol"] is None for row in rows)
+    assert not (tmp_path / "missing.db").exists()
+
+
+def test_sector_benchmarks_are_shared_and_outages_preserve_score_and_membership():
+    class SectorProvider:
+        def __init__(self):
+            self.calls = []
+            self.fail_sector = False
+
+        def fetch(self, symbols, *, interval, period=None):
+            self.calls.append((list(symbols), interval, period))
+            if interval == "1d":
+                return {symbol: performance_history() for symbol in symbols}
+            result = {}
+            for symbol in symbols:
+                if symbol == "XLK" and self.fail_sector:
+                    continue
+                current = bars(close=101 if symbol == "SPY" else 102 if symbol == "XLK" else 103)
+                current["Volume"] = 3000
+                prior = [bars(day=day) for day in ("2026-09-28", "2026-09-29", "2026-09-30", "2026-10-01")]
+                result[symbol] = pd.concat([*prior, current]) if period == "5d" else current
+            return result
+
+    provider = SectorProvider()
+    context = MonitorContext(rows=[{"symbol": s, "watchlist_member": True, "breakout_price": 101,
+                                    "sector_symbol": "XLK", "sector_name": "Technology"} for s in ("AAA", "BBB")],
+                             settings=OrbSettings(), equity=100_000)
+    monitor = IntradayMonitor(lambda: context, enabled=False, provider=provider, now=moment)
+    monitor.refresh_once()
+    rows = monitor.snapshot()["rows"]
+    assert {row["symbol"] for row in rows} == {"AAA", "BBB"}
+    assert all(row["momentum"]["rs_sector_pp"] > 0 for row in rows)
+    assert all(row["momentum"]["sector_as_of"] == row["momentum"]["as_of"] for row in rows)
+    scores = [row["momentum"]["score"] for row in rows]
+    assert provider.calls[:2] == [(["AAA", "BBB", "SPY", "XLK"], "1m", "5d"), (["AAA", "BBB"], "1d", None)]
+    provider.fail_sector = True
+    monitor.refresh_once()
+    rows = monitor.snapshot()["rows"]
+    assert [row["momentum"]["score"] for row in rows] == scores
+    assert all(row["momentum"]["rs_sector_pp"] is None for row in rows)
+    assert all(row["quote_status"] == "CURRENT" for row in rows)
+    assert len(rows) == 2 and all(row["momentum"]["rank"] for row in rows)
+    assert provider.calls[-1] == (["AAA", "BBB", "SPY", "XLK"], "1m", "1d")

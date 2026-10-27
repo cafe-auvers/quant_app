@@ -329,11 +329,16 @@
                 <div id="mobile-momentum-legend" class="mobile-momentum-legend" hidden>
                   <strong>Condition first. Rank #1 can still be weak.</strong><br>
                   <span data-rating="GOOD">Green = good</span> · <span data-rating="NORMAL">White = normal / mixed</span> · <span data-rating="BAD">Red = weak / extended</span><br>
-                  RS/SPY: <span data-rating="GOOD">≥ +0.5 pp</span> · <span data-rating="NORMAL">0 to &lt; +0.5</span> · <span data-rating="BAD">&lt; 0</span><br>
-                  RVOL: <span data-rating="GOOD">≥ 1.5×</span> · <span data-rating="NORMAL">1 to &lt; 1.5×</span> · <span data-rating="BAD">&lt; 1×</span> · <span data-rating="UNKNOWN">Amber = confirm data</span>
+                  RS/SPY &amp; Sector: <span data-rating="GOOD">≥ +0.5 pp</span> · <span data-rating="NORMAL">0 to &lt; +0.5</span> · <span data-rating="BAD">&lt; 0</span><br>
+                  RVOL: <span data-rating="GOOD">≥ 1.5×</span> · <span data-rating="NORMAL">1 to &lt; 1.5×</span> · <span data-rating="BAD">&lt; 1×</span><br>
+                  ER: <span data-rating="GOOD">≥ +0.40</span> · <span data-rating="NORMAL">+0.20 to &lt; +0.40</span> · <span data-rating="BAD">&lt; +0.20</span><br>
+                  VWAP: <span data-rating="GOOD">above</span> · <span data-rating="BAD">below / stretched</span> · <span data-rating="UNKNOWN">Amber = confirm data</span>
                 </div>
                 <details id="mobile-momentum-help" class="mobile-momentum-help" hidden>
                   <summary>Conditions, examples and scoring</summary>
+                  <p>Sector pp compares the stock with its broad sector ETF from the same 09:30 ET open to the identical completed minute used for SPY. The ETF ticker appears beside the value. Classification comes from the local profile cache. A missing sector or a mismatched ETF endpoint stays unknown; SPY is never substituted for a sector.</p>
+                  <p>vs VWAP is (completed stock price / session VWAP − 1) × 100. Red means below VWAP or more than 0.5 ADR above it: an upward trend can still be too stretched to chase. VWAP uses reported minute typical prices and volume; ~ marks estimates.</p>
+                  <p>ER 30m is signed net price change divided by total absolute minute-close changes over the last 30 completed minutes. +1 is smooth upward progress, −1 smooth downward progress, and 0 means no net progress. It uses at least five completed minutes early in the session (~); gaps stay unknown rather than making a path look smoother. The Condition badge also requires sector excess ≥ +0.5 pp, ER ≥ +0.40, and price no more than 0.5 ADR above VWAP for Strong. New signals refine Condition; score weights and ranking are unchanged.</p>
                   <p>RS/SPY +5 pp means the stock has gained 5 percentage points more than SPY since the open. RVOL 1× is usual volume at this time; 1.8× is 80% above usual. The color thresholds are starting heuristics, not proven trading edges.</p>
                   <p>Strong requires RS ≥ +0.5 pp, RVOL ≥ 1.5×, a gain from the open, price above VWAP and in the top quarter of today's range, at or above breakout, within 0.5 ADR of entry, and complete data. Mixed means some support is ordinary. Weak means a measured condition failed; Extended means price is more than 0.5 ADR above entry. Confirm means reported metrics look strong but data is estimated. Check data means a required metric is missing. Tap Condition to see the reasons. Rank only compares this list; #1 does not guarantee a strong setup.</p>
                   <p>Leading candidates appear first. Score: 40% strength vs SPY since the 09:30 ET open, 25% same-time relative volume, 25% VWAP and session-range position, 10% proximity to the planned ORB entry. Strength and entry distance use daily ADR.</p>
@@ -346,6 +351,7 @@
               <div id="mobile-momentum-detail" class="mobile-momentum-detail" role="region" aria-label="Momentum ranking details" hidden>
                 <div><strong id="mobile-momentum-heading"></strong><button id="mobile-momentum-close" type="button" aria-label="Close momentum details">Close</button></div>
                 <p id="mobile-momentum-condition"></p>
+                <div id="mobile-momentum-signals" class="mobile-momentum-signals" hidden></div>
                 <p id="mobile-momentum-metrics"></p>
                 <p id="mobile-momentum-reason"></p>
                 <p id="mobile-momentum-components"></p>

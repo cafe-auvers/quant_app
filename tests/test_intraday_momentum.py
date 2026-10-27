@@ -304,7 +304,7 @@ def test_relative_volume_one_is_normal_and_one_point_eight_is_good(rvol, expecte
     ({"quality": "PARTIAL", "rvol": None, "rs_open_pp": -1}, "Weak", "BAD", "Lagging SPY"),
 ])
 def test_absolute_conditions_are_independent_of_rank_and_score(updates, label, tone, reason):
-    result = {**evaluate(), "score": 99, "rank": 1, **updates}
+    result = {**evaluate(), "score": 99, "rank": 1, "signals_version": 0, **updates}
     assessment = assess_momentum(result)
     assert assessment["label"] == label
     assert assessment["tone"] == tone
@@ -318,4 +318,101 @@ def test_evaluation_includes_condition_and_preserves_bad_first_rank():
     assign_momentum_ranks([row])
     assert result["rank"] == 1
     assert result["assessment"]["label"] == "Extended"
-    assert result["assessment"]["metrics"] == {"rs": "GOOD", "rvol": "BAD"}
+    assert result["assessment"]["metrics"]["rs"] == "GOOD"
+    assert result["assessment"]["metrics"]["rvol"] == "BAD"
+
+
+@pytest.mark.parametrize("name, symbol", [("Technology", "XLK"), ("Health Care", "XLV"),
+                                        ("Healthcare", "XLV"), ("Financial Services", "XLF"),
+                                        ("Consumer Defensive", "XLP"), ("Real Estate", "XLRE"),
+                                        ("Unclassified", None), (None, None)])
+def test_sector_mapping_uses_broad_etfs_without_fabricating_a_benchmark(name, symbol):
+    from src.core.intraday_momentum import sector_proxy
+    assert sector_proxy(name) == symbol
+
+
+def test_sector_excess_uses_identical_open_and_endpoint_and_does_not_change_score():
+    sector = session(start=200, end=201)
+    result = evaluate(sector_benchmark=sector, sector_symbol="XLK", sector_name="Technology")
+    assert result["rs_sector_pp"] == pytest.approx(1.5)
+    assert result["sector_return_open_percent"] == pytest.approx(.5)
+    assert result["sector_as_of"] == result["as_of"]
+    assert result["score"] == evaluate()["score"]
+    assert result["vwap_distance_adr"] == pytest.approx(result["vwap_distance_percent"] / 4)
+    sector.loc[moment("10:05")] = [999, 999, 999, 999, 999]
+    assert evaluate(sector_benchmark=sector, sector_symbol="XLK")["rs_sector_pp"] == pytest.approx(1.5)
+
+
+@pytest.mark.parametrize("missing", ["09:30", "10:04"])
+def test_sector_missing_endpoint_stays_unknown_without_suppressing_existing_score(missing):
+    sector = session().drop(moment(missing))
+    result = evaluate(sector_benchmark=sector, sector_symbol="XLK")
+    assert result["rs_sector_pp"] is result["sector_as_of"] is None
+    assert result["score"] == evaluate()["score"]
+    assert result["assessment"]["tone"] != "GOOD"
+
+
+def test_sector_outage_does_not_reuse_cached_live_benchmark_or_rewind_other_signals():
+    result = evaluate(sector_benchmark=session(), sector_symbol="XLK", sector_failed=True)
+    assert result["rs_sector_pp"] is None
+    assert result["as_of"] == moment().isoformat()
+    assert result["rs_open_pp"] == pytest.approx(1.9)
+
+
+@pytest.mark.parametrize("mode, expected", [("up", 1), ("down", -1), ("flat", 0), ("chop", 0)])
+def test_signed_efficiency_distinguishes_smooth_declines_from_upward_progress(mode, expected):
+    frame = history()
+    index = pd.date_range(moment("09:34"), moment("10:04"), freq="min")
+    if mode == "up":
+        prices = np.arange(100., 131.)
+    elif mode == "down":
+        prices = np.arange(131., 100., -1)
+    elif mode == "chop":
+        prices = np.array([100., 101.] * 15 + [100.])
+    else:
+        prices = np.full(31, 100.)
+    frame.loc[index, "Close"] = prices
+    result = evaluate(frame)
+    assert result["directional_efficiency"] == expected
+    assert result["efficiency_minutes"] == 30
+    assert result["efficiency_warming_up"] is False
+    assert -1 <= result["directional_efficiency"] <= 1
+
+
+def test_efficiency_gaps_are_unknown_and_future_bars_do_not_improve_quality():
+    frame = history().drop(moment("09:45"))
+    result = evaluate(frame)
+    assert result["directional_efficiency"] is None
+    assert "Missing" in result["efficiency_reason"]
+    assert result["score"] is not None
+    # A gap outside the last 30-minute close-to-close window is harmless.
+    assert evaluate(history().drop(moment("09:31")))["directional_efficiency"] == 1
+
+
+@pytest.mark.parametrize("time, ratio, warming", [("09:34", None, True), ("09:35", 1, True), ("10:00", 1, False)])
+def test_efficiency_early_session_minimum_is_five_completed_minutes(time, ratio, warming):
+    result = evaluate(now=moment(time))
+    assert result["directional_efficiency"] == ratio
+    assert result["efficiency_warming_up"] is warming
+
+
+@pytest.mark.parametrize("updates, label, metric, rating", [
+    ({}, "Strong", "efficiency", "GOOD"),
+    ({"rs_sector_pp": -.01}, "Weak", "sector", "BAD"),
+    ({"rs_sector_pp": .49}, "Mixed", "sector", "NORMAL"),
+    ({"rs_sector_pp": .5}, "Strong", "sector", "GOOD"),
+    ({"rs_sector_pp": None}, "Check data", "sector", "UNKNOWN"),
+    ({"directional_efficiency": -.9}, "Weak", "efficiency", "BAD"),
+    ({"directional_efficiency": .19}, "Weak", "efficiency", "BAD"),
+    ({"directional_efficiency": .2}, "Mixed", "efficiency", "NORMAL"),
+    ({"directional_efficiency": .4}, "Strong", "efficiency", "GOOD"),
+    ({"directional_efficiency": None}, "Check data", "efficiency", "UNKNOWN"),
+    ({"efficiency_warming_up": True}, "Confirm", "efficiency", "GOOD"),
+    ({"vwap_distance_adr": .501}, "Extended", "vwap", "BAD"),
+    ({"vwap_distance_adr": None}, "Check data", "vwap", "UNKNOWN"),
+])
+def test_new_condition_checks_are_absolute_and_do_not_reweight_the_score(updates, label, metric, rating):
+    result = {**evaluate(), "rs_sector_pp": 1, "directional_efficiency": .6, **updates}
+    condition = assess_momentum(result)
+    assert condition["label"] == label
+    assert condition["metrics"][metric] == rating

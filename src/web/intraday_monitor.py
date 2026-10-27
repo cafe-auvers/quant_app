@@ -415,7 +415,8 @@ class IntradayMonitor:
                 self._snapshot["refreshing"] = True
             context = self.load_context()
             symbols = list(dict.fromkeys(row["symbol"] for row in context.rows))
-            quote_symbols = list(dict.fromkeys([*symbols, BENCHMARK])) if symbols else []
+            sectors = [row["sector_symbol"] for row in context.rows if row.get("sector_symbol")]
+            quote_symbols = list(dict.fromkeys([*symbols, BENCHMARK, *sectors])) if symbols else []
             active = is_nyse_trading_day(now.date()) and dt.time(4) <= now.time() < dt.time(20)
             # Off-hours: read plans each minute, fetch each symbol once per date.
             due = quote_symbols if active else [s for s in quote_symbols if s not in self._frames or s in self._failed_symbols or self._adr_session != now.date()]
@@ -467,6 +468,9 @@ class IntradayMonitor:
                     row, self._frames[row["symbol"]], self._frames.get(BENCHMARK, pd.DataFrame()),
                     now=self.now(), adr=adr.get(row["symbol"]), stale_seconds=self.stale_seconds,
                     benchmark_failed=BENCHMARK in self._failed_symbols,
+                    sector_benchmark=self._frames.get(row.get("sector_symbol"), pd.DataFrame()),
+                    sector_symbol=row.get("sector_symbol"), sector_name=row.get("sector_name"),
+                    sector_failed=row.get("sector_symbol") in self._failed_symbols,
                 )
             assign_momentum_ranks(rows)
             self._daily_quotes = {s: quote for s, quote in self._daily_quotes.items() if s in symbols}
