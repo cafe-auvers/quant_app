@@ -555,6 +555,22 @@ input::placeholder { color: #65776f; }
   .mobile-monitor-action button { width: 28px; min-height: 32px; padding: 0; border: 1px solid #315548; border-radius: 5px; color: var(--green); background: #132820; font-size: 16px; }
   .mobile-monitor-action button:disabled { color: var(--muted); border-color: transparent; background: transparent; }
   .mobile-monitor-status { flex: 0 0 auto; padding: 9px 11px; border-top: 1px solid var(--line); color: var(--muted); font-size: 10px; line-height: 1.5; }
+  .mobile-monitor-table.momentum-table { min-width: 640px; }
+  .momentum-table th:nth-child(n+2):not(:last-child) { width: 58px; }
+  .momentum-table th:nth-child(2), .momentum-table th:nth-child(7) { width: 84px; }
+  .mobile-monitor-momentum button { padding: 0; min-height: 40px; border: 0; background: transparent; color: inherit; font-size: 11px; font-weight: 800; }
+  .mobile-monitor-momentum[data-status="LEADING"], .mobile-monitor-strength[data-tone="positive"] { color: var(--green); }
+  .mobile-monitor-momentum[data-status="WATCH"], .mobile-monitor-momentum[data-status="STALE"] { color: #edc17d; }
+  .mobile-monitor-strength[data-tone="negative"] { color: #ff8c95; }
+  .mobile-momentum-help { margin: 0 0 7px; color: var(--muted); font-size: 10px; line-height: 1.5; }
+  .mobile-momentum-help[hidden], .mobile-momentum-detail[hidden] { display: none; }
+  .mobile-momentum-help summary { cursor: pointer; color: var(--green); }
+  .mobile-momentum-help[open] { max-height: 145px; overflow-y: auto; }
+  .mobile-momentum-help p { margin: 6px 0; }
+  .mobile-momentum-detail { flex: 0 0 auto; max-height: 180px; overflow-y: auto; padding: 8px 11px; border-top: 1px solid var(--line); color: var(--muted); background: #132820; font-size: 10px; line-height: 1.5; }
+  .mobile-momentum-detail > div { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--ink); }
+  .mobile-momentum-detail button { min-height: 28px; padding: 3px 8px; color: var(--green); background: #10261f; border: 1px solid var(--line); border-radius: 5px; }
+  .mobile-momentum-detail p { margin: 5px 0 0; }
   .display-settings-heading { min-height: 45px; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 6px 8px 6px 12px; border-bottom: 1px solid var(--line); }
   .display-settings-heading strong { font-size: 13px; }
   .display-settings-heading button { min-height: 31px; padding: 0 10px; border: 1px solid #315548; border-radius: 7px; color: var(--green); background: #10261f; font-size: 10px; font-weight: 850; }

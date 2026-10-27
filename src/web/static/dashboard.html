@@ -326,8 +326,20 @@
                   <button type="button" data-monitor-filter="today" aria-pressed="false">Buy Today</button>
                 </div>
                 <input id="mobile-monitor-search" type="search" placeholder="Find a stock" aria-label="Find monitored stock" autocomplete="off">
+                <details id="mobile-momentum-help" class="mobile-momentum-help" hidden>
+                  <summary>How momentum ranks work</summary>
+                  <p>Leading candidates appear first. Score: 40% strength vs SPY since the 09:30 ET open, 25% same-time relative volume, 25% VWAP and session-range position, 10% proximity to the planned ORB entry. Strength and entry distance use daily ADR.</p>
+                  <p>Leading requires a positive return from the open, positive strength vs SPY, RVOL ≥ 1.5x, price above VWAP and in the top quarter of today's range, at or above breakout, and within 0.5 ADR of entry. Watch shows which checks are missing.</p>
+                  <p>RVOL uses the median of 3–4 complete prior sessions. Completed, synchronized regular-session bars only. Missing or stale data stays unranked. These starting weights are unvalidated; a score is not a win probability or a buy instruction.</p>
+                </details>
               </div>
               <div id="mobile-list-items" class="mobile-list-items" role="listbox" aria-label="Watchlist stocks"></div>
+              <div id="mobile-momentum-detail" class="mobile-momentum-detail" role="region" aria-label="Momentum ranking details" hidden>
+                <div><strong id="mobile-momentum-heading"></strong><button id="mobile-momentum-close" type="button" aria-label="Close momentum details">Close</button></div>
+                <p id="mobile-momentum-metrics"></p>
+                <p id="mobile-momentum-reason"></p>
+                <p id="mobile-momentum-components"></p>
+              </div>
               <div id="mobile-monitor-status" class="mobile-monitor-status" role="status">Checking intraday prices…</div>
             </div>
           </div>

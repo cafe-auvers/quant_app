@@ -22,6 +22,8 @@ def test_monitor_table_best_orb_filter_and_completed_range_explanation(width, tm
         ("PASS_FAIL", "PASS", "FAIL", False),
         ("PASS_STALE", "PASS", "PASS", True),
         ("BEST", "PASS", "PASS", False),
+        ("LEADER_TWO", "PASS", "PASS", False),
+        ("WATCH_HIGH", "PASS", "PASS", False),
         ("LOW_VOL", "PASS", "PASS", False),
         ("WAIT", "WAITING", "PASS", False),
     ]:
@@ -43,6 +45,19 @@ def test_monitor_table_best_orb_filter_and_completed_range_explanation(width, tm
         })
     best = next(row for row in rows if row["symbol"] == "BEST")
     best["orb"].append({**best["orb"][0], "window": "5m", "risk_percent": 0.0175 * 100, "score": 90})
+    for symbol, score, rank, candidate in [
+        ("BEST", 78.6, 1, True), ("LEADER_TWO", 65, 2, True),
+        ("WATCH_HIGH", 95, 3, False), ("PASS_STALE", 99, 1, True),
+    ]:
+        next(row for row in rows if row["symbol"] == symbol)["momentum"] = {
+            "status": "LEADING" if candidate else "WATCH", "score": score,
+            "rank": rank, "candidate": candidate, "as_of": now.isoformat(),
+            "reason": "Leading SPY with volume support" if candidate else "More than 0.5 ADR above planned entry",
+            "rs_open_pp": 1.9, "rvol": 2.5, "rvol_sessions": 4,
+            "vwap_distance_percent": 1.2, "range_location_percent": 95,
+            "entry_extension_adr": .12, "entry_window": "5m",
+            "components": {"relative_strength": 95, "relative_volume": 75, "trend": 97, "entry": 76},
+        }
     session = {"mode": "CONNECTED", "csrf_token": "test",
                "market_status": {"state": "OPEN", "phase": "REGULAR"}}
     errors, mutations = [], []
@@ -92,7 +107,12 @@ def test_monitor_table_best_orb_filter_and_completed_range_explanation(width, tm
             page.screenshot(path=str(tmp_path / f"monitor-table-{width}.png"))
             page.locator("#mobile-list-items").evaluate("node => {node.scrollLeft = 80}")
             page.locator('[data-monitor-filter="orb"]').click()
-            assert sorted(page.locator(".mobile-monitor-row").evaluate_all("rows => rows.map(row => row.dataset.mobileSymbol)")) == ["BEST", "PASS_STALE"]
+            assert page.locator(".mobile-monitor-row").evaluate_all("rows => rows.map(row => row.dataset.mobileSymbol)") == ["BEST", "LEADER_TWO", "WATCH_HIGH", "PASS_STALE"]
+            assert page.locator(".mobile-monitor-table th").all_inner_texts() == ["Stock", "Momentum", "RS/SPY pp", "RVOL", "Today %", "Breakout", "Best ORB", "1M %", "3M %", "+"]
+            assert page.locator('[data-mobile-symbol="BEST"] .mobile-monitor-momentum').inner_text() == "#1 · 79"
+            assert page.locator('[data-mobile-symbol="BEST"] .mobile-monitor-strength').inner_text() == "+1.90"
+            assert page.locator('[data-mobile-symbol="BEST"] .mobile-monitor-volume').inner_text() == "2.5x"
+            assert page.locator('[data-mobile-symbol="PASS_STALE"] .mobile-monitor-momentum').inner_text() == "Stale"
             stale = page.locator('[data-mobile-symbol="PASS_STALE"] .mobile-monitor-result')
             assert stale.inner_text() == "1m · 0.5%*"
             assert "Passed earlier · latest quote stale" in stale.get_attribute("title")
@@ -103,5 +123,28 @@ def test_monitor_table_best_orb_filter_and_completed_range_explanation(width, tm
             assert not errors and not mutations
             assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
             page.screenshot(path=str(tmp_path / f"monitor-orb-filter-{width}.png"))
+            page.locator("#mobile-list-items").evaluate("node => {node.scrollLeft = 0}")
+            page.locator('[data-mobile-symbol="BEST"] .mobile-monitor-momentum button').click()
+            assert "Leading · #1 · 78.6/100" in page.locator("#mobile-momentum-heading").inner_text()
+            assert "RVOL 2.50x (4 sessions)" in page.locator("#mobile-momentum-metrics").inner_text()
+            assert "Entry +0.12 ADR (5m)" in page.locator("#mobile-momentum-metrics").inner_text()
+            assert "Completed bars through" in page.locator("#mobile-momentum-reason").inner_text()
+            assert "RS 95" in page.locator("#mobile-momentum-components").inner_text()
+            page.screenshot(path=str(tmp_path / f"monitor-momentum-details-{width}.png"))
+            page.locator("#mobile-momentum-close").click()
+            assert page.locator("#mobile-momentum-detail").is_hidden()
+            page.locator("#mobile-momentum-help summary").click()
+            assert "40% strength vs SPY" in page.locator("#mobile-momentum-help").inner_text()
+            assert "not a win probability" in page.locator("#mobile-momentum-help").inner_text()
+            assert not errors and not mutations
+            assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+            page.locator("#mobile-monitor-search").fill("LEADER")
+            assert page.locator('[data-mobile-symbol="LEADER_TWO"] .mobile-monitor-momentum').inner_text() == "#2 · 65"
+            page.evaluate("Date.now = () => new Date().getTime() + 600000")
+            page.locator("#mobile-monitor-search").fill("BEST")
+            assert page.locator('[data-mobile-symbol="BEST"] .mobile-monitor-momentum').inner_text() == "Stale"
+            assert page.locator('[data-mobile-symbol="BEST"] .mobile-monitor-strength').inner_text() == "—"
+            assert "0 Leading" in page.locator("#mobile-monitor-status").inner_text()
+            assert not errors and not mutations
         finally:
             browser.close()

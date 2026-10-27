@@ -323,6 +323,49 @@ An earlier confirmed ORB with a stale quote has an asterisk and amber text,
 with its stale status in the tooltip. It does not claim a fresh entry signal.
 Hover over the stock for its company name, latest price, and quote time.
 
+Within **ORB passed**, the table adds **Momentum**, **RS/SPY pp**, and **RVOL**.
+Tap Momentum for the score components, VWAP distance, session-range position,
+entry distance in ADR, data time, and reasons. Leading candidates sort first,
+then Watch candidates, by score within each group; unavailable/stale evidence
+remains unranked. Search keeps the ranks of the full monitored candidate set.
+An earlier ORB pass remains visible after a pullback, but does not establish
+current momentum. The All, Broken out, and Buy Today views keep their existing
+columns and ordering.
+
+The advisory `INTRADAY_MOMENTUM_V1` score uses these starting weights:
+
+- **40% relative strength:** stock return from its 09:30 regular-session open
+  minus SPY's return over the identical completed-bar interval, in percentage
+  points. Divide by the stock's completed daily ADR; 0.5 ADR of excess return
+  earns 100 component points, and nonpositive excess earns zero. Overnight
+  gaps are excluded; this is excess return, not beta-adjusted alpha.
+- **25% same-time relative volume:** today's cumulative regular-session volume
+  divided by the median cumulative volume through the same minute in 3–4
+  complete prior sessions. 1x earns zero component points; 3x earns 100.
+- **25% trend:** half for price strictly above the session's minute-bar VWAP
+  estimate, half for price's location from session low (0) to high (100).
+  VWAP weights each minute's typical price `(H + L + C) / 3` by its volume.
+- **10% entry proximity:** 100 component points at the existing best passing
+  ORB's planned entry, declining to zero at an absolute distance of 0.5 ADR.
+
+Every component is capped to 0–100. Leading additionally requires a positive
+return from the open, positive excess vs SPY, RVOL at least 1.5x, price above
+VWAP and in the top quarter of today's range, at or above the saved breakout,
+and within 0.5 ADR of the planned entry. Other complete candidates show
+Watch with the reasons. A rank is a review priority, not a win probability.
+These weights and cutoffs have not been validated for predictive performance.
+
+Both instruments must have complete current-session opening bars, aligned to
+the latest common completed minute. Forming minutes, extended-hours bars,
+future observations, incomplete prior volume sessions, and stale or failed
+SPY downloads cannot manufacture a rank. Ranking runs only during regular
+hours. A five-day minute-history batch seeds the short RVOL baseline once per
+symbol/session; subsequent refreshes reuse that history and fetch today's
+minutes. The detail shows the actual baseline session count; this is not a
+20-day RVOL measure. SPY is fetched once per batch, without becoming a watchlist
+member. Ranking does not change ORB eligibility, execution, sizing, or risk
+limits, and inspecting scores sends no trading or planning commands.
+
 Connected mode uses a separate web-process Yahoo/yfinance worker with batches
 of at most 40 symbols and four download threads. It polls once per minute
 during extended US trading hours, caches completed daily ADR, pauses after

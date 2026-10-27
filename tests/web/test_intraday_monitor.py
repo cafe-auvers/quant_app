@@ -129,7 +129,7 @@ def test_worker_reuses_daily_history_for_watchlist_performance_each_minute():
     assert row["return_1m"] == pytest.approx(37.5)
     assert row["return_3m"] == pytest.approx(120)
     assert row["breakout_status"] == "NO_LEVEL"
-    assert provider.calls == [(["AAA"], "1m"), (["AAA"], "1d"), (["AAA"], "1m")]
+    assert provider.calls == [(["AAA", "SPY"], "1m"), (["AAA"], "1d"), (["AAA", "SPY"], "1m")]
 
 
 def test_price_pass_does_not_hide_stop_adr_failure():
@@ -269,10 +269,10 @@ def test_worker_caches_daily_inputs_and_adds_new_stocks_next_cycle():
     monitor = IntradayMonitor(lambda: context, enabled=False, provider=provider, now=moment)
     monitor.refresh_once()
     monitor.refresh_once()
-    assert provider.calls == [(["AAA"], "1m"), (["AAA"], "1d"), (["AAA"], "1m")]
+    assert provider.calls == [(["AAA", "SPY"], "1m"), (["AAA"], "1d"), (["AAA", "SPY"], "1m")]
     context.rows.append({"symbol": "BBB"})
     monitor.refresh_once()
-    assert provider.calls[-2:] == [(["AAA", "BBB"], "1m"), (["BBB"], "1d")]
+    assert provider.calls[-3:] == [(["BBB"], "1m"), (["AAA", "SPY"], "1m"), (["BBB"], "1d")]
     provider.failed = True
     monitor.refresh_once()
     stale = monitor.snapshot()["rows"][0]
@@ -283,6 +283,69 @@ def test_worker_caches_daily_inputs_and_adds_new_stocks_next_cycle():
     provider.failed = False
     monitor.refresh_once()
     assert monitor.snapshot()["rows"][0]["quote_status"] == "CURRENT"
+
+
+def test_momentum_worker_primes_history_once_and_suppresses_only_ranking_on_spy_outage():
+    calls = []
+    fail_market = [False]
+    clock = [moment()]
+
+    class MomentumProvider:
+        def fetch(self, symbols, *, interval, period=None):
+            calls.append((list(symbols), interval, period))
+            if interval == "1d":
+                return {symbol: performance_history() for symbol in symbols}
+            result = {}
+            for symbol in symbols:
+                if symbol == "SPY" and fail_market[0]:
+                    continue
+                current = bars(close=101 if symbol == "SPY" else 103)
+                current["Volume"] = 3000
+                prior = [bars(day=day) for day in ("2026-09-28", "2026-09-29", "2026-09-30", "2026-10-01")]
+                result[symbol] = pd.concat([*prior, current]) if period == "5d" else current
+            return result
+
+    monitor = IntradayMonitor(
+        lambda: MonitorContext(rows=[{"symbol": "AAA", "breakout_price": 101, "watchlist_member": True}],
+                               settings=OrbSettings(), equity=100_000),
+        enabled=False, provider=MomentumProvider(), now=lambda: clock[0],
+    )
+    monitor.refresh_once()
+    first = monitor.snapshot()["rows"][0]
+    assert first["momentum"]["rank"] == 1
+    assert first["momentum"]["candidate"] is True
+    assert first["momentum"]["rvol"] == 3
+    assert first["momentum"]["rs_open_pp"] > 0
+    monitor.refresh_once()
+    assert calls == [(["AAA", "SPY"], "1m", "5d"), (["AAA"], "1d", None),
+                     (["AAA", "SPY"], "1m", "1d")]
+    assert monitor.snapshot()["rows"][0]["momentum"] == first["momentum"]
+    fail_market[0] = True
+    monitor.refresh_once()
+    row = monitor.snapshot()["rows"][0]
+    assert row["quote_status"] == "CURRENT"
+    assert row["orb"][0]["price_status"] == "PASS"
+    assert row["momentum"]["score"] is row["momentum"]["rank"] is None
+    assert "SPY" in row["momentum"]["reason"]
+    fail_market[0] = False
+    monitor.refresh_once()
+    assert monitor.snapshot()["rows"][0]["momentum"]["rank"] == 1
+    clock[0] = moment("10:10")
+    assert monitor.snapshot()["rows"][0]["momentum"]["score"] is None
+    clock[0] = moment("09:35", "2026-10-05")
+    assert monitor.snapshot()["rows"][0]["momentum"]["rank"] is None
+
+
+def test_empty_monitor_does_not_fetch_a_benchmark_and_spy_membership_is_not_duplicated():
+    context = MonitorContext()
+    provider = Provider()
+    monitor = IntradayMonitor(lambda: context, enabled=False, provider=provider, now=moment)
+    monitor.refresh_once()
+    assert not provider.calls
+    context.rows = [{"symbol": "SPY", "watchlist_member": True}]
+    monitor.refresh_once()
+    assert provider.calls == [(["SPY"], "1m"), (["SPY"], "1d")]
+    assert len(monitor.snapshot()["rows"]) == 1
 
 
 def test_snapshot_reads_never_download_or_start_multiple_workers():

@@ -12,6 +12,9 @@ from typing import Any, Callable
 
 import pandas as pd
 
+from src.core.intraday_momentum import (
+    BENCHMARK, assign_momentum_ranks, evaluate_momentum, unavailable_momentum,
+)
 from src.core.opening_liquidity import opening_liquidity_rejection, opening_volume_totals
 from src.core.orb_entry_logic import passive_entry_prices
 from src.risk.orb_position import (
@@ -164,6 +167,7 @@ def suppress_stale_signals(row: dict) -> None:
     row["quote_status"] = "STALE" if row.get("current_price") else "UNAVAILABLE"
     row["breakout_status"] = "UNKNOWN" if row.get("breakout_price") else "NO_LEVEL"
     row["broke_out_today"] = None
+    row["momentum"] = unavailable_momentum("STALE", "Stock quote is stale or unavailable")
     for window in row.get("orb", []):
         # An observed crossing remains a historical fact for this session.
         # It does not certify the current quote or authorize an entry.
@@ -334,6 +338,7 @@ class IntradayMonitor:
         self._active_until = 0.0
         self._next_refresh = 0.0
         self._frames = {}
+        self._history_session = {}
         self._failed_symbols = set()
         self._adr = {}
         self._daily_quotes = {}
@@ -373,6 +378,12 @@ class IntradayMonitor:
                     window.update(price_status="UNKNOWN", position_status="UNKNOWN",
                                   price_reason="Current regular-session data unavailable",
                                   position_reason="Current regular-session data unavailable")
+            momentum = row.get("momentum", {})
+            if not is_nyse_trading_day(now.date()) or not dt.time(9, 30) <= now.time() < nyse_regular_session_close_time(now.date()):
+                row["momentum"] = unavailable_momentum("CLOSED", "Momentum ranking is available during the regular session")
+            elif momentum.get("as_of") and (now - dt.datetime.fromisoformat(momentum["as_of"])).total_seconds() > self.stale_seconds:
+                row["momentum"] = unavailable_momentum("STALE", "Synchronized stock/SPY bars are stale")
+        assign_momentum_ranks(snapshot["rows"])
         return {**snapshot, "enabled": self.enabled, "source": "Yahoo Finance · 1-minute bars",
                 "refresh_seconds": self.refresh_seconds, "stale_seconds": self.stale_seconds, "advisory": True,
                 "position_context_error": context.position_error}
@@ -398,11 +409,21 @@ class IntradayMonitor:
             with self._lock:
                 self._snapshot["refreshing"] = True
             context = self.load_context()
-            symbols = [row["symbol"] for row in context.rows]
+            symbols = list(dict.fromkeys(row["symbol"] for row in context.rows))
+            quote_symbols = list(dict.fromkeys([*symbols, BENCHMARK])) if symbols else []
             active = is_nyse_trading_day(now.date()) and dt.time(4) <= now.time() < dt.time(20)
             # Off-hours: read plans each minute, fetch each symbol once per date.
-            due = symbols if active else [s for s in symbols if s not in self._frames or s in self._failed_symbols or self._adr_session != now.date()]
-            frames = self.provider.fetch(due, interval="1m", period="1d" if active else "5d") if due else {}
+            due = quote_symbols if active else [s for s in quote_symbols if s not in self._frames or s in self._failed_symbols or self._adr_session != now.date()]
+            # Prime a small same-clock volume baseline once per symbol/session.
+            # Subsequent cycles download today's minutes only, including SPY once.
+            history_due = [s for s in due if self._history_session.get(s) != now.date()]
+            current_due = [s for s in due if s not in history_due]
+            frames = {}
+            if history_due:
+                frames.update(self.provider.fetch(history_due, interval="1m", period="5d"))
+                self._history_session.update({s: now.date() for s in history_due if s in frames})
+            if current_due:
+                frames.update(self.provider.fetch(current_due, interval="1m", period="1d" if active else "5d"))
             adr = dict(self._adr) if self._adr_session == now.date() else {}
             missing_adr = [s for s in symbols if s not in adr or (adr[s] is None and self.monotonic() >= self._adr_retry_after.get(s, 0))]
             if missing_adr:
@@ -414,9 +435,21 @@ class IntradayMonitor:
                     if quote is not None:
                         self._daily_quotes[symbol] = quote
                 self._adr_retry_after.update({s: self.monotonic() + 900 for s in missing_adr})
-            self._frames = {s: frames.get(s, self._frames.get(s, pd.DataFrame())) for s in symbols}
+            for symbol, frame in frames.items():
+                old = self._frames.get(symbol, pd.DataFrame())
+                if not old.empty and old.index.tz is not None and frame.index.tz is not None:
+                    old = old.copy()
+                    frame = frame.copy()
+                    old.index = old.index.tz_convert(US_MARKET_ZONE)
+                    frame.index = frame.index.tz_convert(US_MARKET_ZONE)
+                    frame = pd.concat([old, frame])
+                    frame = frame.loc[~frame.index.duplicated(keep="last")].sort_index()
+                    frame = frame[frame.index.date >= now.date() - dt.timedelta(days=10)]
+                self._frames[symbol] = frame
+            self._frames = {s: self._frames.get(s, pd.DataFrame()) for s in quote_symbols}
+            self._history_session = {s: day for s, day in self._history_session.items() if s in quote_symbols}
             self._failed_symbols = (self._failed_symbols | (set(due) - frames.keys())) - frames.keys()
-            self._failed_symbols.intersection_update(symbols)
+            self._failed_symbols.intersection_update(quote_symbols)
             rows = [evaluate_monitor_row(
                 row, self._frames[row["symbol"]], now=self.now(), context=context,
                 adr=adr.get(row["symbol"]), fetch_failed=row["symbol"] in self._failed_symbols,
@@ -425,6 +458,12 @@ class IntradayMonitor:
             for row in rows:
                 apply_daily_close_fallback(row, self._daily_quotes.get(row["symbol"]), self.now())
                 apply_daily_performance(row, self._daily_frames.get(row["symbol"], pd.DataFrame()), self.now())
+                row["momentum"] = evaluate_momentum(
+                    row, self._frames[row["symbol"]], self._frames.get(BENCHMARK, pd.DataFrame()),
+                    now=self.now(), adr=adr.get(row["symbol"]), stale_seconds=self.stale_seconds,
+                    benchmark_failed=BENCHMARK in self._failed_symbols,
+                )
+            assign_momentum_ranks(rows)
             self._daily_quotes = {s: quote for s, quote in self._daily_quotes.items() if s in symbols}
             self._daily_frames = {s: frame for s, frame in self._daily_frames.items() if s in symbols}
             with self._lock:
