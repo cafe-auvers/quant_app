@@ -44,6 +44,63 @@ def _number(value) -> float | None:
         return None
 
 
+def assess_momentum(momentum: dict) -> dict:
+    """Rate observed conditions independently of the relative rank and score."""
+    rs = _number(momentum.get("rs_open_pp"))
+    rvol = _number(momentum.get("rvol"))
+    ratings = {
+        "rs": "UNKNOWN" if rs is None else "GOOD" if rs >= 0.5 else "BAD" if rs < 0 else "NORMAL",
+        "rvol": "UNKNOWN" if rvol is None else "GOOD" if rvol >= 1.5 else "BAD" if rvol < 1 else "NORMAL",
+    }
+    values = {key: _number(momentum.get(key)) for key in (
+        "stock_return_open_percent", "vwap_distance_percent", "range_location_percent",
+        "entry_extension_adr", "breakout_distance_percent",
+    )}
+    bad, normal = [], []
+    extension = values["entry_extension_adr"]
+    if extension is not None and abs(extension) > 0.5:
+        bad.append("More than 0.5 ADR above entry" if extension > 0 else "More than 0.5 ADR below entry")
+    for key, reason in (
+        ("stock_return_open_percent", "Not advancing from the open"),
+        ("vwap_distance_percent", "At or below VWAP"),
+    ):
+        if values[key] is not None and values[key] <= 0:
+            bad.append(reason)
+    if values["breakout_distance_percent"] is not None and values["breakout_distance_percent"] < 0:
+        bad.append("Below daily breakout")
+    if rs is not None:
+        if rs < 0:
+            bad.append("Lagging SPY")
+        elif rs < 0.5:
+            normal.append("RS below +0.5 pp")
+    if rvol is not None:
+        if rvol < 1:
+            bad.append("Volume below normal")
+        elif rvol < 1.5:
+            normal.append("RVOL below 1.5x")
+    location = values["range_location_percent"]
+    if location is not None:
+        if location < 50:
+            bad.append("In lower half of today's range")
+        elif location < 75:
+            normal.append("Below top quarter of today's range")
+    missing = rs is None or rvol is None or any(value is None for value in values.values())
+    uncertain = missing or momentum.get("quality") != "FULL"
+    if bad:
+        label = "Extended" if extension is not None and extension > 0.5 else "Weak"
+        tone, reasons = "BAD", bad + normal
+    elif missing:
+        label, tone, reasons = "Check data", "UNKNOWN", ["Required condition data missing", *normal]
+    elif normal:
+        label, tone, reasons = "Mixed", "NORMAL", normal
+    elif uncertain:
+        label, tone, reasons = "Confirm", "UNKNOWN", ["Strong reported metrics; confirm estimated data"]
+    else:
+        label, tone, reasons = "Strong", "GOOD", ["Strength, volume, trend and entry checks passed"]
+    return {"label": label, "tone": tone, "reasons": reasons, "metrics": ratings,
+            "data_uncertain": uncertain}
+
+
 def _bars(frame: pd.DataFrame, now: dt.datetime) -> pd.DataFrame:
     if frame.empty or not isinstance(frame.index, pd.DatetimeIndex) or frame.index.tz is None:
         return pd.DataFrame()
@@ -190,7 +247,7 @@ def evaluate_momentum(
     quality = "PARTIAL" if missing else "ESTIMATED" if warnings else "FULL"
     candidate = not flags and not warnings
     reasons = flags + warnings
-    return {
+    result = {
         "version": MOMENTUM_VERSION, "benchmark": BENCHMARK,
         "status": "PARTIAL" if missing else "LEADING" if candidate else "WATCH", "candidate": candidate,
         "reason": "; ".join(reasons) if reasons else "Leading SPY with volume support and a nearby planned entry",
@@ -202,12 +259,15 @@ def evaluate_momentum(
         "vwap": vwap, "vwap_distance_percent": (price / vwap - 1) * 100 if vwap else None,
         "range_location_percent": location, "high_distance_percent": (price / high - 1) * 100 if high else None,
         "entry_extension_adr": extension_adr, "entry_window": plan["window"],
+        "breakout_distance_percent": (price / breakout - 1) * 100,
         "components": {key: round(value, 1) if value is not None else None for key, value in components.items()},
         "quality": quality, "missing_components": missing, "component_coverage_percent": round(available_weight * 100),
         "bar_coverage_percent": round(coverage, 1), "rvol_estimated": rvol_estimated,
         "rvol_bar_coverage_percent": round(min([coverage, *prior_coverages]), 1) if prior_coverages else None,
         "session_closed": session_closed,
     }
+    result["assessment"] = assess_momentum(result)
+    return result
 
 
 def assign_momentum_ranks(rows: list[dict]) -> None:

@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 import pytest
 
 from src.utils.market_calendar import US_MARKET_ZONE
+from src.core.intraday_momentum import assess_momentum
 from src.web.assets import ReleaseAssets
 
 
@@ -54,18 +55,25 @@ def test_monitor_table_best_orb_filter_and_completed_range_explanation(width, tm
             "rank": rank, "candidate": candidate, "as_of": now.isoformat(),
             "reason": "Leading SPY with volume support" if candidate else "More than 0.5 ADR above planned entry",
             "rs_open_pp": 1.9, "rvol": 2.5, "rvol_sessions": 4,
+            "stock_return_open_percent": 2, "breakout_distance_percent": 1, "quality": "FULL",
             "vwap_distance_percent": 1.2, "range_location_percent": 95,
             "entry_extension_adr": .12, "entry_window": "5m",
             "components": {"relative_strength": 95, "relative_volume": 75, "trend": 97, "entry": 76},
         }
     estimated = next(row for row in rows if row["symbol"] == "WATCH_HIGH")
     estimated["momentum"].update(quality="ESTIMATED", rvol_estimated=True, bar_coverage_percent=90)
+    estimated["momentum"].update(rs_open_pp=5, rvol=1.8, entry_extension_adr=.7)
+    next(row for row in rows if row["symbol"] == "LEADER_TWO")["momentum"].update(rs_open_pp=.2, rvol=1)
     partial = {**estimated, "symbol": "PARTIAL", "name": "PARTIAL",
                "momentum": {**estimated["momentum"], "status": "PARTIAL", "quality": "PARTIAL",
                             "rank": 4, "score": 64, "component_coverage_percent": 75,
                             "rvol": None, "rvol_sessions": 2, "rvol_estimated": False,
                             "components": {**estimated["momentum"]["components"], "relative_volume": None}}}
     rows.append(partial)
+    partial["momentum"].update(entry_extension_adr=.12)
+    for row in rows:
+        if row.get("momentum"):
+            row["momentum"]["assessment"] = assess_momentum(row["momentum"])
     session = {"mode": "CONNECTED", "csrf_token": "test",
                "market_status": {"state": "OPEN", "phase": "REGULAR"}}
     errors, mutations = [], []
@@ -116,16 +124,29 @@ def test_monitor_table_best_orb_filter_and_completed_range_explanation(width, tm
             page.locator("#mobile-list-items").evaluate("node => {node.scrollLeft = 80}")
             page.locator('[data-monitor-filter="orb"]').click()
             assert page.locator(".mobile-monitor-row").evaluate_all("rows => rows.map(row => row.dataset.mobileSymbol)") == ["BEST", "LEADER_TWO", "WATCH_HIGH", "PARTIAL", "PASS_STALE"]
-            assert page.locator(".mobile-monitor-table th").all_inner_texts() == ["Stock", "Momentum", "RS/SPY pp", "RVOL", "Today %", "Breakout", "Best ORB", "1M %", "3M %", "+"]
+            assert page.locator(".mobile-monitor-table th").all_inner_texts() == ["Stock", "Condition", "Momentum", "RS/SPY pp", "RVOL", "Today %", "Breakout", "Best ORB", "1M %", "3M %", "+"]
             assert page.locator('[data-mobile-symbol="BEST"] .mobile-monitor-momentum').inner_text() == "#1 · 79"
             assert page.locator('[data-mobile-symbol="BEST"] .mobile-monitor-strength').inner_text() == "+1.90"
-            assert page.locator('[data-mobile-symbol="BEST"] .mobile-monitor-volume').inner_text() == "2.5x"
+            assert page.locator('[data-mobile-symbol="BEST"] .mobile-monitor-volume').inner_text() == "2.50x"
+            assert page.locator('[data-mobile-symbol="BEST"] .momentum-condition').inner_text() == "Strong"
+            assert page.locator('[data-mobile-symbol="BEST"] .momentum-condition').get_attribute("data-rating") == "GOOD"
+            assert page.locator('[data-mobile-symbol="LEADER_TWO"] .momentum-condition').inner_text() == "Mixed"
+            for key in ("strength", "volume"):
+                assert page.locator(f'[data-mobile-symbol="BEST"] .mobile-monitor-{key}').get_attribute("data-rating") == "GOOD"
+                neutral = page.locator(f'[data-mobile-symbol="LEADER_TWO"] .mobile-monitor-{key}')
+                assert neutral.get_attribute("data-rating") == "NORMAL"
+                assert neutral.evaluate("node => getComputedStyle(node).color") == "rgb(243, 245, 244)"
             assert page.locator('[data-mobile-symbol="PASS_STALE"] .mobile-monitor-momentum').inner_text() == "Stale"
             assert page.locator('[data-mobile-symbol="WATCH_HIGH"] .mobile-monitor-momentum').inner_text() == "#3 · 95*"
-            assert page.locator('[data-mobile-symbol="WATCH_HIGH"] .mobile-monitor-volume').inner_text() == "~2.5x"
+            assert page.locator('[data-mobile-symbol="WATCH_HIGH"] .mobile-monitor-volume').inner_text() == "~1.80x"
+            assert page.locator('[data-mobile-symbol="WATCH_HIGH"] .mobile-monitor-strength').inner_text() == "+5.00"
+            assert page.locator('[data-mobile-symbol="WATCH_HIGH"] .momentum-condition').inner_text() == "Extended"
+            assert page.locator('[data-mobile-symbol="WATCH_HIGH"] .momentum-condition').get_attribute("data-rating") == "BAD"
             assert page.locator('[data-mobile-symbol="PARTIAL"] .mobile-monitor-momentum').inner_text() == "#4 · 64*"
-            assert page.locator('[data-mobile-symbol="PARTIAL"] .mobile-monitor-strength').inner_text() == "+1.90"
+            assert page.locator('[data-mobile-symbol="PARTIAL"] .mobile-monitor-strength').inner_text() == "+5.00"
             assert page.locator('[data-mobile-symbol="PARTIAL"] .mobile-monitor-volume').inner_text() == "—"
+            assert page.locator('[data-mobile-symbol="PARTIAL"] .momentum-condition').inner_text() == "Check data"
+            assert page.locator('[data-mobile-symbol="PASS_STALE"] .momentum-condition').inner_text() == "Stale"
             stale = page.locator('[data-mobile-symbol="PASS_STALE"] .mobile-monitor-result')
             assert stale.inner_text() == "1m · 0.5%*"
             assert "Passed earlier · latest quote stale" in stale.get_attribute("title")
@@ -137,7 +158,8 @@ def test_monitor_table_best_orb_filter_and_completed_range_explanation(width, tm
             assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
             page.screenshot(path=str(tmp_path / f"monitor-orb-filter-{width}.png"))
             page.locator("#mobile-list-items").evaluate("node => {node.scrollLeft = 0}")
-            page.locator('[data-mobile-symbol="BEST"] .mobile-monitor-momentum button').click()
+            page.locator('[data-mobile-symbol="BEST"] .momentum-condition').click()
+            assert "Strong:" in page.locator("#mobile-momentum-condition").inner_text()
             assert "Leading · #1 · 78.6/100" in page.locator("#mobile-momentum-heading").inner_text()
             assert "RVOL 2.50x (4 sessions)" in page.locator("#mobile-momentum-metrics").inner_text()
             assert "Entry +0.12 ADR (5m)" in page.locator("#mobile-momentum-metrics").inner_text()
@@ -154,8 +176,28 @@ def test_monitor_table_best_orb_filter_and_completed_range_explanation(width, tm
             page.locator("#mobile-momentum-help summary").click()
             assert "40% strength vs SPY" in page.locator("#mobile-momentum-help").inner_text()
             assert "not a win probability" in page.locator("#mobile-momentum-help").inner_text()
+            assert "1.8× is 80% above usual" in page.locator("#mobile-momentum-help").inner_text()
             assert not errors and not mutations
             assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+            best["momentum"]["rvol"] = .99
+            best["momentum"]["assessment"] = assess_momentum(best["momentum"])
+            page.reload()
+            page.locator("#mobile-list-menu").click()
+            page.locator('[data-monitor-filter="orb"]').click()
+            assert page.locator('[data-mobile-symbol="BEST"] .mobile-monitor-momentum').inner_text() == "#1 · 79"
+            assert page.locator('[data-mobile-symbol="BEST"] .momentum-condition').inner_text() == "Weak"
+            volume = page.locator('[data-mobile-symbol="BEST"] .mobile-monitor-volume')
+            assert volume.inner_text() == "0.99x"
+            assert volume.get_attribute("data-rating") == "BAD"
+            assert volume.evaluate("node => getComputedStyle(node).color") == "rgb(255, 140, 149)"
+            assert "No Strong setups" in page.locator("#mobile-monitor-status").inner_text()
+            assert max(page.locator(".mobile-monitor-row").evaluate_all("rows => rows.map(row => row.getBoundingClientRect().height)")) <= 42
+            page.screenshot(path=str(tmp_path / f"monitor-rank-one-weak-{width}.png"))
+            best["momentum"]["rvol"] = 2.5
+            best["momentum"]["assessment"] = assess_momentum(best["momentum"])
+            page.reload()
+            page.locator("#mobile-list-menu").click()
+            page.locator('[data-monitor-filter="orb"]').click()
             page.locator("#mobile-monitor-search").fill("LEADER")
             assert page.locator('[data-mobile-symbol="LEADER_TWO"] .mobile-monitor-momentum').inner_text() == "#2 · 65"
             page.evaluate("Date.now = () => new Date().getTime() + 600000")

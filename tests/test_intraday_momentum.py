@@ -6,7 +6,7 @@ import pandas as pd
 import pytest
 
 from src.core.intraday_momentum import (
-    assign_momentum_ranks, best_passed_orb, evaluate_momentum,
+    assess_momentum, assign_momentum_ranks, best_passed_orb, evaluate_momentum,
 )
 from src.utils.market_calendar import US_MARKET_ZONE
 
@@ -268,3 +268,54 @@ def test_orb_geometry_uses_existing_best_plan_without_changing_it():
     before = [dict(plan) for plan in row["orb"]]
     evaluate(row=row)
     assert row["orb"] == before
+
+
+@pytest.mark.parametrize("rs, expected", [(-0.01, "BAD"), (0, "NORMAL"),
+                                        (0.49, "NORMAL"), (0.5, "GOOD"), (5, "GOOD")])
+def test_relative_strength_color_bands_have_explicit_boundaries(rs, expected):
+    result = evaluate()
+    result["rs_open_pp"] = rs
+    assert assess_momentum(result)["metrics"]["rs"] == expected
+
+
+@pytest.mark.parametrize("rvol, expected", [(0.99, "BAD"), (1, "NORMAL"),
+                                          (1.49, "NORMAL"), (1.5, "GOOD"), (1.8, "GOOD")])
+def test_relative_volume_one_is_normal_and_one_point_eight_is_good(rvol, expected):
+    result = evaluate()
+    result["rvol"] = rvol
+    assert assess_momentum(result)["metrics"]["rvol"] == expected
+
+
+@pytest.mark.parametrize("updates, label, tone, reason", [
+    ({}, "Strong", "GOOD", "checks passed"),
+    ({"rs_open_pp": 0.2}, "Mixed", "NORMAL", "RS below"),
+    ({"rvol": 1}, "Mixed", "NORMAL", "RVOL below"),
+    ({"range_location_percent": 60}, "Mixed", "NORMAL", "Below top quarter"),
+    ({"entry_extension_adr": 0.501}, "Extended", "BAD", "above entry"),
+    ({"entry_extension_adr": -0.501}, "Weak", "BAD", "below entry"),
+    ({"rs_open_pp": -0.01}, "Weak", "BAD", "Lagging SPY"),
+    ({"rvol": 0.99}, "Weak", "BAD", "Volume below normal"),
+    ({"stock_return_open_percent": 0}, "Weak", "BAD", "Not advancing"),
+    ({"vwap_distance_percent": 0}, "Weak", "BAD", "At or below VWAP"),
+    ({"breakout_distance_percent": -0.01}, "Weak", "BAD", "Below daily breakout"),
+    ({"range_location_percent": 49}, "Weak", "BAD", "lower half"),
+    ({"rvol": None, "quality": "PARTIAL"}, "Check data", "UNKNOWN", "data missing"),
+    ({"quality": "ESTIMATED"}, "Confirm", "UNKNOWN", "estimated data"),
+    ({"quality": "PARTIAL", "rvol": None, "rs_open_pp": -1}, "Weak", "BAD", "Lagging SPY"),
+])
+def test_absolute_conditions_are_independent_of_rank_and_score(updates, label, tone, reason):
+    result = {**evaluate(), "score": 99, "rank": 1, **updates}
+    assessment = assess_momentum(result)
+    assert assessment["label"] == label
+    assert assessment["tone"] == tone
+    assert any(reason in item for item in assessment["reasons"])
+    assert result["score"] == 99 and result["rank"] == 1
+
+
+def test_evaluation_includes_condition_and_preserves_bad_first_rank():
+    result = evaluate(history(end=110, volume=900))
+    row = {"symbol": "ONLY", "momentum": result}
+    assign_momentum_ranks([row])
+    assert result["rank"] == 1
+    assert result["assessment"]["label"] == "Extended"
+    assert result["assessment"]["metrics"] == {"rs": "GOOD", "rvol": "BAD"}

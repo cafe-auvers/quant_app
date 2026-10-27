@@ -323,7 +323,32 @@ An earlier confirmed ORB with a stale quote has an asterisk and amber text,
 with its stale status in the tooltip. It does not claim a fresh entry signal.
 Hover over the stock for its company name, latest price, and quote time.
 
-Within **ORB passed**, the table adds **Momentum**, **RS/SPY pp**, and **RVOL**.
+Within **ORB passed**, the table adds **Condition**, **Momentum**, **RS/SPY pp**, and **RVOL**.
+Condition is independent of relative rank: #1 can still show **Weak** or
+**Extended**. The always-visible legend uses these starting heuristics:
+
+| Metric | Green: good | White: normal | Red: bad |
+| --- | --- | --- | --- |
+| RS/SPY, percentage points since open | ≥ +0.5 pp | 0 to < +0.5 pp | < 0 pp |
+| RVOL, same-time cumulative volume | ≥ 1.5× | 1 to < 1.5× | < 1× |
+
+RVOL 1× means usual volume at this time; 1.8× means 80% above the median
+of the available comparison sessions. RS +5 pp means outperforming SPY by
+5 percentage points since the open, not a 5% probability of success.
+
+**Strong** (green) requires all the volume, trend, breakout and entry checks
+used for Leading, RS ≥ +0.5 pp, and complete data. **Mixed** (white) means
+ordinary RS, ordinary volume, or a range position between 50% and 75%.
+**Weak** (red) flags lagging SPY, volume below 1×, no gain since open,
+price at/below VWAP, below breakout, in the lower half of the range, or
+more than 0.5 ADR below entry. **Extended** (red) flags more than 0.5 ADR
+above entry, even with a high score. Known failures take priority over
+missing data. **Confirm** (amber) means otherwise strong reported metrics
+with estimated data; **Check data** (amber) means required evidence is missing.
+Stale observations cannot show a green condition. After close, labels describe
+closing conditions for review. Tap the condition for specific reasons.
+These bands are unvalidated heuristics; the scoring weights and rank order are unchanged.
+
 Tap Momentum for the score components, VWAP distance, session-range position,
 entry distance in ADR, data time, and reasons. Leading candidates sort first,
 then Watch candidates, by score within each group; unavailable/stale evidence
