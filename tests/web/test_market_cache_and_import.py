@@ -232,6 +232,52 @@ def test_cache_eviction_never_removes_pinned_symbol(tmp_path):
     assert len({path.name.split('.')[0] for path in tmp_path.glob('*.json.gz')}) == 25
 
 
+def test_eviction_tolerates_file_removed_by_another_cache(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    cache = ChartBundleCache(tmp_path, max_symbols=1)
+    source = DemoMarketDataSource()
+    for symbol in ('AAPL', 'MSFT'):
+        cache.write(source.chart_bundle(symbol, '1D', daily_bars=50, hourly_months=1))
+    original_stat = Path.stat
+    vanished = tmp_path / 'AAPL.1D.json.gz'
+
+    def remove_before_stat(path, *args, **kwargs):
+        if path == vanished:
+            path.unlink(missing_ok=True)
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'stat', remove_before_stat)
+    cache.evict(pinned_symbols={'MSFT'})
+    assert cache.publication_artifact('MSFT', '1D') is not None
+
+
+def test_active_chart_requests_survive_parallel_cache_eviction(tmp_path):
+    import threading
+
+    barrier = threading.Barrier(2)
+
+    class RacingCache(ChartBundleCache):
+        def evict(self, **kwargs):
+            barrier.wait(timeout=10)
+            return super().evict(**kwargs)
+
+    async def run():
+        coordinator = ChartLoadCoordinator(
+            DemoMarketDataSource(), RacingCache(tmp_path, max_symbols=1),
+            daily_bars=50, hourly_months=1)
+        values = await asyncio.gather(
+            coordinator.get_compressed('AAPL', '1D'),
+            coordinator.get_compressed('MSFT', '1D'))
+        assert len(values) == 2
+        assert not coordinator._request_pins
+        for (artifact, hit), symbol in zip(values, ('AAPL', 'MSFT')):
+            assert not hit
+            assert json.loads(gzip.decompress(artifact.content))['symbol'] == symbol
+
+    asyncio.run(run())
+
+
 def test_concurrent_chart_load_is_deduplicated(tmp_path):
     class CountingSource(DemoMarketDataSource):
         def __init__(self):

@@ -8,6 +8,8 @@ import os
 import tempfile
 import threading
 import time
+from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -251,28 +253,33 @@ class ChartBundleCache:
         return PublicationArtifact(compressed, manifest)
 
     def evict(self, *, pinned_symbols: set[str]) -> list[str]:
+        with self._lock:
+            return self._evict_locked(pinned_symbols=pinned_symbols)
+
+    def _evict_locked(self, *, pinned_symbols: set[str]) -> list[str]:
         pinned = {normalize_symbol(symbol) for symbol in pinned_symbols}
         bundles = list(self.directory.glob("*.json.gz"))
         symbols = {path.name.split(".", 1)[0] for path in bundles}
         excess = max(0, len(symbols) - self.max_symbols)
         if excess == 0:
             return []
-        candidates = sorted(
-            (
-                path
-                for path in bundles
-                if path.name.split(".", 1)[0] not in pinned
-            ),
-            key=lambda path: path.stat().st_mtime,
-        )
+        candidates = []
+        for path in bundles:
+            if path.name.split(".", 1)[0] in pinned:
+                continue
+            try:
+                candidates.append((path.stat().st_mtime, path))
+            except FileNotFoundError:
+                continue
+        candidates.sort(key=lambda item: item[0])
         removed: list[str] = []
-        for path in candidates:
+        for _, path in candidates:
             symbol = path.name.split(".", 1)[0]
             if symbol in removed:
                 continue
             for target in self.directory.glob(f"{symbol}.*"):
                 if target.is_file():
-                    target.unlink()
+                    target.unlink(missing_ok=True)
             removed.append(symbol)
             if len(removed) >= excess:
                 break
@@ -298,6 +305,7 @@ class ChartLoadCoordinator:
         self.hourly_months = hourly_months
         self._pinned_symbols = pinned_symbols or (lambda: set())
         self._runtime_pins: set[str] = set()
+        self._request_pins: Counter[str] = Counter()
         self._pin_lock = threading.Lock()
         self._semaphore = asyncio.Semaphore(worker_limit)
         self._inflight: dict[str, asyncio.Task[CachedBundle]] = {}
@@ -317,8 +325,20 @@ class ChartLoadCoordinator:
 
     def _all_pins(self) -> set[str]:
         with self._pin_lock:
-            runtime = set(self._runtime_pins)
+            runtime = set(self._runtime_pins) | set(self._request_pins)
         return runtime | set(self._pinned_symbols())
+
+    @contextmanager
+    def _pin_request(self, symbol: str):
+        with self._pin_lock:
+            self._request_pins[symbol] += 1
+        try:
+            yield
+        finally:
+            with self._pin_lock:
+                self._request_pins[symbol] -= 1
+                if not self._request_pins[symbol]:
+                    del self._request_pins[symbol]
 
     def _cache_expectations(self, symbol: str, timeframe: str) -> dict[str, str]:
         return {
@@ -353,7 +373,8 @@ class ChartLoadCoordinator:
         symbol = normalize_symbol(symbol)
         timeframe = timeframe.strip().upper()
         self.request_count += 1
-        return await self._get_payload(symbol, timeframe, refresh=refresh)
+        with self._pin_request(symbol):
+            return await self._get_payload(symbol, timeframe, refresh=refresh)
 
     async def get_compressed(
         self, symbol: str, timeframe: str, *, refresh: bool = False
@@ -363,6 +384,12 @@ class ChartLoadCoordinator:
         symbol = normalize_symbol(symbol)
         timeframe = timeframe.strip().upper()
         self.request_count += 1
+        with self._pin_request(symbol):
+            return await self._get_compressed(symbol, timeframe, refresh=refresh)
+
+    async def _get_compressed(
+        self, symbol: str, timeframe: str, *, refresh: bool
+    ) -> tuple[PublicationArtifact, bool]:
         if not refresh:
             artifact = await anyio.to_thread.run_sync(
                 lambda: self.cache.publication_artifact(
