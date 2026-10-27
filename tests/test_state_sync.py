@@ -260,6 +260,7 @@ def test_live_trading_control_is_scoped_to_session_and_release(tmp_path):
         True,
         session_date=session_date,
         runtime_commit_sha=release_sha,
+        persist_across_sessions=False,
     )
 
     assert written.success is True
@@ -282,6 +283,51 @@ def test_live_trading_control_is_scoped_to_session_and_release(tmp_path):
         now=after_close,
         runtime_commit_sha=release_sha,
     )
+
+
+def test_live_trading_on_persists_across_sessions_restart_and_handoff(tmp_path):
+    engine = _make_engine(tmp_path)
+    role = ss.LocalDeviceRole("pc-id", "PC", True)
+    release_sha = "a" * 40
+    enabled = ss.set_live_trading_control(
+        engine, role, True,
+        session_date=dt.date(2026, 10, 7), runtime_commit_sha=release_sha,
+    )
+    assert enabled.success
+    assert enabled.control.persist_across_sessions is True
+    assert ss.claim_main_device(engine, role).success
+    assert ss.claim_main_device(engine, ss.LocalDeviceRole("laptop-id", "LAPTOP")).success
+    engine.dispose()
+
+    restarted = _make_engine(tmp_path)
+    control = ss.get_live_trading_control(restarted).control
+    assert control.persist_across_sessions is True
+    assert ss.live_trading_control_is_effective(
+        control, now=dt.datetime(2026, 10, 20, 14, tzinfo=dt.timezone.utc),
+        runtime_commit_sha=release_sha,
+    )
+    assert not ss.live_trading_control_is_effective(
+        control, runtime_commit_sha="b" * 40,
+    )
+    disabled = ss.set_live_trading_control(restarted, role, False)
+    assert disabled.success
+    assert disabled.control.persist_across_sessions is False
+    assert not ss.get_live_trading_control(restarted).control.enabled
+
+
+@pytest.mark.parametrize("value", ["true", "false", 1, None])
+def test_invalid_live_control_persistence_fails_closed(tmp_path, value):
+    engine = _make_engine(tmp_path)
+    role = ss.LocalDeviceRole("pc-id", "PC")
+    result = ss.set_live_trading_control(engine, role, True, persist_across_sessions=value)
+    assert result.success is False
+    assert ss.get_live_trading_control(engine).control.enabled is False
+    with pytest.raises(ValueError, match="invalid persistence"):
+        ss._live_trading_control_from_state(ss.RemoteState(
+            payload={"enabled": True, "persist_across_sessions": value}, revision=1,
+            updated_at=dt.datetime.now(dt.timezone.utc), updated_by_host="PC",
+            updated_by_device="pc-id",
+        ))
 
 
 def test_legacy_unscoped_live_control_fails_closed():

@@ -151,6 +151,7 @@ class LiveTradingControl:
     updated_by_device: str = ""
     session_date: Optional[date] = None
     runtime_commit_sha: str = ""
+    persist_across_sessions: bool = False
 
 
 @dataclass(frozen=True)
@@ -166,6 +167,9 @@ def _live_trading_control_from_state(state: RemoteState) -> LiveTradingControl:
         raise ValueError(
             "Shared live-trading control has an invalid enabled value."
         )
+    persistent = state.payload.get("persist_across_sessions", False)
+    if not isinstance(persistent, bool):
+        raise ValueError("Shared live-trading control has an invalid persistence value.")
     raw_session_date = str(state.payload.get("session_date") or "").strip()
     session_date = None
     if raw_session_date:
@@ -185,6 +189,7 @@ def _live_trading_control_from_state(state: RemoteState) -> LiveTradingControl:
         runtime_commit_sha=str(
             state.payload.get("runtime_commit_sha") or ""
         ).strip().lower(),
+        persist_across_sessions=persistent,
     )
 
 
@@ -194,18 +199,19 @@ def live_trading_control_block_reason(
     now: Optional[datetime] = None,
     runtime_commit_sha: Optional[str] = None,
 ) -> str:
-    """Explain why a durable live switch is ineffective for this session."""
+    """Explain why the operator's durable live switch is ineffective."""
 
     if not control.enabled:
         return "shared live-trading control is disabled"
-    expected_session = current_or_next_nyse_session_date(now)
-    if control.session_date is None:
-        return "shared live-trading control predates session-scoped arming"
-    if control.session_date != expected_session:
-        return (
-            f"shared live-trading control is armed for {control.session_date}, "
-            f"not {expected_session}"
-        )
+    if not control.persist_across_sessions:
+        expected_session = current_or_next_nyse_session_date(now)
+        if control.session_date is None:
+            return "shared live-trading control predates session-scoped arming"
+        if control.session_date != expected_session:
+            return (
+                f"shared live-trading control is armed for {control.session_date}, "
+                f"not {expected_session}"
+            )
     expected_commit = str(
         runtime_commit_sha
         if runtime_commit_sha is not None
@@ -602,6 +608,7 @@ def set_live_trading_control(
     *,
     session_date: Optional[date] = None,
     runtime_commit_sha: Optional[str] = None,
+    persist_across_sessions: bool = True,
 ) -> LiveTradingControlResult:
     """Atomically set the global kill switch from either registered device.
 
@@ -609,6 +616,8 @@ def set_live_trading_control(
     execute; this row controls whether execution is armed for the deployment.
     The row lock serializes simultaneous operator actions, so the last
     committed action wins and every change advances the durable revision.
+    Normal ON actions persist until OFF for the same approved release. A
+    supervised session can explicitly request session-scoped authorization.
     """
 
     if engine is None:
@@ -616,6 +625,8 @@ def set_live_trading_control(
             False,
             error="Shared live-trading database is unavailable.",
         )
+    if not isinstance(persist_across_sessions, bool):
+        return LiveTradingControlResult(False, error="Persistence must be a boolean.")
     try:
         table = _ensure_state_sync_table(engine)
         audit_table = _ensure_live_trading_control_audit_table(engine)
@@ -648,6 +659,7 @@ def set_live_trading_control(
                     armed_session.isoformat() if armed_session else ""
                 ),
                 "runtime_commit_sha": armed_commit,
+                "persist_across_sessions": bool(enabled and persist_across_sessions),
             }
             values = {
                 "payload": json.dumps(

@@ -51,3 +51,37 @@ def test_duplicate_cancel_or_contradictory_fill_stays_unresolved():
     for rows in ([original,cancel,cancel], [original,cancel,replace(original,filled_quantity=1)],
                  [original], [replace(original,filled_quantity=1),cancel]):
         assert authoritative_order_history(rows) == rows
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_cancel_after_korean_midnight_uses_domestic_calendar_date(reverse):
+    original, cancel = _rows()
+    original.raw_response.update(
+        ord_dt="20261007", ord_tmd="231828",
+        dmst_ord_dt="20261007", thco_ord_tmd="231828",
+    )
+    cancel.raw_response.update(
+        ord_dt="20261007", ord_tmd="015526",
+        dmst_ord_dt="20261008", thco_ord_tmd="015526",
+    )
+    rows = [cancel, original] if reverse else [original, cancel]
+    assert authoritative_order_history(rows) == [cancel]
+
+
+@pytest.mark.parametrize("proof", [
+    {"dmst_ord_dt": "20261007", "thco_ord_tmd": "231827"},
+    {"dmst_ord_dt": "20261008"},
+    {"thco_ord_tmd": "015526"},
+    {"dmst_ord_dt": "invalid", "thco_ord_tmd": "015526"},
+    {"dmst_ord_dt": "20261009", "thco_ord_tmd": "015526"},
+    {"dmst_ord_dt": "20261008", "thco_ord_tmd": "015526", "ord_dt": ""},
+    {},
+])
+def test_earlier_or_incomplete_domestic_time_does_not_retire_original(proof):
+    original, cancel = _rows()
+    original.raw_response.update(
+        dmst_ord_dt="20261007", thco_ord_tmd="231828",
+    )
+    cancel.raw_response.update(proof)
+    rows = [original, cancel]
+    assert authoritative_order_history(rows) == rows

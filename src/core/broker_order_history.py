@@ -1,7 +1,7 @@
 """Resolve KIS original rows only when an exact zero-fill cancel proves retirement."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Sequence
 
 from src.core.order_state import BrokerOrderStatusSnapshot, OrderStatus
@@ -11,15 +11,48 @@ def _identity(row: BrokerOrderStatusSnapshot) -> tuple:
     return (row.environment, row.account_no, row.symbol, row.side, row.broker_order_id)
 
 
-def _broker_time(row: BrokerOrderStatusSnapshot) -> datetime | None:
-    date = str(row.raw_response.get("ord_dt") or "")
-    time = str(row.raw_response.get("ord_tmd") or "")
+def _broker_time(
+    row: BrokerOrderStatusSnapshot, *, domestic: bool = False
+) -> datetime | None:
+    date_key, time_key = (
+        ("dmst_ord_dt", "thco_ord_tmd") if domestic else ("ord_dt", "ord_tmd")
+    )
+    date = str(row.raw_response.get(date_key) or "")
+    time = str(row.raw_response.get(time_key) or "")
     if len(date) != 8 or len(time) != 6 or not (date + time).isdigit():
         return None
     try:
         return datetime.strptime(date + time, "%Y%m%d%H%M%S")
     except ValueError:
         return None
+
+
+def _cancel_is_later(
+    original: BrokerOrderStatusSnapshot, cancel: BrokerOrderStatusSnapshot
+) -> bool:
+    # ord_dt is the trading date, while Korean clock times can cross midnight.
+    # Use the broker's domestic calendar date/time pair when it is supplied.
+    session_date = str(original.raw_response.get("ord_dt") or "")
+    if session_date != str(cancel.raw_response.get("ord_dt") or ""):
+        return False
+    try:
+        if len(session_date) != 8:
+            return False
+        datetime.strptime(session_date, "%Y%m%d")
+    except ValueError:
+        return False
+    domestic = any(
+        row.raw_response.get(key)
+        for row in (original, cancel)
+        for key in ("dmst_ord_dt", "thco_ord_tmd")
+    )
+    original_time = _broker_time(original, domestic=domestic)
+    cancel_time = _broker_time(cancel, domestic=domestic)
+    return bool(
+        original_time is not None
+        and cancel_time is not None
+        and timedelta(0) <= cancel_time - original_time <= timedelta(days=1)
+    )
 
 
 def _cancel_code(row: BrokerOrderStatusSnapshot) -> str:
@@ -54,11 +87,8 @@ def authoritative_order_history(
         # identity unresolved rather than hiding a contradictory observation.
         if any(row.filled_quantity or row.remaining_quantity for row in same):
             continue
-        original_time, cancel_time = _broker_time(original), _broker_time(cancel)
         if (cancel.status == OrderStatus.CANCELLED
                 and cancel.quantity_requested == original.quantity_requested
-                and original_time is not None and cancel_time is not None
-                and cancel_time.date() == original_time.date()
-                and cancel_time >= original_time):
+                and _cancel_is_later(original, cancel)):
             retired.add(index)
     return [row for index, row in enumerate(rows) if index not in retired]

@@ -46,26 +46,37 @@ def get_latest_price_history_dates(
     metadata = MetaData()
     price_history = _get_price_history_table(metadata)
     rows = []
+    conn = None
     try:
         _ensure_price_history_table(engine)
-        with engine.connect() as conn:
-            for chunk in _record_chunks(cleaned_symbols, CACHE_QUERY_SYMBOL_CHUNK_SIZE):
-                stmt = (
-                    select(
-                        price_history.c.symbol,
-                        func.max(price_history.c.date).label("latest_date"),
-                    )
-                    .where(
-                        price_history.c.symbol.in_(chunk),
-                        price_history.c.interval == interval.strip().lower(),
-                    )
-                    .group_by(price_history.c.symbol)
+        conn = engine.connect()
+        for chunk in _record_chunks(cleaned_symbols, CACHE_QUERY_SYMBOL_CHUNK_SIZE):
+            stmt = (
+                select(
+                    price_history.c.symbol,
+                    func.max(price_history.c.date).label("latest_date"),
                 )
+                .where(
+                    price_history.c.symbol.in_(chunk),
+                    price_history.c.interval == interval.strip().lower(),
+                )
+                .group_by(price_history.c.symbol)
+            )
+            try:
+                rows.extend(conn.execute(stmt).all())
+            except SQLAlchemyError:
+                # Match hourly verification: retry a transient timeout once
+                # on a fresh connection without discarding completed chunks.
+                conn.close()
+                conn = engine.connect()
                 rows.extend(conn.execute(stmt).all())
     except SQLAlchemyError as exc:
         if strict:
             raise RuntimeError("Unable to verify latest price-history dates") from exc
         return {}
+    finally:
+        if conn is not None:
+            conn.close()
 
     return {str(row.symbol).upper(): row.latest_date for row in rows if row.latest_date is not None}
 

@@ -57,6 +57,17 @@ from src.services import account_reconciliation as reconciliation_module
 NOW = datetime(2026, 8, 15, 14, 0, tzinfo=timezone.utc)
 
 
+@pytest.mark.parametrize('status', [OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.EXPIRED])
+def test_exact_terminal_snapshot_clears_remaining_open_quantity(status):
+    order = _order(status=ExecutionOrderStatus.CANCEL_PENDING if status == OrderStatus.CANCELLED
+                   else ExecutionOrderStatus.WORKING)
+    snapshot = BrokerOrderStatusSnapshot(
+        environment='PROD', account_no='1', symbol='AAPL', broker_order_id='B-1',
+        quantity_requested=10, status=status, filled_quantity=0, remaining_quantity=0)
+    reconciliation_module._apply_exact_order_snapshot(order, snapshot)
+    assert order.remaining_quantity == 0
+
+
 def test_prefetched_snapshot_is_account_scoped_and_cannot_be_applied_elsewhere(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'snapshot-account.db'}", future=True)
     snapshot = AccountBrokerSnapshot(environment="PROD", account_no="other",

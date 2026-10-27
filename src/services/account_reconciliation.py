@@ -692,7 +692,9 @@ def _apply_exact_order_snapshot(
     before = copy.deepcopy(order)
     _clear_absence(order)
     order.filled_quantity = max(order.filled_quantity, snapshot.filled_quantity)
-    if snapshot.remaining_quantity or snapshot.status == OrderStatus.FILLED:
+    if snapshot.remaining_quantity or snapshot.status in {
+        OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.EXPIRED,
+    }:
         order.remaining_quantity = max(0, snapshot.remaining_quantity)
     else:
         order.remaining_quantity = max(
