@@ -11,6 +11,7 @@ from src.core.broker_order_history import authoritative_order_history
 
 import copy
 import logging
+import math
 import threading
 import time
 import weakref
@@ -909,6 +910,113 @@ def _clear_entry_card_tracking(
         card.entry_attempt_group_id = ""
 
 
+def _recover_detached_working_entry(
+    card: Optional[TradeCardState],
+    order: ExecutionOrderRecord,
+    broker: BrokerOrderStatusSnapshot,
+    snapshot: AccountBrokerSnapshot,
+    orders: Sequence[ExecutionOrderRecord],
+    reservations: Mapping[str, CapitalReservation],
+) -> bool:
+    """Restore a lost link only from one proven, current-session obligation."""
+    if card is None or _card_tracks_order(card, order):
+        return False
+    if (
+        card.board_status not in (BoardStatus.BUY_TODAY, BoardStatus.ENTRY_PENDING)
+        or card.broker_quantity
+        or card.entry_submission_unresolved
+        or card.entry_cancel_in_flight
+        or card.entry_cancel_reason
+        or card.entry_block_reason in ("cancel_requested", "eod_cancel_requested")
+        or card.pending_entry_replacement
+        or card.exit_all_required
+        or card.stop_loss_triggered
+        or card.pending_partial_sell_quantity
+        or card.reserved_sell_quantity
+        or card.exit_submission_unresolved
+        or card.exit_cancel_in_flight
+        or card.exit_client_order_id
+        or card.entry_parent_intent_id not in ("", order.attempt_group_id)
+        or card.entry_order_generation > 1
+        or card.session_date != snapshot.session_date
+        or not snapshot.completeness.holdings_complete
+        or not snapshot.completeness.open_orders_complete
+        or not snapshot.completeness.history_complete
+        or order.origin != OrderOrigin.APPLICATION
+        or order.broker_identity_status != BrokerIdentityStatus.EXACT
+        or order.side != OrderSide.BUY
+        or order.intent != OrderIntent.ENTRY
+        or order.status not in (ExecutionOrderStatus.ACKNOWLEDGED, ExecutionOrderStatus.WORKING)
+        or order.recovery_state != OrderRecoveryState.NONE
+        or not order.attempt_group_id
+        or broker.status not in (OrderStatus.ACCEPTED, OrderStatus.WORKING)
+        or broker.filled_quantity
+        or order.filled_quantity
+        or snapshot.holding_for(order.symbol) is not None
+        or (broker.environment, broker.account_no, broker.symbol, broker.side, broker.broker_order_id)
+        != (order.environment, order.account_no, order.symbol, order.side, order.broker_order_id)
+    ):
+        return False
+    active = [item for item in orders if _order_key(item) == _order_key(order)
+              and item.side == OrderSide.BUY and item.status in _OPEN_EXECUTION_STATUSES]
+    broker_active = [item for item in authoritative_order_history(snapshot.orders)
+                     if item.symbol == order.symbol and item.side == OrderSide.BUY
+                     and is_open_status(item.status)]
+    if len(active) != 1 or len(broker_active) != 1:
+        return False
+    reservation = reservations.get(order.capital_reservation_id)
+    if (
+        reservation is None or not reservation.is_open()
+        or (reservation.environment, reservation.account_no, reservation.symbol, reservation.attempt_group_id)
+        != (order.environment, order.account_no, order.symbol, order.attempt_group_id)
+        or card.capital_reservation_id not in ("", order.capital_reservation_id)
+    ):
+        return False
+    # Legacy imported orders lack market_session_date; require the actual
+    # broker session as well as the local preparation/candidate chronology.
+    broker_day = str(broker.raw_response.get("ord_dt") or "")
+    prepared = _parse_utc_timestamp(order.prepared_at)
+    submitted = _parse_utc_timestamp(order.submission_started_at)
+    acknowledged = _parse_utc_timestamp(order.acknowledged_at)
+    candidate = card.entry_candidate_created_at
+    if (
+        broker_day != snapshot.session_date.strftime("%Y%m%d")
+        or (order.market_session_date and order.market_session_date != snapshot.session_date.isoformat())
+        or prepared is None or candidate is None
+        or submitted is None or acknowledged is None
+        or prepared.astimezone(US_MARKET_ZONE).date() != snapshot.session_date
+        or not candidate <= prepared <= submitted <= acknowledged <= snapshot.observed_at
+        or card.entry_range_closed_at is None or card.entry_breakout_confirmed_at is None
+        or not card.entry_range_closed_at <= card.entry_breakout_confirmed_at <= prepared
+    ):
+        return False
+    price = float(card.entry_execution_price or card.entry_trigger or 0.0)
+    quantity = order.submitted_quantity
+    if (
+        quantity <= 0 or quantity != card.planned_quantity
+        or quantity != card.target_position_quantity
+        or quantity != order.remaining_quantity
+        or quantity != broker.quantity_requested or quantity != broker.remaining_quantity
+        or not card.entry_orb_low or not 0 < card.entry_orb_low < price
+        or not math.isclose(price, order.submitted_limit_price, rel_tol=0, abs_tol=1e-8)
+        or not math.isclose(price, broker.limit_price, rel_tol=0, abs_tol=1e-8)
+        or not math.isclose(reservation.remaining_reserved_notional, quantity * price, rel_tol=0, abs_tol=0.01)
+        or not math.isclose(reservation.remaining_projected_open_risk, quantity * (price - card.entry_orb_low), rel_tol=0, abs_tol=0.01)
+    ):
+        return False
+    card.entry_client_order_id = order.client_order_id
+    card.entry_attempt_group_id = order.attempt_group_id
+    card.entry_attempt_count = order.attempt_number
+    card.entry_pending_attempt_number = order.attempt_number
+    card.capital_reservation_id = order.capital_reservation_id
+    card.entry_order_generation = max(1, card.entry_order_generation)
+    card.entry_parent_intent_id = card.entry_parent_intent_id or order.attempt_group_id
+    card.entry_orb_window = card.entry_orb_window or card.selected_orb_window
+    card.entry_block_reason = ""
+    card.next_retry_at = None
+    return True
+
+
 def _apply_definitive_entry_nonacceptance(
     card: TradeCardState,
     order: ExecutionOrderRecord,
@@ -1549,6 +1657,10 @@ def reduce_account_reconciliation(
                 )
             )
         card = card_by_key.get(_order_key(exact))
+        if not contradiction:
+            _recover_detached_working_entry(
+                card, exact, broker_snapshot, snapshot, orders, reservation_by_id
+            )
         linked_card = card if _card_tracks_order(card, exact) else None
         _project_exact_order_to_card(
             order=exact,

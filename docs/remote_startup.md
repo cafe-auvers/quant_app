@@ -19,6 +19,15 @@ never automatically enabled. This compatibility task does not submit orders.
 Once the persistent implementation is deployed and its ON choice confirmed,
 disable the compatibility task.
 
+A detached Buy Today card can recover its original pending entry from a unique
+application-owned exact broker order in the current session. Recovery requires
+complete holdings/order evidence, matching quantity, price, submission chronology
+and the active reservation's notional and stop risk. Conflicting, historical,
+filled or unowned orders cannot establish this link. A separate entry guard
+blocks another proposal whenever an open entry already exists for the same
+account and symbol. Recovery preserves the original order and reservation;
+normal fill, cancellation and position-protection handling then resumes.
+
 Recovery snapshots named `data/*.json.corrupt-*` are private runtime state.
 Ignore and preserve them so a recovered snapshot cannot make an otherwise
 approved checkout appear dirty and block the next startup.

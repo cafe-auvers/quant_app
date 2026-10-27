@@ -58,7 +58,7 @@ from typing import Any, Callable, Dict, List, Optional
 from src.core import execution_config
 from src.core.execution_config import is_buyboard_engine_enabled
 from src.core.execution_result import UnifiedExecutionStatus
-from src.core.order_state import RESERVED_MOO_EXECUTION, BrokerOrder, OrderIntent, OrderStatus
+from src.core.order_state import RESERVED_MOO_EXECUTION, BrokerOrder, OrderIntent, OrderSide, OrderStatus, is_open_status
 from src.core.orb_entry_logic import passive_entry_prices
 from src.core.trade_card_state import (
     BoardStatus,
@@ -876,6 +876,20 @@ class TradingEngine:
             if card.entry_runtime_status != EntryRuntimeStatus.EXECUTE_READY:
                 continue
             try:
+                # A detached card must not turn an existing commitment into
+                # a second proposal. Account reconciliation restores proven
+                # lifecycle links; uncertain links remain blocked here.
+                existing_order = self._entry_deadline_lookup.find_open_entry_order(card)
+                if existing_order is not None and is_open_status(existing_order.status) and (
+                    existing_order.environment, existing_order.account_no, existing_order.symbol,
+                    existing_order.side, existing_order.intent,
+                ) == (card.environment, card.account_no, card.symbol, OrderSide.BUY, OrderIntent.ENTRY):
+                    card.entry_runtime_status = EntryRuntimeStatus.RISK_INVALID
+                    card.entry_block_reason = (
+                        "An entry order is already pending; waiting for account reconciliation"
+                    )
+                    changed.append(card)
+                    continue
                 if not _complete_orb_entry_plan(card):
                     has_candidate_geometry = bool(
                         card.entry_orb_high

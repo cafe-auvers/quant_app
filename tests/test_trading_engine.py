@@ -703,6 +703,24 @@ def _pending_order(*, status, filled=0, avg_fill_price=0.0, deadline_seconds_ago
     return order
 
 
+def test_detached_buy_today_cannot_propose_another_entry_while_order_is_open(tmp_path):
+    submitted = []
+    working = _pending_order(status=OrderStatus.WORKING)
+    engine = _make_engine(tmp_path, find_order=lambda card: working,
+                          submit_order=lambda **kwargs: submitted.append(kwargs))
+    card = _buy_today_card(board_status=BoardStatus.BUY_TODAY,
+                 entry_runtime_status=EntryRuntimeStatus.EXECUTE_READY)
+    engine._prepare_entry_attempt = lambda card: pytest.fail('Must not prepare another identity')
+
+    changed = engine.run_heartbeat([card])
+
+    assert not submitted
+    assert card in changed
+    assert card.board_status == BoardStatus.BUY_TODAY
+    assert card.entry_runtime_status == EntryRuntimeStatus.RISK_INVALID
+    assert 'already pending' in card.entry_block_reason
+
+
 def _replacement_card(**overrides):
     fields = dict(
         board_status=BoardStatus.ENTRY_PENDING,
