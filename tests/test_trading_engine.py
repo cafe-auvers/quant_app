@@ -703,14 +703,18 @@ def _pending_order(*, status, filled=0, avg_fill_price=0.0, deadline_seconds_ago
     return order
 
 
-def test_detached_buy_today_cannot_propose_another_entry_while_order_is_open(tmp_path):
+@pytest.mark.parametrize('filled', [False, True])
+def test_detached_buy_today_cannot_propose_another_entry_while_order_is_open(tmp_path, filled):
     submitted = []
-    working = _pending_order(status=OrderStatus.WORKING)
+    working = _pending_order(status=OrderStatus.FILLED if filled else OrderStatus.WORKING,
+                             filled=10 if filled else 0)
     engine = _make_engine(tmp_path, find_order=lambda card: working,
                           submit_order=lambda **kwargs: submitted.append(kwargs))
     card = _buy_today_card(board_status=BoardStatus.BUY_TODAY,
                  entry_runtime_status=EntryRuntimeStatus.EXECUTE_READY)
     engine._prepare_entry_attempt = lambda card: pytest.fail('Must not prepare another identity')
+    if filled:
+        engine._entry_deadline_lookup.find_entry_commitment = lambda card: working
 
     changed = engine.run_heartbeat([card])
 
@@ -719,6 +723,15 @@ def test_detached_buy_today_cannot_propose_another_entry_while_order_is_open(tmp
     assert card.board_status == BoardStatus.BUY_TODAY
     assert card.entry_runtime_status == EntryRuntimeStatus.RISK_INVALID
     assert 'already pending' in card.entry_block_reason
+
+
+def test_buy_today_with_existing_holdings_cannot_submit_again(tmp_path):
+    submitted = []
+    engine = _make_engine(tmp_path, submit_order=lambda **kwargs: submitted.append(kwargs))
+    card = _buy_today_card(broker_quantity=10, entry_runtime_status=EntryRuntimeStatus.EXECUTE_READY)
+    engine.run_heartbeat([card])
+    assert not submitted
+    assert 'holdings already exist' in card.entry_block_reason
 
 
 def _replacement_card(**overrides):

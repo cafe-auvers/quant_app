@@ -3,12 +3,14 @@ from datetime import date, datetime, timezone
 
 import pytest
 
-from src.core.account_broker_snapshot import AccountBrokerSnapshot, SnapshotCompleteness
+from src.core.account_broker_snapshot import AccountBrokerSnapshot, AccountHoldingSnapshot, SnapshotCompleteness
 from src.core.capital_reservation import CapitalReservation
 from src.core.execution_order_record import BrokerIdentityStatus, ExecutionOrderRecord, ExecutionOrderStatus
 from src.core.order_state import BrokerOrderStatusSnapshot, OrderIntent, OrderSide, OrderStatus
 from src.core.trade_card_state import BoardStatus, EntryRuntimeStatus, TradeCardState
 from src.services.account_reconciliation import AccountLocalState, reduce_account_reconciliation
+from src.services.buyboard_runtime import _portfolio_projected_exposures, _unrepresented_entry_fills
+from src.core.capital_reservation import CapitalReservationStatus
 
 
 def _time(value):
@@ -52,10 +54,11 @@ def _incident():
     return card, order, reservation, broker
 
 
-def _reduce(card, order, reservation, broker, *, extra_orders=(), extra_broker=(), complete=True):
+def _reduce(card, order, reservation, broker, *, extra_orders=(), extra_broker=(), complete=True, holdings=()):
     return reduce_account_reconciliation(
         AccountBrokerSnapshot(
             environment='PROD', account_no='1', orders=(broker, *extra_broker),
+            holdings=holdings,
             observed_at=_time('16:40:00'), session_date=date(2026, 10, 27),
             completeness=SnapshotCompleteness(holdings_complete=True, open_orders_complete=complete,
                 history_complete=True, reserved_orders_complete=True, account_balance_complete=True),
@@ -154,3 +157,143 @@ def test_detached_entry_recovery_rejects_unproven_or_conflicting_lifecycle(case)
     plan = _reduce(card, order, reservation, broker, **kwargs)
     assert all(updated.entry_client_order_id != order.client_order_id for updated in plan.card_updates)
     assert not plan.commands
+
+
+def _filled_incident():
+    card, order, reservation, broker = _incident()
+    order.status, order.filled_quantity, order.remaining_quantity = ExecutionOrderStatus.FILLED, 32, 0
+    order.average_fill_price = 90.8
+    broker.status, broker.filled_quantity, broker.remaining_quantity = OrderStatus.FILLED, 32, 0
+    broker.avg_fill_price = 90.8
+    return card, order, reservation, broker
+
+
+def test_filled_order_stays_in_risk_projection_until_holdings_arrive():
+    card, order, _, _ = _filled_incident()
+    exposures = _portfolio_projected_exposures(cards=(card,), execution_orders=(order,))
+    fill, = exposures
+    assert fill.source == 'FILLED_ENTRY_AWAITING_POSITION'
+    assert fill.gross_notional_usd == pytest.approx(2905.6)
+    assert fill.open_risk_usd == pytest.approx(38.08)
+    assert not fill.reservation_id
+    assert _unrepresented_entry_fills(card, (order,)) == (order,)
+    card.broker_quantity = 32
+    assert not _portfolio_projected_exposures(cards=(card,), execution_orders=(order,))
+
+
+def test_filled_entry_fence_does_not_resurrect_an_older_candidate():
+    card, order, _, _ = _filled_incident()
+    card.entry_candidate_created_at = _time('15:00:00')
+    assert not _unrepresented_entry_fills(card, (order,))
+    assert not _portfolio_projected_exposures(cards=(card,), execution_orders=(order,))
+
+
+@pytest.mark.parametrize('sell_time', ['2026-10-27T15:00:00+00:00', '2026-10-28T15:00:00+00:00'])
+def test_partial_exit_is_deducted_from_proven_fill_exposure(sell_time):
+    card, order, _, _ = _filled_incident()
+    order.filled_quantity = order.submitted_quantity = 64
+    sell = deepcopy(order)
+    sell.client_order_id, sell.broker_order_id = 'SELL-1', 'BROKER-SELL'
+    sell.side, sell.intent = OrderSide.SELL, OrderIntent.PARTIAL_EXIT
+    sell.submission_started_at = sell_time
+    sell.filled_quantity = sell.submitted_quantity = 32
+    card.broker_quantity = 32
+    assert not _unrepresented_entry_fills(card, (order, sell))
+    assert not _portfolio_projected_exposures(cards=(card,), execution_orders=(order, sell))
+
+
+def test_confirmed_fill_retains_stop_across_repeated_empty_holdings_then_exit():
+    card, order, reservation, broker = _filled_incident()
+    card.entry_client_order_id = order.client_order_id
+    card.entry_attempt_group_id = order.attempt_group_id
+    first = _reduce(card, order, reservation, broker)
+    repaired, = first.card_updates
+    assert repaired.broker_quantity == repaired.stop_quantity == 32
+    assert repaired.active_stop_price == 89.61
+    updated_order = first.order_updates[0] if first.order_updates else order
+    second = _reduce(repaired, updated_order, reservation, broker)
+    preserved = second.card_updates[0] if second.card_updates else repaired
+    assert preserved.broker_quantity == preserved.stop_quantity == 32
+    assert preserved.active_stop_price == 89.61
+    assert any(item.code == 'HOLDINGS_LAG_ENTRY_FILL' for item in second.alerts)
+    sell = deepcopy(order)
+    sell.side, sell.intent = OrderSide.SELL, OrderIntent.PARTIAL_EXIT
+    sell.client_order_id, sell.broker_order_id = 'SELL-1', 'BROKER-SELL'
+    sell.submission_started_at = _time('15:00:00').isoformat()
+    closed = _reduce(preserved, updated_order, reservation, broker, extra_orders=(sell,))
+    flat, = closed.card_updates
+    assert flat.broker_quantity == 0
+    assert flat.active_stop_price is None
+
+
+@pytest.mark.parametrize('quantity', [16, 32])
+def test_detached_fill_recovers_original_stop_after_fresh_holdings(quantity):
+    card, order, reservation, broker = _filled_incident()
+    if quantity == 16:
+        order.status, broker.status = ExecutionOrderStatus.PARTIALLY_FILLED, OrderStatus.PARTIALLY_FILLED
+    order.filled_quantity = broker.filled_quantity = quantity
+    order.remaining_quantity = broker.remaining_quantity = 32 - quantity
+    reservation.remaining_reserved_notional = (32 - quantity) * 90.8
+    reservation.remaining_projected_open_risk = (32 - quantity) * 1.19
+    holding = AccountHoldingSnapshot(symbol='KOD', quantity=quantity, average_price=90.8, sellable_quantity=quantity)
+    plan = _reduce(card, order, reservation, broker, holdings=(holding,))
+    repaired, = plan.card_updates
+    assert repaired.board_status == BoardStatus.OPEN_POSITION
+    assert repaired.broker_quantity == repaired.stop_quantity == quantity
+    assert repaired.active_stop_price == 89.61
+    assert 'STOP_REQUIRED' not in repaired.warnings
+    assert not plan.commands
+
+
+def test_partial_fill_and_pending_remainder_keep_the_full_commitment():
+    card, order, reservation, _ = _filled_incident()
+    order.status = ExecutionOrderStatus.PARTIALLY_FILLED
+    order.filled_quantity = order.remaining_quantity = 16
+    reservation.remaining_reserved_notional = 16 * 90.8
+    reservation.remaining_projected_open_risk = 16 * 1.19
+    exposures = _portfolio_projected_exposures(cards=(card,), execution_orders=(order,), active_reservations=(reservation,))
+    assert sum(item.gross_notional_usd for item in exposures) == pytest.approx(2905.6)
+
+
+def test_two_confirmed_fills_only_project_quantity_missing_from_holdings():
+    card, order, _, _ = _filled_incident()
+    other = deepcopy(order)
+    other.client_order_id, other.broker_order_id = 'SECOND', 'SECOND-BROKER'
+    card.broker_quantity = 32
+    exposures = _portfolio_projected_exposures(cards=(card,), execution_orders=(order, other))
+    exposure, = exposures
+    assert exposure.gross_notional_usd == pytest.approx(2905.6)
+
+
+def test_fresh_partial_fill_recovers_before_same_plan_reservation_settlement():
+    card, order, reservation, broker = _incident()
+    broker.status = OrderStatus.PARTIALLY_FILLED
+    broker.filled_quantity = broker.remaining_quantity = 16
+    broker.avg_fill_price = 90.8
+    holding = AccountHoldingSnapshot(symbol='KOD', quantity=16, average_price=90.8, sellable_quantity=16)
+    plan = _reduce(card, order, reservation, broker, holdings=(holding,))
+    repaired, = plan.card_updates
+    assert repaired.broker_quantity == repaired.stop_quantity == 16
+    assert repaired.active_stop_price == 89.61
+
+
+def test_loader_fetches_consumed_candidate_proof_on_fresh_and_cached_reads():
+    from sqlalchemy import create_engine
+    from src.services.account_reconciliation import load_account_local_state
+    from src.services.capital_reservation_repository import save_reservation_strict
+    from src.services.execution_order_repository import ensure_execution_orders_table, insert_execution_order
+    card, order, reservation, _ = _filled_incident()
+    reservation.status = CapitalReservationStatus.CONSUMED
+    reservation.remaining_reserved_notional = reservation.remaining_projected_open_risk = 0
+    engine = create_engine('sqlite:///:memory:')
+    try:
+        ensure_execution_orders_table(engine)
+        with engine.begin() as conn:
+            insert_execution_order(conn, order)
+        save_reservation_strict(engine, reservation)
+        for _ in range(2):
+            state = load_account_local_state(engine, environment='PROD', account_no='1', cards=(card,))
+            assert len(state.capital_reservations) == 1
+            assert state.capital_reservations[0].status == CapitalReservationStatus.CONSUMED
+    finally:
+        engine.dispose()

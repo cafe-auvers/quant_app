@@ -22,11 +22,16 @@ disable the compatibility task.
 A detached Buy Today card can recover its original pending entry from a unique
 application-owned exact broker order in the current session. Recovery requires
 complete holdings/order evidence, matching quantity, price, submission chronology
-and the active reservation's notional and stop risk. Conflicting, historical,
-filled or unowned orders cannot establish this link. A separate entry guard
-blocks another proposal whenever an open entry already exists for the same
-account and symbol. Recovery preserves the original order and reservation;
-normal fill, cancellation and position-protection handling then resumes.
+and the reservation's original notional and stop risk. Current-candidate partial
+or full fills also require matching fresh holdings before restoring their stop;
+consumed reservation proof is loaded only for that recovery. Conflicting,
+historical or unowned orders cannot establish this link. A separate entry guard
+blocks another proposal whenever an open entry or an unrepresented confirmed
+fill exists for the same account and candidate. Positive holdings also block a
+stale Buy Today card. Confirmed fills remain in projected exposure until
+holdings catch up; confirmed later sells reduce that exposure. Delayed holdings
+cannot erase a proven position and its stop while its net fills remain positive.
+Recovery preserves broker orders; normal lifecycle management then resumes.
 
 Recovery snapshots named `data/*.json.corrupt-*` are private runtime state.
 Ignore and preserve them so a recovered snapshot cannot make an otherwise

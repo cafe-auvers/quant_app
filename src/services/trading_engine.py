@@ -289,6 +289,7 @@ class EntryDeadlineLookup:
     # which never touches ``applied_filled_quantity``).
     persist_order: Optional[Callable[[BrokerOrder], None]] = None
     find_entry_order_by_id: Optional[Callable[[str], Optional[BrokerOrder]]] = None
+    find_entry_commitment: Optional[Callable[[TradeCardState], Optional[BrokerOrder]]] = None
 
 
 @dataclass
@@ -876,17 +877,26 @@ class TradingEngine:
             if card.entry_runtime_status != EntryRuntimeStatus.EXECUTE_READY:
                 continue
             try:
+                if card.broker_quantity > 0:
+                    card.entry_runtime_status = EntryRuntimeStatus.RISK_INVALID
+                    card.entry_block_reason = "Broker holdings already exist; waiting for account reconciliation"
+                    changed.append(card)
+                    continue
                 # A detached card must not turn an existing commitment into
                 # a second proposal. Account reconciliation restores proven
                 # lifecycle links; uncertain links remain blocked here.
-                existing_order = self._entry_deadline_lookup.find_open_entry_order(card)
-                if existing_order is not None and is_open_status(existing_order.status) and (
+                commitment_lookup = self._entry_deadline_lookup.find_entry_commitment
+                existing_order = (commitment_lookup or self._entry_deadline_lookup.find_open_entry_order)(card)
+                if existing_order is not None and (
+                    is_open_status(existing_order.status)
+                    or (commitment_lookup is not None and existing_order.filled_quantity > 0)
+                ) and (
                     existing_order.environment, existing_order.account_no, existing_order.symbol,
                     existing_order.side, existing_order.intent,
                 ) == (card.environment, card.account_no, card.symbol, OrderSide.BUY, OrderIntent.ENTRY):
                     card.entry_runtime_status = EntryRuntimeStatus.RISK_INVALID
                     card.entry_block_reason = (
-                        "An entry order is already pending; waiting for account reconciliation"
+                        "An entry order is already pending or filled; waiting for account reconciliation"
                     )
                     changed.append(card)
                     continue

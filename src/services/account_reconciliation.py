@@ -921,9 +921,16 @@ def _recover_detached_working_entry(
     """Restore a lost link only from one proven, current-session obligation."""
     if card is None or _card_tracks_order(card, order):
         return False
+    filled = (order.status == ExecutionOrderStatus.FILLED
+              and broker.status == OrderStatus.FILLED
+              and order.filled_quantity == broker.filled_quantity == order.submitted_quantity)
+    has_fill = 0 < order.filled_quantity == broker.filled_quantity <= order.submitted_quantity
+    holding = snapshot.holding_for(order.symbol)
     if (
-        card.board_status not in (BoardStatus.BUY_TODAY, BoardStatus.ENTRY_PENDING)
-        or card.broker_quantity
+        card.board_status not in (BoardStatus.BUY_TODAY, BoardStatus.ENTRY_PENDING, BoardStatus.OPEN_POSITION)
+        or (card.board_status == BoardStatus.OPEN_POSITION and (not has_fill or (
+            card.stop_type is not None and card.active_stop_price != card.entry_orb_low)))
+        or card.broker_quantity not in (0, order.filled_quantity if has_fill else 0)
         or card.entry_submission_unresolved
         or card.entry_cancel_in_flight
         or card.entry_cancel_reason
@@ -946,13 +953,12 @@ def _recover_detached_working_entry(
         or order.broker_identity_status != BrokerIdentityStatus.EXACT
         or order.side != OrderSide.BUY
         or order.intent != OrderIntent.ENTRY
-        or order.status not in (ExecutionOrderStatus.ACKNOWLEDGED, ExecutionOrderStatus.WORKING)
+        or order.status not in (ExecutionOrderStatus.ACKNOWLEDGED, ExecutionOrderStatus.WORKING, ExecutionOrderStatus.PARTIALLY_FILLED, ExecutionOrderStatus.FILLED)
         or order.recovery_state != OrderRecoveryState.NONE
         or not order.attempt_group_id
-        or broker.status not in (OrderStatus.ACCEPTED, OrderStatus.WORKING)
-        or broker.filled_quantity
-        or order.filled_quantity
-        or snapshot.holding_for(order.symbol) is not None
+        or broker.status not in (OrderStatus.ACCEPTED, OrderStatus.WORKING, OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED)
+        or (not has_fill and (broker.filled_quantity or order.filled_quantity or holding is not None))
+        or (has_fill and (holding is None or holding.quantity != order.filled_quantity))
         or (broker.environment, broker.account_no, broker.symbol, broker.side, broker.broker_order_id)
         != (order.environment, order.account_no, order.symbol, order.side, order.broker_order_id)
     ):
@@ -962,11 +968,12 @@ def _recover_detached_working_entry(
     broker_active = [item for item in authoritative_order_history(snapshot.orders)
                      if item.symbol == order.symbol and item.side == OrderSide.BUY
                      and is_open_status(item.status)]
-    if len(active) != 1 or len(broker_active) != 1:
+    if len(active) != (0 if filled else 1) or len(broker_active) != (0 if filled else 1):
         return False
     reservation = reservations.get(order.capital_reservation_id)
     if (
-        reservation is None or not reservation.is_open()
+        reservation is None or (not filled and not reservation.is_open())
+        or (filled and not reservation.is_open() and reservation.status != CapitalReservationStatus.CONSUMED)
         or (reservation.environment, reservation.account_no, reservation.symbol, reservation.attempt_group_id)
         != (order.environment, order.account_no, order.symbol, order.attempt_group_id)
         or card.capital_reservation_id not in ("", order.capital_reservation_id)
@@ -995,15 +1002,25 @@ def _recover_detached_working_entry(
     if (
         quantity <= 0 or quantity != card.planned_quantity
         or quantity != card.target_position_quantity
-        or quantity != order.remaining_quantity
-        or quantity != broker.quantity_requested or quantity != broker.remaining_quantity
+        or order.remaining_quantity != quantity - order.filled_quantity
+        or quantity != broker.quantity_requested or broker.remaining_quantity != quantity - broker.filled_quantity
         or not card.entry_orb_low or not 0 < card.entry_orb_low < price
         or not math.isclose(price, order.submitted_limit_price, rel_tol=0, abs_tol=1e-8)
         or not math.isclose(price, broker.limit_price, rel_tol=0, abs_tol=1e-8)
-        or not math.isclose(reservation.remaining_reserved_notional, quantity * price, rel_tol=0, abs_tol=0.01)
-        or not math.isclose(reservation.remaining_projected_open_risk, quantity * (price - card.entry_orb_low), rel_tol=0, abs_tol=0.01)
+        or not math.isclose(reservation.requested_notional, quantity * price, rel_tol=0, abs_tol=0.01)
+        or not math.isclose(reservation.projected_open_risk, quantity * (price - card.entry_orb_low), rel_tol=0, abs_tol=0.01)
+        or reservation.remaining_reserved_notional + 0.01 < order.remaining_quantity * price
+        or reservation.remaining_reserved_notional > reservation.requested_notional + 0.01
+        or reservation.remaining_projected_open_risk + 0.01 < order.remaining_quantity * (price - card.entry_orb_low)
+        or reservation.remaining_projected_open_risk > reservation.projected_open_risk + 0.01
     ):
         return False
+    if has_fill:
+        from src.core.entry_fill_exposure import candidate_fill_exposure
+        entries, net = candidate_fill_exposure(card, orders)
+        if len(entries) != 1 or net != order.filled_quantity:
+            return False
+        card.warnings = [item for item in card.warnings if item != 'STOP_REQUIRED']
     card.entry_client_order_id = order.client_order_id
     card.entry_attempt_group_id = order.attempt_group_id
     card.entry_attempt_count = order.attempt_number
@@ -1948,6 +1965,15 @@ def reduce_account_reconciliation(
                 and card.broker_quantity > 0
                 and card.symbol not in holding_by_symbol
             ):
+                from src.core.entry_fill_exposure import candidate_fill_exposure
+                _, known_net = candidate_fill_exposure(card, orders)
+                if known_net > 0:
+                    alerts.append(ReconciliationAlert(
+                        "HOLDINGS_LAG_ENTRY_FILL", ReconciliationAlertSeverity.CRITICAL,
+                        "Holdings have not yet reflected a confirmed current-session entry fill",
+                        card.symbol,
+                    ))
+                    continue
                 card.broker_quantity = 0
                 card.orderable_quantity = 0
                 if card.board_status in (
@@ -2160,6 +2186,28 @@ def reduce_account_reconciliation(
     )
 
 
+def _include_recovery_reservations(engine, cards, relational):
+    from src.core.entry_fill_exposure import candidate_fill_exposure
+    from src.services.capital_reservation_repository import fetch_reservation
+    reservations = list(relational.capital_reservations)
+    known = {item.reservation_id for item in reservations}
+    for card in cards:
+        if card.board_status not in (BoardStatus.BUY_TODAY, BoardStatus.ENTRY_PENDING, BoardStatus.OPEN_POSITION):
+            continue
+        if card.board_status == BoardStatus.OPEN_POSITION and card.stop_type is not None:
+            continue
+        entries, _ = candidate_fill_exposure(card, relational.execution_orders)
+        for order in entries:
+            if (_card_tracks_order(card, order) or not order.capital_reservation_id
+                    or order.capital_reservation_id in known):
+                continue
+            reservation = fetch_reservation(engine, order.capital_reservation_id)
+            if reservation is not None:
+                reservations.append(reservation)
+                known.add(reservation.reservation_id)
+    return tuple(reservations)
+
+
 def load_account_local_state(
     engine: Engine,
     *,
@@ -2224,7 +2272,7 @@ def load_account_local_state(
         return AccountLocalState(
             cards=account_cards,
             execution_orders=relational.execution_orders,
-            capital_reservations=relational.capital_reservations,
+            capital_reservations=_include_recovery_reservations(engine, account_cards, relational),
             external_orders=relational.external_orders,
         )
 
@@ -2273,7 +2321,7 @@ def load_account_local_state(
     return AccountLocalState(
         cards=account_cards,
         execution_orders=relational.execution_orders,
-        capital_reservations=relational.capital_reservations,
+        capital_reservations=_include_recovery_reservations(engine, account_cards, relational),
         external_orders=relational.external_orders,
     )
 

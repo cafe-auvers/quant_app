@@ -608,6 +608,15 @@ def _portfolio_position_from_card(
     )
 
 
+def _unrepresented_entry_fills(card, orders):
+    """Keep this candidate's proven fills visible while holdings catch up."""
+    if card is None:
+        return ()
+    from src.core.entry_fill_exposure import candidate_fill_exposure
+    fills, net = candidate_fill_exposure(card, orders)
+    return fills if net > card.broker_quantity else ()
+
+
 def _portfolio_projected_exposures(
     *,
     cards,
@@ -616,6 +625,8 @@ def _portfolio_projected_exposures(
     external_orders=(),
 ) -> tuple[PortfolioProjectedExposure, ...]:
     """Project every durable, exposure-increasing account commitment once."""
+    from src.core.entry_fill_exposure import candidate_fill_exposure
+    execution_orders = tuple(execution_orders)
 
     cards_by_symbol = {
         str(card.symbol or "").upper(): card for card in cards if card is not None
@@ -627,6 +638,20 @@ def _portfolio_projected_exposures(
     }
     seen_reservation_ids: set[str] = set()
     exposures: list[PortfolioProjectedExposure] = []
+
+    for card in cards_by_symbol.values():
+        fills = _unrepresented_entry_fills(card, execution_orders)
+        if not fills:
+            continue
+        _, net = candidate_fill_exposure(card, execution_orders)
+        missing = net - max(0, card.broker_quantity)
+        price = max(max(item.average_fill_price, item.submitted_limit_price) for item in fills)
+        stop = float(card.entry_orb_low or 0.0)
+        exposures.append(PortfolioProjectedExposure(
+            symbol=card.symbol, gross_notional_usd=missing * price,
+            open_risk_usd=missing * (price - stop) if 0 < stop < price else missing * price,
+            source="FILLED_ENTRY_AWAITING_POSITION", strategy_id=RISK_STRATEGY_ID,
+        ))
 
     def stop_for(symbol: str, reference_price: float) -> float:
         card = cards_by_symbol.get(str(symbol or "").upper())
@@ -1224,6 +1249,8 @@ def build_buyboard_runtime(
                         else ()
                     ),
                 )
+                if any(item.source == "FILLED_ENTRY_AWAITING_POSITION" for item in projected_exposures):
+                    portfolio_reasons.append("A confirmed entry fill is awaiting holdings reconciliation")
                 try:
                     usable_buying_power = float(
                         entry_buying_power(environment, account_no, symbol, exchange, limit_price)
@@ -1366,6 +1393,7 @@ def build_buyboard_runtime(
         *,
         side: OrderSide,
         intent: Optional[OrderIntent] = None,
+        include_unrepresented_fills: bool = False,
     ) -> Optional[BrokerOrder]:
         if not guarded_mode:
             return _find_open_order(
@@ -1438,6 +1466,10 @@ def build_buyboard_runtime(
             if intent is not None and record.intent != intent:
                 continue
             return broker_order_from_execution_record(record)
+        if include_unrepresented_fills:
+            fills = _unrepresented_entry_fills(card, records)
+            if fills:
+                return broker_order_from_execution_record(fills[0])
         return None
 
     def reconcile_runtime_order(order: BrokerOrder) -> BrokerOrder:
@@ -1496,6 +1528,10 @@ def build_buyboard_runtime(
             else order_ledger.upsert_order
         ),
         find_entry_order_by_id=find_runtime_entry_order_by_id,
+        find_entry_commitment=lambda card: find_runtime_order(
+            card, side=OrderSide.BUY, intent=OrderIntent.ENTRY,
+            include_unrepresented_fills=True,
+        ),
     )
 
     def build_replacement_risk_decision(
@@ -1572,6 +1608,8 @@ def build_buyboard_runtime(
                 active_reservations=reservations,
                 external_orders=external_orders,
             )
+            if any(item.source == "FILLED_ENTRY_AWAITING_POSITION" for item in projected):
+                reasons.append("A confirmed entry fill is awaiting holdings reconciliation")
             try:
                 buying_power = float(
                     entry_buying_power(candidate_card.environment, candidate_card.account_no,
