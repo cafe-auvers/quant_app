@@ -3021,17 +3021,20 @@
 
   function monitorMomentum(row) {
     const momentum = row.momentum || {status: 'UNAVAILABLE', reason: 'Waiting for momentum data'};
-    if (state.session?.market_status?.phase !== 'REGULAR') {
+    const phase = state.session?.market_status?.phase;
+    const sessionClosed = phase === 'AFTER_HOURS' && momentum.session_closed
+      && momentum.session_date === new Intl.DateTimeFormat('en-CA', {timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit'}).format(new Date(Date.now()));
+    if (phase !== 'REGULAR' && !sessionClosed) {
       return {status: 'CLOSED', reason: 'Momentum ranking is available during the regular session'};
     }
     const quoteAge = (Date.now() - new Date(row.quote_as_of).getTime()) / 1000;
     const age = (Date.now() - new Date(momentum.as_of).getTime()) / 1000;
-    if (state.monitorError || row.quote_status !== 'CURRENT' || !Number.isFinite(quoteAge)
-      || quoteAge > state.monitorStaleSeconds || (momentum.as_of && (!Number.isFinite(age) || age > state.monitorStaleSeconds))) {
+    if (!sessionClosed && (state.monitorError || row.quote_status !== 'CURRENT' || !Number.isFinite(quoteAge)
+      || quoteAge > state.monitorStaleSeconds || (momentum.as_of && (!Number.isFinite(age) || age > state.monitorStaleSeconds)))) {
       return {status: 'STALE', reason: 'Stock or synchronized SPY data is stale'};
     }
     if (!bestMonitorOrb(row)) return {status: 'NOT_PASSED', reason: 'Waiting for a passing ORB'};
-    if (!['LEADING', 'WATCH'].includes(momentum.status) || !momentum.as_of) return {...momentum, score: null, rank: null};
+    if (!['LEADING', 'WATCH', 'PARTIAL'].includes(momentum.status) || !momentum.as_of) return {...momentum, score: null, rank: null};
     return momentum;
   }
 
@@ -3052,22 +3055,25 @@
     const momentum = monitorMomentum(row);
     const score = monitorNumber(momentum.score);
     const labels = {UNAVAILABLE: 'Data unavailable', STALE: 'Stale data', NOT_PASSED: 'Waiting for ORB', FORMING: 'Waiting for bars', CLOSED: 'Market closed'};
-    byId('mobile-momentum-heading').textContent = `${row.symbol} · ${score === null ? labels[momentum.status] || 'Data unavailable' : `${momentum.candidate ? 'Leading' : 'Watch'} · #${momentum.rank} · ${score.toFixed(1)}/100`}`;
+    const quality = momentum.quality === 'PARTIAL' ? ` · Partial (${momentum.component_coverage_percent}% of components)`
+      : momentum.quality === 'ESTIMATED' ? ' · Estimated' : '';
+    byId('mobile-momentum-heading').textContent = `${row.symbol} · ${score === null ? labels[momentum.status] || 'Data unavailable' : `${momentum.candidate ? 'Leading' : 'Watch'} · #${momentum.rank} · ${score.toFixed(1)}/100${quality}${momentum.session_closed ? ' · Session ended' : ''}`}`;
     const format = (value, suffix = '', signed = false) => {
       const number = monitorNumber(value);
       return number === null ? '—' : `${signed && number >= 0 ? '+' : ''}${number.toFixed(2)}${suffix}`;
     };
     byId('mobile-momentum-metrics').textContent = score === null ? '' : [
       `RS vs SPY ${format(momentum.rs_open_pp, ' pp', true)}`,
-      `RVOL ${format(momentum.rvol, 'x')} (${momentum.rvol_sessions} sessions)`,
+      `RVOL ${momentum.rvol_estimated ? '~' : ''}${format(momentum.rvol, 'x')} (${momentum.rvol_sessions} sessions)`,
       `vs VWAP ${format(momentum.vwap_distance_percent, '%', true)}`,
       `Range position ${format(momentum.range_location_percent, '%')}`,
       `Entry ${format(momentum.entry_extension_adr, ' ADR', true)} (${momentum.entry_window})`,
+      ...(momentum.bar_coverage_percent === undefined ? [] : [`Reported minutes ${format(momentum.bar_coverage_percent, '%')}`]),
     ].join(' · ');
     byId('mobile-momentum-reason').textContent = `${momentum.reason || ''}${momentum.as_of ? ` · Completed bars through ${new Date(momentum.as_of).toLocaleTimeString('en-US', {timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit'})} ET` : ''}`;
     const components = momentum.components;
     byId('mobile-momentum-components').textContent = components && score !== null
-      ? `Components / 100: RS ${components.relative_strength} · Volume ${components.relative_volume} · Trend ${components.trend} · Entry ${components.entry}` : '';
+      ? `Components / 100: RS ${components.relative_strength ?? '—'} · Volume ${components.relative_volume ?? '—'} · Trend ${components.trend ?? '—'} · Entry ${components.entry ?? '—'}${momentum.quality === 'PARTIAL' ? '. Available weights rescaled; missing metrics are not zero.' : ''}` : '';
   }
 
   function bestMonitorOrb(row) {
@@ -3138,7 +3144,9 @@
       rank.dataset.status = momentum.status;
       const inspect = document.createElement('button');
       inspect.type = 'button';
-      inspect.textContent = score === null ? momentum.status === 'STALE' ? 'Stale' : 'Data' : `#${momentum.rank} · ${Math.round(score)}`;
+      const estimated = ['ESTIMATED', 'PARTIAL'].includes(momentum.quality);
+      const emptyLabels = {STALE: 'Stale', CLOSED: 'Closed', FORMING: 'Forming'};
+      inspect.textContent = score === null ? emptyLabels[momentum.status] || 'No data' : `#${momentum.rank} · ${Math.round(score)}${estimated ? '*' : ''}`;
       inspect.setAttribute('aria-label', `${row.symbol} momentum details${score === null ? '' : `: ${momentum.candidate ? 'Leading' : 'Watch'}, score ${score}`}`);
       inspect.setAttribute('aria-expanded', String(state.monitorMomentumSymbol === row.symbol));
       inspect.setAttribute('aria-controls', 'mobile-momentum-detail');
@@ -3152,7 +3160,7 @@
         'mobile-monitor-strength', 'Stock return minus SPY return since 09:30 ET, in percentage points; synchronized completed bars');
       strength.dataset.tone = excess !== null && excess > 0 ? 'positive' : 'negative';
       const rvol = monitorNumber(momentum.rvol);
-      cell(score === null || rvol === null ? '—' : `${rvol.toFixed(1)}x`, 'mobile-monitor-volume',
+      cell(score === null || rvol === null ? '—' : `${momentum.rvol_estimated ? '~' : ''}${rvol.toFixed(1)}x`, 'mobile-monitor-volume',
         `Cumulative regular-session volume / median volume at this time across ${momentum.rvol_sessions || 'available'} prior sessions`);
     }
     const percent = (key, title) => {
@@ -3290,12 +3298,14 @@
     byId('mobile-momentum-help').hidden = !monitor || state.monitorFilter !== 'orb';
     renderMonitorMomentumDetail();
     const leadingCount = state.visibleRows.filter(row => monitorMomentum(row).candidate).length;
+    const rankedCount = state.visibleRows.filter(row => monitorNumber(monitorMomentum(row).score) !== null).length;
+    const sessionRanks = state.visibleRows.some(row => monitorMomentum(row).session_closed);
     byId('mobile-monitor-status').textContent = state.monitorError || (state.monitorEnabled === false
       ? 'Sandbox · intraday quotes are available in Connected mode'
       : state.monitorAsOf ? monitorMarketClosed()
         ? 'Market closed · showing latest available prices. ORB checks resume next session.'
         : state.monitorFilter === 'orb'
-          ? `${leadingCount} Leading · ranked before Watch. Tap a score for reasons. RS/SPY is from the open; RVOL is at the same time of day. Advisory; Yahoo data may be delayed. Swipe for all columns.`
+          ? `${sessionRanks ? 'Session ended · ranks use regular-session bars' : `${leadingCount} Leading · ranked before Watch`}. ${rankedCount} ranked. * = estimated or partial data; tap a score for reasons. Advisory; Yahoo data may be delayed. Swipe for all columns.`
           : `All watchlists · checks every minute · Yahoo quotes may be delayed. 1M / 3M = months. Swipe for all columns. * = earlier pass, stale quote.${state.monitorPositionError ? ` ${state.monitorPositionError}` : ''}`
       : 'Checking prices · Watchlist + Buylist + Buy Today');
   }

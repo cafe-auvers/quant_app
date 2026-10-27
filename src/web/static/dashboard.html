@@ -330,7 +330,8 @@
                   <summary>How momentum ranks work</summary>
                   <p>Leading candidates appear first. Score: 40% strength vs SPY since the 09:30 ET open, 25% same-time relative volume, 25% VWAP and session-range position, 10% proximity to the planned ORB entry. Strength and entry distance use daily ADR.</p>
                   <p>Leading requires a positive return from the open, positive strength vs SPY, RVOL ≥ 1.5x, price above VWAP and in the top quarter of today's range, at or above breakout, and within 0.5 ADR of entry. Watch shows which checks are missing.</p>
-                  <p>RVOL uses the median of 3–4 complete prior sessions. Completed, synchronized regular-session bars only. Missing or stale data stays unranked. These starting weights are unvalidated; a score is not a win probability or a buy instruction.</p>
+                  <p>RVOL uses reported volume from 3–4 prior sessions through the same time. Sparse minute bars produce estimates marked *. Missing metrics produce a partial score using rescaled available weights; they are never counted as zero. Tap a score for coverage and reasons. Only a verified open and fresh synchronized price are required for price strength.</p>
+                  <p>Stale prices stay unranked during trading. After the regular session, its last observations remain available for review and are labelled Session ended. These starting weights are unvalidated; a score is not a win probability or a buy instruction.</p>
                 </details>
               </div>
               <div id="mobile-list-items" class="mobile-list-items" role="listbox" aria-label="Watchlist stocks"></div>

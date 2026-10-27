@@ -348,6 +348,22 @@ def test_empty_monitor_does_not_fetch_a_benchmark_and_spy_membership_is_not_dupl
     assert len(monitor.snapshot()["rows"]) == 1
 
 
+def test_completed_session_score_survives_after_hours_quote_age_but_not_next_session():
+    clock = [moment("17:00")]
+    monitor = IntradayMonitor(lambda: MonitorContext(), enabled=False, now=lambda: clock[0])
+    monitor._snapshot = {"rows": [{
+        "symbol": "AAA", "quote_as_of": moment("15:59").isoformat(), "quote_status": "CURRENT",
+        "current_price": 103, "breakout_price": 101, "orb": [],
+        "momentum": {"score": 70, "rank": 1, "candidate": False, "status": "WATCH",
+                     "session_closed": True, "session_date": "2026-10-02", "as_of": moment("16:00").isoformat()},
+    }], "as_of": moment("16:01").isoformat(), "error": "", "refreshing": False}
+    row = monitor.snapshot()["rows"][0]
+    assert row["quote_status"] == "STALE"
+    assert row["momentum"]["score"] == 70 and row["momentum"]["rank"] == 1
+    clock[0] = moment("09:40", "2026-10-05")
+    assert monitor.snapshot()["rows"][0]["momentum"]["score"] is None
+
+
 def test_snapshot_reads_never_download_or_start_multiple_workers():
     started, release = threading.Event(), threading.Event()
     calls = []

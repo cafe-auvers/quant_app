@@ -560,7 +560,7 @@ input::placeholder { color: #65776f; }
   .momentum-table th:nth-child(2), .momentum-table th:nth-child(7) { width: 84px; }
   .mobile-monitor-momentum button { padding: 0; min-height: 40px; border: 0; background: transparent; color: inherit; font-size: 11px; font-weight: 800; }
   .mobile-monitor-momentum[data-status="LEADING"], .mobile-monitor-strength[data-tone="positive"] { color: var(--green); }
-  .mobile-monitor-momentum[data-status="WATCH"], .mobile-monitor-momentum[data-status="STALE"] { color: #edc17d; }
+  .mobile-monitor-momentum[data-status="WATCH"], .mobile-monitor-momentum[data-status="PARTIAL"], .mobile-monitor-momentum[data-status="STALE"] { color: #edc17d; }
   .mobile-monitor-strength[data-tone="negative"] { color: #ff8c95; }
   .mobile-momentum-help { margin: 0 0 7px; color: var(--muted); font-size: 10px; line-height: 1.5; }
   .mobile-momentum-help[hidden], .mobile-momentum-detail[hidden] { display: none; }

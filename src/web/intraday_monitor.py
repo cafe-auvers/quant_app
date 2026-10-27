@@ -167,7 +167,8 @@ def suppress_stale_signals(row: dict) -> None:
     row["quote_status"] = "STALE" if row.get("current_price") else "UNAVAILABLE"
     row["breakout_status"] = "UNKNOWN" if row.get("breakout_price") else "NO_LEVEL"
     row["broke_out_today"] = None
-    row["momentum"] = unavailable_momentum("STALE", "Stock quote is stale or unavailable")
+    if not row.get("momentum", {}).get("session_closed"):
+        row["momentum"] = unavailable_momentum("STALE", "Stock quote is stale or unavailable")
     for window in row.get("orb", []):
         # An observed crossing remains a historical fact for this session.
         # It does not certify the current quote or authorize an entry.
@@ -379,8 +380,12 @@ class IntradayMonitor:
                                   price_reason="Current regular-session data unavailable",
                                   position_reason="Current regular-session data unavailable")
             momentum = row.get("momentum", {})
-            if not is_nyse_trading_day(now.date()) or not dt.time(9, 30) <= now.time() < nyse_regular_session_close_time(now.date()):
+            if not is_nyse_trading_day(now.date()) or now.time() < dt.time(9, 30):
                 row["momentum"] = unavailable_momentum("CLOSED", "Momentum ranking is available during the regular session")
+            elif momentum.get("session_closed") and momentum.get("session_date") == now.date().isoformat():
+                pass  # A completed-session observation does not age into a live signal.
+            elif now.time() >= nyse_regular_session_close_time(now.date()):
+                row["momentum"] = unavailable_momentum("CLOSED", "Waiting for the completed-session ranking refresh")
             elif momentum.get("as_of") and (now - dt.datetime.fromisoformat(momentum["as_of"])).total_seconds() > self.stale_seconds:
                 row["momentum"] = unavailable_momentum("STALE", "Synchronized stock/SPY bars are stale")
         assign_momentum_ranks(snapshot["rows"])

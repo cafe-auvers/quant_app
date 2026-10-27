@@ -332,7 +332,7 @@ An earlier ORB pass remains visible after a pullback, but does not establish
 current momentum. The All, Broken out, and Buy Today views keep their existing
 columns and ordering.
 
-The advisory `INTRADAY_MOMENTUM_V1` score uses these starting weights:
+The advisory `INTRADAY_MOMENTUM_V2` score uses these starting weights:
 
 - **40% relative strength:** stock return from its 09:30 regular-session open
   minus SPY's return over the identical completed-bar interval, in percentage
@@ -340,8 +340,9 @@ The advisory `INTRADAY_MOMENTUM_V1` score uses these starting weights:
   earns 100 component points, and nonpositive excess earns zero. Overnight
   gaps are excluded; this is excess return, not beta-adjusted alpha.
 - **25% same-time relative volume:** today's cumulative regular-session volume
-  divided by the median cumulative volume through the same minute in 3–4
-  complete prior sessions. 1x earns zero component points; 3x earns 100.
+  divided by the median reported cumulative volume through the same minute in
+  3–4 prior sessions whose history covers that time. 1x earns zero component
+  points; 3x earns 100. Sparse bars mark the ratio as an estimate (`~`).
 - **25% trend:** half for price strictly above the session's minute-bar VWAP
   estimate, half for price's location from session low (0) to high (100).
   VWAP weights each minute's typical price `(H + L + C) / 3` by its volume.
@@ -355,11 +356,20 @@ and within 0.5 ADR of the planned entry. Other complete candidates show
 Watch with the reasons. A rank is a review priority, not a win probability.
 These weights and cutoffs have not been validated for predictive performance.
 
-Both instruments must have complete current-session opening bars, aligned to
-the latest common completed minute. Forming minutes, extended-hours bars,
-future observations, incomplete prior volume sessions, and stale or failed
-SPY downloads cannot manufacture a rank. Ranking runs only during regular
-hours. A five-day minute-history batch seeds the short RVOL baseline once per
+Price strength requires verified 09:30 opening prices and synchronized recent
+completed-bar endpoints for the stock and SPY. Missing intervening minutes do
+not erase these returns. No prices or missing volume are forward-filled.
+VWAP and RVOL use reported bars and carry an estimated marker when coverage
+is sparse; the detail reports minute coverage. A score marked `*` uses estimated
+or partial evidence. Missing components remain unavailable rather than zero,
+and a partial score rescales the available component weights. Only candidates
+with complete evidence can be labelled Leading; estimates remain Watch.
+
+During regular hours, genuinely stale prices stay unranked. After the close,
+the current session's last regular-session observations remain ranked for
+review, with a Session ended label and their actual timestamp. After-hours
+prices do not enter those metrics. Old sessions and absent opening prices
+cannot produce a current-session rank. A five-day minute-history batch seeds the short RVOL baseline once per
 symbol/session; subsequent refreshes reuse that history and fetch today's
 minutes. The detail shows the actual baseline session count; this is not a
 20-day RVOL measure. SPY is fetched once per batch, without becoming a watchlist

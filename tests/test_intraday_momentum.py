@@ -102,27 +102,74 @@ def test_missing_opening_bar_cannot_be_replaced_with_a_later_open(which):
     frames[key] = frames[key].drop(moment("09:30"))
     result = evaluate(**frames)
     assert result["score"] is None
-    assert "incomplete" in result["reason"]
+    assert "opening" in result["reason"] and "unavailable" in result["reason"]
 
 
 @pytest.mark.parametrize("volume", [float("nan"), float("inf"), -1])
-def test_invalid_volume_never_becomes_zero_or_a_high_rank(volume):
+def test_invalid_volume_is_missing_without_hiding_reliable_price_components(volume):
     frame = history()
     frame["Volume"] = frame["Volume"].astype(float)
     frame.loc[moment("09:45"), "Volume"] = volume
-    assert evaluate(frame)["score"] is None
+    result = evaluate(frame)
+    assert result["status"] == "PARTIAL"
+    assert result["score"] is not None
+    assert result["rvol"] is result["components"]["relative_volume"] is None
+    assert result["vwap"] is result["components"]["trend"] is None
+    assert result["component_coverage_percent"] == 50
+    assert result["rs_open_pp"] == pytest.approx(1.9)
+    assert result["candidate"] is False
 
 
-def test_rvol_excludes_incomplete_prior_sessions_and_never_uses_full_day_totals():
+def test_sparse_prior_sessions_produce_labelled_estimates_without_full_day_totals():
     frame = history()
     frame.loc[moment("15:59", "2026-10-01")] = [100, 101, 99, 100, 999_999]
     assert evaluate(frame)["rvol"] == 3
     frame = frame.drop(moment("09:45", "2026-10-01"))
-    assert evaluate(frame)["rvol_sessions"] == 3
+    assert evaluate(frame)["rvol_sessions"] == 4
     frame = frame.drop(moment("09:45", "2026-09-30"))
     result = evaluate(frame)
-    assert result["score"] is None
-    assert "3 complete prior sessions" in result["reason"]
+    assert result["score"] is not None
+    assert result["rvol_sessions"] == 4
+    assert result["rvol_estimated"] is True
+    assert result["quality"] == "ESTIMATED"
+    assert result["rvol_bar_coverage_percent"] < 100
+    assert result["candidate"] is False
+
+
+def test_missing_history_does_not_hide_price_strength_or_count_volume_as_zero():
+    result = evaluate(frame=session())
+    assert result["score"] is not None
+    assert result["status"] == result["quality"] == "PARTIAL"
+    assert result["components"]["relative_volume"] is result["rvol"] is None
+    assert result["component_coverage_percent"] == 75
+    assert result["rs_open_pp"] == pytest.approx(1.9)
+    parts = result["components"]
+    assert result["score"] == pytest.approx((parts["relative_strength"] * .4
+        + parts["trend"] * .25 + parts["entry"] * .1) / .75, abs=.1)
+
+
+def test_missing_middle_minutes_do_not_destroy_verified_open_to_price_strength():
+    frame = history().drop([moment("10:00"), moment("09:45")])
+    result = evaluate(frame)
+    assert result["rs_open_pp"] == pytest.approx(1.9)
+    assert result["quality"] == "ESTIMATED"
+    assert result["score"] is not None and result["candidate"] is False
+    assert result["bar_coverage_percent"] == pytest.approx(33 / 35 * 100, abs=.1)
+    assert result["rvol"] == pytest.approx(3 * 33 / 35)
+
+
+def test_missing_intermediate_spy_minutes_do_not_change_anchored_relative_return():
+    market = session(start=500, end=500.5).drop(moment("09:45"))
+    assert evaluate(market=market)["rs_open_pp"] == pytest.approx(1.9)
+
+
+def test_truncated_or_missing_open_history_is_not_used_for_relative_volume():
+    frame = history()
+    frame = frame.drop([moment("10:04", "2026-10-01"), moment("09:30", "2026-09-30")])
+    result = evaluate(frame)
+    assert result["rvol"] is None
+    assert result["rvol_sessions"] == 2
+    assert result["status"] == "PARTIAL"
 
 
 def test_rvol_uses_median_so_one_previous_volume_spike_does_not_dominate():
@@ -136,7 +183,6 @@ def test_rvol_uses_median_so_one_previous_volume_spike_does_not_dominate():
     ({"market": pd.DataFrame()}, "SPY"),
     ({"market": session(until="09:45")}, "stale"),
     ({"row": card(quote_status="STALE")}, "stale"),
-    ({"frame": session()}, "3 complete"),
     ({"adr": None}, "ADR"),
     ({"adr": 0}, "ADR"),
     ({"row": card(orb=[])}, "passing ORB"),
@@ -148,10 +194,36 @@ def test_missing_or_stale_inputs_remain_unranked_with_a_reason(kwargs, phrase):
     assert phrase in result["reason"]
 
 
-@pytest.mark.parametrize("time, day", [("09:29", "2026-10-02"), ("16:00", "2026-10-02"),
-                                      ("10:05", "2026-10-04"), ("13:00", "2026-11-27")])
+@pytest.mark.parametrize("time, day", [("09:29", "2026-10-02"), ("10:05", "2026-10-04")])
 def test_no_live_momentum_rank_outside_regular_hours(time, day):
     assert evaluate(now=moment(time, day))["status"] == "CLOSED"
+
+
+def test_regular_session_ranks_remain_for_review_after_close_without_after_hours_prices():
+    frame = pd.concat([
+        *(session(day=day, until="15:59", volume=1000) for day in ("2026-09-28", "2026-09-29", "2026-09-30", "2026-10-01")),
+        session(until="15:59"),
+    ])
+    market = session(until="15:59", start=500, end=500.5)
+    frame.loc[moment("16:05")] = [900, 901, 899, 900, 999_999]
+    result = evaluate(frame, market, row=card(quote_status="STALE"), now=moment("16:10"))
+    assert result["score"] is not None
+    assert result["session_closed"] is True
+    assert result["as_of"] == moment("16:00").isoformat()
+    assert result["stock_return_open_percent"] == pytest.approx(2)
+    assert result["rs_open_pp"] == pytest.approx(1.9)
+
+
+def test_early_close_is_used_for_completed_session_freshness():
+    row = card()
+    frame = pd.concat([*(session(day=day, until="12:59", volume=1000) for day in
+                         ("2026-11-23", "2026-11-24", "2026-11-25")),
+                       session(day="2026-11-27", until="12:59")])
+    result = evaluate(frame, session(day="2026-11-27", until="12:59", start=500, end=500.5),
+                      row=row, now=moment("13:30", "2026-11-27"))
+    assert result["session_closed"] is True
+    assert result["as_of"] == moment("13:00", "2026-11-27").isoformat()
+    assert result["score"] is not None
 
 
 def test_extended_move_and_low_volume_are_watch_candidates_even_after_an_orb_pass():
