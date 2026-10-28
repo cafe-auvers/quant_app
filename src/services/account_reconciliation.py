@@ -1028,7 +1028,7 @@ def _recover_detached_working_entry(
     card.capital_reservation_id = order.capital_reservation_id
     card.entry_order_generation = max(1, card.entry_order_generation)
     card.entry_parent_intent_id = card.entry_parent_intent_id or order.attempt_group_id
-    card.entry_orb_window = card.entry_orb_window or card.selected_orb_window
+    card.entry_orb_window = card.selected_orb_window or card.entry_orb_window
     card.entry_block_reason = ""
     card.next_retry_at = None
     return True

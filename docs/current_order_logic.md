@@ -112,6 +112,11 @@ cannot replace or clear that generation's price, stop, risk, or quantity,
 including while the card still says Buy Today and broker acknowledgment is
 pending. A later ORB becomes active only through the guarded replacement path.
 
+Reactivating a flat card after a confirmed zero-fill cancellation clears the
+previous entry generation, including its window and reservation references,
+even when the EP profile is unchanged. An unresolved entry or position blocks
+reactivation; a new submission freezes the current candidate's window.
+
 The persisted `Buffer %` remains planning metadata and is retained across
 devices, but the finalized passive-order zone and live confirmation above use
 the raw canonical `breakout_price`. The active order trigger is **not**

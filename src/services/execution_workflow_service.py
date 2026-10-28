@@ -1023,6 +1023,18 @@ def _require_board_action_not_conflicted(engine, command, card) -> List[Executio
         # Completed fills stay in the ledger, outside the new planning cycle.
         return active_orders
 
+    if isinstance(command, types.ActivateForToday) and (
+        active_orders
+        or card.entry_client_order_id
+        or card.entry_pending_attempt_number
+        or card.entry_submission_unresolved
+        or card.entry_cancel_in_flight
+        or has_confirmed_fill_or_position_evidence()
+    ):
+        raise BoardCommandRejectedError(
+            "Cannot reactivate while an entry order or position is unresolved"
+        )
+
     if isinstance(command, types.SetBreakoutPrice):
         if has_confirmed_fill_or_position_evidence():
             raise BoardCommandRejectedError(
@@ -1535,8 +1547,7 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
             card.entry_attempt_group_id = ""
             card.entry_attempt_count = 0
     elif isinstance(command, types.ActivateForToday):
-        if card.is_ep != command.is_ep:
-            clear_executable_entry_plan()
+        clear_executable_entry_plan()
         card.is_ep = command.is_ep
         card.board_status_updated_at = command.requested_at
         card.buy_today_note = ""

@@ -8,6 +8,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.pool import NullPool
 
 from src.core.board_workflow import (
+    ActivateForToday,
     BoardActionContext,
     ClearBreakoutPrice,
     MoveToBuylist,
@@ -635,6 +636,78 @@ def test_premarket_buy_today_set_invalidates_old_orb_geometry(engine):
     assert result.card.target_position_quantity == 0
     assert result.card.position_percent == 0.0
     assert result.card.market_data_last_trusted_price is None
+
+
+@pytest.mark.parametrize("is_ep", [False, True])
+def test_reactivation_clears_cancelled_entry_plan_with_unchanged_profile(engine, is_ep):
+    card = _seed(
+        engine,
+        breakout_price=56.91,
+        is_ep=is_ep,
+        selected_orb_window="1m",
+        entry_orb_window="1m",
+        entry_orb_high=56.6,
+        entry_orb_low=55.772,
+        entry_trigger=57.54,
+        entry_execution_price=57.54,
+        planned_quantity=42,
+        target_position_quantity=42,
+        entry_attempt_count=1,
+        entry_order_generation=1,
+        entry_parent_intent_id="cancelled-entry-group",
+        capital_reservation_id="retired-reservation",
+    )
+
+    result = request_board_action(
+        engine,
+        ActivateForToday(
+            environment=card.environment,
+            account_no=card.account_no,
+            symbol=card.symbol,
+            expected_card_version=card.version,
+            is_ep=is_ep,
+        ),
+        context=_context(),
+    )
+
+    assert result.card.board_status == BoardStatus.BUY_TODAY
+    assert result.card.entry_runtime_status == EntryRuntimeStatus.ORB_FORMING
+    assert result.card.breakout_price == 56.91
+    assert result.card.is_ep is is_ep
+    assert result.card.selected_orb_window is None
+    assert result.card.entry_orb_window is None
+    assert result.card.entry_trigger is None
+    assert result.card.planned_quantity == result.card.target_position_quantity == 0
+    assert result.card.entry_attempt_count == result.card.entry_order_generation == 0
+    assert result.card.entry_parent_intent_id == result.card.capital_reservation_id == ""
+
+
+@pytest.mark.parametrize("evidence", [
+    {"entry_client_order_id": "pending-entry"},
+    {"entry_pending_attempt_number": 1},
+    {"broker_quantity": 27, "orderable_quantity": 27, "average_entry_price": 57.15},
+])
+def test_reactivation_preserves_unresolved_entry_or_position(engine, evidence):
+    card = _seed(
+        engine, board_status=BoardStatus.BUY_TODAY, breakout_price=56.91,
+        selected_orb_window="5m", entry_orb_window="5m", entry_trigger=57.15,
+        **evidence,
+    )
+
+    with pytest.raises(BoardCommandRejectedError, match="Cannot reactivate"):
+        request_board_action(
+            engine,
+            ActivateForToday(
+                environment=card.environment, account_no=card.account_no,
+                symbol=card.symbol, expected_card_version=card.version,
+            ),
+            context=_context(),
+        )
+
+    stored = card_repo.get_trade_card(engine, card.environment, card.account_no, card.symbol)
+    assert stored.entry_orb_window == "5m"
+    assert stored.entry_trigger == 57.15
+    assert stored.version == card.version
 
 
 def test_premarket_clear_remands_buy_today_and_removes_executable_plan(engine):

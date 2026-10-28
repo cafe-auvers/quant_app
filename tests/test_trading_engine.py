@@ -319,6 +319,23 @@ def test_fresh_quote_allows_entry_submission_and_moves_to_entry_pending(tmp_path
     assert card.entry_runtime_status == EntryRuntimeStatus.ORDER_PENDING
 
 
+def test_new_entry_freezes_current_window_before_preparing_identity(tmp_path):
+    engine = _make_engine(tmp_path)
+    engine._market_data.subscribe(["AAPL"])
+    engine._market_data.poll_once()
+    card = _buy_today_card(entry_orb_window="1m", selected_orb_window="5m")
+    prepared = []
+    engine._prepare_entry_attempt = lambda current: prepared.append(
+        (current.entry_orb_window, current.entry_execution_price, current.planned_quantity)
+    )
+
+    engine._evaluate_buy_today([card])
+
+    assert prepared == [("5m", 100.0, 10)]
+    assert card.board_status == BoardStatus.ENTRY_PENDING
+    assert card.entry_orb_window == card.selected_orb_window == "5m"
+
+
 def test_definitive_broker_rejection_returns_entry_to_clean_buylist(tmp_path):
     def reject(**kwargs):
         raise GuardedSubmissionRejectedError("security is suspended")
