@@ -1397,6 +1397,57 @@ def test_cancel_confirmed_reaches_cancelled(tmp_path):
 
 
 @pytest.mark.usefixtures("trading_enabled")
+def test_cancel_budget_race_retires_local_command_and_allows_fresh_cancel(tmp_path):
+    from src.services.mutation_budget_protocol import CommandType, MutationAdmissionDeferredError
+
+    class BudgetRace(AllowAllMutationBudget):
+        defer = True
+
+        def execute_mutation(self, operation, **context):
+            if context["command_type"] == CommandType.CANCEL and self.defer:
+                self.defer = False
+                raise MutationAdmissionDeferredError("cancel allowance consumed before HTTP")
+            return operation()
+
+    gateway, broker, engine = _guarded_gateway(tmp_path, mutation_budget=BudgetRace())
+    _submit_and_acknowledge(gateway, broker)
+    before = fetch_execution_order(engine, "CID-1")
+    with pytest.raises(GuardedCancellationPreBrokerAbortedError):
+        gateway.cancel_guarded(_cancel_request())
+    after = fetch_execution_order(engine, "CID-1")
+    assert after.status == before.status
+    assert after.recovery_state == OrderRecoveryState.NONE
+    assert after.capital_reservation_id == before.capital_reservation_id
+    assert broker.cancel_calls == []
+    command = get_command_by_idempotency_key(engine, "CANCEL:CANCEL-1")
+    assert command.status == "PRE_BROKER_ABORTED"
+    assert command.redacted_response["broker_dispatched"] is False
+    broker.queue_cancel_confirmed()
+    gateway.cancel_guarded(_cancel_request(cancel_command_id="CANCEL-2"))
+    assert len(broker.cancel_calls) == 1
+    assert fetch_execution_order(engine, "CID-1").status == ExecutionOrderStatus.CANCELLED
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_cancel_preflight_budget_exhaustion_is_not_ambiguous(tmp_path):
+    from src.services.mutation_budget_protocol import CommandType, MutationBudgetExceededError
+
+    class NoCancelBudget(AllowAllMutationBudget):
+        def require_available(self, command_type, **context):
+            if command_type == CommandType.CANCEL:
+                raise MutationBudgetExceededError("cancel allowance exhausted")
+
+    gateway, broker, engine = _guarded_gateway(tmp_path, mutation_budget=NoCancelBudget())
+    _submit_and_acknowledge(gateway, broker)
+    before = fetch_execution_order(engine, "CID-1")
+    with pytest.raises(GuardedCancellationPreBrokerAbortedError):
+        gateway.cancel_guarded(_cancel_request())
+    assert fetch_execution_order(engine, "CID-1").status == before.status
+    assert get_command_by_idempotency_key(engine, "CANCEL:CANCEL-1") is None
+    assert broker.cancel_calls == []
+
+
+@pytest.mark.usefixtures("trading_enabled")
 def test_reserved_cancel_uses_actual_submission_date_in_seoul(tmp_path):
     gateway, broker, engine = _guarded_gateway(tmp_path)
     _submit_and_acknowledge(gateway, broker)

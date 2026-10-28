@@ -1344,6 +1344,37 @@ def test_ambiguous_cancel_preserves_id_and_blocks_additional_broker_calls(
 
 
 @pytest.mark.usefixtures("trading_enabled")
+def test_eod_cancel_budget_deferral_retries_without_leaving_a_cancel_fence(tmp_path, monkeypatch):
+    from src.services.mutation_budget_protocol import CommandType, MutationAdmissionDeferredError
+
+    class BudgetRace(AllowAllMutationBudget):
+        defer = True
+
+        def execute_mutation(self, operation, **context):
+            if context["command_type"] == CommandType.CANCEL and self.defer:
+                self.defer = False
+                raise MutationAdmissionDeferredError("cancel allowance consumed before HTTP")
+            return operation()
+
+    runtime, broker, gateway, engine, market_data = _make_runtime(tmp_path, monkeypatch)
+    card = _persist_owned_card(engine, _card())
+    _submit_guarded_entry(runtime, broker, market_data, card)
+    gateway._mutation_budget = BudgetRace()
+    card.entry_block_reason = "eod_cancel_requested"
+    runtime.trading_engine.run_heartbeat([card])
+    assert broker.cancel_calls == []
+    assert card.entry_cancel_command_id == ""
+    assert card.entry_cancel_in_flight is False
+    first = _cancel_commands(engine)
+    assert len(first) == 1 and first[0].status == "PRE_BROKER_ABORTED"
+    broker.queue_cancel_confirmed()
+    runtime.trading_engine.run_heartbeat([card])
+    assert len(broker.cancel_calls) == 1
+    commands = _cancel_commands(engine)
+    assert len(commands) == 2 and commands[1].idempotency_key != commands[0].idempotency_key
+
+
+@pytest.mark.usefixtures("trading_enabled")
 def test_entry_limits_do_not_block_exits_cancellation_reconciliation_or_recovery(
     tmp_path, monkeypatch
 ):

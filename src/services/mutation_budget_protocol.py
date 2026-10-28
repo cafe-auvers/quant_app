@@ -31,6 +31,10 @@ class MutationBudgetExceededError(RuntimeError):
     budget for this command type."""
 
 
+class MutationAdmissionDeferredError(MutationBudgetExceededError):
+    """Cancellation admission failed before its broker operation was invoked."""
+
+
 class MutationBudgetProtocol(Protocol):
     def require_available(self, command_type: CommandType, **context: Any) -> None:
         """Raise :class:`MutationBudgetExceededError` (or a subclass) if

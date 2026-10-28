@@ -24,6 +24,7 @@ from typing import Callable, Dict, Optional, TypeVar
 
 from src.services.mutation_budget_protocol import (
     CommandType,
+    MutationAdmissionDeferredError,
     MutationBudgetExceededError,
 )
 
@@ -533,17 +534,26 @@ class KisRequestScheduler:
             attempt += 1
             waiter = self._acquire_turn(priority)
             try:
-                self.require_available(
-                    command_type,
-                    account_no=account_no,
-                    endpoint=endpoint,
-                    priority=priority,
-                    is_new_entry=is_new_entry,
-                    consume=True,
-                )
+                try:
+                    self.require_available(
+                        command_type,
+                        account_no=account_no,
+                        endpoint=endpoint,
+                        priority=priority,
+                        is_new_entry=is_new_entry,
+                        consume=True,
+                    )
+                except MutationBudgetExceededError as exc:
+                    if command_type == CommandType.CANCEL:
+                        raise MutationAdmissionDeferredError(str(exc)) from exc
+                    raise
                 self._wait_for_request_spacing(RequestKind.MUTATION)
                 self._release_admission(waiter)
                 result = operation()
+            except MutationAdmissionDeferredError:
+                # No operation ran. A later cancellation decision may retry
+                # after the allowance resets; this is not broker ambiguity.
+                raise
             except Exception as exc:
                 retry_after = self._defer_for_exception(exc)
                 confirmed = False

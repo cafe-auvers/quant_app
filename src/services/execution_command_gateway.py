@@ -125,7 +125,10 @@ from src.services.discovered_external_order_repository import (
     ensure_discovered_external_orders_table,
     require_no_active_unowned_external_order,
 )
-from src.services.mutation_budget_protocol import CommandType, MutationBudgetProtocol
+from src.services.mutation_budget_protocol import (
+    CommandType, MutationAdmissionDeferredError, MutationBudgetExceededError,
+    MutationBudgetProtocol,
+)
 from src.services.controlled_live_policy import (
     LiveExecutionEnvelopeError,
     require_live_entry_allowed,
@@ -2773,15 +2776,18 @@ class ExecutionCommandGateway:
         )
         self._require_verified_lease(request.lease)
         cancel_priority = self._priority_for_record(record)
-        self._require_budget_available(
-            mutation_budget,
-            CommandType.CANCEL,
-            account_no=record.account_no,
-            endpoint="cancel_order",
-            priority=cancel_priority,
-            is_new_entry=False,
-            consume=False,
-        )
+        try:
+            self._require_budget_available(
+                mutation_budget,
+                CommandType.CANCEL,
+                account_no=record.account_no,
+                endpoint="cancel_order",
+                priority=cancel_priority,
+                is_new_entry=False,
+                consume=False,
+            )
+        except MutationBudgetExceededError as exc:
+            raise GuardedCancellationPreBrokerAbortedError(str(exc)) from exc
 
         if not permission_check(record):
             raise CancelNotPermittedError(
@@ -2909,6 +2915,15 @@ class ExecutionCommandGateway:
                     "side": record.side.value,
                 },
             )
+        except (MutationAdmissionDeferredError, PreBrokerDispatchAbortedError) as exc:
+            apply_status_transition(record, pre_cancel_status)
+            with engine.begin() as conn:
+                update_execution_order(conn, record, expected_version=record.version)
+                update_command_response(
+                    conn, cancel_idempotency_key, status="PRE_BROKER_ABORTED",
+                    broker_response={"error": str(exc), "broker_dispatched": False},
+                )
+            raise GuardedCancellationPreBrokerAbortedError(str(exc)) from exc
         except Exception as exc:
             error_message = str(exc)
             classify = getattr(self._real_broker, "is_ambiguous_cancellation_error", None)

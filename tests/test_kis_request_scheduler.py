@@ -41,6 +41,7 @@ def test_final_entry_validation_occurs_after_http_scheduler_wait():
     assert events == ["waited", "validated"]
 from src.services.mutation_budget_protocol import (
     CommandType,
+    MutationAdmissionDeferredError,
     MutationBudgetExceededError,
 )
 from src.services.broker import KisBroker
@@ -402,6 +403,25 @@ def test_budgets_are_isolated_per_account_and_endpoint():
         endpoint="cancel_order",
         priority=RequestPriority.EXIT_CANCEL_OR_RECONCILIATION,
     )
+
+
+def test_cancel_budget_deferral_is_local_and_can_retry_after_reset():
+    clock = [100.0]
+    scheduler = _scheduler(monotonic=lambda: clock[0])
+    scheduler.configure_verified_mutation_budget(
+        account_no="test", endpoint="cancel_order", capacity=1, window_seconds=1,
+    )
+    scheduler.require_available(CommandType.CANCEL, account_no="test", endpoint="cancel_order")
+    calls = []
+    context = dict(command_type=CommandType.CANCEL, account_no="test",
+                   endpoint="cancel_order", priority=RequestPriority.ENTRY_CANCEL)
+    with pytest.raises(MutationAdmissionDeferredError):
+        scheduler.execute_mutation(lambda: calls.append("cancel"), **context)
+    assert calls == []
+    assert scheduler.metrics().ambiguous_mutations_not_retried == 0
+    clock[0] += 1.1
+    scheduler.execute_mutation(lambda: calls.append("cancel"), **context)
+    assert calls == ["cancel"]
 
 
 def test_scheduler_restart_deterministically_returns_entry_budget_to_uncertain():

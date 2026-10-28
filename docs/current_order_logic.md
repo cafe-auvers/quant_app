@@ -333,6 +333,12 @@ completion attempts to replenish the manually sold quantity.
 - Entry Pending requests cancellation during the EOD safety window. It moves
   only after broker confirmation: zero fill to Buylist, any fill to Open
   Position, uncertainty stays Entry Pending.
+- A cancellation blocked by the local mutation allowance before its HTTP
+  operation is not a broker-ambiguous cancellation. Restore the prior order
+  status, retire any journaled local attempt as `PRE_BROKER_ABORTED`, and let
+  a later heartbeat make a fresh cancellation decision after budget recovery.
+  Keep its capital reserved until broker confirmation. A cancellation that
+  may have reached KIS retains its stable identity and reconciliation fence.
 - Open Position remains open. EOD stops trying to complete any unfilled entry
   remainder and keeps the filled position protected.
 - Outside regular hours, feed unavailability does not create a new automatic
