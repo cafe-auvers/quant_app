@@ -985,6 +985,13 @@ class TradingEngine:
                     continue
                 if card not in changed:
                     changed.append(card)
+                if not (
+                    card.entry_client_order_id
+                    or card.entry_pending_attempt_number
+                    or card.entry_submission_unresolved
+                    or card.entry_cancel_in_flight
+                ):
+                    card.entry_orb_window = card.selected_orb_window or card.entry_orb_window
                 self._prepare_entry_attempt(card)
                 key = f"{card.environment}:{card.account_no}:{card.symbol}"
                 trigger_cards[key] = card

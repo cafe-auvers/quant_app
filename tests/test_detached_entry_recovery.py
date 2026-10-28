@@ -91,6 +91,17 @@ def test_detached_working_entry_recovers_original_obligation_without_new_exposur
     assert _reduce(repaired, order, reservation, broker).card_updates == ()
 
 
+def test_detached_entry_recovers_window_from_the_verified_current_plan():
+    card, order, reservation, broker = _incident()
+    card.entry_orb_window = '1m'
+
+    repaired, = _reduce(card, order, reservation, broker).card_updates
+
+    assert repaired.entry_orb_window == repaired.selected_orb_window == '5m'
+    assert repaired.entry_execution_price == order.submitted_limit_price
+    assert repaired.planned_quantity == order.submitted_quantity
+
+
 @pytest.mark.parametrize('case', [
     'terminal', 'filled', 'prior_broker_session', 'new_candidate', 'changed_stop',
     'changed_quantity', 'wrong_reservation_group', 'wrong_reservation_notional',
