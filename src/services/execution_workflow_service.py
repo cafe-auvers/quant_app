@@ -1023,18 +1023,6 @@ def _require_board_action_not_conflicted(engine, command, card) -> List[Executio
         # Completed fills stay in the ledger, outside the new planning cycle.
         return active_orders
 
-    if isinstance(command, types.ActivateForToday) and (
-        active_orders
-        or card.entry_client_order_id
-        or card.entry_pending_attempt_number
-        or card.entry_submission_unresolved
-        or card.entry_cancel_in_flight
-        or has_confirmed_fill_or_position_evidence()
-    ):
-        raise BoardCommandRejectedError(
-            "Cannot reactivate while an entry order or position is unresolved"
-        )
-
     if isinstance(command, types.SetBreakoutPrice):
         if has_confirmed_fill_or_position_evidence():
             raise BoardCommandRejectedError(
@@ -1151,6 +1139,24 @@ def _require_board_action_not_conflicted(engine, command, card) -> List[Executio
         raise BoardCommandRejectedError(
             "An active unlinked owned broker order fences execution; explicitly link or resolve it before another execution action"
         )
+    if isinstance(command, types.ActivateForToday) and (
+        active_orders
+        or card.entry_client_order_id
+        or card.entry_pending_attempt_number
+        or has_confirmed_fill_or_position_evidence()
+    ):
+        raise BoardCommandRejectedError(
+            "Cannot reactivate while an entry order or position is unresolved"
+        )
+    if isinstance(command, types.ActivateForToday):
+        from src.services.capital_reservation_repository import list_active_reservations
+
+        if any(row.symbol == card.symbol for row in list_active_reservations(
+            engine, environment=card.environment, account_no=card.account_no
+        )):
+            raise BoardCommandRejectedError(
+                "Cannot reactivate while capital remains reserved for this symbol"
+            )
     if isinstance(command, types.CancelEntry) and card.entry_block_reason == "cancel_requested":
         raise BoardCommandRejectedError("Entry cancellation is already pending")
     if isinstance(command, types.RequestPartialSell):
@@ -1547,7 +1553,13 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
             card.entry_attempt_group_id = ""
             card.entry_attempt_count = 0
     elif isinstance(command, types.ActivateForToday):
+        allocation = card.position_percent
+        previously_submitted = bool(
+            card.entry_orb_window or card.entry_order_generation or card.entry_parent_intent_id
+        )
         clear_executable_entry_plan()
+        if not previously_submitted:
+            card.position_percent = allocation
         card.is_ep = command.is_ep
         card.board_status_updated_at = command.requested_at
         card.buy_today_note = ""
@@ -1822,8 +1834,9 @@ def request_board_action(
                 command, current, resolved_context
             )
             _require_current_board_runtime(command, current, resolved_context)
-            if current.board_status == BoardStatus.CLOSED and isinstance(
-                command, (SetBreakoutPrice, MoveToBuylist, ActivateForToday)
+            if isinstance(command, ActivateForToday) or (
+                current.board_status == BoardStatus.CLOSED
+                and isinstance(command, (SetBreakoutPrice, MoveToBuylist))
             ):
                 active_orders = _require_board_action_not_conflicted(engine, command, current)
             ownership = get_ownership_in_transaction(

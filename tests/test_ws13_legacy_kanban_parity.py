@@ -235,6 +235,7 @@ def test_l3_buylist_activate_routes_through_buy_today_kanban_command(
         position_runtime_status=PositionRuntimeStatus.NONE,
         broker_quantity=0,
         orderable_quantity=0,
+        average_entry_price=0.0,
     )
     dispatched = []
     legacy = BuylistActionsMixin()
