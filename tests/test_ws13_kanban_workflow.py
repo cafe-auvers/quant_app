@@ -225,6 +225,7 @@ def test_buylist_to_buy_today_is_a_revision_aware_workflow_request(tmp_path):
         orderable_quantity=0,
         entry_runtime_status=EntryRuntimeStatus.DATA_UNAVAILABLE,
         entry_block_reason="Current-session ORB minute bars are unavailable",
+        average_entry_price=0.0,
     )
     projection = _projection(engine, card, readiness_generation=7)
 
@@ -247,7 +248,11 @@ def test_buy_today_activation_without_context_targets_next_market_session(
     from src.utils import market_calendar
 
     engine = _engine(tmp_path)
-    card = _seed(engine, board_status=BoardStatus.BUYLIST)
+    card = _seed(
+        engine, board_status=BoardStatus.BUYLIST,
+        position_runtime_status=PositionRuntimeStatus.NONE,
+        broker_quantity=0, orderable_quantity=0, average_entry_price=0.0,
+    )
     projection = _projection(engine, card)
     next_session = date(2026, 8, 24)
     monkeypatch.setattr(

@@ -710,6 +710,33 @@ def test_reactivation_preserves_unresolved_entry_or_position(engine, evidence):
     assert stored.version == card.version
 
 
+def test_reactivation_cannot_discard_an_orphan_active_capital_reservation(engine):
+    from src.core.capital_reservation import CapitalReservation
+    from src.services.capital_reservation_repository import save_reservation_strict
+
+    card = _seed(engine, breakout_price=56.91, capital_reservation_id="orphan-reservation")
+    save_reservation_strict(engine, CapitalReservation(
+        reservation_id="orphan-reservation", environment=card.environment,
+        account_no=card.account_no, symbol=card.symbol, attempt_group_id="orphan-group",
+        requested_notional=1000.0, remaining_reserved_notional=1000.0,
+        projected_open_risk=25.0, remaining_projected_open_risk=25.0,
+    ))
+
+    with pytest.raises(BoardCommandRejectedError, match="capital remains reserved"):
+        request_board_action(
+            engine,
+            ActivateForToday(
+                environment=card.environment, account_no=card.account_no,
+                symbol=card.symbol, expected_card_version=card.version,
+            ),
+            context=_context(),
+        )
+
+    stored = card_repo.get_trade_card(engine, card.environment, card.account_no, card.symbol)
+    assert stored.capital_reservation_id == "orphan-reservation"
+    assert stored.version == card.version
+
+
 def test_premarket_clear_remands_buy_today_and_removes_executable_plan(engine):
     card = _seed(
         engine,
