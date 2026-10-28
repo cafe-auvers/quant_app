@@ -658,6 +658,32 @@ def test_sector_classification_batch_is_read_only_and_unknown_does_not_fall_back
     assert not (tmp_path / "missing.db").exists()
 
 
+@pytest.mark.parametrize('fail_query', [False, True])
+def test_sector_reader_explicitly_closes_connection_even_on_query_error(tmp_path, monkeypatch, fail_query):
+    import sqlite3
+    from src.web import monitor_source
+
+    class Connection:
+        closed = False
+
+        def execute(self, sql, *args):
+            if fail_query:
+                raise sqlite3.OperationalError('unavailable')
+            return [('AAA', 'Technology')] if sql.startswith('SELECT') else []
+
+        def close(self):
+            self.closed = True
+
+    connection = Connection()
+    mirror = tmp_path / 'profiles.db'
+    mirror.touch()
+    monkeypatch.setattr(monitor_source.sqlite3, 'connect', lambda *args, **kwargs: connection)
+    rows = [{'symbol': 'AAA'}]
+    monitor_source.load_monitor_sectors(rows, mirror)
+    assert connection.closed
+    assert rows[0]['sector_symbol'] == (None if fail_query else 'XLK')
+
+
 def test_sector_benchmarks_are_shared_and_outages_preserve_score_and_membership():
     class SectorProvider:
         def __init__(self):

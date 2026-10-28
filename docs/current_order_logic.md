@@ -303,6 +303,13 @@ For partial fills, only the filled quantity is protected. Incremental fills
 update the protected quantity and actual average price. An old-generation fill
 during replacement cannot inherit the proposed later-generation stop.
 
+Confirmed entry fills remain in the exposure fence until complete broker
+holdings account for them. That acknowledgment is persisted for the entry
+candidate. Later complete holdings reductions, including manual broker sales,
+reduce the position without replaying old buys as missing exposure. New or
+increased fills still wait for holdings, and incomplete holdings cannot retire
+the fence. External orders keep their existing ownership and mutation rules.
+
 ## 8. End-of-day behavior
 
 - Buy Today with no durable order returns to Buylist after its scheduled

@@ -4,6 +4,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 from src.core.intraday_momentum import sector_proxy
@@ -24,7 +25,7 @@ def load_monitor_sectors(rows: list[dict], mirror) -> None:
     if not mirror.is_file():
         return
     try:
-        with sqlite3.connect(mirror.as_uri() + "?mode=ro", uri=True, timeout=3) as connection:
+        with closing(sqlite3.connect(mirror.as_uri() + "?mode=ro", uri=True, timeout=3)) as connection:
             connection.execute("PRAGMA query_only=ON")
             profiles = {}
             symbols = list(dict.fromkeys(row["symbol"] for row in rows))

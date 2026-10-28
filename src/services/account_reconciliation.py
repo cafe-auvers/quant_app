@@ -1900,6 +1900,11 @@ def reduce_account_reconciliation(
     # Holdings reconciliation is independent from reserved/history failures.
     if snapshot.completeness.allows(ReconciliationAction.POSITION_QUANTITY_UPDATE):
         holding_by_symbol = {holding.symbol: holding for holding in snapshot.holdings}
+        from src.core.entry_fill_exposure import reconcile_candidate_fill_holdings
+        for card in cards:
+            if (card.environment, card.account_no) == (snapshot.environment, snapshot.account_no):
+                holding = holding_by_symbol.get(card.symbol)
+                reconcile_candidate_fill_holdings(card, orders, holding.quantity if holding else 0)
         for holding in snapshot.holdings:
             key = (snapshot.environment, snapshot.account_no, holding.symbol)
             card = card_by_key.get(key)
@@ -1938,6 +1943,8 @@ def reduce_account_reconciliation(
                 )
             else:
                 card.broker_quantity = holding.quantity
+                if card.stop_quantity > holding.quantity:
+                    card.stop_quantity = holding.quantity
                 card.orderable_quantity = (
                     holding.sellable_quantity
                     if holding.sellable_quantity is not None

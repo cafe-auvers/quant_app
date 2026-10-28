@@ -54,13 +54,13 @@ def _incident():
     return card, order, reservation, broker
 
 
-def _reduce(card, order, reservation, broker, *, extra_orders=(), extra_broker=(), complete=True, holdings=()):
+def _reduce(card, order, reservation, broker, *, extra_orders=(), extra_broker=(), complete=True, holdings=(), holdings_complete=True):
     return reduce_account_reconciliation(
         AccountBrokerSnapshot(
             environment='PROD', account_no='1', orders=(broker, *extra_broker),
             holdings=holdings,
             observed_at=_time('16:40:00'), session_date=date(2026, 10, 27),
-            completeness=SnapshotCompleteness(holdings_complete=True, open_orders_complete=complete,
+            completeness=SnapshotCompleteness(holdings_complete=holdings_complete, open_orders_complete=complete,
                 history_complete=True, reserved_orders_complete=True, account_balance_complete=True),
         ),
         AccountLocalState(cards=(card,), execution_orders=(order, *extra_orders),
@@ -297,3 +297,99 @@ def test_loader_fetches_consumed_candidate_proof_on_fresh_and_cached_reads():
             assert state.capital_reservations[0].status == CapitalReservationStatus.CONSUMED
     finally:
         engine.dispose()
+
+
+@pytest.mark.parametrize('remaining', [0, 16])
+def test_external_exit_after_holdings_account_for_fill_does_not_leave_phantom_exposure(remaining):
+    card, order, reservation, broker = _filled_incident()
+    holding = AccountHoldingSnapshot(symbol='KOD', quantity=32, average_price=90.8, sellable_quantity=32)
+    opened = _reduce(card, order, reservation, broker, holdings=(holding,))
+    card = TradeCardState.from_dict(opened.card_updates[0].to_dict())
+    manual = deepcopy(broker)
+    manual.broker_order_id, manual.side = 'MANUAL-SELL', OrderSide.SELL
+    manual.filled_quantity = manual.quantity_requested = 32 - remaining
+    # KIS has no verified normalized submission timestamp. Holdings proof
+    # must work without inventing one or adopting the external order.
+    assert not manual.submitted_at
+    holdings = (AccountHoldingSnapshot(symbol='KOD', quantity=remaining, average_price=90.8,
+                                     sellable_quantity=remaining),) if remaining else ()
+    reduced = _reduce(card, order, reservation, broker, extra_broker=(manual,), holdings=holdings)
+    repaired, = reduced.card_updates
+    assert repaired.broker_quantity == repaired.stop_quantity == remaining
+    assert not _unrepresented_entry_fills(repaired, (order,))
+    assert not _portfolio_projected_exposures(cards=(repaired,), execution_orders=(order,))
+    assert not any(alert.code == 'HOLDINGS_LAG_ENTRY_FILL' for alert in reduced.alerts)
+    assert not reduced.commands
+    assert all(external.disposition.value != 'ADOPTED' for external in reduced.external_order_updates)
+    repeated = _reduce(repaired, order, reservation, broker, extra_broker=(manual,), holdings=holdings)
+    final = repeated.card_updates[0] if repeated.card_updates else repaired
+    assert final.broker_quantity == remaining
+    assert not _unrepresented_entry_fills(final, (order,))
+
+
+def test_new_partial_fill_after_manual_exit_stays_fenced_until_holdings_catch_up():
+    from src.core.entry_fill_exposure import reconcile_candidate_fill_holdings
+    card, order, _, _ = _filled_incident()
+    order.filled_quantity = 16
+    reconcile_candidate_fill_holdings(card, (order,), 16)
+    reconcile_candidate_fill_holdings(card, (order,), 0)
+    card.broker_quantity = 0
+    assert not _unrepresented_entry_fills(card, (order,))
+    order.filled_quantity = 32
+    reconcile_candidate_fill_holdings(card, (order,), 0)
+    assert _unrepresented_entry_fills(card, (order,)) == (order,)
+    projected, = _portfolio_projected_exposures(cards=(card,), execution_orders=(order,))
+    assert projected.gross_notional_usd == pytest.approx(16 * 90.8)
+    reconcile_candidate_fill_holdings(card, (order,), 16)
+    card.broker_quantity = 16
+    assert not _unrepresented_entry_fills(card, (order,))
+
+
+def test_holdings_checkpoint_is_candidate_scoped_and_reset_with_generation():
+    from src.core.entry_fill_exposure import reconcile_candidate_fill_holdings
+    card, order, _, _ = _filled_incident()
+    reconcile_candidate_fill_holdings(card, (order,), 32)
+    reconcile_candidate_fill_holdings(card, (order,), 0)
+    assert not _unrepresented_entry_fills(card, (order,))
+    card.entry_candidate_created_at = _time('13:54:50')
+    assert _unrepresented_entry_fills(card, (order,)) == (order,)
+    card.clear_orb_generation_metadata()
+    assert card.entry_fill_reconciliation == {}
+
+
+def test_projected_fill_alone_never_acknowledges_complete_holdings():
+    card, order, reservation, broker = _filled_incident()
+    card.entry_client_order_id = order.client_order_id
+    card.entry_attempt_group_id = order.attempt_group_id
+    first = _reduce(card, order, reservation, broker)
+    card = first.card_updates[0]
+    assert card.broker_quantity == 32
+    assert not card.entry_fill_reconciliation
+    repeated = _reduce(card, order, reservation, broker)
+    assert any(alert.code == 'HOLDINGS_LAG_ENTRY_FILL' for alert in repeated.alerts)
+
+
+def test_incomplete_holdings_cannot_retire_previously_observed_entry():
+    card, order, reservation, broker = _filled_incident()
+    holding = AccountHoldingSnapshot(symbol='KOD', quantity=32, average_price=90.8, sellable_quantity=32)
+    opened = _reduce(card, order, reservation, broker, holdings=(holding,))
+    card = opened.card_updates[0]
+    before = card.to_dict()
+    incomplete = _reduce(card, order, reservation, broker, holdings_complete=False)
+    final = incomplete.card_updates[0] if incomplete.card_updates else card
+    assert final.broker_quantity == 32
+    assert final.entry_fill_reconciliation == before['entry_fill_reconciliation']
+
+
+def test_second_buy_after_external_reduction_still_projects_missing_quantity():
+    from src.core.entry_fill_exposure import reconcile_candidate_fill_holdings
+    card, order, _, _ = _filled_incident()
+    reconcile_candidate_fill_holdings(card, (order,), 32)
+    reconcile_candidate_fill_holdings(card, (order,), 16)
+    card.broker_quantity = 16
+    second = deepcopy(order)
+    second.client_order_id, second.broker_order_id = 'NEW-BUY', 'NEW-BROKER'
+    second.filled_quantity = second.submitted_quantity = 16
+    reconcile_candidate_fill_holdings(card, (order, second), 16)
+    exposure, = _portfolio_projected_exposures(cards=(card,), execution_orders=(order, second))
+    assert exposure.gross_notional_usd == pytest.approx(16 * 90.8)

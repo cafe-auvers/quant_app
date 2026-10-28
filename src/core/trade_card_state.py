@@ -17,6 +17,7 @@ broker position actually exists (section 194).
 """
 from __future__ import annotations
 
+import copy
 import math
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timezone
@@ -259,6 +260,8 @@ class TradeCardState:
     entry_range_closed_at: Optional[datetime] = None
     entry_breakout_confirmed_at: Optional[datetime] = None
     entry_candidate_created_at: Optional[datetime] = None
+    # Candidate-scoped proof that entry fills have reached complete holdings.
+    entry_fill_reconciliation: Dict[str, Any] = field(default_factory=dict)
     # Every successful broker submit advances this generation. Candidate
     # state for a not-yet-successful upgrade remains separate below.
     entry_order_generation: int = 0
@@ -567,6 +570,7 @@ class TradeCardState:
         self.entry_range_closed_at = None
         self.entry_breakout_confirmed_at = None
         self.entry_candidate_created_at = None
+        self.entry_fill_reconciliation = {}
         self.entry_order_generation = 0
         self.entry_parent_intent_id = ""
         self.orb_candidate_states = {}
@@ -640,6 +644,7 @@ class TradeCardState:
                 if self.entry_candidate_created_at
                 else None
             ),
+            "entry_fill_reconciliation": copy.deepcopy(self.entry_fill_reconciliation),
             "entry_order_generation": self.entry_order_generation,
             "entry_parent_intent_id": self.entry_parent_intent_id,
             "orb_candidate_states": self.orb_candidate_states,
@@ -767,6 +772,7 @@ class TradeCardState:
             entry_range_closed_at=data.get("entry_range_closed_at"),
             entry_breakout_confirmed_at=data.get("entry_breakout_confirmed_at"),
             entry_candidate_created_at=data.get("entry_candidate_created_at"),
+            entry_fill_reconciliation=copy.deepcopy(data.get("entry_fill_reconciliation") or {}),
             entry_order_generation=int(data.get("entry_order_generation", 0) or 0),
             entry_parent_intent_id=str(data.get("entry_parent_intent_id", "")),
             orb_candidate_states=dict(data.get("orb_candidate_states") or {}),
