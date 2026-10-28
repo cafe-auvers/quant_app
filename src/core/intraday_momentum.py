@@ -165,15 +165,21 @@ def _valid_observations(frame: pd.DataFrame, columns: list[str]) -> bool:
                         for column in columns))
 
 
-def directional_efficiency(stock: pd.DataFrame, start: pd.Timestamp, cutoff: pd.Timestamp) -> dict:
-    """Signed net progress / total close-to-close travel, on a 30-minute horizon."""
-    minutes = min(30, int((cutoff - start).total_seconds() // 60) + 1)
+def directional_efficiency(
+    stock: pd.DataFrame, start: pd.Timestamp, cutoff: pd.Timestamp, *, horizon_minutes: int = 30,
+) -> dict:
+    """Signed net progress / total close-to-close travel for completed bars."""
+    if horizon_minutes not in (5, 30):
+        raise ValueError("Price-path efficiency horizon must be 5 or 30 minutes")
+    minimum = 5
+    minutes = min(horizon_minutes, int((cutoff - start).total_seconds() // 60) + 1)
     result = {"directional_efficiency": None, "efficiency_minutes": minutes,
-              "efficiency_warming_up": minutes < 30, "efficiency_reason": "Waiting for five completed minutes"}
-    if minutes < 5:
+              "efficiency_warming_up": minutes < horizon_minutes,
+              "efficiency_reason": f"Waiting for {minimum} completed minute(s)"}
+    if minutes < minimum:
         return result
     first = cutoff - pd.Timedelta(minutes=minutes - 1)
-    # Use the preceding close as the anchor once the 30-minute window rolls.
+    # Use the preceding close as the anchor once the window rolls.
     anchor = first - pd.Timedelta(minutes=1) if first > start else start
     expected = pd.date_range(anchor, cutoff, freq="min")
     if not expected.isin(stock.index).all() or not _valid_observations(stock.loc[expected], ["Close"]):
@@ -188,7 +194,22 @@ def directional_efficiency(stock: pd.DataFrame, start: pd.Timestamp, cutoff: pd.
     travel = sum(abs(right - left) for left, right in zip(closes, closes[1:]))
     result.update(directional_efficiency=max(-1., min(1., (closes[-1] - closes[0]) / travel)) if travel else 0.,
                   efficiency_reason="Signed net change / total absolute minute-close changes; "
-                  + ("early-session window" if minutes < 30 else "last 30 completed minutes"))
+                  + ("early-session window" if minutes < horizon_minutes
+                     else f"last {horizon_minutes} completed minutes"))
+    return result
+
+
+def candle_efficiency(stock: pd.DataFrame, cutoff: pd.Timestamp) -> dict:
+    """Signed body/range proxy for the last completed one-minute candle."""
+    result = {"value": None, "minutes": 1, "warming_up": False, "estimated": True,
+              "reason": "Missing or invalid completed one-minute candle"}
+    if cutoff not in stock.index or not _valid_observations(stock.loc[[cutoff]], ["Open", "High", "Low", "Close"]):
+        return result
+    opened, high, low, closed = (float(stock.loc[cutoff, key]) for key in ("Open", "High", "Low", "Close"))
+    if low > min(opened, closed) or high < max(opened, closed):
+        return result
+    result.update(value=round((closed - opened) / (high - low), 12) if high > low else 0.,
+                  reason="One-minute candle estimate: (close - open) / (high - low); intraminute price path unavailable")
     return result
 
 
@@ -208,7 +229,16 @@ def additional_signals(stock: pd.DataFrame, sector: pd.DataFrame, result: dict, 
                 change = (float(endpoints.Close.iloc[-1]) / float(endpoints.Open.iloc[0]) - 1) * 100
                 signals.update(rs_sector_pp=result["stock_return_open_percent"] - change,
                                sector_return_open_percent=change, sector_as_of=result["as_of"], sector_reason="")
-    signals.update(directional_efficiency(stock, start, cutoff))
+    signals["efficiency_windows"] = {"1m": candle_efficiency(stock, cutoff)}
+    for minutes in (5, 30):
+        window = directional_efficiency(stock, start, cutoff, horizon_minutes=minutes)
+        if minutes == 30:
+            signals.update(window)
+        signals["efficiency_windows"][f"{minutes}m"] = {
+            "value": window["directional_efficiency"], "minutes": window["efficiency_minutes"],
+            "warming_up": window["efficiency_warming_up"], "reason": window["efficiency_reason"],
+            "estimated": False,
+        }
     return signals
 
 

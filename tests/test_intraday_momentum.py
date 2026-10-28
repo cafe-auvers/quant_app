@@ -396,6 +396,65 @@ def test_efficiency_early_session_minimum_is_five_completed_minutes(time, ratio,
     assert result["efficiency_warming_up"] is warming
 
 
+@pytest.mark.parametrize('opened,high,low,closed,expected', [
+    (100, 102, 99, 101, 1 / 3), (101, 102, 99, 100, -1 / 3),
+    (100, 100, 100, 100, 0), (100, 101, 99, 100, 0),
+    (1.8, 2, 1.75, 1.9, .4),
+    (100, 99, 98, 99, None), (100, 101, 100.5, 101, None),
+    (100, float('nan'), 99, 101, None),
+])
+def test_one_minute_candle_proxy_handles_wicks_flat_and_invalid_bars(opened, high, low, closed, expected):
+    from src.core.intraday_momentum import candle_efficiency
+    frame = pd.DataFrame({'Open': [opened], 'High': [high], 'Low': [low], 'Close': [closed]},
+                         index=[moment('10:04')])
+    result = candle_efficiency(frame, pd.Timestamp(moment('10:04')))
+    assert result['estimated'] is True
+    assert result['value'] == (pytest.approx(expected) if expected is not None else None)
+    assert candle_efficiency(frame, pd.Timestamp(moment('10:03')))['value'] is None
+
+
+def test_five_minute_efficiency_uses_exact_window_and_preceding_close():
+    frame = history()
+    frame.loc[pd.date_range(moment('09:59'), moment('10:04'), freq='min'), 'Close'] = [100, 102, 101, 103, 102, 103]
+    result = evaluate(frame)
+    windows = result['efficiency_windows']
+    assert set(windows) == {'1m', '5m', '30m'}
+    assert windows['5m']['value'] == pytest.approx(3 / 7)
+    assert windows['5m']['minutes'] == 5
+    assert windows['5m']['warming_up'] is False
+    assert windows['30m']['value'] == result['directional_efficiency']
+    assert windows['30m']['minutes'] == result['efficiency_minutes']
+
+
+def test_efficiency_windows_require_only_their_own_completed_bars():
+    # Missing an older minute invalidates30m without hiding the shorter windows.
+    frame = history().drop(moment('09:45'))
+    frame.loc[moment('10:04'), ['Open', 'High', 'Low', 'Close']] = [101, 103, 99, 102]
+    windows = evaluate(frame)['efficiency_windows']
+    assert windows['1m']['value'] == .25
+    assert windows['5m']['value'] is not None
+    assert windows['30m']['value'] is None
+    frame = frame.drop(moment('10:02'))
+    windows = evaluate(frame)['efficiency_windows']
+    assert windows['1m']['value'] == .25
+    assert windows['5m']['value'] is None
+    assert windows['30m']['value'] is None
+
+
+def test_short_efficiency_windows_wait_for_completed_candles_and_preserve_condition():
+    frame = history()
+    frame.loc[moment('09:31'), ['Open', 'High', 'Low', 'Close']] = [100, 102, 98, 101]
+    assert evaluate(frame, now=moment('09:31'))['status'] == 'FORMING'
+    early = evaluate(frame, now=moment('09:32'))['efficiency_windows']
+    assert early['1m']['value'] == .25
+    assert early['5m']['value'] is None
+    assert early['30m']['value'] is None
+    assert evaluate(now=moment('09:35'))['efficiency_windows']['5m']['value'] == 1
+    result = evaluate()
+    altered = {**result, 'efficiency_windows': {'1m': {'value': -1}, '5m': {'value': -1}}}
+    assert assess_momentum(altered) == assess_momentum(result)
+
+
 @pytest.mark.parametrize("updates, label, metric, rating", [
     ({}, "Strong", "efficiency", "GOOD"),
     ({"rs_sector_pp": -.01}, "Weak", "sector", "BAD"),

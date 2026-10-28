@@ -3054,6 +3054,17 @@
     return momentum.assessment || {label: 'Check data', tone: 'UNKNOWN', reasons: ['Waiting for condition assessment'], metrics: {}};
   }
 
+  function monitorEfficiency(momentum, minutes) {
+    const window = momentum.efficiency_windows?.[`${minutes}m`] || (minutes === 30 ? {
+      value: momentum.directional_efficiency, minutes: momentum.efficiency_minutes,
+      warming_up: momentum.efficiency_warming_up, reason: momentum.efficiency_reason,
+    } : {});
+    const value = monitorNumber(momentum.score) === null ? null : monitorNumber(window.value);
+    return {...window, value, rating: value === null ? 'UNKNOWN' : value >= .4 ? 'GOOD' : value >= .2 ? 'NORMAL' : 'BAD',
+      prefix: window.estimated || window.warming_up ? '~' : '',
+      title: `${window.reason || 'Efficiency unavailable'}.${window.warming_up ? ` Actual window: ${window.minutes} completed minutes.` : ''} Green ≥ +0.40; white +0.20 to < +0.40; red < +0.20, including downward action.`};
+  }
+
   function renderMonitorMomentumDetail() {
     const panel = byId('mobile-momentum-detail');
     const row = state.visibleRows.find(item => item.symbol === state.monitorMomentumSymbol);
@@ -3080,7 +3091,12 @@
       for (const [label, value, rating, title] of [
         [`Sector · ${momentum.sector_symbol || '?'}`, format(momentum.rs_sector_pp, ' pp', true), condition.metrics.sector, momentum.sector_reason || `${momentum.sector_name}: stock minus sector ETF, 09:30 ET to the identical completed minute`],
         ['Price vs VWAP', `${momentum.bar_coverage_percent < 100 ? '~' : ''}${format(momentum.vwap_distance_percent, '%', true)}`, condition.metrics.vwap, `Price ${format(momentum.signal_price, '')} / VWAP ${format(momentum.vwap, '')}; distance ${format(momentum.vwap_distance_adr, ' ADR', true)}`],
-        [`Efficiency · ${momentum.efficiency_minutes || 30}m`, `${momentum.efficiency_warming_up ? '~' : ''}${format(momentum.directional_efficiency, '', true)}`, condition.metrics.efficiency, momentum.efficiency_reason || 'Signed efficiency unavailable'],
+        ...[1, 5, 30].map(minutes => {
+          const efficiency = monitorEfficiency(momentum, minutes);
+          return [`ER ${minutes}m${efficiency.estimated ? ' · est.' : efficiency.warming_up ? ` · ${efficiency.minutes}m so far` : ''}`,
+            `${efficiency.value === null ? '' : efficiency.prefix}${format(efficiency.value, '', true)}`,
+            efficiency.rating, efficiency.title];
+        }),
       ]) {
         const card = document.createElement('div');
         card.title = title;
@@ -3226,8 +3242,13 @@
         momentum.sector_reason || `Stock minus ${momentum.sector_name} ETF ${momentum.sector_symbol}, same 09:30 ET open and completed minute as RS/SPY. Green ≥ +0.5 pp; white 0 to < +0.5; red < 0.`);
       extra('vwap_distance_percent', '%', 'mobile-monitor-vwap', 'vwap',
         'Completed stock price versus regular-session VWAP. Green above; white at VWAP; red below or > 0.5 ADR above VWAP.', momentum.bar_coverage_percent < 100 ? '~' : '');
-      extra('directional_efficiency', '', 'mobile-monitor-efficiency', 'efficiency',
-        `${momentum.efficiency_reason || 'Signed efficiency unavailable'}. Green ≥ +0.40; white +0.20 to < +0.40; red < +0.20, including negative/downward action.`, momentum.efficiency_warming_up ? '~' : '');
+      for (const minutes of [1, 5, 30]) {
+        const efficiency = monitorEfficiency(momentum, minutes);
+        const node = cell(efficiency.value === null ? '—' : `${efficiency.prefix}${efficiency.value >= 0 ? '+' : ''}${efficiency.value.toFixed(2)}`,
+          `mobile-monitor-efficiency mobile-monitor-er-${minutes}`, efficiency.title);
+        node.dataset.rating = efficiency.rating;
+        node.setAttribute('aria-label', `ER ${minutes} minutes${efficiency.estimated ? ', candle estimate' : ''}: ${node.textContent}, ${efficiency.rating}`);
+      }
     }
     const percent = (key, title) => {
       const value = monitorNumber(row[key]);
@@ -3333,7 +3354,7 @@
       table.classList.toggle('momentum-table', ranked);
       table.setAttribute('aria-label', 'Watchlist breakout monitor');
       const header = table.createTHead().insertRow();
-      const columns = ranked ? ['Stock', 'Condition', 'Momentum', 'RS/SPY pp', 'RVOL', 'Sector pp', 'vs VWAP', 'ER 30m', 'Today %', 'Breakout', 'Best ORB', '1M %', '3M %', '+']
+      const columns = ranked ? ['Stock', 'Condition', 'Momentum', 'RS/SPY pp', 'RVOL', 'Sector pp', 'vs VWAP', 'ER 1m', 'ER 5m', 'ER 30m', 'Today %', 'Breakout', 'Best ORB', '1M %', '3M %', '+']
         : ['Stock', 'Today %', 'Breakout', 'Best ORB', '1M %', '3M %', '+'];
       columns.forEach((label, index) => {
         const cell = document.createElement('th');
@@ -3341,6 +3362,8 @@
         cell.textContent = label;
         if (label === 'Momentum') cell.title = 'Advisory score out of 100; Leading candidates first. Tap a score for its reasons.';
         if (label === 'Condition') cell.title = 'Absolute checks independent of rank. Even #1 can be Weak or Extended. Tap for reasons.';
+        if (label === 'ER 1m') cell.title = 'Estimated one-minute candle body / high-low range; ~ marks this candle proxy.';
+        if (label === 'ER 5m' || label === 'ER 30m') cell.title = 'Signed net progress / total absolute minute-close changes over the completed window.';
         if (index === columns.length - 1) cell.setAttribute('aria-label', 'Add to Buy Today');
         header.appendChild(cell);
       });

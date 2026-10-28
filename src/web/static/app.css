@@ -555,14 +555,14 @@ input::placeholder { color: #65776f; }
   .mobile-monitor-action button { width: 28px; min-height: 32px; padding: 0; border: 1px solid #315548; border-radius: 5px; color: var(--green); background: #132820; font-size: 16px; }
   .mobile-monitor-action button:disabled { color: var(--muted); border-color: transparent; background: transparent; }
   .mobile-monitor-status { flex: 0 0 auto; padding: 9px 11px; border-top: 1px solid var(--line); color: var(--muted); font-size: 10px; line-height: 1.5; }
-  .mobile-monitor-table.momentum-table { min-width: 960px; }
+  .mobile-monitor-table.momentum-table { min-width: 1080px; }
   .momentum-table th:nth-child(n+2):not(:last-child) { width: 58px; }
   .momentum-table th:nth-child(2) { width: 82px; }
   .momentum-table th:nth-child(3) { width: 70px; }
   .momentum-table th:nth-child(4) { width: 68px; }
   .momentum-table th:nth-child(6) { width: 90px; }
   .momentum-table th:nth-child(7) { width: 75px; }
-  .momentum-table th:nth-child(11) { width: 84px; }
+  .momentum-table th:nth-child(13) { width: 84px; }
   .mobile-monitor-momentum button { padding: 0; min-height: 40px; border: 0; background: transparent; color: inherit; font-size: 11px; font-weight: 800; }
   .mobile-monitor-momentum[data-status="STALE"] { color: #edc17d; }
   .momentum-condition { min-height: 29px; max-width: 100%; padding: 3px 5px; border: 1px solid currentColor; border-radius: 5px; background: transparent; font-size: 10px; font-weight: 800; white-space: nowrap; }

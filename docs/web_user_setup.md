@@ -349,9 +349,11 @@ Stale observations cannot show a green condition. After close, labels describe
 closing conditions for review. Tap the condition for specific reasons.
 These bands are unvalidated heuristics; the scoring weights and rank order are unchanged.
 
-The additional **Sector pp**, **vs VWAP**, and **ER 30m** columns refine the
-Condition badge without changing score weights or relative ranking. Swipe the
-table to see the extra columns, or tap Condition for three colored metric cards.
+The additional **Sector pp**, **vs VWAP**, and **ER 1m / ER 5m / ER 30m** columns
+show strength across short and longer windows. Swipe the table to see them, or
+tap Condition for colored metric cards. Each ER uses green ≥ +0.40, white +0.20
+to < +0.40, and red < +0.20. Score weights and relative ranking are unchanged;
+the Condition badge continues to use ER 30m, with ER 1m and ER 5m advisory only.
 
 - **Sector pp:** stock return minus its broad sector ETF return, from the same
   09:30 ET open to the exact completed-minute endpoint used for RS/SPY. ETF
@@ -367,11 +369,17 @@ table to see the extra columns, or tap Condition for three colored metric cards.
   positive distance can mean chasing a stretched price. The session VWAP uses
   volume-weighted minute typical prices, not tick executions; `~` marks sparse-bar
   estimates. The current displayed after-hours quote is not mixed with RTH VWAP.
-- **ER 30m:** signed net price change divided by summed absolute one-minute
-  close changes over the last 30 completed minutes, from −1 to +1. This is a
+- **ER 1m:** the last completed candle's `(close - open) / (high - low)`,
+  from −1 to +1, marked `~` as a candle estimate. The one-minute data cannot
+  reconstruct the intraminute price path. A flat candle with no range is 0;
+  missing or inconsistent OHLC values stay unknown. This window needs one
+  completed candle and does not include the forming candle.
+- **ER 5m / ER 30m:** signed net price change divided by summed absolute
+  one-minute close changes over the last 5 or 30 completed minutes, from −1
+  to +1. This is a
   signed adaptation of [Kaufman's efficiency ratio](https://chartschool.stockcharts.com/table-of-contents/technical-indicators-and-overlays/technical-overlays/kaufmans-adaptive-moving-average-kama).
   Smooth rises approach +1; smooth declines approach −1; flat/no-net-progress
-  paths are 0. Green ≥ +0.40, white +0.20 to < +0.40, red < +0.20. Before 30
+  paths are 0. ER 5m waits for five completed minutes. Before 30
   minutes are available, use the session open and at least five completed bars,
   mark `~`, and show the actual window in details. Missing minute closes stay
   unknown because skipping them could make the path look falsely smooth.
