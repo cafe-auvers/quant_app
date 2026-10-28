@@ -1926,6 +1926,33 @@ def test_eod_cleanup_is_a_no_op_without_an_eod_service_wired(tmp_path):
 # --- P0-5: cumulative fill accounting across multiple entry attempts -------
 
 
+def test_manual_exit_keeps_raised_stop_and_does_not_replenish_sold_quantity(tmp_path):
+    from src.services.position_manager import BrokerHolding
+    candidate = dt.datetime(2026, 10, 27, 13, 50, tzinfo=dt.timezone.utc)
+    order = _pending_order(status=OrderStatus.PARTIALLY_FILLED, filled=24, avg_fill_price=100)
+    order.quantity_requested = 32
+    order.remaining_quantity = 8
+    engine = _make_engine(tmp_path, submit_order=lambda **kw: pytest.fail('manual sale must not be replenished'))
+    engine._entry_deadline_lookup.refresh_broker_position = (
+        lambda card: BrokerHolding(symbol='AAPL', quantity=8, average_price=100)
+    )
+    engine._market_is_open_fn = lambda: True
+    card = _open_card(broker_quantity=0, orderable_quantity=0, stop_quantity=0,
+                      active_stop_price=97, entry_orb_low=95, target_position_quantity=32,
+                      entry_candidate_created_at=candidate,
+                      entry_fill_reconciliation={'candidate': candidate.isoformat(),
+                        'observed_fills': {order.client_order_id: 16}, 'external_exit_quantity': 16})
+    engine._protect_new_fill(card, order)
+    assert card.active_stop_price == 97
+    assert card.broker_quantity == card.stop_quantity == 8
+    assert card.entry_remaining_target_quantity == 8
+    engine._process_entry_completion([card])
+    order.status = OrderStatus.CANCELLED
+    order.remaining_quantity = 0
+    engine._protect_new_fill(card, order)
+    assert card.entry_remaining_target_quantity == 0
+
+
 def test_second_attempt_fill_accumulates_via_broker_refresh(tmp_path):
     """A completion order's own filled_quantity starts back at 0 -- without
     a broker-truth refresh this either gets ignored (below the running

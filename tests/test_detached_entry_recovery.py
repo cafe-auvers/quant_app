@@ -393,3 +393,105 @@ def test_second_buy_after_external_reduction_still_projects_missing_quantity():
     reconcile_candidate_fill_holdings(card, (order, second), 16)
     exposure, = _portfolio_projected_exposures(cards=(card,), execution_orders=(order, second))
     assert exposure.gross_notional_usd == pytest.approx(16 * 90.8)
+
+
+def _sell(order, quantity, submitted='15:00:00'):
+    sell = deepcopy(order)
+    sell.side, sell.intent = OrderSide.SELL, OrderIntent.PARTIAL_EXIT
+    sell.client_order_id, sell.broker_order_id = 'LOCAL-SELL', 'BROKER-SELL'
+    sell.submitted_quantity = sell.filled_quantity = quantity
+    sell.submission_started_at = _time(submitted).isoformat()
+    return sell
+
+
+def test_holdings_first_local_sell_is_not_deducted_twice_when_new_buy_arrives():
+    from src.core.entry_fill_exposure import reconcile_candidate_fill_holdings
+    card, order, _, _ = _filled_incident()
+    reconcile_candidate_fill_holdings(card, (order,), 32, observed_at=_time('14:00:00'))
+    # Holdings can move before terminal order history reaches the ledger.
+    reconcile_candidate_fill_holdings(card, (order,), 16, observed_at=_time('16:00:00'))
+    sell = _sell(order, 16)
+    second = deepcopy(order)
+    second.client_order_id, second.broker_order_id = 'NEW-BUY', 'NEW-BROKER'
+    second.filled_quantity = second.submitted_quantity = 16
+    card.broker_quantity = 16
+    reconcile_candidate_fill_holdings(card, (order, sell, second), 16, observed_at=_time('16:10:00'))
+    exposure, = _portfolio_projected_exposures(cards=(card,), execution_orders=(order, sell, second))
+    assert exposure.gross_notional_usd == pytest.approx(16 * 90.8)
+
+
+def test_distinct_future_local_sell_keeps_manual_exit_adjustment_with_new_buy():
+    from src.core.entry_fill_exposure import reconcile_candidate_fill_holdings
+    card, order, _, _ = _filled_incident()
+    reconcile_candidate_fill_holdings(card, (order,), 32, observed_at=_time('14:00:00'))
+    reconcile_candidate_fill_holdings(card, (order,), 16, observed_at=_time('14:10:00'))
+    sell = _sell(order, 8, submitted='15:00:00')
+    second = deepcopy(order)
+    second.client_order_id, second.broker_order_id = 'NEW-BUY', 'NEW-BROKER'
+    second.filled_quantity = second.submitted_quantity = 16
+    # Manual sale16 + later app sale8 + new buy16 =>24 held; the new buy
+    # must be acknowledged once holdings actually contain those24 shares.
+    card.broker_quantity = 24
+    reconcile_candidate_fill_holdings(card, (order, sell, second), 24, observed_at=_time('16:10:00'))
+    assert not _unrepresented_entry_fills(card, (order, sell, second))
+
+
+def test_later_adoption_timestamp_does_not_make_an_old_sell_a_distinct_future_exit():
+    from src.core.entry_fill_exposure import reconcile_candidate_fill_holdings
+    from src.core.execution_order_record import OrderOrigin
+    card, order, _, _ = _filled_incident()
+    reconcile_candidate_fill_holdings(card, (order,), 32, observed_at=_time('14:00:00'))
+    reconcile_candidate_fill_holdings(card, (order,), 16, observed_at=_time('14:10:00'))
+    adopted = _sell(order, 16)
+    adopted.origin = OrderOrigin.USER_ADOPTED
+    adopted.submission_started_at = None
+    adopted.prepared_at = _time('15:00:00').isoformat()
+    second = deepcopy(order)
+    second.client_order_id, second.broker_order_id = 'NEW-BUY', 'NEW-BROKER'
+    second.filled_quantity = second.submitted_quantity = 16
+    card.broker_quantity = 16
+    reconcile_candidate_fill_holdings(card, (order, adopted, second), 16, observed_at=_time('16:10:00'))
+    assert _unrepresented_entry_fills(card, (order, adopted, second))
+
+
+def test_working_owned_sell_prevents_speculative_manual_exit_adjustment():
+    from src.core.entry_fill_exposure import reconcile_candidate_fill_holdings
+    card, order, _, _ = _filled_incident()
+    sell = _sell(order, 0)
+    sell.status = ExecutionOrderStatus.WORKING
+    sell.submitted_quantity = sell.remaining_quantity = 16
+    reconcile_candidate_fill_holdings(card, (order, sell), 32, observed_at=_time('14:00:00'))
+    reconcile_candidate_fill_holdings(card, (order, sell), 16, observed_at=_time('16:00:00'))
+    card.broker_quantity = 16
+    assert card.entry_fill_reconciliation['external_exit_quantity'] == 0
+    assert _unrepresented_entry_fills(card, (order, sell))
+
+
+def test_manual_flat_during_working_buy_remainder_keeps_stop_and_order_link_for_later_fill():
+    card, order, reservation, broker = _filled_incident()
+    order.status, broker.status = ExecutionOrderStatus.PARTIALLY_FILLED, OrderStatus.PARTIALLY_FILLED
+    order.filled_quantity = broker.filled_quantity = 16
+    order.remaining_quantity = broker.remaining_quantity = 16
+    holding = AccountHoldingSnapshot(symbol='KOD', quantity=16, average_price=90.8, sellable_quantity=16)
+    first = _reduce(card, order, reservation, broker, holdings=(holding,))
+    opened = first.card_updates[0]
+    flat = _reduce(opened, order, reservation, broker).card_updates[0]
+    assert flat.board_status == BoardStatus.ENTRY_PENDING
+    assert flat.entry_client_order_id == order.client_order_id
+    assert flat.broker_quantity == flat.stop_quantity == 0
+    assert flat.active_stop_price == 89.61
+    broker.filled_quantity = 24
+    broker.remaining_quantity = 8
+    holding = AccountHoldingSnapshot(symbol='KOD', quantity=8, average_price=90.8, sellable_quantity=8)
+    later = _reduce(flat, order, reservation, broker, holdings=(holding,)).card_updates[0]
+    assert later.board_status == BoardStatus.OPEN_POSITION
+    assert later.broker_quantity == later.stop_quantity == 8
+    assert later.active_stop_price == 89.61
+    assert later.entry_client_order_id == order.client_order_id
+    assert later.entry_remaining_target_quantity == 8
+    broker.status = OrderStatus.CANCELLED
+    broker.remaining_quantity = 0
+    later.entry_cancel_reason = 'TTL_REPRICE'
+    terminal = _reduce(later, order, reservation, broker, holdings=(holding,))
+    ended = terminal.card_updates[0] if terminal.card_updates else later
+    assert ended.entry_remaining_target_quantity == 0

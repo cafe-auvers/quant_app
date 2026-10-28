@@ -1900,11 +1900,19 @@ def reduce_account_reconciliation(
     # Holdings reconciliation is independent from reserved/history failures.
     if snapshot.completeness.allows(ReconciliationAction.POSITION_QUANTITY_UPDATE):
         holding_by_symbol = {holding.symbol: holding for holding in snapshot.holdings}
-        from src.core.entry_fill_exposure import reconcile_candidate_fill_holdings
+        from src.core.entry_fill_exposure import candidate_has_manual_reduction, reconcile_candidate_fill_holdings
         for card in cards:
             if (card.environment, card.account_no) == (snapshot.environment, snapshot.account_no):
                 holding = holding_by_symbol.get(card.symbol)
-                reconcile_candidate_fill_holdings(card, orders, holding.quantity if holding else 0)
+                reconcile_candidate_fill_holdings(
+                    card, orders, holding.quantity if holding else 0, observed_at=snapshot.observed_at
+                )
+                if candidate_has_manual_reduction(card):
+                    card.entry_remaining_target_quantity = sum(
+                        max(0, order.remaining_quantity) for order in orders
+                        if _order_key(order) == _card_key(card) and order.side == OrderSide.BUY
+                        and order.intent == OrderIntent.ENTRY and order.status not in _TERMINAL_EXECUTION_STATUSES
+                    )
         for holding in snapshot.holdings:
             key = (snapshot.environment, snapshot.account_no, holding.symbol)
             card = card_by_key.get(key)
@@ -1983,6 +1991,17 @@ def reduce_account_reconciliation(
                     continue
                 card.broker_quantity = 0
                 card.orderable_quantity = 0
+                pending_entries = [order for order in orders
+                    if _order_key(order) == _card_key(card)
+                    and order.side == OrderSide.BUY and order.intent == OrderIntent.ENTRY
+                    and order.status not in _TERMINAL_EXECUTION_STATUSES]
+                if pending_entries:
+                    # Flat holdings do not end a still-working entry cycle.
+                    # Preserve its identity and frozen stop for later fills.
+                    card.board_status = BoardStatus.ENTRY_PENDING
+                    card.entry_runtime_status = EntryRuntimeStatus.ORDER_PENDING
+                    card.stop_quantity = 0
+                    continue
                 if card.board_status in (
                     BoardStatus.OPEN_POSITION,
                     BoardStatus.PARTIAL_SELL,

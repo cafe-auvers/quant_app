@@ -309,6 +309,9 @@ candidate. Later complete holdings reductions, including manual broker sales,
 reduce the position without replaying old buys as missing exposure. New or
 increased fills still wait for holdings, and incomplete holdings cannot retire
 the fence. External orders keep their existing ownership and mutation rules.
+If a manual sale reduces a position during a still-working entry, retain the
+existing order linkage and frozen stop for later fills. Do not submit new
+completion attempts to replenish the manually sold quantity.
 
 ## 8. End-of-day behavior
 

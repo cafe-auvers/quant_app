@@ -58,6 +58,7 @@ from typing import Any, Callable, Dict, List, Optional
 from src.core import execution_config
 from src.core.execution_config import is_buyboard_engine_enabled
 from src.core.execution_result import UnifiedExecutionStatus
+from src.core.entry_fill_exposure import candidate_has_manual_reduction
 from src.core.order_state import RESERVED_MOO_EXECUTION, BrokerOrder, OrderIntent, OrderSide, OrderStatus, is_open_status
 from src.core.orb_entry_logic import passive_entry_prices
 from src.core.trade_card_state import (
@@ -1718,6 +1719,8 @@ class TradingEngine:
         was_first_fill = card.broker_quantity <= 0
         self._apply_cumulative_fill(card, order)
         remaining_target = max(0, card.target_position_quantity - card.broker_quantity)
+        if candidate_has_manual_reduction(card):
+            remaining_target = max(0, order.remaining_quantity) if is_open_status(order.status) else 0
         card.entry_remaining_target_quantity = remaining_target
         # A liquidation already in progress for this card (a stop hit while
         # completing the entry, or an explicit Sell All/Partial Sell) owns
@@ -1735,7 +1738,9 @@ class TradingEngine:
                 if remaining_target > 0
                 else PositionRuntimeStatus.OPEN
             )
-        if was_first_fill:
+        if was_first_fill and not (
+            candidate_has_manual_reduction(card) and card.stop_type is not None and card.active_stop_price
+        ):
             # Set the initial ORB-low stop. A later completion fill must
             # not re-run this (section 620: the entry ORB is frozen at
             # first fill, never recalculated).
@@ -1950,6 +1955,8 @@ class TradingEngine:
                 continue
             if card.entry_remaining_target_quantity <= 0:
                 continue
+            if candidate_has_manual_reduction(card):
+                continue  # Keep existing broker orders; never replenish a manual exit.
             if card.exit_all_required:
                 continue  # a stop/liquidation is in progress -- do not buy more
             if card.entry_submission_unresolved:
