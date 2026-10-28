@@ -1719,7 +1719,7 @@ class ExecutionCommandGateway:
         except Exception as exc:
             if not dispatched:
                 raise
-            if isinstance(exc, PreBrokerDispatchAbortedError):
+            if isinstance(exc, (PreBrokerDispatchAbortedError, MutationAdmissionDeferredError)):
                 observer("MUTATION_TERMINAL", {**common_observation, "result": "PRE_BROKER_ABORTED",
                     "identity_ambiguous": False, "resolved": True, "broker_confirmed_terminal": False})
                 raise

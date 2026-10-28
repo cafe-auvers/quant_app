@@ -1448,6 +1448,42 @@ def test_cancel_preflight_budget_exhaustion_is_not_ambiguous(tmp_path):
 
 
 @pytest.mark.usefixtures("trading_enabled")
+def test_request_boundary_cancel_deferral_emits_pre_broker_observation(tmp_path):
+    from src.services.mutation_budget_protocol import CommandType, MutationAdmissionDeferredError
+    from src.services.kis_request_boundary import execute_kis_request
+
+    class HttpAdmissionBlocked(AllowAllMutationBudget):
+        def execute_mutation(self, operation, **context):
+            if context["command_type"] == CommandType.CANCEL:
+                raise MutationAdmissionDeferredError("cancel allowance exhausted before HTTP")
+            return operation()
+
+    gateway, broker, engine = _guarded_gateway(tmp_path, mutation_budget=HttpAdmissionBlocked())
+    _submit_and_acknowledge(gateway, broker)
+    broker.schedules_at_request_boundary = True
+    events = []
+    http_calls = []
+    gateway._qualification_observer = lambda kind, payload: events.append((kind, payload))
+
+    def deferred_at_http_admission(**request):
+        return execute_kis_request(
+            lambda: http_calls.append("POST"), account_no=request["account_no"],
+            endpoint="cancel_order", default_kind=gw_module.RequestKind.MUTATION,
+        )
+
+    broker.cancel_order = deferred_at_http_admission
+    with pytest.raises(GuardedCancellationPreBrokerAbortedError):
+        gateway.cancel_guarded(_cancel_request())
+    kind, payload = events[-1]
+    assert kind == "MUTATION_TERMINAL"
+    assert payload["result"] == "PRE_BROKER_ABORTED"
+    assert payload["identity_ambiguous"] is False and payload["resolved"] is True
+    assert http_calls == []
+    assert get_command_by_idempotency_key(engine, "CANCEL:CANCEL-1").status == "PRE_BROKER_ABORTED"
+    assert fetch_execution_order(engine, "CID-1").status == ExecutionOrderStatus.ACKNOWLEDGED
+
+
+@pytest.mark.usefixtures("trading_enabled")
 def test_reserved_cancel_uses_actual_submission_date_in_seoul(tmp_path):
     gateway, broker, engine = _guarded_gateway(tmp_path)
     _submit_and_acknowledge(gateway, broker)
