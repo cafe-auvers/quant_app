@@ -678,6 +678,79 @@ def test_background_balance_retains_response_time_instead_of_request_or_apply_ti
     worker._account_reader.close()
 
 
+@pytest.mark.parametrize("change", ["card", "reservation", "other_account", "http_mutation"])
+def test_background_balance_ignores_planning_churn_but_rejects_http_mutations(tmp_path, monkeypatch, change):
+    from sqlalchemy import text
+    from src.services import buying_power_cache, kis_request_boundary as boundary
+    from src.services.background_account_reader import BackgroundAccountReader
+    from src.services.kis_request_scheduler import RequestKind
+
+    buying_power_cache.clear()
+    monkeypatch.setattr(boundary, "_account_mutations", {})
+    monkeypatch.setattr(boundary, "get_process_kis_request_scheduler", lambda: None)
+    broker = _FakeBroker()
+    worker, engine = _worker(tmp_path, broker=broker)
+    worker.runtime = SimpleNamespace(broker=broker)
+    _seed_card(engine)
+    cards = worker._load_cards_if_changed()
+    worker._balance_reader = BackgroundAccountReader()
+    monkeypatch.setattr(BuyboardRuntimeWorker, "_extract_account_balance", staticmethod(lambda _raw: (5000, 10_000)))
+    now = dt.datetime.now(dt.timezone.utc)
+    old_generation = worker._account_read_generation(cards)
+    try:
+        worker._refresh_background_balance(cards, ["1"], now)
+        pending = worker._balance_reader._pending
+        _, fetched_at = pending[1].result(timeout=3)
+        if change == "card":
+            cards[0].entry_client_order_id = "locally-prepared-but-not-sent"
+        elif change == "reservation":
+            from src.services.capital_reservation_repository import ensure_capital_reservations_table
+
+            ensure_capital_reservations_table(engine)
+            with engine.begin() as connection:
+                connection.execute(text("UPDATE capital_reservations SET updated_at=updated_at"))
+        else:
+            boundary.execute_kis_request(lambda: None, account_no="2" if change == "other_account" else "1",
+                                         endpoint="submit", default_kind=RequestKind.MUTATION)
+        if change in {"card", "reservation"}:
+            assert worker._account_read_generation(cards) != old_generation
+        worker._refresh_background_balance(cards, ["1"], dt.datetime.now(dt.timezone.utc))
+        snapshot = buying_power_cache.get_snapshot("PROD", "1")
+        if change == "http_mutation":
+            assert snapshot is None
+        else:
+            assert snapshot.total_equity_usd == 10_000
+            assert snapshot.usable_buying_power_usd == 5000
+            assert snapshot.received_at == fetched_at
+    finally:
+        worker._balance_reader.close()
+        buying_power_cache.clear()
+
+
+def test_background_balance_waits_for_in_flight_http_and_drops_shutdown_results(tmp_path, monkeypatch):
+    from src.services import buying_power_cache, kis_request_boundary as boundary
+    from src.services.background_account_reader import BackgroundAccountReader
+
+    buying_power_cache.clear()
+    monkeypatch.setattr(boundary, "_account_mutations", {"1": (1, 1)})
+    worker, _ = _worker(tmp_path, broker=_FakeBroker())
+    worker.runtime = SimpleNamespace(broker=worker._broker)
+    worker._balance_reader = BackgroundAccountReader()
+    now = dt.datetime.now(dt.timezone.utc)
+    try:
+        worker._refresh_background_balance([], ["1"], now)
+        assert worker._balance_reader._pending is None
+        boundary._account_mutations["1"] = (2, 0)
+        worker._refresh_background_balance([], ["1"], now)
+        worker._balance_reader._pending[1].result(timeout=3)
+        worker._stop_requested = True
+        worker._refresh_background_balance([], ["1"], now)
+        assert buying_power_cache.get_snapshot("PROD", "1") is None
+    finally:
+        worker._balance_reader.close()
+        buying_power_cache.clear()
+
+
 def test_same_device_mode_disables_elapsed_card_fallback(
     tmp_path, monkeypatch
 ):

@@ -51,6 +51,36 @@ def kis_read_priority_scope(priority):
         _read_priority.reset(token)
 _scheduler_lock = threading.Lock()
 _process_scheduler_ref: Optional[weakref.ReferenceType[Any]] = None
+_mutation_lock = threading.Lock()
+_account_mutations: dict[str, tuple[int, int]] = {}
+
+
+def account_mutation_generation(account_no: str) -> tuple[int, int]:
+    """Return this account's HTTP mutation generation and in-flight count."""
+    with _mutation_lock:
+        return _account_mutations.get(str(account_no or ""), (0, 0))
+
+
+@contextmanager
+def account_balance_publication_scope(account_no: str, expected: tuple[int, int]) -> Iterator[bool]:
+    """Atomically compare a balance read and publish before another HTTP mutation."""
+    with _mutation_lock:
+        current = _account_mutations.get(str(account_no or ""), (0, 0))
+        yield current == expected and current[1] == 0
+
+
+@contextmanager
+def _account_mutation_in_flight(account_no: str) -> Iterator[None]:
+    key = str(account_no or "")
+    with _mutation_lock:
+        generation, active = _account_mutations.get(key, (0, 0))
+        _account_mutations[key] = (generation + 1, active + 1)
+    try:
+        yield
+    finally:
+        with _mutation_lock:
+            generation, active = _account_mutations[key]
+            _account_mutations[key] = (generation + 1, active - 1)
 
 
 def install_process_kis_request_scheduler(scheduler: Any) -> None:
@@ -148,21 +178,28 @@ def execute_kis_request(
         else get_process_kis_request_scheduler()
     )
     kind = force_kind or (context.kind if context is not None else default_kind)
-    if scheduler is None:
-        if kind == RequestKind.MUTATION and context is not None and context.pre_dispatch_check is not None:
-            try:
-                context.pre_dispatch_check()
-            except Exception as exc:
-                raise PreBrokerDispatchAbortedError(str(exc)) from exc
-        return operation()
-
-    priority = force_priority or (
-        context.priority if context is not None else default_priority
-    )
     resolved_account = (
         context.account_no
         if context is not None and context.account_no
         else str(account_no or "")
+    )
+
+    def checked_operation():
+        if kind == RequestKind.MUTATION:
+            if context is not None and context.pre_dispatch_check is not None:
+                try:
+                    context.pre_dispatch_check()
+                except Exception as exc:
+                    raise PreBrokerDispatchAbortedError(str(exc)) from exc
+            with _account_mutation_in_flight(resolved_account):
+                return operation()
+        return operation()
+
+    if scheduler is None:
+        return checked_operation()
+
+    priority = force_priority or (
+        context.priority if context is not None else default_priority
     )
     resolved_endpoint = (
         context.endpoint
@@ -190,13 +227,6 @@ def execute_kis_request(
         if context is not None and context.mutation_classifier is not None
         else mutation_classifier
     )
-    def checked_operation():
-        if context is not None and context.pre_dispatch_check is not None:
-            try:
-                context.pre_dispatch_check()
-            except Exception as exc:
-                raise PreBrokerDispatchAbortedError(str(exc)) from exc
-        return operation()
     return scheduler.execute_mutation(
         checked_operation,
         command_type=command_type,

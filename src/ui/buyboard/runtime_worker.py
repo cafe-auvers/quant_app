@@ -2970,12 +2970,17 @@ class BuyboardRuntimeWorker(QThread):
         if completed is not None:
             request, future = completed
             try:
-                if not self._stop_requested and request.generation == self._account_read_generation(cards):
-                    positions, received_at = future.result()
-                    self._record_buying_power(request.account_no, positions, received_at=received_at)
-                    self._account_balance_refreshed_at[request.account_no] = max(
-                        self._account_balance_refreshed_at.get(request.account_no, received_at), received_at)
-                    self._balance_refresh_retry_not_before.pop(request.account_no, None)
+                from src.services.kis_request_boundary import account_balance_publication_scope
+
+                if (not self._stop_requested and request.account_no in accounts
+                        and request.generation[:2] == (self._environment, request.account_no)):
+                    with account_balance_publication_scope(request.account_no, request.generation[2:]) as current:
+                        if current:
+                            positions, received_at = future.result()
+                            self._record_buying_power(request.account_no, positions, received_at=received_at)
+                            self._account_balance_refreshed_at[request.account_no] = max(
+                                self._account_balance_refreshed_at.get(request.account_no, received_at), received_at)
+                            self._balance_refresh_retry_not_before.pop(request.account_no, None)
             except Exception:
                 logger.exception("Background account-value read failed")
                 self._balance_refresh_retry_not_before[request.account_no] = now + timedelta(seconds=5)
@@ -2993,7 +2998,10 @@ class BuyboardRuntimeWorker(QThread):
             age = self._age_seconds(self._account_balance_refreshed_at.get(account), now)
             if age is not None and age < min(float(execution_config.ACTIVE_ACCOUNT_REFRESH_SECONDS), 7.5):
                 continue
-            request = AccountReadRequest(account, False, now, self._account_read_generation(cards))
+            generation = self._balance_read_generation(account)
+            if generation[-1] != 0:
+                continue
+            request = AccountReadRequest(account, False, now, generation)
             broker = ReadOnlyBroker(self.runtime.broker)
             environment = self._environment
             extractor = type(self)._extract_account_balance
@@ -3005,6 +3013,13 @@ class BuyboardRuntimeWorker(QThread):
             reader.submit(request, read)
             self._last_balance_read_started = account
             break
+
+    def _balance_read_generation(self, account_no: str) -> tuple:
+        from src.services.kis_request_boundary import account_mutation_generation
+
+        # Planning/reservation writes do not change broker balances. Actual
+        # HTTP mutations do; never apply a read that overlaps one.
+        return (self._environment, account_no, *account_mutation_generation(account_no))
 
     def _account_read_generation(self, cards: List[TradeCardState]) -> tuple:
         return (

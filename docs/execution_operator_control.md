@@ -289,4 +289,17 @@ The global live-trading switch remains an emergency disable available from
 either physical device. Broker submissions retain the existing lease-token
 fence and re-read shared ownership at the broker boundary.
 
+Account-value reads use a separate fence from position/order reconciliation.
+Local plan preparation, reservation updates, and rejected requests that never
+reach KIS do not invalidate a completed account-value read. A submit, cancel,
+or replacement HTTP request for the same account does invalidate overlapping
+reads, including requests whose acknowledgement is uncertain. Cache publication
+checks that fence atomically before a new HTTP mutation can start. Full broker
+reconciliation retains its stricter order-state fence.
+
+The execution equity and cash cache still expires after 15 seconds and keeps
+the actual response timestamp. Failed, stale, wrong-account, and late shutdown
+results never gain a fresh timestamp. The web board's displayed NAV is a
+longer-lived observation and does not establish execution freshness by itself.
+
 Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.
