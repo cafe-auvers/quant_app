@@ -64,6 +64,27 @@ def test_background_monitor_runs_during_regular_session_without_a_browser():
     assert calls == [True]
 
 
+def test_first_strong_survives_extension_weakness_stale_data_and_restart(tmp_path):
+    now = dt.datetime(2026, 10, 29, 9, 36, tzinfo=US_MARKET_ZONE)
+    path = tmp_path / 'history.sqlite3'
+    card = row()
+    history = MonitorHistory(path)
+    history.observe([card], now)
+    assert card['condition_history']['first_strong'] is None
+    card['momentum'].update(quality='FULL', assessment={'label': 'Strong'})
+    history.observe([card], now + dt.timedelta(minutes=1))
+    first = copy.deepcopy(card['condition_history']['first_strong'])
+    for index, label in enumerate(('Extended', 'Weak', 'STALE'), start=2):
+        card['momentum']['assessment']['label'] = label
+        if label == 'STALE':
+            card.update(quote_status='STALE', orb=[])
+        MonitorHistory(path).observe([card], now + dt.timedelta(minutes=index))
+        assert card['condition_history']['first_strong'] == first
+    assert first['observed_at'] == (now + dt.timedelta(minutes=1)).isoformat()
+    MonitorHistory(path).observe([card], now + dt.timedelta(days=1))
+    assert card['condition_history']['first_strong'] is None
+
+
 def test_aggregate_backfill_is_batched_and_failed_symbols_are_not_retried_each_minute():
     import pandas as pd
     from src.web.intraday_monitor import IntradayMonitor, MonitorContext

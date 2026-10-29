@@ -2937,6 +2937,9 @@
   }
 
   function listEmptyMessage() {
+    if (state.listMode === 'monitor' && state.monitorFilter === 'strong_today') {
+      return 'No matching stocks recorded Strong today. History begins when monitoring starts; earlier conditions are unknown.';
+    }
     if (state.listMode !== 'history') return 'No stocks in this list.';
     if (state.historyLoading) return 'Loading watchlist history...';
     if (state.historyError) return state.historyError;
@@ -3012,9 +3015,10 @@
       if (state.monitorFilter === 'orb') return monitorBrokeOut(row) && Boolean(bestMonitorOrb(row));
       if (state.monitorFilter === 'early') return Boolean(row.early_review?.active || row.condition_history?.first_early);
       if (state.monitorFilter === 'strong') return monitorBrokeOut(row) && Boolean(bestMonitorOrb(row)) && monitorCondition(monitorMomentum(row)).tone === 'GOOD';
+      if (state.monitorFilter === 'strong_today') return Boolean(row.condition_history?.first_strong);
       if (state.monitorFilter === 'today') return Boolean(row.buy_today_member);
       return true;
-    }).sort((a, b) => (state.monitorFilter === 'early' ? Number(Boolean(b.early_review?.active)) - Number(Boolean(a.early_review?.active)) : 0) || Number(monitorCondition(monitorMomentum(b)).tone === 'GOOD') - Number(monitorCondition(monitorMomentum(a)).tone === 'GOOD') || compareMonitorMomentum(a, b) || (
+    }).sort((a, b) => (state.monitorFilter === 'strong_today' ? new Date(a.condition_history.first_strong.observed_at) - new Date(b.condition_history.first_strong.observed_at) : 0) || (state.monitorFilter === 'early' ? Number(Boolean(b.early_review?.active)) - Number(Boolean(a.early_review?.active)) : 0) || Number(monitorCondition(monitorMomentum(b)).tone === 'GOOD') - Number(monitorCondition(monitorMomentum(a)).tone === 'GOOD') || compareMonitorMomentum(a, b) || (
       Number(Boolean(b.broke_out_today)) - Number(Boolean(a.broke_out_today))
       || Number(Boolean(bestMonitorOrb(b))) - Number(Boolean(bestMonitorOrb(a)))
       || (monitorNumber(b.change_percent) ?? -Infinity) - (monitorNumber(a.change_percent) ?? -Infinity)
@@ -3228,11 +3232,11 @@
       const history = row.condition_history;
       const clock = event => event?.observed_at ? new Date(event.observed_at).toLocaleTimeString('en-US', {timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit'}) : '—';
       const first = cell('', 'mobile-monitor-history', history?.source || 'Live observation history starts when monitoring begins');
-      const firstOrb = document.createElement('div');
-      firstOrb.textContent = `ORB ${clock(history?.first_orb)}`;
+      const firstCondition = document.createElement('div');
+      firstCondition.textContent = history?.first_strong ? `Strong ${clock(history.first_strong)}` : `ORB ${clock(history?.first_orb)}`;
       const firstEarly = document.createElement('div');
       firstEarly.textContent = `Early ${clock(history?.first_early)}${row.early_review?.active ? ' · now' : history?.first_early ? ' · earlier' : ''}`;
-      first.append(firstOrb, firstEarly);
+      first.append(firstCondition, firstEarly);
       const rank = cell('', 'mobile-monitor-momentum', momentum.reason || '');
       rank.dataset.status = momentum.status;
       const inspect = document.createElement('button');
@@ -3435,6 +3439,9 @@
       : !state.monitorAsOf ? 'Checking prices'
         : monitorMarketClosed() ? 'Market closed \u00b7 showing latest available prices. ORB checks resume next session.'
           : `${sessionRanks ? 'Session ended \u00b7 closing conditions for review' : `${strongCount} Strong \u00b7 ${leadingCount} Leading`}. ${rankedCount} ranked. ${strongCount ? 'Rank is relative; check Condition.' : 'No Strong setups in this view.'} * = estimated or partial data. Tap a condition for reasons. Yahoo data may be delayed. Swipe for all columns.`);
+    if (state.monitorFilter === 'strong_today' && !state.monitorError && state.monitorEnabled !== false && state.monitorAsOf) {
+      status.textContent = `${state.visibleRows.length} stocks recorded Strong today; ${strongCount} Strong now. Retains later Extended, Weak and stale conditions. First Strong times are shown in ET, earliest first. History covers live observations only. Manual review only.`;
+    }
     if (lastUpdate && !state.monitorError) status.textContent += ` Updated ${lastUpdate} ET \u00b7 checks every 60s during regular market hours, including with the browser closed; failures back off.`;
     status.textContent += ' Historical + current Watchlist + Buylist with saved breakout prices.';
     status.textContent += ` ${state.visibleRows.filter(row => row.early_review?.active).length} early ORB reviews now. Early today retains earlier observations. Manual review only.`;

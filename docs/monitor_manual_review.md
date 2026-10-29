@@ -13,6 +13,12 @@ extends. It never activates Buy Today or submits an order. The existing
 explicit publication controls and execution checks remain mandatory.
 
 Each row shows first observed ORB and early-review times in New York time.
+Strong now filters on the current condition. Strong today lists stocks observed
+Strong at least once this New York session at their current saved breakout
+level, even when they later become Extended, Weak or stale. It sorts by first
+Strong time. The First seen column shows that time when one has been recorded;
+otherwise it shows the first ORB observation. No early-review pass is treated
+as proof of a Strong condition.
 Condition details show first Strong, first Extended and observed transitions.
 These records persist in `monitor_history.sqlite3` in the private web data
 directory. They are scoped by New York session, symbol and breakout price.

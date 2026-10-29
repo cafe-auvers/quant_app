@@ -76,6 +76,15 @@ def test_monitor_table_best_orb_filter_and_completed_range_explanation(width, tm
         'first_early':observation, 'first_strong':None, 'first_extended':None, 'observed_from':observation['observed_at'], 'events':[observation]})
     estimated.update(early_review={'active':False}, condition_history={'session_date':now.date().isoformat(),'source':'Live observations', 'first_orb':observation,
         'first_early':observation, 'first_strong':None, 'first_extended':{**observation,'observed_at':now.isoformat()}, 'observed_from':observation['observed_at'], 'events':[observation]})
+    for card, minutes in ((best, 5), (estimated, 7), (next(row for row in rows if row['symbol'] == 'PASS_STALE'), 20)):
+        strong = {**observation, 'condition': 'Strong', 'observed_at': (now-timedelta(minutes=minutes)).isoformat()}
+        history = card.setdefault('condition_history', {'session_date': now.date().isoformat(), 'events': []})
+        history.update(first_strong=strong, observed_from=strong['observed_at'])
+        history['events'].append(strong)
+    next(row for row in rows if row['symbol'] == 'LEADER_TWO')['condition_history'] = {
+        'session_date': (now-timedelta(days=1)).date().isoformat(),
+        'first_strong': {**observation, 'condition': 'Strong'},
+    }
     estimated["momentum"]["efficiency_windows"] = {"1m": {"value": -.2, "estimated": True}, "5m": {"value": .1}}
     next(row for row in rows if row["symbol"] == "LEADER_TWO")["momentum"].update(rs_open_pp=.2, rvol=1)
     partial = {**estimated, "symbol": "PARTIAL", "name": "PARTIAL",
@@ -234,9 +243,20 @@ def test_monitor_table_best_orb_filter_and_completed_range_explanation(width, tm
             assert page.locator('[data-mobile-symbol="WATCH_HIGH"] .mobile-monitor-er-current').inner_text() == '~-0.80'
             page.locator('[data-mobile-symbol="WATCH_HIGH"] .momentum-condition').click()
             assert 'first early review' in page.locator('#mobile-momentum-history').inner_text()
-            assert 'first Strong not observed' in page.locator('#mobile-momentum-history').inner_text()
+            assert 'first Strong not observed' not in page.locator('#mobile-momentum-history').inner_text()
             page.locator('#mobile-momentum-close').click()
+            page.locator('[data-monitor-filter="strong_today"]').click()
+            assert page.locator('.mobile-monitor-row').evaluate_all("rows => rows.map(row => row.dataset.mobileSymbol)") == ['PASS_STALE', 'WATCH_HIGH', 'BEST']
+            assert page.locator('[data-mobile-symbol="WATCH_HIGH"] .momentum-condition').inner_text() == 'Extended'
+            assert page.locator('[data-mobile-symbol="PASS_STALE"] .momentum-condition').inner_text() == 'Stale'
+            assert 'Strong ' in page.locator('[data-mobile-symbol="WATCH_HIGH"] .mobile-monitor-history').inner_text()
+            assert '3 stocks recorded Strong today; 1 Strong now' in page.locator('#mobile-monitor-status').inner_text()
+            page.locator('#mobile-monitor-search').fill('LEADER')
+            assert page.locator('.mobile-monitor-row').count() == 0
+            assert 'No matching stocks recorded Strong today' in page.locator('.mobile-list-empty').inner_text()
+            page.locator('#mobile-monitor-search').fill('')
             page.locator('[data-monitor-filter="strong"]').click()
+            assert page.locator('[data-monitor-filter="strong"]').inner_text() == 'Strong now'
             assert page.locator('.mobile-monitor-row').evaluate_all("rows => rows.map(row => row.dataset.mobileSymbol)") == ['BEST']
             if width > 900:
                 assert page.locator('#desktop-monitor-panel').is_visible()
@@ -262,6 +282,10 @@ def test_monitor_table_best_orb_filter_and_completed_range_explanation(width, tm
             assert volume.get_attribute("data-rating") == "BAD"
             assert volume.evaluate("node => getComputedStyle(node).color") == "rgb(255, 140, 149)"
             assert "No Strong setups" in page.locator("#mobile-monitor-status").inner_text()
+            page.locator('[data-monitor-filter="strong_today"]').click()
+            assert page.locator('[data-mobile-symbol="BEST"] .momentum-condition').inner_text() == 'Weak'
+            assert '3 stocks recorded Strong today; 0 Strong now' in page.locator('#mobile-monitor-status').inner_text()
+            page.locator('[data-monitor-filter="orb"]').click()
             assert max(page.locator(".mobile-monitor-row").evaluate_all("rows => rows.map(row => row.getBoundingClientRect().height)")) <= 42
             page.screenshot(path=str(tmp_path / f"monitor-rank-one-weak-{width}.png"))
             best["momentum"]["rvol"] = 2.5
