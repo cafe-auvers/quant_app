@@ -228,6 +228,9 @@ def test_monitor_table_best_orb_filter_and_completed_range_explanation(width, tm
                 page.locator('#desktop-monitor-close').click()
                 assert page.locator('#desktop-monitor-panel').is_hidden()
                 page.locator('#desktop-monitor-open').click()
+                page.locator('[data-mobile-symbol="BEST"] .mobile-monitor-stock button').click()
+                assert page.locator('#desktop-monitor-panel').is_hidden()
+                page.locator('#desktop-monitor-open').click()
             page.locator('[data-monitor-filter="orb"]').click()
             with page.expect_response("**/api/v1/intraday-monitor"):
                 page.clock.fast_forward(60_001)

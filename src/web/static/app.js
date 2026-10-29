@@ -3295,7 +3295,8 @@
     });
     action.appendChild(addToday);
     stock.addEventListener('click', () => {
-      byId('mobile-list-popover').hidden = true;
+      if (compactLayout.matches) byId('mobile-list-popover').hidden = true;
+      else activateListMode('watchlist');
       byId('mobile-list-menu').setAttribute('aria-expanded', 'false');
       void selectSymbol(row.symbol);
     });
