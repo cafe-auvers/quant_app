@@ -380,14 +380,17 @@ def test_signed_efficiency_distinguishes_smooth_declines_from_upward_progress(mo
     assert -1 <= result["directional_efficiency"] <= 1
 
 
-def test_efficiency_gaps_are_unknown_and_future_bars_do_not_improve_quality():
+def test_efficiency_gaps_show_explicit_estimates_without_filling_prices():
     frame = history().drop(moment("09:45"))
     result = evaluate(frame)
-    assert result["directional_efficiency"] is None
-    assert "Missing" in result["efficiency_reason"]
+    assert result["directional_efficiency"] is not None
+    assert result['efficiency_estimated'] is True
+    assert result['efficiency_missing_minutes'] == 1
+    assert 'Estimated' in result['efficiency_reason']
+    assert result['quality'] == 'ESTIMATED'
     assert result["score"] is not None
     # The entire session path is required, including earlier minutes.
-    assert evaluate(history().drop(moment("09:31")))["directional_efficiency"] is None
+    assert evaluate(history().drop(moment("09:31")))['efficiency_estimated'] is True
 
 
 @pytest.mark.parametrize("time, ratio, warming", [("09:34", None, True), ("09:35", 1, False), ("10:00", 1, False)])

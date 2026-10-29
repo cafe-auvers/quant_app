@@ -70,6 +70,12 @@ def test_monitor_table_best_orb_filter_and_completed_range_explanation(width, tm
     estimated = next(row for row in rows if row["symbol"] == "WATCH_HIGH")
     estimated["momentum"].update(quality="ESTIMATED", rvol_estimated=True, bar_coverage_percent=90)
     estimated["momentum"].update(rs_open_pp=5, rvol=1.8, entry_extension_adr=.7, rs_sector_pp=-.5, directional_efficiency=-.8)
+    estimated['momentum']['efficiency_estimated'] = True
+    observation = {'observed_at':(now-timedelta(minutes=10)).isoformat(), 'condition':'Confirm', 'early':True}
+    best.update(early_review={'active':True}, condition_history={'session_date':now.date().isoformat(),'source':'Live observations', 'first_orb':observation,
+        'first_early':observation, 'first_strong':None, 'first_extended':None, 'observed_from':observation['observed_at'], 'events':[observation]})
+    estimated.update(early_review={'active':False}, condition_history={'session_date':now.date().isoformat(),'source':'Live observations', 'first_orb':observation,
+        'first_early':observation, 'first_strong':None, 'first_extended':{**observation,'observed_at':now.isoformat()}, 'observed_from':observation['observed_at'], 'events':[observation]})
     estimated["momentum"]["efficiency_windows"] = {"1m": {"value": -.2, "estimated": True}, "5m": {"value": .1}}
     next(row for row in rows if row["symbol"] == "LEADER_TWO")["momentum"].update(rs_open_pp=.2, rvol=1)
     partial = {**estimated, "symbol": "PARTIAL", "name": "PARTIAL",
@@ -79,6 +85,7 @@ def test_monitor_table_best_orb_filter_and_completed_range_explanation(width, tm
                             "components": {**estimated["momentum"]["components"], "relative_volume": None}}}
     rows.append(partial)
     partial["momentum"].update(entry_extension_adr=.12)
+    partial.update(early_review={'active':False}, condition_history={})
     partial["momentum"].update(rs_sector_pp=None, directional_efficiency=None)
     partial["momentum"]["efficiency_windows"] = {"1m": {"value": None}, "5m": {"value": None}}
     for row in rows:
@@ -88,7 +95,8 @@ def test_monitor_table_best_orb_filter_and_completed_range_explanation(width, tm
         {**next(row for row in rows if row['symbol'] == 'WAIT'), 'symbol': 'HISTORY',
          'watchlist_member': False, 'historical_watchlist_member': True},
         {**best, 'symbol': 'NO_LEVEL', 'breakout_price': None},
-        {**best, 'symbol': 'NO_BREAK', 'broke_out_today': False, 'momentum': None},
+        {**best, 'symbol': 'NO_BREAK', 'broke_out_today': False, 'momentum': None,
+         'early_review': {'active':False}, 'condition_history': {}},
     ])
     session = {"mode": "CONNECTED", "csrf_token": "test",
                "market_status": {"state": "OPEN", "phase": "REGULAR"}}
@@ -128,13 +136,13 @@ def test_monitor_table_best_orb_filter_and_completed_range_explanation(width, tm
             page.locator("#mobile-list-menu" if width <= 900 else "#desktop-monitor-open").click()
             waiting = page.locator('[data-mobile-symbol="WAIT"]')
             waiting.wait_for()
-            assert waiting.locator("td").count() == 14
+            assert waiting.locator("td").count() == 15
             assert page.locator('[data-mobile-symbol="HISTORY"]').count() == 1
             assert page.locator('[data-mobile-symbol="NO_LEVEL"]').count() == 0
             assert "Waiting" in waiting.inner_text()
             assert "Range complete · waiting above $104.00" in waiting.locator(".mobile-monitor-result").get_attribute("title")
             assert waiting.locator(".mobile-monitor-percent").all_inner_texts() == ["-2.5%", "+0.0%", "+40.2%"]
-            assert page.locator(".mobile-monitor-table th").all_inner_texts() == ["Stock", "Condition", "Momentum", "RS/SPY pp", "RVOL", "Sector pp", "vs VWAP", "Current ER", "Today %", "Breakout", "Best ORB", "1M %", "3M %", "+"]
+            assert page.locator(".mobile-monitor-table th").all_inner_texts() == ["Stock", "Condition", "First seen · ET", "Momentum", "RS/SPY pp", "RVOL", "Sector pp", "vs VWAP", "Current ER", "Today %", "Breakout", "Best ORB", "1M %", "3M %", "+"]
             assert page.locator('[data-mobile-symbol="BEST"] .mobile-monitor-result').inner_text() == "5m · 1.75%"
             assert page.locator('[data-mobile-symbol="BEST"] .mobile-monitor-breakout').inner_text() == "Yes"
             assert page.locator('[data-mobile-symbol="LOW_VOL"] .mobile-monitor-result').inner_text() == "Low vol"
@@ -143,7 +151,7 @@ def test_monitor_table_best_orb_filter_and_completed_range_explanation(width, tm
             page.locator("#mobile-list-items").evaluate("node => {node.scrollLeft = 80}")
             page.locator('[data-monitor-filter="orb"]').click()
             assert page.locator(".mobile-monitor-row").evaluate_all("rows => rows.map(row => row.dataset.mobileSymbol)") == ["BEST", "LEADER_TWO", "WATCH_HIGH", "PARTIAL", "PASS_STALE"]
-            assert page.locator(".mobile-monitor-table th").all_inner_texts() == ["Stock", "Condition", "Momentum", "RS/SPY pp", "RVOL", "Sector pp", "vs VWAP", "Current ER", "Today %", "Breakout", "Best ORB", "1M %", "3M %", "+"]
+            assert page.locator(".mobile-monitor-table th").all_inner_texts() == ["Stock", "Condition", "First seen · ET", "Momentum", "RS/SPY pp", "RVOL", "Sector pp", "vs VWAP", "Current ER", "Today %", "Breakout", "Best ORB", "1M %", "3M %", "+"]
             assert page.locator('[data-mobile-symbol="BEST"] .mobile-monitor-momentum').inner_text() == "#1 · 79"
             assert page.locator('[data-mobile-symbol="BEST"] .mobile-monitor-strength').inner_text() == "+1.90"
             assert page.locator('[data-mobile-symbol="BEST"] .mobile-monitor-volume').inner_text() == "2.50x"
@@ -220,6 +228,14 @@ def test_monitor_table_best_orb_filter_and_completed_range_explanation(width, tm
             page.locator('[data-monitor-filter="orb"]').click()
             passed = set(page.locator('.mobile-monitor-row').evaluate_all("rows => rows.map(row => row.dataset.mobileSymbol)"))
             assert passed <= broken
+            page.locator('[data-monitor-filter="early"]').click()
+            assert set(page.locator('.mobile-monitor-row').evaluate_all("rows => rows.map(row => row.dataset.mobileSymbol)")) == {'BEST','WATCH_HIGH'}
+            assert 'earlier' in page.locator('[data-mobile-symbol="WATCH_HIGH"] .mobile-monitor-history').inner_text()
+            assert page.locator('[data-mobile-symbol="WATCH_HIGH"] .mobile-monitor-er-current').inner_text() == '~-0.80'
+            page.locator('[data-mobile-symbol="WATCH_HIGH"] .momentum-condition').click()
+            assert 'first early review' in page.locator('#mobile-momentum-history').inner_text()
+            assert 'first Strong not observed' in page.locator('#mobile-momentum-history').inner_text()
+            page.locator('#mobile-momentum-close').click()
             page.locator('[data-monitor-filter="strong"]').click()
             assert page.locator('.mobile-monitor-row').evaluate_all("rows => rows.map(row => row.dataset.mobileSymbol)") == ['BEST']
             if width > 900:

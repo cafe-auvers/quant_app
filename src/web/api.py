@@ -39,6 +39,7 @@ from .hourly_source import build_pc_hourly_reader
 from .market_status import nyse_market_status
 from .live_updates import LiveUpdateHub
 from .intraday_monitor import IntradayMonitor
+from .monitor_history import MonitorHistory
 from .monitor_source import load_monitor_context
 from .store import ConflictError, SessionRecord, ValidationError, WebStore
 from .watchlist_history import WatchlistHistorySource, merge_watchlist_history
@@ -182,6 +183,7 @@ def build_services(config: WebConfig) -> WebServices:
         monitor=IntradayMonitor(
             lambda: load_monitor_context(config, store, canonical_planning),
             enabled=config.mode == "CONNECTED",
+            history=MonitorHistory(config.data_dir/'monitor_history.sqlite3'),
             refresh_seconds=float(get_env_value("WEB_MONITOR_REFRESH_SECONDS", "60")),
             stale_seconds=float(get_env_value("WEB_MONITOR_QUOTE_MAX_AGE_SECONDS", "180")),
         ),
@@ -1251,6 +1253,7 @@ async def web_services_lifespan(app: FastAPI):
     services.monitor.on_update = lambda: loop.call_soon_threadsafe(
         services.live_updates.publish, {"kind": "intraday_monitor"}
     )
+    services.monitor.start()
     try:
         yield
     finally:

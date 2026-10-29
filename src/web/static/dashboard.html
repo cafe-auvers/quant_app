@@ -327,6 +327,7 @@
                   <button type="button" data-monitor-filter="all" class="active" aria-pressed="true">All</button>
                   <button type="button" data-monitor-filter="breakouts" aria-pressed="false">Broken out</button>
                   <button type="button" data-monitor-filter="orb" aria-pressed="false" title="At least one ORB passed price breakout, position bounds and minimum opening liquidity">ORB passed</button>
+                  <button type="button" data-monitor-filter="early" aria-pressed="false" title="Live-observed early ORB reviews from this session, retained after conditions change. Manual review only.">Early today</button>
                   <button type="button" data-monitor-filter="strong" aria-pressed="false" title="ORB passed stocks with Strong current conditions">Strong</button>
                   <button type="button" data-monitor-filter="today" aria-pressed="false">Buy Today</button>
                 </div>
@@ -343,7 +344,7 @@
                   <summary>Conditions, examples and scoring</summary>
                   <p>Sector pp compares the stock with its broad sector ETF from the same 09:30 ET open to the identical completed minute used for SPY. The ETF ticker appears beside the value. Classification comes from the local profile cache. A missing sector or a mismatched ETF endpoint stays unknown; SPY is never substituted for a sector.</p>
                   <p>vs VWAP is (completed stock price / session VWAP − 1) × 100. Red means below VWAP or more than 0.5 ADR above it: an upward trend can still be too stretched to chase. VWAP uses reported minute typical prices and volume; ~ marks estimates.</p>
-                  <p>Current ER is signed net price change from the 09:30 ET open divided by total absolute minute-close changes through the latest completed minute. +1 is smooth upward progress, &minus;1 smooth downward progress, and 0 no net progress. It needs five completed minutes and a complete price path; missing minutes stay unknown. Strong requires current ER &ge; +0.40. There is no separate 1m, 5m, or 30m ER and no 30-minute warm-up.</p>
+                  <p>Current ER is signed net price change from the 09:30 ET open divided by total absolute minute-close changes through the latest completed minute. +1 is smooth upward progress, &minus;1 smooth downward progress, and 0 no net progress. It needs five completed minutes and a complete price path; zero-volume minutes are restored only when completed aggregate candles reconcile. Otherwise ~ER is an estimate from reported closes, with coverage shown. Strong still requires complete data and current ER &ge; +0.40. Early today records passing ORB reviews near entry independently of Strong, retains them after extension, and does not add stocks to Buy Today.</p>
                   <p>RS/SPY +5 pp means the stock has gained 5 percentage points more than SPY since the open. RVOL 1× is usual volume at this time; 1.8× is 80% above usual. The color thresholds are starting heuristics, not proven trading edges.</p>
                   <p>Strong also requires sector excess &ge; +0.5 pp, current ER &ge; +0.40, price no more than 0.5 ADR above VWAP, RS ≥ +0.5 pp, RVOL ≥ 1.5×, a gain from the open, price above VWAP and in the top quarter of today's range, at or above breakout, within 0.5 ADR of entry, and complete data. Mixed means some support is ordinary. Weak means a measured condition failed; Extended means price is more than 0.5 ADR above entry. Confirm means reported metrics look strong but data is estimated. Check data means a required metric is missing. Tap Condition to see the reasons. Rank only compares this list; #1 does not guarantee a strong setup.</p>
                   <p>Leading candidates appear first. Score: 40% strength vs SPY since the 09:30 ET open, 25% same-time relative volume, 25% VWAP and session-range position, 10% proximity to the planned ORB entry. Strength and entry distance use daily ADR.</p>
@@ -356,6 +357,7 @@
               <div id="mobile-momentum-detail" class="mobile-momentum-detail" role="region" aria-label="Momentum ranking details" hidden>
                 <div><strong id="mobile-momentum-heading"></strong><button id="mobile-momentum-close" type="button" aria-label="Close momentum details">Close</button></div>
                 <p id="mobile-momentum-condition"></p>
+                <p id="mobile-momentum-history"></p>
                 <div id="mobile-momentum-signals" class="mobile-momentum-signals" hidden></div>
                 <p id="mobile-momentum-metrics"></p>
                 <p id="mobile-momentum-reason"></p>

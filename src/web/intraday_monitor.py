@@ -15,6 +15,7 @@ import pandas as pd
 from src.core.intraday_momentum import (
     BENCHMARK, assign_momentum_ranks, evaluate_momentum, unavailable_momentum,
 )
+from src.core.monitor_bar_repair import regular_gaps, repair_zero_volume_minutes
 from src.core.opening_liquidity import opening_liquidity_rejection, opening_volume_totals
 from src.core.orb_entry_logic import passive_entry_prices
 from src.risk.orb_position import (
@@ -323,7 +324,7 @@ class IntradayMonitor:
     def __init__(
         self, load_context: Callable[[], MonitorContext], *, enabled: bool,
         refresh_seconds: float = 60, stale_seconds: float = 180,
-        provider=None, now=None, monotonic=None,
+        provider=None, now=None, monotonic=None, history=None,
     ):
         self.load_context = load_context
         self.enabled = enabled
@@ -331,6 +332,7 @@ class IntradayMonitor:
         self.stale_seconds = max(60, stale_seconds)
         self.on_update = None
         self.provider = provider or YahooMonitorProvider()
+        self.history = history
         self.now = now or (lambda: dt.datetime.now(US_MARKET_ZONE))
         self.monotonic = monotonic or time.monotonic
         self._lock = threading.Lock()
@@ -344,6 +346,8 @@ class IntradayMonitor:
         self._quote_failures = {}
         self._quote_retry_after = {}
         self._frames = {}
+        self._aggregate_frames = {5: {}, 60: {}}
+        self._aggregate_retry_after = {}
         self._history_session = {}
         self._failed_symbols = set()
         self._adr = {}
@@ -393,6 +397,10 @@ class IntradayMonitor:
                 row["momentum"] = unavailable_momentum("CLOSED", "Waiting for the completed-session ranking refresh")
             elif momentum.get("as_of") and (now - dt.datetime.fromisoformat(momentum["as_of"])).total_seconds() > self.stale_seconds:
                 row["momentum"] = unavailable_momentum("STALE", "Synchronized stock/SPY bars are stale")
+            if row.get('quote_status') != 'CURRENT' or row.get('orb_session_date') != now.date().isoformat():
+                row['early_review'] = {'active':False, 'reason':'Current regular-session evidence unavailable'}
+            if row.get('condition_history', {}).get('session_date') != now.date().isoformat():
+                row.pop('condition_history', None)
         assign_momentum_ranks(snapshot["rows"])
         return {**snapshot, "enabled": self.enabled, "source": "Yahoo Finance · 1-minute bars",
                 "refresh_seconds": self.refresh_seconds, "stale_seconds": self.stale_seconds, "advisory": True,
@@ -403,10 +411,18 @@ class IntradayMonitor:
         # Changes join the next cycle; repeated edits cannot multiply downloads.
         self._wake.set()
 
+    def start(self) -> None:
+        with self._lock:
+            if self.enabled and self._thread is None and not self._stop.is_set():
+                self._thread = threading.Thread(target=self._run, name='web-intraday-monitor', daemon=True)
+                self._thread.start()
+
     def _run(self) -> None:
         while not self._stop.is_set():
             tick = self.monotonic()
-            if tick < self._active_until and tick >= self._next_refresh:
+            now = self.now().astimezone(US_MARKET_ZONE)
+            regular = is_nyse_trading_day(now.date()) and dt.time(9,30) <= now.time() < nyse_regular_session_close_time(now.date())
+            if (regular or tick < self._active_until) and tick >= self._next_refresh:
                 self.refresh_once()
             self._wake.wait(timeout=1)
             self._wake.clear()
@@ -474,30 +490,40 @@ class IntradayMonitor:
             self._failed_symbols = (self._failed_symbols | (set(due) - frames.keys())) - frames.keys()
             self._failed_symbols.intersection_update(quote_symbols)
             evaluated_at = self.now()
+            repaired, repairs = self._repair_minute_coverage(quote_symbols, evaluated_at)
             rows = [evaluate_monitor_row(
-                row, self._frames[row["symbol"]], now=evaluated_at, context=context,
+                row, repaired[row["symbol"]], now=evaluated_at, context=context,
                 adr=adr.get(row["symbol"]), fetch_failed=row["symbol"] in self._failed_symbols,
                 stale_seconds=self.stale_seconds,
             ) for row in context.rows]
             for row in rows:
+                row['minute_repair'] = repairs.get(row['symbol'], {})
+                row['adr_percent'] = adr.get(row['symbol'])
                 apply_daily_close_fallback(row, self._daily_quotes.get(row["symbol"]), evaluated_at)
                 apply_daily_performance(row, self._daily_frames.get(row["symbol"], pd.DataFrame()), evaluated_at)
                 row["momentum"] = evaluate_momentum(
-                    row, self._frames[row["symbol"]], self._frames.get(BENCHMARK, pd.DataFrame()),
+                    row, repaired[row["symbol"]], repaired.get(BENCHMARK, pd.DataFrame()),
                     now=evaluated_at, adr=adr.get(row["symbol"]), stale_seconds=self.stale_seconds,
                     benchmark_failed=BENCHMARK in self._failed_symbols,
-                    sector_benchmark=self._frames.get(row.get("sector_symbol"), pd.DataFrame()),
+                    sector_benchmark=repaired.get(row.get("sector_symbol"), pd.DataFrame()),
                     sector_symbol=row.get("sector_symbol"), sector_name=row.get("sector_name"),
                     sector_failed=row.get("sector_symbol") in self._failed_symbols,
                 )
             assign_momentum_ranks(rows)
+            history_error = ''
+            if self.history is not None:
+                try:
+                    self.history.observe(rows, evaluated_at)
+                except Exception:
+                    history_error = 'Condition history could not be saved; first-observation times may be unavailable'
+                    logger.warning(history_error, exc_info=True)
             self._daily_quotes = {s: quote for s, quote in self._daily_quotes.items() if s in symbols}
             self._daily_frames = {s: frame for s, frame in self._daily_frames.items() if s in symbols}
             with self._lock:
                 self._adr = {s: adr.get(s) for s in symbols}
                 self._adr_session = now.date()
                 self._context = context
-                self._snapshot = {"rows": rows, "as_of": self.now().isoformat(), "error": "", "refreshing": False}
+                self._snapshot = {"rows": rows, "as_of": self.now().isoformat(), "error": "", "refreshing": False, 'history_error': history_error}
                 if due and not frames:
                     self._failure_cycles += 1
                     delay = self.refresh_seconds * min(15, 2 ** min(self._failure_cycles, 4))
@@ -527,3 +553,32 @@ class IntradayMonitor:
         self._wake.set()
         if self._thread is not None:
             self._thread.join(timeout=1)
+
+    def _repair_minute_coverage(self, symbols: list[str], now: dt.datetime) -> tuple[dict, dict]:
+        """Bound aggregate checks; reuse proofs instead of multiplying minute retries."""
+        frames = {s: self._frames.get(s, pd.DataFrame()) for s in symbols}
+        counts = {s: {'verified_zero_volume_minutes': 0, 'remaining_gaps': regular_gaps(f, now)}
+                  for s, f in frames.items()}
+        # Resolve the most relevant visible setups first. Other symbols join
+        # later cycles, at most 24 symbols per aggregate interval per cycle.
+        passed = {r['symbol'] for r in self._snapshot['rows'] if any(
+            p.get('price_status') == p.get('position_status') == p.get('liquidity_status') == 'PASS'
+            for p in r.get('orb', []))}
+        for interval in (5, 60):
+            needed = [s for s in symbols if counts[s]['remaining_gaps'] > 0 and s not in self._failed_symbols]
+            due = sorted((s for s in needed if self.monotonic() >= self._aggregate_retry_after.get((interval, s), 0)),
+                         key=lambda s: (s not in passed, s))[:24]
+            if due:
+                fetched = self.provider.fetch(due, interval=f'{interval}m', period='5d')
+                self._aggregate_frames[interval].update(fetched)
+                for s in due:
+                    self._aggregate_retry_after[interval, s] = self.monotonic() + (interval*60 if s in fetched else 900)
+            for s in needed:
+                frames[s], count = repair_zero_volume_minutes(
+                    frames[s], self._aggregate_frames[interval].get(s, pd.DataFrame()),
+                    interval_minutes=interval, now=now,
+                )
+                counts[s]['verified_zero_volume_minutes'] += count
+                counts[s]['remaining_gaps'] = regular_gaps(frames[s], now)
+            self._aggregate_frames[interval] = {s:f for s,f in self._aggregate_frames[interval].items() if s in symbols}
+        return frames, counts

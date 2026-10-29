@@ -127,7 +127,7 @@ def assess_momentum(momentum: dict) -> dict:
         missing_metrics += [name for name, value in (
             ("sector strength", sector), ("current ER", efficiency), ("VWAP distance in ADR", vwap_adr),
         ) if value is None]
-        uncertain = uncertain or missing or bool(momentum.get("efficiency_warming_up"))
+        uncertain = uncertain or missing or bool(momentum.get("efficiency_warming_up")) or bool(momentum.get('efficiency_estimated'))
     if bad:
         label = "Extended" if (extension is not None and extension > 0.5) or (_number(momentum.get("vwap_distance_adr")) or 0) > .5 else "Weak"
         tone, reasons = "BAD", bad + normal
@@ -177,15 +177,19 @@ def directional_efficiency(stock: pd.DataFrame, start: pd.Timestamp, cutoff: pd.
     """Current signed ER from the regular-session open to the completed cutoff."""
     minutes = int((cutoff - start).total_seconds() // 60) + 1
     result = {"directional_efficiency": None, "efficiency_minutes": minutes,
+              "efficiency_estimated": False, "efficiency_missing_minutes": 0,
               "efficiency_warming_up": minutes < 5,
               "efficiency_reason": "Waiting for five completed minutes for current ER"}
     if minutes < 5:
         return result
     expected = pd.date_range(start, cutoff, freq="min")
-    if not expected.isin(stock.index).all() or not _valid_observations(stock.loc[expected], ["Close"]):
-        result["efficiency_reason"] = "Missing or invalid minute closes in efficiency window; gaps are not filled"
+    observed = stock.loc[stock.index.isin(expected)]
+    missing = len(expected)-len(observed)
+    result.update(efficiency_missing_minutes=missing, efficiency_coverage_percent=len(observed)/minutes*100)
+    if start not in observed.index or cutoff not in observed.index or len(observed) < 5 or not _valid_observations(observed, ["Close"]):
+        result["efficiency_reason"] = "Need a valid opening/latest price and at least five reported closes for current ER"
         return result
-    closes = stock.loc[expected, "Close"].astype(float).tolist()
+    closes = observed.Close.astype(float).tolist()
     opened = _number(stock.loc[start, "Open"])
     if opened is None or opened <= 0:
         return result
@@ -193,6 +197,8 @@ def directional_efficiency(stock: pd.DataFrame, start: pd.Timestamp, cutoff: pd.
     travel = sum(abs(right - left) for left, right in zip(closes, closes[1:]))
     result.update(directional_efficiency=max(-1., min(1., (closes[-1] - closes[0]) / travel)) if travel else 0.,
                   efficiency_reason="Current ER: signed change from 09:30 ET open / total absolute minute-close changes through the latest completed minute")
+    if missing:
+        result.update(efficiency_estimated=True, efficiency_reason=f"Estimated current ER from {len(observed)}/{minutes} reported minutes; gaps are not filled. Unobserved movement can overstate smoothness.")
     return result
 
 
@@ -356,6 +362,11 @@ def evaluate_momentum(
     result.update(additional_signals(stock, sector_benchmark if sector_benchmark is not None else pd.DataFrame(), result,
                                     start=start, cutoff=cutoff, now=now, sector_symbol=sector_symbol,
                                     sector_name=sector_name, sector_failed=sector_failed, adr=adr))
+    if result.get('efficiency_estimated'):
+        result['quality'] = 'ESTIMATED' if result['quality'] == 'FULL' else result['quality']
+        result['candidate'] = False
+        result['status'] = 'PARTIAL' if result['quality'] == 'PARTIAL' else 'WATCH'
+        result['reason'] = '; '.join(filter(None, [result['reason'], result['efficiency_reason']]))
     result["assessment"] = assess_momentum(result)
     return result
 

@@ -692,16 +692,25 @@ def test_cached_reads_keep_session_history_but_clear_it_next_day(monkeypatch):
                               enabled=False, provider=Provider(), now=lambda: clock[0])
     monitor.refresh_once()
     monkeypatch.setattr("src.web.intraday_monitor.evaluate_monitor_row", lambda *_args, **_kwargs: pytest.fail("Cached reads must not calculate ORB"))
+    monitor._snapshot['rows'][0].update(
+        early_review={'active': True},
+        condition_history={'session_date': clock[0].date().isoformat(), 'first_early': {'observed_at': clock[0].isoformat()}},
+    )
     assert monitor.snapshot()["rows"][0]["orb"][0]["price_status"] == "PASS"
+    assert monitor.snapshot()['rows'][0]['early_review']['active']
     clock[0] = moment("10:10")
     row = monitor.snapshot()["rows"][0]
     assert row["quote_status"] == "STALE"
     assert row["orb"][0]["price_status"] == "PASS"
+    assert not row['early_review']['active']
+    assert row['condition_history']['first_early']
     clock[0] = moment("10:05", "2026-10-04")
     row = monitor.snapshot()["rows"][0]
     assert row["quote_status"] == "CLOSED"
     assert row["broke_out_today"] is None
     assert row["orb"][0]["price_status"] == "UNKNOWN"
+    assert not row['early_review']['active']
+    assert 'condition_history' not in row
 
 
 def test_authenticated_monitor_serves_shared_cached_worker_result(authenticated, services):
