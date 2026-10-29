@@ -19,7 +19,7 @@
         <div class="brand-mark">Q</div>
         <div><div class="brand-name">Quant Web</div><div class="brand-sub">Review workspace</div></div>
       </div>
-      <div class="topbar-actions"><button id="desktop-orb-settings" class="ghost-button" type="button">ORB settings</button><button id="logout-button" class="ghost-button">Sign out</button></div>
+      <div class="topbar-actions"><button id="desktop-monitor-open" class="ghost-button" type="button" aria-controls="desktop-monitor-panel">Monitor · Intraday watch</button><button id="desktop-orb-settings" class="ghost-button" type="button">ORB settings</button><button id="logout-button" class="ghost-button">Sign out</button></div>
     </header>
     <section class="status-strip" aria-live="polite">
       <span id="market-summary" title="Checking NYSE market status"><i id="market-dot" class="status-dot"></i><b id="market-status-long">Market Status: Checking</b><b id="market-status-compact">Market Checking</b></span>
@@ -31,6 +31,9 @@
       <span id="market-countdown" title="NYSE regular-session countdown">Checking market…</span>
     </section>
     <main class="workspace">
+      <section id="desktop-monitor-panel" aria-label="Intraday watch" hidden>
+        <div class="desktop-monitor-heading"><div><span class="eyebrow">LIVE WATCHLIST</span><h1>Intraday watch</h1></div><button id="desktop-monitor-close" class="ghost-button" type="button">Back to chart</button></div>
+      </section>
       <aside id="stock-rail" class="stock-rail">
         <div class="rail-head">
           <button id="rail-collapse" class="icon-button" aria-label="Collapse stock list">☰</button>
@@ -40,6 +43,7 @@
           </div>
         </div>
         <div class="list-tabs" role="tablist">
+          <button class="list-tab" data-list="monitor">Monitor</button>
           <button class="list-tab active" data-list="scanner">Scanner</button>
           <button class="list-tab" data-list="history">History</button>
           <button class="list-tab" data-list="watchlist">Watchlist</button>
@@ -323,24 +327,25 @@
                   <button type="button" data-monitor-filter="all" class="active" aria-pressed="true">All</button>
                   <button type="button" data-monitor-filter="breakouts" aria-pressed="false">Broken out</button>
                   <button type="button" data-monitor-filter="orb" aria-pressed="false" title="At least one ORB passed price breakout, position bounds and minimum opening liquidity">ORB passed</button>
+                  <button type="button" data-monitor-filter="strong" aria-pressed="false" title="ORB passed stocks with Strong current conditions">Strong</button>
                   <button type="button" data-monitor-filter="today" aria-pressed="false">Buy Today</button>
                 </div>
                 <input id="mobile-monitor-search" type="search" placeholder="Find a stock" aria-label="Find monitored stock" autocomplete="off">
                 <div id="mobile-momentum-legend" class="mobile-momentum-legend" hidden>
-                  <strong>Condition first. Rank #1 can still be weak.</strong><br>
+                  <strong>Condition first. Rank #1 can still be weak. Strong setups appear first; use Strong to show only those stocks.</strong><br>
                   <span data-rating="GOOD">Green = good</span> · <span data-rating="NORMAL">White = normal / mixed</span> · <span data-rating="BAD">Red = weak / extended</span><br>
                   RS/SPY &amp; Sector: <span data-rating="GOOD">≥ +0.5 pp</span> · <span data-rating="NORMAL">0 to &lt; +0.5</span> · <span data-rating="BAD">&lt; 0</span><br>
                   RVOL: <span data-rating="GOOD">≥ 1.5×</span> · <span data-rating="NORMAL">1 to &lt; 1.5×</span> · <span data-rating="BAD">&lt; 1×</span><br>
-                  ER: <span data-rating="GOOD">≥ +0.40</span> · <span data-rating="NORMAL">+0.20 to &lt; +0.40</span> · <span data-rating="BAD">&lt; +0.20</span><br>
+                  Current ER: <span data-rating="GOOD">≥ +0.40</span> · <span data-rating="NORMAL">+0.20 to &lt; +0.40</span> · <span data-rating="BAD">&lt; +0.20</span><br>
                   VWAP: <span data-rating="GOOD">above</span> · <span data-rating="BAD">below / stretched</span> · <span data-rating="UNKNOWN">Amber = confirm data</span>
                 </div>
                 <details id="mobile-momentum-help" class="mobile-momentum-help" hidden>
                   <summary>Conditions, examples and scoring</summary>
                   <p>Sector pp compares the stock with its broad sector ETF from the same 09:30 ET open to the identical completed minute used for SPY. The ETF ticker appears beside the value. Classification comes from the local profile cache. A missing sector or a mismatched ETF endpoint stays unknown; SPY is never substituted for a sector.</p>
                   <p>vs VWAP is (completed stock price / session VWAP − 1) × 100. Red means below VWAP or more than 0.5 ADR above it: an upward trend can still be too stretched to chase. VWAP uses reported minute typical prices and volume; ~ marks estimates.</p>
-                  <p>ER 1m (~) estimates the latest completed candle's direction and body strength: (close − open) / (high − low). It uses the candle range because the intraminute price path is unavailable. ER 5m and ER 30m measure signed net price change divided by total absolute minute-close changes over their completed windows. +1 is smooth upward progress, −1 smooth downward progress, and 0 means no net progress. ER 5m waits for five completed minutes; ER 30m uses at least five early in the session (~). Gaps stay unknown. Each ER has its own color. The Condition badge continues to use ER 30m ≥ +0.40 for Strong; ER 1m and ER 5m add context. Score weights, ranking and trading gates are unchanged.</p>
+                  <p>Current ER is signed net price change from the 09:30 ET open divided by total absolute minute-close changes through the latest completed minute. +1 is smooth upward progress, &minus;1 smooth downward progress, and 0 no net progress. It needs five completed minutes and a complete price path; missing minutes stay unknown. Strong requires current ER &ge; +0.40. There is no separate 1m, 5m, or 30m ER and no 30-minute warm-up.</p>
                   <p>RS/SPY +5 pp means the stock has gained 5 percentage points more than SPY since the open. RVOL 1× is usual volume at this time; 1.8× is 80% above usual. The color thresholds are starting heuristics, not proven trading edges.</p>
-                  <p>Strong requires RS ≥ +0.5 pp, RVOL ≥ 1.5×, a gain from the open, price above VWAP and in the top quarter of today's range, at or above breakout, within 0.5 ADR of entry, and complete data. Mixed means some support is ordinary. Weak means a measured condition failed; Extended means price is more than 0.5 ADR above entry. Confirm means reported metrics look strong but data is estimated. Check data means a required metric is missing. Tap Condition to see the reasons. Rank only compares this list; #1 does not guarantee a strong setup.</p>
+                  <p>Strong also requires sector excess &ge; +0.5 pp, current ER &ge; +0.40, price no more than 0.5 ADR above VWAP, RS ≥ +0.5 pp, RVOL ≥ 1.5×, a gain from the open, price above VWAP and in the top quarter of today's range, at or above breakout, within 0.5 ADR of entry, and complete data. Mixed means some support is ordinary. Weak means a measured condition failed; Extended means price is more than 0.5 ADR above entry. Confirm means reported metrics look strong but data is estimated. Check data means a required metric is missing. Tap Condition to see the reasons. Rank only compares this list; #1 does not guarantee a strong setup.</p>
                   <p>Leading candidates appear first. Score: 40% strength vs SPY since the 09:30 ET open, 25% same-time relative volume, 25% VWAP and session-range position, 10% proximity to the planned ORB entry. Strength and entry distance use daily ADR.</p>
                   <p>Leading requires a positive return from the open, positive strength vs SPY, RVOL ≥ 1.5x, price above VWAP and in the top quarter of today's range, at or above breakout, and within 0.5 ADR of entry. Watch shows which checks are missing.</p>
                   <p>RVOL uses reported volume from 3–4 prior sessions through the same time. Sparse minute bars produce estimates marked *. Missing metrics produce a partial score using rescaled available weights; they are never counted as zero. Tap a score for coverage and reasons. Only a verified open and fresh synchronized price are required for price strength.</p>

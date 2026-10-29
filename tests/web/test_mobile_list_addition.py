@@ -220,18 +220,17 @@ def test_monitor_add_today_uses_watchlist_promotion_and_existing_confirmation(li
     page = list_browser.new_page(viewport={"width": 390, "height": 844}, has_touch=True)
     state = open_watchlist(page, breakout=breakout)
     page.locator("#mobile-list-menu").click()
-    page.locator('[data-mobile-symbol="SHMD"] .mobile-monitor-action button').click()
     if breakout is None:
-        page.locator("#breakout-price-popup").wait_for(state="visible")
+        assert page.locator('[data-mobile-symbol="SHMD"]').count() == 0
         assert state["posts"] == []
-        page.locator("#breakout-price-popup-input").fill("2.75")
-        page.locator("#breakout-price-form button[type=submit]").click()
+        assert state["errors"] == []
+        page.close()
+        return
+    page.locator('[data-mobile-symbol="SHMD"] .mobile-monitor-action button').click()
     page.locator("#operator-confirm-dialog").wait_for(state="visible")
     assert state["card"]["buy_today_member"] is False
     assert state["card"]["buylist_member"] is True
-    assert [payload["operation"] for _, payload in state["posts"]] == (
-        ["set_breakout", "promote_buylist"] if breakout is None else ["promote_buylist"]
-    )
+    assert [payload["operation"] for _, payload in state["posts"]] == ["promote_buylist"]
     page.locator("#operator-confirm-submit").click()
     page.wait_for_function("document.querySelector('#quick-buy-today').textContent === 'Cancel Today' && !document.querySelector('#quick-buy-today').disabled")
     assert state["card"]["buy_today_member"] is True

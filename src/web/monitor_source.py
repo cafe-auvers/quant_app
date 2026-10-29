@@ -13,6 +13,7 @@ from src.services.monitor_equity import read_monitor_equity
 from src.utils.config import get_env_value
 from src.utils.market_calendar import US_MARKET_ZONE
 from .intraday_monitor import MonitorContext, merge_monitor_rows
+from .watchlist_history import WatchlistHistorySource
 
 
 def load_monitor_sectors(rows: list[dict], mirror) -> None:
@@ -43,9 +44,16 @@ def load_monitor_sectors(rows: list[dict], mirror) -> None:
 
 
 def load_monitor_context(config, store, canonical) -> MonitorContext:
+    today = dt.datetime.now(US_MARKET_ZONE).date()
+    since = today - dt.timedelta(days=3660)
+    history = WatchlistHistorySource.from_config(config).list_range(since, today)
+    history += store.list_watchlist_history(since, today)
+    historical_symbols = {row["symbol"] for row in history}
     if config.mode == "SANDBOX":
-        return MonitorContext(rows=merge_monitor_rows(store.list_plans(), store.list_buy_today_drafts()))
-    planning = canonical.list_plans()
+        plans = [{**row, "historical_watchlist_member": row["symbol"] in historical_symbols}
+                 for row in store.list_plans()]
+        return MonitorContext(rows=merge_monitor_rows(plans, store.list_buy_today_drafts()))
+    planning = canonical.list_monitor_plans(historical_symbols)
     rows = merge_monitor_rows(planning["rows"], store.list_shared_buy_today_drafts())
     load_monitor_sectors(rows, config.resolved_local_mirror_path)
     context = MonitorContext(rows=rows)

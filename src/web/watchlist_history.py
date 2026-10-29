@@ -66,7 +66,9 @@ def resolve_watchlist_history_path(config: WebConfig) -> Path | None:
             candidate = PROJECT_ROOT / candidate
         return candidate.resolve()
 
-    candidates = [PROJECT_ROOT / "data" / "watchlist.json"]
+    repository = config.resolved_pc_repository
+    candidates = ([repository / "data" / "watchlist.json"] if repository else [])
+    candidates.append(PROJECT_ROOT / "data" / "watchlist.json")
     linked_root = _linked_main_worktree()
     if linked_root is not None and linked_root != PROJECT_ROOT:
         candidates.append(linked_root / "data" / "watchlist.json")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import threading
 from types import SimpleNamespace
 
@@ -242,15 +243,60 @@ def test_premarket_does_not_confirm_regular_session_breakouts():
 
 def test_union_includes_all_memberships_and_only_current_drafts():
     plans = [
-        {"symbol": "AAA", "watchlist_member": True, "buylist_member": True, "version": 2},
-        {"symbol": "BBB", "buylist_member": True, "version": 3},
-        {"symbol": "CCC", "buy_today_member": True},
+        {"symbol": "AAA", "watchlist_member": True, "buylist_member": True, "version": 2, "breakout_price": 10},
+        {"symbol": "BBB", "buylist_member": True, "version": 3, "breakout_price": 20},
+        {"symbol": "CCC", "buy_today_member": True, "breakout_price": 30},
         {"symbol": "DDD", "breakout_price": 10},
     ]
     rows = merge_monitor_rows(plans, [{"symbol": "AAA", "card_version": 2}, {"symbol": "BBB", "card_version": 2}, {"symbol": "ORPHAN"}])
     assert [row["symbol"] for row in rows] == ["AAA", "BBB", "CCC"]
     assert rows[0]["buy_today_member"] is True
     assert not rows[1].get("buy_today_member")
+
+
+def test_monitor_membership_requires_a_positive_breakout_and_keeps_history():
+    plans = [
+        {"symbol": "HIST", "historical_watchlist_member": True, "breakout_price": 10},
+        {"symbol": "TODAY", "watchlist_member": True, "breakout_price": 20},
+        {"symbol": "BUY", "buylist_member": True, "breakout_price": 30},
+        {"symbol": "ORPHAN", "breakout_price": 40},
+        *({"symbol": f"INVALID{i}", "watchlist_member": True, "breakout_price": value}
+          for i, value in enumerate((None, 0, -1, float("nan"), float("inf"), "bad"))),
+    ]
+    assert [row["symbol"] for row in merge_monitor_rows(plans, [])] == ["BUY", "HIST", "TODAY"]
+
+
+def test_canonical_monitor_reads_historical_levels_without_changing_current_lists(tmp_path):
+    from .test_canonical_planning import canonical_source
+
+    source = canonical_source(tmp_path)
+    try:
+        current = source.list_plans()
+        monitor = source.list_monitor_plans({"HIST", "OLD"})
+        assert {row["symbol"] for row in monitor["rows"]} == {"AAPL", "MSFT", "NVDA", "HIST"}
+        history = next(row for row in monitor["rows"] if row["symbol"] == "HIST")
+        assert history["historical_watchlist_member"] is True
+        assert history["watchlist_member"] is False
+        assert history["breakout_price"] == 88.5
+        assert source.list_plans() == current
+    finally:
+        source.close()
+
+
+def test_monitor_context_loads_history_from_the_connected_pc_archive(web_config, services, tmp_path):
+    from dataclasses import replace
+    from src.web.monitor_source import load_monitor_context
+    from .test_canonical_planning import canonical_source
+
+    archive = tmp_path / "archive.json"
+    archive.write_text(json.dumps({"sessions": {"2026-10-01": {"items": [{"symbol": "HIST"}]}}}), encoding="utf-8")
+    source = canonical_source(tmp_path)
+    try:
+        config = replace(web_config, mode="CONNECTED", watchlist_history_path=str(archive))
+        context = load_monitor_context(config, services.store, source)
+        assert "HIST" in {row["symbol"] for row in context.rows}
+    finally:
+        source.close()
 
 
 class Provider:
@@ -261,6 +307,42 @@ class Provider:
     def fetch(self, symbols, *, interval, period=None):
         self.calls.append((list(symbols), interval))
         return {} if self.failed or interval == "1d" else {s: bars() for s in symbols}
+
+
+def test_partial_yahoo_outage_backs_off_failed_symbols_without_delaying_healthy_stocks():
+    ticks = [0.0]
+    class PartialProvider(Provider):
+        def fetch(self, symbols, *, interval, period=None):
+            data = super().fetch(symbols, interval=interval, period=period)
+            return {symbol: frame for symbol, frame in data.items() if symbol != "BAD"}
+
+    provider = PartialProvider()
+    monitor = IntradayMonitor(lambda: MonitorContext(rows=[{"symbol": "GOOD"}, {"symbol": "BAD"}]),
+                              enabled=False, provider=provider, now=moment, monotonic=lambda: ticks[0])
+    monitor.refresh_once()
+    assert monitor._quote_retry_after["BAD"] == 120
+    ticks[0] = 60
+    monitor.refresh_once()
+    assert provider.calls[-1] == (["GOOD", "SPY"], "1m")
+    ticks[0] = 120
+    monitor.refresh_once()
+    assert monitor._quote_retry_after["BAD"] == 360
+    ticks[0] = 180
+    monitor.refresh_once()
+    assert provider.calls[-1] == (["GOOD", "SPY"], "1m")
+
+
+def test_total_yahoo_outage_uses_exponential_backoff_capped_at_fifteen_minutes():
+    ticks = [0.0]
+    provider = Provider()
+    provider.failed = True
+    monitor = IntradayMonitor(lambda: MonitorContext(rows=[{"symbol": "AAA"}]), enabled=False,
+                              provider=provider, now=moment, monotonic=lambda: ticks[0])
+    for delay in (120, 240, 480, 900, 900):
+        monitor.refresh_once()
+        assert monitor._quote_retry_after["AAA"] - ticks[0] == delay
+        assert monitor.snapshot()["next_refresh_in_seconds"] == delay
+        ticks[0] += delay
 
 
 def test_worker_caches_daily_inputs_and_adds_new_stocks_next_cycle():
@@ -281,6 +363,7 @@ def test_worker_caches_daily_inputs_and_adds_new_stocks_next_cycle():
     assert stale["quote_as_of"] == moment().isoformat()
     assert stale["broke_out_today"] is None
     provider.failed = False
+    monitor._quote_retry_after.clear()
     monitor.refresh_once()
     assert monitor.snapshot()["rows"][0]["quote_status"] == "CURRENT"
 
@@ -328,6 +411,7 @@ def test_momentum_worker_primes_history_once_and_suppresses_only_ranking_on_spy_
     assert row["momentum"]["score"] is row["momentum"]["rank"] is None
     assert "SPY" in row["momentum"]["reason"]
     fail_market[0] = False
+    monitor._quote_retry_after.clear()
     monitor.refresh_once()
     assert monitor.snapshot()["rows"][0]["momentum"]["rank"] == 1
     clock[0] = moment("10:10")
@@ -417,6 +501,7 @@ def test_closed_market_downloads_once_and_retries_failures_with_backoff():
     assert monitor._next_refresh > monitor.monotonic() + 100
     assert monitor.snapshot()["rows"][0]["quote_status"] == "STALE"
     provider.failed = False
+    monitor._quote_retry_after.clear()
     monitor.refresh_once()
     assert monitor.snapshot()["rows"][0]["quote_status"] == "CLOSED"
 
@@ -592,7 +677,7 @@ def test_shared_bounds_failure_preserves_price_monitoring_membership(web_config,
     from dataclasses import replace
     from src.web.monitor_source import load_monitor_context
 
-    source = SimpleNamespace(list_plans=lambda: {"rows": [{"symbol": "AAA", "watchlist_member": True}]},
+    source = SimpleNamespace(list_monitor_plans=lambda _history: {"rows": [{"symbol": "AAA", "watchlist_member": True, "breakout_price": 10}]},
                              orb_monitor_inputs=lambda: {"account_no": "a", "document": {"orb_settings": bounds}})
     context = load_monitor_context(replace(web_config, mode="CONNECTED", pc_repository_path=str(tmp_path)), services.store, source)
     assert len(context.rows) == 1

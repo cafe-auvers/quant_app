@@ -12,7 +12,7 @@ from src.utils.market_calendar import (
 )
 
 
-MOMENTUM_VERSION = "INTRADAY_MOMENTUM_V2"
+MOMENTUM_VERSION = "INTRADAY_MOMENTUM_V3"
 BENCHMARK = "SPY"
 MIN_VOLUME_SESSIONS = 3
 MAX_VOLUME_SESSIONS = 4
@@ -97,7 +97,12 @@ def assess_momentum(momentum: dict) -> dict:
             bad.append("In lower half of today's range")
         elif location < 75:
             normal.append("Below top quarter of today's range")
-    missing = rs is None or rvol is None or any(value is None for value in values.values())
+    labels = {"stock_return_open_percent": "gain since open", "vwap_distance_percent": "VWAP",
+              "range_location_percent": "session range position", "entry_extension_adr": "entry distance",
+              "breakout_distance_percent": "breakout distance"}
+    missing_metrics = [labels.get(name, name) for name, value in
+                       {"RS versus SPY": rs, "RVOL": rvol, **values}.items() if value is None]
+    missing = bool(missing_metrics)
     uncertain = missing or momentum.get("quality") != "FULL"
     if momentum.get("signals_version"):
         sector = _number(momentum.get("rs_sector_pp"))
@@ -113,18 +118,21 @@ def assess_momentum(momentum: dict) -> dict:
         elif sector is not None and sector < .5:
             normal.append("Sector excess below +0.5 pp")
         if efficiency is not None and efficiency < .2:
-            bad.append("Downward or choppy recent price action")
+            bad.append("Current ER below +0.20: downward or choppy session")
         elif efficiency is not None and efficiency < .4:
-            normal.append("Recent upward progress is only moderate")
+            normal.append("Current ER below +0.40: moderate upward progress")
         if vwap_adr is not None and vwap_adr > .5:
             bad.append("More than 0.5 ADR above VWAP")
         missing = missing or sector is None or efficiency is None or vwap_adr is None
+        missing_metrics += [name for name, value in (
+            ("sector strength", sector), ("current ER", efficiency), ("VWAP distance in ADR", vwap_adr),
+        ) if value is None]
         uncertain = uncertain or missing or bool(momentum.get("efficiency_warming_up"))
     if bad:
         label = "Extended" if (extension is not None and extension > 0.5) or (_number(momentum.get("vwap_distance_adr")) or 0) > .5 else "Weak"
         tone, reasons = "BAD", bad + normal
     elif missing:
-        label, tone, reasons = "Check data", "UNKNOWN", ["Required condition data missing", *normal]
+        label, tone, reasons = "Check data", "UNKNOWN", ["Required condition data missing: " + ", ".join(missing_metrics), *normal]
     elif normal:
         label, tone, reasons = "Mixed", "NORMAL", normal
     elif uncertain:
@@ -165,51 +173,26 @@ def _valid_observations(frame: pd.DataFrame, columns: list[str]) -> bool:
                         for column in columns))
 
 
-def directional_efficiency(
-    stock: pd.DataFrame, start: pd.Timestamp, cutoff: pd.Timestamp, *, horizon_minutes: int = 30,
-) -> dict:
-    """Signed net progress / total close-to-close travel for completed bars."""
-    if horizon_minutes not in (5, 30):
-        raise ValueError("Price-path efficiency horizon must be 5 or 30 minutes")
-    minimum = 5
-    minutes = min(horizon_minutes, int((cutoff - start).total_seconds() // 60) + 1)
+def directional_efficiency(stock: pd.DataFrame, start: pd.Timestamp, cutoff: pd.Timestamp) -> dict:
+    """Current signed ER from the regular-session open to the completed cutoff."""
+    minutes = int((cutoff - start).total_seconds() // 60) + 1
     result = {"directional_efficiency": None, "efficiency_minutes": minutes,
-              "efficiency_warming_up": minutes < horizon_minutes,
-              "efficiency_reason": f"Waiting for {minimum} completed minute(s)"}
-    if minutes < minimum:
+              "efficiency_warming_up": minutes < 5,
+              "efficiency_reason": "Waiting for five completed minutes for current ER"}
+    if minutes < 5:
         return result
-    first = cutoff - pd.Timedelta(minutes=minutes - 1)
-    # Use the preceding close as the anchor once the window rolls.
-    anchor = first - pd.Timedelta(minutes=1) if first > start else start
-    expected = pd.date_range(anchor, cutoff, freq="min")
+    expected = pd.date_range(start, cutoff, freq="min")
     if not expected.isin(stock.index).all() or not _valid_observations(stock.loc[expected], ["Close"]):
         result["efficiency_reason"] = "Missing or invalid minute closes in efficiency window; gaps are not filled"
         return result
     closes = stock.loc[expected, "Close"].astype(float).tolist()
-    if first == start:
-        opened = _number(stock.loc[start, "Open"])
-        if opened is None or opened <= 0:
-            return result
-        closes.insert(0, opened)
+    opened = _number(stock.loc[start, "Open"])
+    if opened is None or opened <= 0:
+        return result
+    closes.insert(0, opened)
     travel = sum(abs(right - left) for left, right in zip(closes, closes[1:]))
     result.update(directional_efficiency=max(-1., min(1., (closes[-1] - closes[0]) / travel)) if travel else 0.,
-                  efficiency_reason="Signed net change / total absolute minute-close changes; "
-                  + ("early-session window" if minutes < horizon_minutes
-                     else f"last {horizon_minutes} completed minutes"))
-    return result
-
-
-def candle_efficiency(stock: pd.DataFrame, cutoff: pd.Timestamp) -> dict:
-    """Signed body/range proxy for the last completed one-minute candle."""
-    result = {"value": None, "minutes": 1, "warming_up": False, "estimated": True,
-              "reason": "Missing or invalid completed one-minute candle"}
-    if cutoff not in stock.index or not _valid_observations(stock.loc[[cutoff]], ["Open", "High", "Low", "Close"]):
-        return result
-    opened, high, low, closed = (float(stock.loc[cutoff, key]) for key in ("Open", "High", "Low", "Close"))
-    if low > min(opened, closed) or high < max(opened, closed):
-        return result
-    result.update(value=round((closed - opened) / (high - low), 12) if high > low else 0.,
-                  reason="One-minute candle estimate: (close - open) / (high - low); intraminute price path unavailable")
+                  efficiency_reason="Current ER: signed change from 09:30 ET open / total absolute minute-close changes through the latest completed minute")
     return result
 
 
@@ -229,16 +212,7 @@ def additional_signals(stock: pd.DataFrame, sector: pd.DataFrame, result: dict, 
                 change = (float(endpoints.Close.iloc[-1]) / float(endpoints.Open.iloc[0]) - 1) * 100
                 signals.update(rs_sector_pp=result["stock_return_open_percent"] - change,
                                sector_return_open_percent=change, sector_as_of=result["as_of"], sector_reason="")
-    signals["efficiency_windows"] = {"1m": candle_efficiency(stock, cutoff)}
-    for minutes in (5, 30):
-        window = directional_efficiency(stock, start, cutoff, horizon_minutes=minutes)
-        if minutes == 30:
-            signals.update(window)
-        signals["efficiency_windows"][f"{minutes}m"] = {
-            "value": window["directional_efficiency"], "minutes": window["efficiency_minutes"],
-            "warming_up": window["efficiency_warming_up"], "reason": window["efficiency_reason"],
-            "estimated": False,
-        }
+    signals.update(directional_efficiency(stock, start, cutoff))
     return signals
 
 

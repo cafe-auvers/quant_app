@@ -282,21 +282,31 @@ Operator Control, saved scanner setups, and chart preferences. Shared risk
 changes still require **Save shared settings**; navigating between pages keeps
 unsaved form values. Opening a page does not change risk settings or control.
 
-The mobile bottom **Watchlist** button opens **Monitor** by default. It combines
-Watchlist, Buylist, canonical Buy Today, and current Buy Today drafts into one
-deduplicated table, with one line per stock: **Stock**, **Today %**, **Breakout**,
-**Best ORB**, **1M %**, and **3M %**. Today % compares the latest quote with the
-previous regular-session close; monthly returns use 21 and 63 trading sessions,
-matching the chart growth convention. Missing history shows a dash. Daily
-history is cached from the existing ADR batch (six months, once per session),
-while the latest price updates each minute. Swipe horizontally on narrow phones;
-the stock column stays visible. Tap a symbol to review its chart, or **+** to
-use the existing Buy Today workflow. Watchlist-only stocks are promoted through
-the existing Buylist step, and executable activation keeps its confirmation.
-Stocks that broke out today appear first, followed by passing ORBs and stronger
-daily changes. **Broken out**, **ORB passed**, **Buy Today**, and symbol search narrow
-the view.
-New intraday additions enter the next refresh cycle automatically.
+On PC, use **Monitor / Intraday watch** in the header or **Monitor** in the
+stock rail. The full-width monitor stays open during refreshes; **Back to chart**
+returns to the chart. On mobile, bottom **Watchlist** opens Monitor.
+
+**All** is the deduplicated union of historical Watchlists, today's Watchlist,
+Buylist, and active Buy Today members **with a positive saved breakout price**.
+Historical membership comes from the desktop archive and canonical dated cards;
+the level is the current saved canonical level, never an old archived price.
+No-level stocks and orphan breakout cards are excluded before Yahoo downloads.
+New additions join the next refresh automatically.
+
+**Broken out** contains All stocks that exceeded their saved level during the
+regular session, including subsequent pullbacks. **ORB passed** is a subset of
+Broken out with passing price, position bounds, and opening liquidity. **Strong**
+is the subset of ORB passed with Strong current conditions. Stale earlier passes
+remain marked as historical observations; stale prices cannot show Strong.
+The monitor calculates breakout, ORB, and condition using one refresh cutoff,
+then publishes one snapshot, so separate filter refreshes cannot race.
+
+Every view shows Condition, Momentum, RS/SPY, RVOL, sector excess, VWAP distance,
+and **Current ER**, alongside Today %, Breakout, Best ORB, and 1M/3M returns.
+Strong rows appear first. Tap a condition for reasons and missing data.
+Today % uses the previous session close; 1M and 3M use 21 and 63 trading sessions.
+Daily history is cached from the existing six-month ADR download once per session.
+Swipe horizontally on phones; the stock column stays visible.
 
 The worker checks all 1m, 5m, and 30m ranges and eight risk cases. **Best ORB**
 shows the highest-scoring valid window and risk, such as `5m · 0.5%`. A pass
@@ -323,7 +333,7 @@ An earlier confirmed ORB with a stale quote has an asterisk and amber text,
 with its stale status in the tooltip. It does not claim a fresh entry signal.
 Hover over the stock for its company name, latest price, and quote time.
 
-Within **ORB passed**, the table adds **Condition**, **Momentum**, **RS/SPY pp**, and **RVOL**.
+All monitor filters show **Condition**, **Momentum**, **RS/SPY pp**, and **RVOL**.
 Condition is independent of relative rank: #1 can still show **Weak** or
 **Extended**. The always-visible legend uses these starting heuristics:
 
@@ -349,49 +359,30 @@ Stale observations cannot show a green condition. After close, labels describe
 closing conditions for review. Tap the condition for specific reasons.
 These bands are unvalidated heuristics; the scoring weights and rank order are unchanged.
 
-The additional **Sector pp**, **vs VWAP**, and **ER 1m / ER 5m / ER 30m** columns
-show strength across short and longer windows. Swipe the table to see them, or
-tap Condition for colored metric cards. Each ER uses green ≥ +0.40, white +0.20
-to < +0.40, and red < +0.20. Score weights and relative ranking are unchanged;
-the Condition badge continues to use ER 30m, with ER 1m and ER 5m advisory only.
+**Sector pp**, **vs VWAP**, and **Current ER** refine Condition without changing
+the score weights. Current ER uses green >= +0.40, white +0.20 to < +0.40, and red
+< +0.20. It is one signed session-to-current efficiency value, not three windows.
 
-- **Sector pp:** stock return minus its broad sector ETF return, from the same
-  09:30 ET open to the exact completed-minute endpoint used for RS/SPY. ETF
-  ticker is shown in the cell. Green ≥ +0.5 pp, white 0 to < +0.5 pp, red < 0 pp.
-  Classifications come from read-only `stock_profiles` in the existing SQLite
-  mirror. Unknown classifications stay unknown; there is no SPY substitution.
-  The broad proxies are XLK, XLV, XLF, XLY, XLP, XLC, XLE, XLI, XLB, XLU and
-  XLRE. [State Street's sector ETF list](https://www.ssga.com/us/en/individual/capabilities/equities/sector-investing/select-sector-etfs)
-  identifies these exposures. Shared ETFs are downloaded once per worker cycle,
-  never added to watchlist membership. A sector outage does not erase SPY ranks.
-- **vs VWAP:** `(completed stock close / session VWAP - 1) × 100`. Green above,
-  white exactly at VWAP, red below or more than 0.5 daily ADR above it. A large
-  positive distance can mean chasing a stretched price. The session VWAP uses
-  volume-weighted minute typical prices, not tick executions; `~` marks sparse-bar
-  estimates. The current displayed after-hours quote is not mixed with RTH VWAP.
-- **ER 1m:** the last completed candle's `(close - open) / (high - low)`,
-  from −1 to +1, marked `~` as a candle estimate. The one-minute data cannot
-  reconstruct the intraminute price path. A flat candle with no range is 0;
-  missing or inconsistent OHLC values stay unknown. This window needs one
-  completed candle and does not include the forming candle.
-- **ER 5m / ER 30m:** signed net price change divided by summed absolute
-  one-minute close changes over the last 5 or 30 completed minutes, from −1
-  to +1. This is a
-  signed adaptation of [Kaufman's efficiency ratio](https://chartschool.stockcharts.com/table-of-contents/technical-indicators-and-overlays/technical-overlays/kaufmans-adaptive-moving-average-kama).
-  Smooth rises approach +1; smooth declines approach −1; flat/no-net-progress
-  paths are 0. ER 5m waits for five completed minutes. Before 30
-  minutes are available, use the session open and at least five completed bars,
-  mark `~`, and show the actual window in details. Missing minute closes stay
-  unknown because skipping them could make the path look falsely smooth.
+- Sector excess compares the stock with its cached broad sector ETF using the
+  same 09:30 ET open and completed endpoint as SPY. Missing classifications or
+  mismatched ETF endpoints stay unknown; SPY is never substituted.
+- VWAP distance uses completed minute typical prices and volume. Strong needs
+  price above VWAP and no more than 0.5 ADR above it.
+- Current ER = (latest completed close - 09:30 open) / sum of absolute price
+  changes from the open through each completed minute close. Smooth rises
+  approach +1; smooth declines approach -1; no net progress gives 0. It needs
+  five completed minutes, then has no 30-minute warm-up. Missing minute closes
+  anywhere in the session path keep ER unknown. Premarket and forming candles
+  are excluded. The signed value is an adaptation of Kaufman's efficiency ratio.
 
-Strong additionally requires green sector excess and efficiency, no VWAP
-stretch, and a full efficiency window. Sector underperformance or weak recent
-price action yields Weak; excessive VWAP distance yields Extended. Missing new
-metrics cannot yield Strong. Existing score/rank remains visible, including
-when sector or efficiency data is missing. All thresholds remain heuristics.
+Strong requires RS versus SPY >= +0.5 pp, sector excess >= +0.5 pp, RVOL >= 1.5x,
+current ER >= +0.40, a gain since open, price above VWAP but within 0.5 ADR of it,
+price in the top quarter of today's range and at/above breakout, within 0.5 ADR
+of planned entry, and complete fresh data. Estimated otherwise-strong data
+shows Confirm; missing required metrics show Check data. These remain heuristics.
 
 Tap Momentum for the score components, VWAP distance, session-range position,
-entry distance in ADR, data time, and reasons. Leading candidates sort first,
+entry distance in ADR, data time, and reasons. Strong conditions sort first, then Leading candidates,
 then Watch candidates, by score within each group; unavailable/stale evidence
 remains unranked. Search keeps the ranks of the full monitored candidate set.
 An earlier ORB pass remains visible after a pullback, but does not establish
@@ -448,7 +439,7 @@ during extended US trading hours, caches completed daily ADR, pauses after
 three minutes without a visible monitoring client, and avoids repeated closed
 market downloads. Yahoo data can be delayed. Quote age and failed refreshes are
 explicit; partial failures retain prices but suppress fresh signals. A failed
-quote batch backs off for two minutes; failed daily history retries after
+quote batch and individual failed symbols back off for 2, 4, 8, then at most 15 minutes; failed daily history retries after
 15 minutes. There are no broker calls, scanner runs, order submissions, or
 execution-state changes from reading this monitor. The **+** action explicitly
 uses the existing planning/operator endpoints. Sandbox does not download quotes.
@@ -486,3 +477,12 @@ The status includes the owner, heartbeat age, and reason without changing
 execution ownership or readiness gates.
 
 Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.
+
+Monitor requests on visible PC and mobile browsers poll the same cached worker
+every 60 seconds. Opening additional clients does not add Yahoo download cycles.
+The worker pauses after three minutes without a visible client. It caches daily
+history and prior-session minute history, deduplicates benchmark/sector tickers,
+and does not fall back to per-ticker retry loops after failed batches. Failed
+symbols back off for 2, 4, 8, then at most 15 minutes while healthy symbols keep
+the normal cadence. Yahoo can still rate-limit or delay data; a one-minute
+check is not a guarantee of a new quote every minute.

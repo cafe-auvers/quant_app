@@ -417,6 +417,21 @@ class CanonicalPlanningSource:
         rows.sort(key=lambda row: (row["symbol"]))
         return {"rows": rows, "revision": snapshot.revision}
 
+    def list_monitor_plans(self, historical_symbols: set[str]) -> dict[str, Any]:
+        """Project current levels for monitor members from one canonical snapshot."""
+        snapshot = self._load_snapshot()
+        rows = []
+        for card in snapshot.cards:
+            row = self._project(card)
+            row["historical_watchlist_member"] = card.symbol in historical_symbols or bool(
+                card.watchlist_session_date and not row["watchlist_member"]
+            )
+            if row["breakout_price"] is not None and any(row[key] for key in (
+                "watchlist_member", "buylist_member", "buy_today_member", "historical_watchlist_member",
+            )):
+                rows.append(row)
+        return {"rows": sorted(rows, key=lambda row: row["symbol"]), "revision": snapshot.revision}
+
     def list_buy_today(self) -> dict[str, Any]:
         snapshot = self._load_snapshot()
         rows = [self._project(card) for card in snapshot.cards]

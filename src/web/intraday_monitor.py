@@ -50,10 +50,12 @@ class MonitorContext:
 
 
 def merge_monitor_rows(plans: list[dict], drafts: list[dict]) -> list[dict]:
-    """Union memberships without monitoring orphaned drafts or breakout-only cards."""
+    """Monitor the membership union only when a valid saved breakout exists."""
     rows = {}
     for card in plans:
-        if not any(card.get(key) for key in ("watchlist_member", "buylist_member", "buy_today_member")):
+        if positive(card.get("breakout_price")) is None or not any(card.get(key) for key in (
+            "watchlist_member", "buylist_member", "buy_today_member", "historical_watchlist_member",
+        )):
             continue
         rows[card["symbol"]] = dict(card)
     for draft in drafts:
@@ -338,6 +340,9 @@ class IntradayMonitor:
         self._thread = None
         self._active_until = 0.0
         self._next_refresh = 0.0
+        self._failure_cycles = 0
+        self._quote_failures = {}
+        self._quote_retry_after = {}
         self._frames = {}
         self._history_session = {}
         self._failed_symbols = set()
@@ -391,6 +396,7 @@ class IntradayMonitor:
         assign_momentum_ranks(snapshot["rows"])
         return {**snapshot, "enabled": self.enabled, "source": "Yahoo Finance · 1-minute bars",
                 "refresh_seconds": self.refresh_seconds, "stale_seconds": self.stale_seconds, "advisory": True,
+                "next_refresh_in_seconds": max(0, round(self._next_refresh - self.monotonic())),
                 "position_context_error": context.position_error}
 
     def invalidate(self) -> None:
@@ -420,6 +426,7 @@ class IntradayMonitor:
             active = is_nyse_trading_day(now.date()) and dt.time(4) <= now.time() < dt.time(20)
             # Off-hours: read plans each minute, fetch each symbol once per date.
             due = quote_symbols if active else [s for s in quote_symbols if s not in self._frames or s in self._failed_symbols or self._adr_session != now.date()]
+            due = [s for s in due if self.monotonic() >= self._quote_retry_after.get(s, 0)]
             # Prime a small same-clock volume baseline once per symbol/session.
             # Subsequent cycles download today's minutes only, including SPY once.
             history_due = [s for s in due if self._history_session.get(s) != now.date()]
@@ -430,6 +437,16 @@ class IntradayMonitor:
                 self._history_session.update({s: now.date() for s in history_due if s in frames})
             if current_due:
                 frames.update(self.provider.fetch(current_due, interval="1m", period="1d" if active else "5d"))
+            for symbol in due:
+                if symbol in frames:
+                    self._quote_failures.pop(symbol, None)
+                    self._quote_retry_after.pop(symbol, None)
+                else:
+                    failures = self._quote_failures.get(symbol, 0) + 1
+                    self._quote_failures[symbol] = failures
+                    self._quote_retry_after[symbol] = self.monotonic() + self.refresh_seconds * min(15, 2 ** min(failures, 4))
+            self._quote_failures = {s: count for s, count in self._quote_failures.items() if s in quote_symbols}
+            self._quote_retry_after = {s: tick for s, tick in self._quote_retry_after.items() if s in quote_symbols}
             adr = dict(self._adr) if self._adr_session == now.date() else {}
             missing_adr = [s for s in symbols if s not in adr or (adr[s] is None and self.monotonic() >= self._adr_retry_after.get(s, 0))]
             if missing_adr:
@@ -456,17 +473,18 @@ class IntradayMonitor:
             self._history_session = {s: day for s, day in self._history_session.items() if s in quote_symbols}
             self._failed_symbols = (self._failed_symbols | (set(due) - frames.keys())) - frames.keys()
             self._failed_symbols.intersection_update(quote_symbols)
+            evaluated_at = self.now()
             rows = [evaluate_monitor_row(
-                row, self._frames[row["symbol"]], now=self.now(), context=context,
+                row, self._frames[row["symbol"]], now=evaluated_at, context=context,
                 adr=adr.get(row["symbol"]), fetch_failed=row["symbol"] in self._failed_symbols,
                 stale_seconds=self.stale_seconds,
             ) for row in context.rows]
             for row in rows:
-                apply_daily_close_fallback(row, self._daily_quotes.get(row["symbol"]), self.now())
-                apply_daily_performance(row, self._daily_frames.get(row["symbol"], pd.DataFrame()), self.now())
+                apply_daily_close_fallback(row, self._daily_quotes.get(row["symbol"]), evaluated_at)
+                apply_daily_performance(row, self._daily_frames.get(row["symbol"], pd.DataFrame()), evaluated_at)
                 row["momentum"] = evaluate_momentum(
                     row, self._frames[row["symbol"]], self._frames.get(BENCHMARK, pd.DataFrame()),
-                    now=self.now(), adr=adr.get(row["symbol"]), stale_seconds=self.stale_seconds,
+                    now=evaluated_at, adr=adr.get(row["symbol"]), stale_seconds=self.stale_seconds,
                     benchmark_failed=BENCHMARK in self._failed_symbols,
                     sector_benchmark=self._frames.get(row.get("sector_symbol"), pd.DataFrame()),
                     sector_symbol=row.get("sector_symbol"), sector_name=row.get("sector_name"),
@@ -481,9 +499,13 @@ class IntradayMonitor:
                 self._context = context
                 self._snapshot = {"rows": rows, "as_of": self.now().isoformat(), "error": "", "refreshing": False}
                 if due and not frames:
+                    self._failure_cycles += 1
+                    delay = self.refresh_seconds * min(15, 2 ** min(self._failure_cycles, 4))
                     if not any(row.get("current_price") for row in rows):
-                        self._snapshot["error"] = f"Yahoo quotes unavailable; next check in {self.refresh_seconds * 2:g} seconds"
-                    self._next_refresh = self.monotonic() + self.refresh_seconds * 2
+                        self._snapshot["error"] = f"Yahoo quotes unavailable; next check in {delay:g} seconds"
+                    self._next_refresh = self.monotonic() + delay
+                else:
+                    self._failure_cycles = 0
             if self.on_update and not self._stop.is_set():
                 self.on_update()
         except Exception:
@@ -493,7 +515,8 @@ class IntradayMonitor:
                 self._snapshot["refreshing"] = False
                 for row in self._snapshot["rows"]:
                     suppress_stale_signals(row)
-            self._next_refresh = self.monotonic() + self.refresh_seconds * 2
+            self._failure_cycles += 1
+            self._next_refresh = self.monotonic() + self.refresh_seconds * min(15, 2 ** min(self._failure_cycles, 4))
         finally:
             # Slow provider calls get a short breathing space before another batch.
             self._next_refresh = max(self._next_refresh, self.monotonic() + 10)

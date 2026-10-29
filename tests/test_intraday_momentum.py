@@ -362,19 +362,20 @@ def test_sector_outage_does_not_reuse_cached_live_benchmark_or_rewind_other_sign
 @pytest.mark.parametrize("mode, expected", [("up", 1), ("down", -1), ("flat", 0), ("chop", 0)])
 def test_signed_efficiency_distinguishes_smooth_declines_from_upward_progress(mode, expected):
     frame = history()
-    index = pd.date_range(moment("09:34"), moment("10:04"), freq="min")
+    index = pd.date_range(moment("09:30"), moment("10:04"), freq="min")
     if mode == "up":
-        prices = np.arange(100., 131.)
+        prices = np.arange(100., 135.)
     elif mode == "down":
-        prices = np.arange(131., 100., -1)
+        prices = np.arange(135., 100., -1)
     elif mode == "chop":
-        prices = np.array([100., 101.] * 15 + [100.])
+        prices = np.array([100., 101.] * 17 + [100.])
     else:
-        prices = np.full(31, 100.)
+        prices = np.full(35, 100.)
     frame.loc[index, "Close"] = prices
+    frame.loc[index[0], "Open"] = prices[0]
     result = evaluate(frame)
     assert result["directional_efficiency"] == expected
-    assert result["efficiency_minutes"] == 30
+    assert result["efficiency_minutes"] == 35
     assert result["efficiency_warming_up"] is False
     assert -1 <= result["directional_efficiency"] <= 1
 
@@ -385,74 +386,39 @@ def test_efficiency_gaps_are_unknown_and_future_bars_do_not_improve_quality():
     assert result["directional_efficiency"] is None
     assert "Missing" in result["efficiency_reason"]
     assert result["score"] is not None
-    # A gap outside the last 30-minute close-to-close window is harmless.
-    assert evaluate(history().drop(moment("09:31")))["directional_efficiency"] == 1
+    # The entire session path is required, including earlier minutes.
+    assert evaluate(history().drop(moment("09:31")))["directional_efficiency"] is None
 
 
-@pytest.mark.parametrize("time, ratio, warming", [("09:34", None, True), ("09:35", 1, True), ("10:00", 1, False)])
+@pytest.mark.parametrize("time, ratio, warming", [("09:34", None, True), ("09:35", 1, False), ("10:00", 1, False)])
 def test_efficiency_early_session_minimum_is_five_completed_minutes(time, ratio, warming):
     result = evaluate(now=moment(time))
     assert result["directional_efficiency"] == ratio
     assert result["efficiency_warming_up"] is warming
 
 
-@pytest.mark.parametrize('opened,high,low,closed,expected', [
-    (100, 102, 99, 101, 1 / 3), (101, 102, 99, 100, -1 / 3),
-    (100, 100, 100, 100, 0), (100, 101, 99, 100, 0),
-    (1.8, 2, 1.75, 1.9, .4),
-    (100, 99, 98, 99, None), (100, 101, 100.5, 101, None),
-    (100, float('nan'), 99, 101, None),
-])
-def test_one_minute_candle_proxy_handles_wicks_flat_and_invalid_bars(opened, high, low, closed, expected):
-    from src.core.intraday_momentum import candle_efficiency
-    frame = pd.DataFrame({'Open': [opened], 'High': [high], 'Low': [low], 'Close': [closed]},
-                         index=[moment('10:04')])
-    result = candle_efficiency(frame, pd.Timestamp(moment('10:04')))
-    assert result['estimated'] is True
-    assert result['value'] == (pytest.approx(expected) if expected is not None else None)
-    assert candle_efficiency(frame, pd.Timestamp(moment('10:03')))['value'] is None
-
-
-def test_five_minute_efficiency_uses_exact_window_and_preceding_close():
+def test_current_er_keeps_the_session_path_instead_of_rolling_after_thirty_minutes():
     frame = history()
-    frame.loc[pd.date_range(moment('09:59'), moment('10:04'), freq='min'), 'Close'] = [100, 102, 101, 103, 102, 103]
+    index = pd.date_range(moment('09:30'), moment('10:04'), freq='min')
+    closes = [100, 110, 100, 110, 100, *np.linspace(100, 103, 30)]
+    frame.loc[index, 'Close'] = closes
     result = evaluate(frame)
-    windows = result['efficiency_windows']
-    assert set(windows) == {'1m', '5m', '30m'}
-    assert windows['5m']['value'] == pytest.approx(3 / 7)
-    assert windows['5m']['minutes'] == 5
-    assert windows['5m']['warming_up'] is False
-    assert windows['30m']['value'] == result['directional_efficiency']
-    assert windows['30m']['minutes'] == result['efficiency_minutes']
+    assert result['directional_efficiency'] == pytest.approx(3 / 43)
+    assert result['efficiency_minutes'] == 35
+    assert result['efficiency_warming_up'] is False
+    assert 'efficiency_windows' not in result
+    assert '09:30 ET' in result['efficiency_reason']
+    assert result['assessment']['metrics']['efficiency'] == 'BAD'
 
 
-def test_efficiency_windows_require_only_their_own_completed_bars():
-    # Missing an older minute invalidates30m without hiding the shorter windows.
-    frame = history().drop(moment('09:45'))
-    frame.loc[moment('10:04'), ['Open', 'High', 'Low', 'Close']] = [101, 103, 99, 102]
-    windows = evaluate(frame)['efficiency_windows']
-    assert windows['1m']['value'] == .25
-    assert windows['5m']['value'] is not None
-    assert windows['30m']['value'] is None
-    frame = frame.drop(moment('10:02'))
-    windows = evaluate(frame)['efficiency_windows']
-    assert windows['1m']['value'] == .25
-    assert windows['5m']['value'] is None
-    assert windows['30m']['value'] is None
-
-
-def test_short_efficiency_windows_wait_for_completed_candles_and_preserve_condition():
-    frame = history()
-    frame.loc[moment('09:31'), ['Open', 'High', 'Low', 'Close']] = [100, 102, 98, 101]
-    assert evaluate(frame, now=moment('09:31'))['status'] == 'FORMING'
-    early = evaluate(frame, now=moment('09:32'))['efficiency_windows']
-    assert early['1m']['value'] == .25
-    assert early['5m']['value'] is None
-    assert early['30m']['value'] is None
-    assert evaluate(now=moment('09:35'))['efficiency_windows']['5m']['value'] == 1
-    result = evaluate()
-    altered = {**result, 'efficiency_windows': {'1m': {'value': -1}, '5m': {'value': -1}}}
-    assert assess_momentum(altered) == assess_momentum(result)
+def test_strong_can_qualify_after_five_completed_minutes_with_current_er():
+    result = evaluate(now=moment('09:35'), sector_benchmark=session(), sector_symbol='XLK')
+    assert result['directional_efficiency'] == 1
+    assert result['efficiency_warming_up'] is False
+    metrics = {**result, 'rs_open_pp': .5, 'rs_sector_pp': .5,
+               'rvol': 1.5, 'entry_extension_adr': .1, 'vwap_distance_adr': .1,
+               'range_location_percent': 90, 'breakout_distance_percent': .1}
+    assert assess_momentum(metrics)['label'] == 'Strong'
 
 
 @pytest.mark.parametrize("updates, label, metric, rating", [
