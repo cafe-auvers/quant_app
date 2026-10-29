@@ -52,6 +52,10 @@ class MonitorHistory:
                 condition TEXT NOT NULL, early INTEGER NOT NULL, orb_passed INTEGER NOT NULL,
                 payload TEXT NOT NULL)''')
             conn.execute('CREATE INDEX IF NOT EXISTS monitor_observation_scope ON monitor_observations(session,symbol,breakout,id)')
+            conn.execute('''CREATE TABLE IF NOT EXISTS monitor_strong_replays (
+                session TEXT NOT NULL, symbol TEXT NOT NULL, breakout REAL NOT NULL,
+                request_key TEXT NOT NULL, payload TEXT NOT NULL,
+                PRIMARY KEY(session,symbol,breakout))''')
 
     @contextmanager
     def _connection(self):
@@ -92,3 +96,14 @@ class MonitorHistory:
                     'first_strong':first(lambda e:e['condition']=='Strong'),
                     'first_extended':first(lambda e:e['condition']=='Extended'),'events':events[-30:],
                     'source':'Live observations since monitoring started; no reconstructed past labels'}
+
+    def load_replays(self, session):
+        with self._lock, self._connection() as conn:
+            return {(symbol, breakout): {'request_key': key, 'result': json.loads(payload)}
+                    for symbol, breakout, key, payload in conn.execute(
+                        'SELECT symbol,breakout,request_key,payload FROM monitor_strong_replays WHERE session=?', (session,))}
+
+    def save_replay(self, scope, request_key, result):
+        with self._lock, self._connection() as conn:
+            conn.execute('INSERT OR REPLACE INTO monitor_strong_replays(session,symbol,breakout,request_key,payload) VALUES(?,?,?,?,?)',
+                         (*scope, request_key, json.dumps(result)))

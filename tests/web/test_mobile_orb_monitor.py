@@ -85,6 +85,12 @@ def test_monitor_table_best_orb_filter_and_completed_range_explanation(width, tm
         'session_date': (now-timedelta(days=1)).date().isoformat(),
         'first_strong': {**observation, 'condition': 'Strong'},
     }
+    reconstructed = {**estimated['condition_history']['first_strong'], 'kind': 'RECONSTRUCTED', 'er': .6, 'rvol': 2.5}
+    estimated['condition_history'].update(first_strong=None, observed_from=observation['observed_at'], events=[observation],
+        reconstruction={'status': 'COMPLETE', 'kind': 'RECONSTRUCTED', 'first_strong': reconstructed,
+                        'strong_minutes': 1, 'checked_through': now.isoformat(), 'uncertain_candidates': 0,
+                        'assumptions': 'Verified historical calculation; actual earlier screen labels are unknown.',
+                        'intervals': [{'from': reconstructed['observed_at'], 'to': reconstructed['observed_at'], 'minutes': 1}]})
     estimated["momentum"]["efficiency_windows"] = {"1m": {"value": -.2, "estimated": True}, "5m": {"value": .1}}
     next(row for row in rows if row["symbol"] == "LEADER_TWO")["momentum"].update(rs_open_pp=.2, rvol=1)
     partial = {**estimated, "symbol": "PARTIAL", "name": "PARTIAL",
@@ -239,21 +245,24 @@ def test_monitor_table_best_orb_filter_and_completed_range_explanation(width, tm
             assert passed <= broken
             page.locator('[data-monitor-filter="early"]').click()
             assert set(page.locator('.mobile-monitor-row').evaluate_all("rows => rows.map(row => row.dataset.mobileSymbol)")) == {'BEST','WATCH_HIGH'}
-            assert 'earlier' in page.locator('[data-mobile-symbol="WATCH_HIGH"] .mobile-monitor-history').inner_text()
+            assert 'Reconstructed' in page.locator('[data-mobile-symbol="WATCH_HIGH"] .mobile-monitor-history').inner_text()
             assert page.locator('[data-mobile-symbol="WATCH_HIGH"] .mobile-monitor-er-current').inner_text() == '~-0.80'
             page.locator('[data-mobile-symbol="WATCH_HIGH"] .momentum-condition').click()
             assert 'first early review' in page.locator('#mobile-momentum-history').inner_text()
             assert 'first Strong not observed' not in page.locator('#mobile-momentum-history').inner_text()
+            assert '(reconstructed)' in page.locator('#mobile-momentum-history').inner_text()
+            assert 'First live Strong not observed' in page.locator('#mobile-momentum-history').inner_text()
             page.locator('#mobile-momentum-close').click()
             page.locator('[data-monitor-filter="strong_today"]').click()
             assert page.locator('.mobile-monitor-row').evaluate_all("rows => rows.map(row => row.dataset.mobileSymbol)") == ['PASS_STALE', 'WATCH_HIGH', 'BEST']
             assert page.locator('[data-mobile-symbol="WATCH_HIGH"] .momentum-condition').inner_text() == 'Extended'
             assert page.locator('[data-mobile-symbol="PASS_STALE"] .momentum-condition').inner_text() == 'Stale'
             assert 'Strong ' in page.locator('[data-mobile-symbol="WATCH_HIGH"] .mobile-monitor-history').inner_text()
-            assert '3 stocks recorded Strong today; 1 Strong now' in page.locator('#mobile-monitor-status').inner_text()
+            assert 'Reconstructed' in page.locator('[data-mobile-symbol="WATCH_HIGH"] .mobile-monitor-history').inner_text()
+            assert '3 stocks qualified Strong today; 1 Strong now' in page.locator('#mobile-monitor-status').inner_text()
             page.locator('#mobile-monitor-search').fill('LEADER')
             assert page.locator('.mobile-monitor-row').count() == 0
-            assert 'No matching stocks recorded Strong today' in page.locator('.mobile-list-empty').inner_text()
+            assert 'No matching Strong readings found' in page.locator('.mobile-list-empty').inner_text()
             page.locator('#mobile-monitor-search').fill('')
             page.locator('[data-monitor-filter="strong"]').click()
             assert page.locator('[data-monitor-filter="strong"]').inner_text() == 'Strong now'
@@ -284,7 +293,7 @@ def test_monitor_table_best_orb_filter_and_completed_range_explanation(width, tm
             assert "No Strong setups" in page.locator("#mobile-monitor-status").inner_text()
             page.locator('[data-monitor-filter="strong_today"]').click()
             assert page.locator('[data-mobile-symbol="BEST"] .momentum-condition').inner_text() == 'Weak'
-            assert '3 stocks recorded Strong today; 0 Strong now' in page.locator('#mobile-monitor-status').inner_text()
+            assert '3 stocks qualified Strong today; 0 Strong now' in page.locator('#mobile-monitor-status').inner_text()
             page.locator('[data-monitor-filter="orb"]').click()
             assert max(page.locator(".mobile-monitor-row").evaluate_all("rows => rows.map(row => row.getBoundingClientRect().height)")) <= 42
             page.screenshot(path=str(tmp_path / f"monitor-rank-one-weak-{width}.png"))

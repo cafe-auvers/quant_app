@@ -357,6 +357,10 @@ class IntradayMonitor:
         self._adr_session = None
         self._context = MonitorContext()
         self._snapshot = {"rows": [], "as_of": None, "error": "", "refreshing": False}
+        self._strong_replay = None
+        if history is not None:
+            from .strong_replay import StrongReplayWorker
+            self._strong_replay = StrongReplayWorker(history, self._attach_replay_result)
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -514,6 +518,8 @@ class IntradayMonitor:
             if self.history is not None:
                 try:
                     self.history.observe(rows, evaluated_at)
+                    if self.enabled and self._strong_replay is not None:
+                        self._strong_replay.attach_and_queue(rows, context, self._frames, self._aggregate_frames, adr, evaluated_at)
                 except Exception:
                     history_error = 'Condition history could not be saved; first-observation times may be unavailable'
                     logger.warning(history_error, exc_info=True)
@@ -532,6 +538,8 @@ class IntradayMonitor:
                     self._next_refresh = self.monotonic() + delay
                 else:
                     self._failure_cycles = 0
+            if self._strong_replay is not None:
+                self._strong_replay.start()
             if self.on_update and not self._stop.is_set():
                 self.on_update()
         except Exception:
@@ -551,8 +559,24 @@ class IntradayMonitor:
     def close(self) -> None:
         self._stop.set()
         self._wake.set()
+        if self._strong_replay is not None:
+            self._strong_replay.close()
         if self._thread is not None:
             self._thread.join(timeout=1)
+
+    def _attach_replay_result(self, scope, key, result):
+        if self._stop.is_set():
+            return
+        changed = False
+        with self._lock:
+            for row in self._snapshot['rows']:
+                history = row.get('condition_history', {})
+                if ((history.get('session_date'), row['symbol'], row.get('breakout_price')) == scope
+                        and history.get('reconstruction', {}).get('request_key') == key):
+                    history['reconstruction'] = {**result, 'request_key': key}
+                    changed = True
+        if changed and self.on_update and not self._stop.is_set():
+            self.on_update()
 
     def _repair_minute_coverage(self, symbols: list[str], now: dt.datetime) -> tuple[dict, dict]:
         """Bound aggregate checks; reuse proofs instead of multiplying minute retries."""
