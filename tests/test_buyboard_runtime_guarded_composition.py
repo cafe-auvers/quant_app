@@ -1482,6 +1482,58 @@ def test_entry_limits_do_not_block_exits_cancellation_reconciliation_or_recovery
 
 
 @pytest.mark.usefixtures("trading_enabled")
+def test_automatic_manual_default_can_submit_guarded_stop_loss_without_user_action(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+    from src.core.runtime_readiness import RuntimeDeviceState
+    from src.services.position_manager import PositionManager
+    from src.ui.buyboard.runtime_worker import BuyboardRuntimeWorker
+
+    runtime, broker, _gateway, engine, market_data = _make_runtime(tmp_path, monkeypatch)
+    monkeypatch.setattr(execution_config, "KANBAN_STRATEGY_INSTANCE_ID", STRATEGY_ID)
+    monkeypatch.setattr(broker, "get_positions", lambda **kwargs: {
+        "overseas": {"holdings": [{
+            "symbol": "AAPL", "quantity": 12, "orderable_quantity": 12,
+        }]},
+    })
+    card = trade_card_repository.create_trade_card(
+        engine, PositionManager().discover_manual_position(
+            None, environment="PROD", account_no="1", symbol="AAPL", name="Apple",
+            broker_quantity=12, average_entry_price=100,
+        ),
+    )
+    worker = SimpleNamespace(
+        _accepting_commands=True, _lease_current=True, _standby_only=False,
+        device_state=RuntimeDeviceState.ACTIVE, _db_engine=engine,
+        readiness_generation=1, reconciliation_accounts_in_progress=set(),
+        _account_reconciliation_is_fresh=lambda account: True,
+        _card_action_ready=lambda card: True,
+    )
+    assert BuyboardRuntimeWorker._ensure_manual_position_stop_protection(worker, [card])
+    card = trade_card_repository.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert card.acknowledge_pending_stop_change()
+    trade_card_repository.update_trade_card(engine, card, expected_version=card.version)
+    market_data.subscribe([card.symbol])
+    market_data._quote_fetcher = lambda symbol: QuoteSnapshot(symbol=symbol, last_price=93.01)
+    market_data.poll_once()
+    runtime.trading_engine.evaluate_quote([card], market_data.latest_quote(card.symbol))
+    runtime.trading_engine.run_heartbeat([card])
+    assert broker.submit_calls == []
+
+    market_data._quote_fetcher = lambda symbol: QuoteSnapshot(symbol=symbol, last_price=92.0)
+    market_data.poll_once()
+    runtime.trading_engine.evaluate_quote([card], market_data.latest_quote(card.symbol))
+    broker.queue_acceptance(broker_order_id="AUTO-DEFAULT-STOP")
+    runtime.trading_engine.run_heartbeat([card])
+    assert len(broker.submit_calls) == 1
+    assert broker.submit_calls[0]["quantity"] == 12
+    assert broker.submit_calls[0]["side"] == OrderSide.SELL
+    assert fetch_execution_order(engine, card.exit_client_order_id).intent == OrderIntent.STOP_LOSS
+    assert card.stop_loss_triggered is True
+
+
+@pytest.mark.usefixtures("trading_enabled")
 def test_guarded_hard_stop_exits_gap_with_trade_only_feed_and_retries_until_flat(
     tmp_path, monkeypatch
 ):

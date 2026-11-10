@@ -66,9 +66,10 @@ from src.core.trade_card_state import (
     BoardStatus,
     EntryRuntimeStatus,
     PositionRuntimeStatus,
+    StopType,
     TradeCardState,
 )
-from src.services.position_manager import PositionManager
+from src.services.position_manager import PositionManager, initialize_manual_position_stop
 from src.utils.market_calendar import US_MARKET_ZONE, previous_nyse_trading_day
 
 logger = logging.getLogger(__name__)
@@ -1984,6 +1985,12 @@ def reduce_account_reconciliation(
                         if "STOP_REQUIRED" not in card.warnings:
                             card.warnings = [*card.warnings, "STOP_REQUIRED"]
                         card.entry_block_reason = "broker_position_requires_stop"
+            if card.entry_block_reason in (
+                "manual_position_requires_stop", "broker_position_requires_stop"
+            ) or "STOP_REQUIRED" in card.warnings:
+                initialize_manual_position_stop(card)
+            if card.stop_type == StopType.MANUAL_PRICE:
+                card.stop_quantity = holding.quantity
         for card in cards:
             if (
                 card.environment == snapshot.environment

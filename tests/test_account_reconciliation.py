@@ -120,7 +120,7 @@ def test_application_order_with_unknown_intent_still_requires_review():
     assert classify_execution_order(order, None) == ReconciliationCategory.UNRECOGNIZED
 
 
-def test_manual_repurchase_reopens_closed_card_without_inventing_stop_or_orders():
+def test_manual_repurchase_reopens_closed_card_with_default_stop_without_orders():
     card = _card(board_status=BoardStatus.CLOSED, broker_quantity=350,
                  position_runtime_status=PositionRuntimeStatus.CLOSED,
                  entry_runtime_status=None, stop_type=None)
@@ -132,10 +132,10 @@ def test_manual_repurchase_reopens_closed_card_without_inventing_stop_or_orders(
     assert reopened.position_runtime_status == PositionRuntimeStatus.OPEN
     assert reopened.broker_quantity == 350
     assert reopened.orderable_quantity == 340
-    assert reopened.stop_type is None
-    assert reopened.active_stop_price is None
-    assert "STOP_REQUIRED" in reopened.warnings
-    assert reopened.entry_block_reason == "broker_position_requires_stop"
+    assert reopened.stop_type == StopType.MANUAL_PRICE
+    assert reopened.active_stop_price == pytest.approx(_holding().average_price * 0.93)
+    assert "AUTO_MANUAL_STOP_PENDING" in reopened.warnings
+    assert reopened.entry_block_reason == "auto_manual_stop_pending"
     assert not plan.commands
     assert not plan.order_updates
     assert card.board_status == BoardStatus.CLOSED
@@ -1493,7 +1493,8 @@ def test_existing_card_with_broker_holding_is_recovered_without_order_sweep():
     recovered = plan.card_updates[0]
     assert recovered.board_status == BoardStatus.OPEN_POSITION
     assert recovered.broker_quantity == 10
-    assert "STOP_REQUIRED" in recovered.warnings
+    assert "AUTO_MANUAL_STOP_PENDING" in recovered.warnings
+    assert recovered.active_stop_price == pytest.approx(_holding().average_price * 0.93)
 
 
 def test_stale_entry_pending_without_a_durable_order_returns_to_buylist_only_on_complete_absence():

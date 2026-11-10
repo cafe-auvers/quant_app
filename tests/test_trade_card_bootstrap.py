@@ -441,7 +441,8 @@ def test_fresh_cached_holding_is_visible_as_open_position(tmp_path, monkeypatch)
     assert card.board_status == BoardStatus.OPEN_POSITION
     assert card.broker_quantity == 7
     assert card.average_entry_price == 181.25
-    assert "STOP_REQUIRED" in card.warnings
+    assert "AUTO_MANUAL_STOP_PENDING" in card.warnings
+    assert card.active_stop_price == 168.57
 
 
 def test_stale_cached_holding_is_not_bootstrapped(tmp_path, monkeypatch):

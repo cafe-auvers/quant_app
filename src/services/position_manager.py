@@ -38,6 +38,45 @@ from src.services.execution_command_gateway import (
 
 logger = logging.getLogger(__name__)
 
+AUTO_MANUAL_STOP_PENDING = "AUTO_MANUAL_STOP_PENDING"
+
+
+def initialize_manual_position_stop(card: TradeCardState) -> bool:
+    """Freeze the user's default risk on discovery, preserving all chosen stops.
+
+    The pending marker is cleared only by the normal guarded stop workflow,
+    which claims execution ownership and installs the market-data stop rule.
+    """
+    if (
+        card.board_status not in {BoardStatus.OPEN_POSITION, BoardStatus.PARTIAL_SELL}
+        or card.broker_quantity <= 0
+        or card.stop_type is not None
+        or card.active_stop_price is not None
+        or card.pending_stop_type is not None
+        or card.pending_stop_price is not None
+        or card.pending_stop_command_id
+        or card.entry_client_order_id
+        or card.entry_submission_unresolved
+        or card.exit_all_required
+        or card.stop_loss_triggered
+    ):
+        return False
+    average = float(card.average_entry_price or 0.0)
+    percent = float(execution_config.MANUAL_POSITION_DEFAULT_STOP_PERCENT)
+    if not math.isfinite(average) or average <= 0:
+        return False
+    price = round_up_to_valid_tick(average * (1 - percent / 100))
+    if not 0 < price < average:
+        return False
+    card.stop_type = StopType.MANUAL_PRICE
+    card.active_stop_price = price
+    card.stop_quantity = card.broker_quantity
+    card.entry_block_reason = "auto_manual_stop_pending"
+    card.warnings = [item for item in card.warnings if item != "STOP_REQUIRED"]
+    if AUTO_MANUAL_STOP_PENDING not in card.warnings:
+        card.warnings.append(AUTO_MANUAL_STOP_PENDING)
+    return True
+
 
 def _default_cancel_intent_factory(
     card: TradeCardState, client_order_id: str, scope: str
@@ -151,8 +190,12 @@ def _prices_match(a: float, b: float, *, tolerance: float = 1e-6) -> bool:
 
 
 def minimum_manual_stop_price(card: TradeCardState) -> float:
-    """Section 646-659: a manual stop can tighten risk but never widen it
-    below breakeven or below the current active stop."""
+    """Initial manual risk is editable; established profit protection tightens."""
+    if (
+        card.stop_type == StopType.MANUAL_PRICE
+        and 0 < (card.active_stop_price or 0) < float(card.average_entry_price or 0)
+    ):
+        return 0.0001
     breakeven = compute_breakeven_stop_price(card.average_entry_price)
     current = card.active_stop_price or 0.0
     return max(breakeven, current)
@@ -283,13 +326,22 @@ class PositionManager:
 
     def apply_manual_stop(self, card: TradeCardState, requested_price: float) -> TradeCardState:
         minimum = minimum_manual_stop_price(card)
-        if requested_price < minimum:
+        if not math.isfinite(requested_price) or requested_price < minimum:
             raise ValueError(
                 f"Manual stop {requested_price} cannot widen risk below the minimum "
-                f"{minimum} (max of breakeven and the current active stop, section 646-659)"
+                f"{minimum}"
             )
         card.stop_type = StopType.MANUAL_PRICE
         card.active_stop_price = requested_price
+        card.stop_quantity = card.broker_quantity
+        card.warnings = [item for item in card.warnings if item not in {
+            AUTO_MANUAL_STOP_PENDING, "STOP_REQUIRED",
+        }]
+        if card.entry_block_reason in {
+            "auto_manual_stop_pending", "manual_position_requires_stop",
+            "broker_position_requires_stop",
+        }:
+            card.entry_block_reason = ""
         return card
 
     def on_partial_exit_filled(
@@ -429,7 +481,14 @@ class PositionManager:
         card.reserved_sell_quantity = 0
         card.next_exit_retry_at = None
         card.last_exit_error = ""
-        card.warnings = [w for w in card.warnings if w != "EXIT_CANCEL_STALLED"]
+        card.warnings = [w for w in card.warnings if w not in {
+            "EXIT_CANCEL_STALLED", "STOP_REQUIRED", AUTO_MANUAL_STOP_PENDING,
+        }]
+        if card.entry_block_reason in {
+            "auto_manual_stop_pending", "manual_position_requires_stop",
+            "broker_position_requires_stop",
+        }:
+            card.entry_block_reason = ""
         return card
 
     # --- Manual purchases outside the application (section 14) -----------
@@ -467,20 +526,13 @@ class PositionManager:
         card.orderable_quantity = broker_quantity
         card.average_entry_price = average_entry_price
         card.position_runtime_status = PositionRuntimeStatus.OPEN
-        if card.stop_type is None:
-            # No ORB/entry history exists for a manually-purchased position
-            # -- section 620 forbids inventing one. Code review finding
-            # P1-3: silently pinning a stop at average cost is unsafe,
-            # because if the current price is already below cost the very
-            # next tick would trigger an immediate Sell All the instant the
-            # engine notices this position. Instead, leave active_stop_price
-            # unset (evaluate_stop_trigger never fires with no stop price),
-            # flag the card for the user, and block new automated entries
-            # for this symbol until an explicit SetManualStop/
-            # SetBreakevenStop command sets a real stop.
+        if card.stop_type is None and card.pending_stop_type is None:
             card.entry_block_reason = "manual_position_requires_stop"
             if "STOP_REQUIRED" not in card.warnings:
                 card.warnings = [*card.warnings, "STOP_REQUIRED"]
+            initialize_manual_position_stop(card)
+        if card.stop_type == StopType.MANUAL_PRICE:
+            card.stop_quantity = broker_quantity
         return card
 
     def reconcile_manual_exit(self, card: TradeCardState, *, broker_quantity: int) -> TradeCardState:
@@ -569,10 +621,24 @@ class PositionManager:
                 if facts_changed:
                     card.broker_quantity = holding.quantity
                     card.average_entry_price = holding.average_price
+                initialized_stop = bool(
+                    "STOP_REQUIRED" in card.warnings
+                    and initialize_manual_position_stop(card)
+                )
+                if card.stop_type == StopType.MANUAL_PRICE:
+                    card.stop_quantity = holding.quantity
+                if facts_changed or initialized_stop:
                     changed.append(card)
                 continue
 
-            if card.board_status != BoardStatus.OPEN_POSITION or facts_changed:
+            if (
+                card.board_status != BoardStatus.OPEN_POSITION
+                or facts_changed
+                or (
+                    card.stop_type is None
+                    and "STOP_REQUIRED" in card.warnings
+                )
+            ):
                 changed.append(
                     self.discover_manual_position(
                         card,

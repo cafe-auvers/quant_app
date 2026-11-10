@@ -1356,6 +1356,15 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
         card.pending_stop_quantity = stop_command.quantity
         card.pending_stop_command_id = command.command_id
         card.pending_stop_requested_at = requested_at
+        card.warnings = [
+            item for item in card.warnings
+            if item not in {"AUTO_MANUAL_STOP_PENDING", "STOP_REQUIRED"}
+        ]
+        if card.entry_block_reason in {
+            "auto_manual_stop_pending", "manual_position_requires_stop",
+            "broker_position_requires_stop",
+        }:
+            card.entry_block_reason = ""
     if isinstance(command, types.CancelEntry):
         if card.board_status == BoardStatus.BUY_TODAY and not card.entry_client_order_id:
             _move_board_card(card, BoardStatus.BUYLIST)

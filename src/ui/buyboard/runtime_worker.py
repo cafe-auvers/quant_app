@@ -2085,6 +2085,77 @@ class BuyboardRuntimeWorker(QThread):
         self._card_collection_revision = revision
         return cards
 
+    def _ensure_manual_position_stop_protection(self, cards) -> bool:
+        """Enroll discovered defaults through the same fenced path as a stop edit."""
+        from src.core.board_workflow import SetManualStop
+        from src.services.execution_workflow_service import (
+            BoardCommandRejectedError, request_board_action,
+        )
+        from src.services.position_manager import AUTO_MANUAL_STOP_PENDING
+        from src.services.trade_card_repository import (
+            TradeCardNotFoundError, TradeCardVersionConflictError,
+        )
+
+        if (
+            not self._accepting_commands
+            or not self._lease_current
+            or self._standby_only
+            or self.device_state != RuntimeDeviceState.ACTIVE
+        ):
+            return False
+        failures = getattr(self, "_manual_stop_enrollment_failures", {})
+        self._manual_stop_enrollment_failures = failures
+        changed = False
+        for card in cards:
+            if (
+                AUTO_MANUAL_STOP_PENDING not in card.warnings
+                or card.entry_block_reason != "auto_manual_stop_pending"
+                or card.board_status not in {
+                    BoardStatus.OPEN_POSITION, BoardStatus.PARTIAL_SELL,
+                }
+                or card.broker_quantity <= 0
+                or not card.active_stop_price
+                or card.pending_stop_command_id
+                or not self._account_reconciliation_is_fresh(card.account_no)
+                or card.account_no in self.reconciliation_accounts_in_progress
+            ):
+                continue
+            context = BoardActionContext(
+                enforce_runtime_fences=True,
+                engine_enabled=execution_config.is_buyboard_engine_enabled(),
+                readiness_generation=int(self.readiness_generation or 0),
+                action_ready=self._card_action_ready(card),
+                device_active=True,
+                regular_session_open=is_regular_session_open(),
+            )
+            try:
+                request_board_action(
+                    self._db_engine,
+                    SetManualStop(
+                        environment=card.environment,
+                        account_no=card.account_no,
+                        symbol=card.symbol,
+                        expected_card_version=card.version,
+                        expected_readiness_generation=context.readiness_generation,
+                        price=card.active_stop_price,
+                    ),
+                    context=context,
+                    claim_kanban_ownership=True,
+                )
+            except (
+                BoardCommandRejectedError, TradeCardNotFoundError,
+                TradeCardVersionConflictError,
+            ) as exc:
+                message = str(exc)
+                if failures.get(card.card_key) != message:
+                    logger.warning("Automatic manual stop pending for %s: %s", card.symbol, message)
+                    failures[card.card_key] = message
+                continue
+            failures.pop(card.card_key, None)
+            changed = True
+            logger.info("Enrolled default manual stop for %s at %s", card.symbol, card.active_stop_price)
+        return changed
+
     def _run_one_cycle(self, *, allow_mutations: bool = True) -> None:
         assert self.runtime is not None
         cycle_timings_ms = {}
@@ -2128,6 +2199,13 @@ class BuyboardRuntimeWorker(QThread):
             if reconciliation_changed:
                 cards = self._load_cards_if_changed(force=True)
         record_phase("account_refresh_and_reconciliation")
+
+        if canonical_available and allow_mutations:
+            if self._ensure_manual_position_stop_protection(cards):
+                cards = self._load_cards_if_changed(force=True)
+                self._configure_verified_mutation_budgets(cards)
+                self._cache_emergency_ownership_proofs(cards)
+        record_phase("manual_position_stop_protection")
 
         changed_ids: set = set()
         changed: List[TradeCardState] = []

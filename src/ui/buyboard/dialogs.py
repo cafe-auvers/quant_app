@@ -655,20 +655,23 @@ def confirm_sell_all(parent, card: TradeCardState) -> bool:
 
 
 def prompt_manual_stop_price(parent, card: TradeCardState) -> Optional[float]:
-    minimum = card.active_stop_price or 0.0
+    from src.services.position_manager import minimum_manual_stop_price
+
+    minimum = minimum_manual_stop_price(card)
+    current = card.active_stop_price or minimum
     dialog = QDialog(parent)
     dialog.setWindowTitle(f"Manual Stop — {card.symbol}")
     layout = QVBoxLayout(dialog)
     layout.addWidget(
         QLabel(
-            f"Current active stop: {minimum:,.2f}\n"
-            "A manual stop can only tighten risk (must be >= the current stop)."
+            f"Current active stop: {current:,.4f}\n"
+            f"Minimum allowed stop: {minimum:,.4f}"
         )
     )
     spin = QDoubleSpinBox()
-    spin.setDecimals(2)
+    spin.setDecimals(4)
     spin.setRange(minimum, 1_000_000.0)
-    spin.setValue(minimum)
+    spin.setValue(current)
     layout.addWidget(spin)
 
     buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)

@@ -296,6 +296,15 @@ still-later candidate strictly beats its active score.
 
 ## 7. Fill and stop behavior
 
+Manual KIS purchases discovered without an existing or pending stop receive a
+default stop 7% below the first reported average cost, rounded up to a supported
+tick and covering the full holding. Syncs and restarts preserve that price;
+explicit manual edits take priority. The active Main automatically enrolls the
+stop through the guarded ownership and stop-change workflow. Unresolved broker
+orders or stale reconciliation keep it visibly pending until resolved. This is
+application-managed protection and retains the normal Live Trading and session
+gates. See [the manual-position policy](manual_position_default_stop_2026-11-11.md).
+
 The stop reference comes from the broker-order generation that actually fills:
 
 ```text

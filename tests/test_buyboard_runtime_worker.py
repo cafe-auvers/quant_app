@@ -1135,6 +1135,56 @@ def _stale_snapshot_stop_worker(tmp_path, monkeypatch, *, stop_price: float):
     return worker, engine, service, now
 
 
+def test_discovered_manual_default_is_enrolled_installed_and_triggers_full_exit(
+    tmp_path, monkeypatch
+):
+    worker, engine, service, now = _stale_snapshot_stop_worker(
+        tmp_path, monkeypatch, stop_price=95.0
+    )
+    monkeypatch.setattr(execution_config, "is_buyboard_engine_enabled", lambda: True)
+    card = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    card.stop_type = None
+    card.active_stop_price = None
+    PositionManager().discover_manual_position(
+        card, environment="PROD", account_no="1", symbol="AAPL", name="Apple",
+        broker_quantity=10, average_entry_price=100,
+    )
+    repo.update_trade_card(engine, card, expected_version=card.version)
+    worker.device_state = RuntimeDeviceState.ACTIVE
+    worker._lease_current = True
+    worker._accepting_commands = True
+    monkeypatch.setattr(worker, "_account_reconciliation_is_fresh", lambda account: True)
+    monkeypatch.setattr(worker, "_card_action_ready", lambda card: True)
+    worker._run_one_cycle()
+
+    saved = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert saved.active_stop_price == 93
+    assert saved.stop_quantity == 10
+    assert saved.pending_stop_command_id == ""
+    assert "AUTO_MANUAL_STOP_PENDING" not in saved.warnings
+    assert worker._market_stop_signatures[saved.card_key] == ("MANUAL_PRICE", 93.0, 10)
+
+    initiations = []
+    real_initiate = worker.runtime.trading_engine._initiate_sell_all
+
+    def record_initiation(current, **kwargs):
+        initiations.append(current.card_key)
+        return real_initiate(current, **kwargs)
+
+    monkeypatch.setattr(worker.runtime.trading_engine, "_initiate_sell_all", record_initiation)
+    for price in (99.0, 93.01, 93.0, 94.0):
+        worker.runtime.trading_engine.evaluate_quote([saved], QuoteSnapshot(
+            symbol="AAPL", last_price=price, regular_session=True,
+            broker_event_at=now, received_at=now, processed_at=now,
+        ))
+        if price > 93 and not initiations:
+            assert saved.board_status == BoardStatus.OPEN_POSITION
+    assert initiations == [saved.card_key]
+    assert saved.board_status == BoardStatus.SELL_ALL
+    assert saved.exit_all_required is True
+    assert saved.stop_loss_triggered is True
+
+
 def test_ui_stop_commit_reaches_feed_when_worker_card_snapshot_is_stale(
     tmp_path, monkeypatch
 ):

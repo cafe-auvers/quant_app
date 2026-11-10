@@ -294,11 +294,7 @@ def test_confirm_flat_closes_card_and_clears_stop():
 
 
 def test_discover_manual_position_creates_new_card_with_membership_preserved():
-    """Section 534-562, corrected per code review finding P1-3: a manual
-    position with no known stop must NOT get one silently invented at
-    average cost (which could immediately trigger a Sell All if the price
-    is already below cost) -- it stays unprotected-but-flagged until the
-    user sets a real stop."""
+    """The user-authorized default is 7% below broker cost, never breakeven."""
     manager = PositionManager()
     card = manager.discover_manual_position(
         None,
@@ -314,13 +310,14 @@ def test_discover_manual_position_creates_new_card_with_membership_preserved():
     assert card.buylist_member is True
     assert card.return_to_buylist_after_close is True
     assert card.broker_quantity == 50
-    assert card.stop_type is None
-    assert card.active_stop_price is None
-    assert card.entry_block_reason == "manual_position_requires_stop"
-    assert "STOP_REQUIRED" in card.warnings
+    assert card.stop_type == StopType.MANUAL_PRICE
+    assert card.active_stop_price == 232.5
+    assert card.stop_quantity == 50
+    assert card.entry_block_reason == "auto_manual_stop_pending"
+    assert "AUTO_MANUAL_STOP_PENDING" in card.warnings
 
 
-def test_discover_manual_position_stop_required_never_auto_triggers_stop():
+def test_discover_manual_position_default_triggers_only_at_seven_percent_loss():
     manager = PositionManager()
     card = manager.discover_manual_position(
         None,
@@ -331,9 +328,10 @@ def test_discover_manual_position_stop_required_never_auto_triggers_stop():
         broker_quantity=50,
         average_entry_price=250.0,
     )
-    # Price already crashed below cost at discovery time -- must not
-    # auto-trigger a stop with no active_stop_price set.
-    assert evaluate_stop_trigger(card, 10.0) is False
+    assert evaluate_stop_trigger(card, 249.0) is False
+    assert evaluate_stop_trigger(card, 232.51) is False
+    assert evaluate_stop_trigger(card, 232.5) is True
+    assert evaluate_stop_trigger(card, 10.0) is True
 
 
 def test_discover_manual_position_updates_existing_card_without_overwriting_known_stop():
