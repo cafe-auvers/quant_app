@@ -252,14 +252,6 @@
             </div>
           </form>
         </div>
-        <div id="operator-confirm-dialog" class="operator-confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="operator-confirm-title" hidden>
-          <div class="operator-confirm-card">
-            <span class="eyebrow">OPERATOR ACTION</span>
-            <h2 id="operator-confirm-title">Confirm action</h2>
-            <p id="operator-confirm-copy"></p>
-            <div class="operator-confirm-actions"><button id="operator-confirm-cancel" type="button">Cancel</button><button id="operator-confirm-submit" type="button">Confirm</button><button id="operator-confirm-ep" type="button" hidden>Publish as EP</button></div>
-          </div>
-        </div>
         <button id="mobile-draw-line" class="mobile-floating-draw" type="button" aria-label="Line Tool" aria-pressed="false" title="Draw and edit chart lines">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 20 4.5-1 10-10-3.5-3.5-10 10L4 20Zm9.5-13 3.5 3.5M3 21h18"/></svg>
         </button>
@@ -409,10 +401,27 @@
       <div id="buy-board-action-facts" class="mobile-board-action-facts"></div>
       <div id="buy-board-action-price-note" class="mobile-kanban-price-note"></div>
       <div id="buy-board-action-warning" class="mobile-kanban-card-warning"></div>
-      <div id="buy-board-action-input" class="mobile-board-action-input" hidden><label id="buy-board-action-input-label" for="buy-board-action-value">Value</label><input id="buy-board-action-value" type="number" min="0" step="0.01" inputmode="decimal"><button id="buy-board-action-input-submit" type="button">Apply</button></div>
+      <div id="buy-board-action-input" class="mobile-board-action-input" hidden>
+        <label id="buy-board-action-input-label" for="buy-board-action-value">Value</label>
+        <input id="buy-board-action-value" type="number" min="0" step="0.01" inputmode="decimal">
+        <div id="buy-board-partial-price-fields" hidden>
+          <label for="buy-board-partial-price">Limit price (optional)</label>
+          <input id="buy-board-partial-price" type="number" min="0.0001" step="any" inputmode="decimal" placeholder="e.g. 3.50">
+          <p>Leave blank to sell immediately. A limit sells at your price or higher; it can fill now if the market is already there. Outside the regular session, it waits for the open. Stops take priority.</p>
+        </div>
+        <button id="buy-board-action-input-submit" type="button">Apply</button>
+      </div>
       <div id="buy-board-action-buttons" class="mobile-board-action-buttons"></div>
       <button id="buy-board-open-chart" class="mobile-secondary-action" type="button">Open chart</button>
       <div id="buy-board-action-status" class="mobile-inline-status" role="status"></div>
+    </div>
+  </div>
+  <div id="operator-confirm-dialog" class="operator-confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="operator-confirm-title" hidden>
+    <div class="operator-confirm-card">
+      <span class="eyebrow">OPERATOR ACTION</span>
+      <h2 id="operator-confirm-title">Confirm action</h2>
+      <p id="operator-confirm-copy"></p>
+      <div class="operator-confirm-actions"><button id="operator-confirm-cancel" type="button">Cancel</button><button id="operator-confirm-submit" type="button">Confirm</button><button id="operator-confirm-ep" type="button" hidden>Publish as EP</button></div>
     </div>
   </div>
 </body>

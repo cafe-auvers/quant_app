@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 
 from src.core import execution_config
 from src.core.order_state import (
@@ -25,6 +26,22 @@ _MANUAL_SESSION_AWARE_INTENTS = frozenset(
         OrderIntent.MANUAL_EXIT,
     }
 )
+
+
+def validate_user_exit_limit_price(price: float) -> float:
+    """Reject prices KIS would round rather than silently lowering a SELL floor."""
+    value = float(price)
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("Sell limit price must be positive and finite")
+    decimal_price = Decimal(str(value))
+    tick = Decimal("0.0001") if value < 1.0 else Decimal("0.01")
+    try:
+        exact_tick = decimal_price == decimal_price.quantize(tick)
+    except InvalidOperation:
+        exact_tick = False
+    if not exact_tick:
+        raise ValueError("Sell limit price supports 2 decimals, or 4 below $1")
+    return value
 
 
 def exit_execution_policy(

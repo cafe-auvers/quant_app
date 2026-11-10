@@ -529,6 +529,7 @@ class CanonicalPlanningSource:
             "pending_partial_sell_quantity": max(
                 0, int(card.pending_partial_sell_quantity or 0)
             ),
+            "pending_partial_sell_price": card.pending_partial_sell_price,
             "reserved_sell_quantity": max(0, int(card.reserved_sell_quantity or 0)),
             "sell_all_at_market_open": bool(card.sell_all_at_market_open),
             "can_cancel_sell_all": can_withdraw_sell_all_intent(card),

@@ -1701,3 +1701,62 @@ def test_post_broker_persistence_ambiguity_stays_unresolved_without_retry(
     assert len(broker.submit_calls) == 1
     assert card.entry_submission_unresolved is True
     assert card.entry_runtime_status == EntryRuntimeStatus.ORDER_PENDING
+
+
+@pytest.mark.usefixtures("trading_enabled")
+@pytest.mark.parametrize("supply_price", [False, True])
+def test_priced_partial_sell_reaches_broker_unchanged_and_survives_reload(tmp_path, monkeypatch, supply_price):
+    runtime, broker, _gateway, engine, _market_data = _make_runtime(tmp_path, monkeypatch)
+    card = _persist_owned_card(engine, _card(
+        board_status=BoardStatus.PARTIAL_SELL, pending_partial_sell_quantity=2,
+        pending_partial_sell_price=125.0, broker_quantity=10, orderable_quantity=10,
+    ))
+    broker.queue_acceptance(broker_order_id="LIMIT-EXIT")
+    runtime.trading_engine._position_callbacks.submit_sell_order(
+        environment="PROD", account_no="1", symbol="AAPL", quantity=2,
+        reason="partial_sell", trade_card=card,
+        **({"limit_price": 125.0} if supply_price else {}),
+    )
+    assert len(broker.submit_calls) == 1
+    assert broker.submit_calls[0]["limit_price"] == 125.0
+    record = fetch_execution_order(engine, card.exit_client_order_id)
+    assert record.intent == OrderIntent.PARTIAL_EXIT
+    assert record.submitted_limit_price == 125.0
+    assert record.attempt_deadline_at is None
+    restored = trade_card_repository.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert restored.pending_partial_sell_price == 125.0
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_priced_partial_sell_adapter_never_converts_off_hours_to_market_open(tmp_path, monkeypatch):
+    runtime, broker, _gateway, engine, _market_data = _make_runtime(tmp_path, monkeypatch)
+    card = _persist_owned_card(engine, _card(
+        board_status=BoardStatus.PARTIAL_SELL, pending_partial_sell_quantity=2,
+        pending_partial_sell_price=125.0, broker_quantity=10, orderable_quantity=10,
+    ))
+    runtime.trading_engine._market_is_open_fn = lambda: False
+    with pytest.raises(RuntimeError, match="regular session"):
+        runtime.trading_engine._position_callbacks.submit_sell_order(
+            environment="PROD", account_no="1", symbol="AAPL", quantity=2,
+            reason="partial_sell", limit_price=125.0, trade_card=card,
+        )
+    assert broker.submit_calls == []
+
+
+@pytest.mark.usefixtures("trading_enabled")
+def test_stop_liquidation_cannot_inherit_a_partial_sell_limit(tmp_path, monkeypatch):
+    runtime, broker, _gateway, engine, market_data = _make_runtime(tmp_path, monkeypatch)
+    card = _persist_owned_card(engine, _card(
+        board_status=BoardStatus.SELL_ALL, exit_all_required=True, stop_loss_triggered=True,
+        pending_partial_sell_price=125.0, broker_quantity=10, orderable_quantity=10,
+    ))
+    market_data.subscribe([card.symbol])
+    market_data.poll_once()
+    broker.queue_acceptance(broker_order_id="STOP-EXIT")
+    runtime.trading_engine._position_callbacks.submit_sell_order(
+        environment="PROD", account_no="1", symbol="AAPL", quantity=10,
+        reason="partial_sell", limit_price=125.0, trade_card=card,
+    )
+    assert len(broker.submit_calls) == 1
+    assert broker.submit_calls[0]["limit_price"] < 125.0
+    assert fetch_execution_order(engine, card.exit_client_order_id).intent == OrderIntent.STOP_LOSS

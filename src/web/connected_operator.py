@@ -577,7 +577,7 @@ class ConnectedOperatorService:
             "deactivate_buy_today": lambda: CancelEntry(**common),
             "cancel_entry": lambda: CancelEntry(**common),
             "request_partial_sell": lambda: RequestPartialSell(
-                quantity=int(quantity or 0), **common
+                quantity=int(quantity or 0), limit_price=price, **common
             ),
             "cancel_partial_sell": lambda: CancelPartialSell(**common),
             "request_sell_all": lambda: RequestSellAll(**common),
@@ -594,7 +594,10 @@ class ConnectedOperatorService:
         factory = command_types.get(action)
         if factory is None:
             raise ValidationError("Unsupported mobile Buy Board action")
-        command = factory()
+        try:
+            command = factory()
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
         if action == "request_partial_sell" and int(quantity or 0) <= 0:
             raise ValidationError("Partial-sell quantity must be positive")
         if action == "set_manual_stop":

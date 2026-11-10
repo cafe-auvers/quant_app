@@ -2069,6 +2069,8 @@ class TradingEngine:
                 continue
             if card.pending_partial_sell_quantity <= 0:
                 continue
+            if card.pending_partial_sell_price is not None and not self._market_is_open():
+                continue  # A priced exit must never become a next-open market order.
             if card.exit_submission_unresolved:
                 continue
             if card.next_exit_retry_at is not None and now < card.next_exit_retry_at:
@@ -2082,8 +2084,13 @@ class TradingEngine:
                 quantity = min(card.pending_partial_sell_quantity, remaining)
                 if quantity <= 0:
                     continue
-                deadline = now + timedelta(
-                    seconds=execution_config.PARTIAL_EXIT_ATTEMPT_TTL_SECONDS
+                deadline = (
+                    now + timedelta(seconds=execution_config.PARTIAL_EXIT_ATTEMPT_TTL_SECONDS)
+                    if card.pending_partial_sell_price is None else None
+                )
+                price_kwargs = (
+                    {"limit_price": card.pending_partial_sell_price}
+                    if card.pending_partial_sell_price is not None else {}
                 )
                 order = self._position_callbacks.submit_sell_order(
                     environment=card.environment,
@@ -2091,8 +2098,9 @@ class TradingEngine:
                     symbol=card.symbol,
                     quantity=quantity,
                     reason="partial_sell",
-                    attempt_deadline_at=deadline.isoformat(),
+                    attempt_deadline_at=deadline.isoformat() if deadline else None,
                     trade_card=card,
+                    **price_kwargs,
                 )
                 if order is not None and order.status == UnifiedExecutionStatus.REJECTED:
                     self._back_off_exit_retry(card, order.error_message or "Partial sell rejected")
@@ -2216,7 +2224,11 @@ class TradingEngine:
         # A rejected or zero-fill cancellation leaves the existing stop
         # untouched. Any broker-confirmed quantity decrease, including a
         # fill racing a user cancel, receives breakeven protection.
-        if remaining < card.broker_quantity:
+        if remaining <= 0:
+            card.broker_quantity = 0
+            card.orderable_quantity = 0
+            self._position_manager.confirm_flat(card)
+        elif remaining < card.broker_quantity:
             self._position_manager.on_partial_exit_filled(
                 card, refreshed_broker_quantity=remaining
             )
@@ -2226,6 +2238,7 @@ class TradingEngine:
             card.board_status = BoardStatus.OPEN_POSITION
             card.position_runtime_status = PositionRuntimeStatus.OPEN
         card.pending_partial_sell_quantity = 0
+        card.pending_partial_sell_price = None
         card.reserved_sell_quantity = 0
         card.exit_client_order_id = ""
         card.exit_pending_attempt_number = 0
@@ -2313,6 +2326,13 @@ class TradingEngine:
         # Only an explicit withdrawal or liquidation upgrade may cancel it.
         if not force and order.execution_policy == RESERVED_MOO_EXECUTION:
             return changed
+        if (
+            not force
+            and card.board_status == BoardStatus.PARTIAL_SELL
+            and card.pending_partial_sell_quantity > 0
+            and card.pending_partial_sell_price is not None
+        ):
+            return changed  # User-priced limits wait for fill, withdrawal, stop or broker expiry.
         if not force and not self._attempt_deadline_passed(order, now):
             return False
         self._position_callbacks.request_cancel(card, order.client_order_id, scope="EXIT")

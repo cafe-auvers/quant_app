@@ -721,12 +721,14 @@ def _handle_card_dropped(main_window, payload: dict, target_status: BoardStatus)
         else:
             command = CancelQueuedSellAll(**common)
     elif target_status == BoardStatus.PARTIAL_SELL:
-        quantity = dialogs.prompt_partial_sell_quantity(main_window, card)
-        if quantity is None:
+        partial_sell = dialogs.prompt_partial_sell(main_window, card)
+        if partial_sell is None:
             return
+        quantity, limit_price = partial_sell
         command = RequestPartialSell(
             **common,
             quantity=quantity,
+            limit_price=limit_price,
         )
     elif target_status == BoardStatus.SELL_ALL:
         if not dialogs.confirm_sell_all(main_window, card):
@@ -1259,11 +1261,12 @@ def _handle_card_context_menu(main_window, payload: dict, global_pos) -> None:
                 "The Buy Board execution engine is not enabled.",
             )
             return
-        quantity = dialogs.prompt_partial_sell_quantity(main_window, card)
-        if quantity is None:
+        partial_sell = dialogs.prompt_partial_sell(main_window, card)
+        if partial_sell is None:
             return
+        quantity, limit_price = partial_sell
         main_window._buyboard_dispatch_command(
-            RequestPartialSell(**common, quantity=quantity),
+            RequestPartialSell(**common, quantity=quantity, limit_price=limit_price),
             interaction_fingerprint=interaction_fingerprint,
         )
     elif chosen is actions.get("sell_all"):

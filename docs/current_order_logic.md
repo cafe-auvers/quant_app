@@ -344,6 +344,27 @@ completion attempts to replenish the manually sold quantity.
   remaining quantity, and a valid later broker timestamp on the same date.
   Missing or contradictory evidence remains fenced.
 
+## Partial sells at a chosen price
+
+On mobile Buy Board, open a position, choose **Partial Sell**, enter the share
+count and optionally a **Limit price** (for example, $3.50). The desktop Partial
+Sell dialog offers the same choice. Blank uses the existing immediate execution
+price; a supplied limit is the minimum sale price and can fill at that price or
+higher, including immediately if the market is already there.
+
+The price is persisted with the exit objective and carried through the operator
+queue to the executor. Priced requests wait for the regular session and never
+become next-open market orders. Once submitted, they wait for a fill, explicit
+cancellation or broker expiry; the short immediate-exit timeout does not cancel
+them or lower their price. Broker expiry ends the request without automatic
+renewal. A request covering every available share still retains its limit.
+
+The existing stop continues monitoring the position. A stop breach or Sell All
+supersedes the limit objective, cancels the exact working partial order, waits
+for terminal confirmation and refreshes holdings before liquidating the
+remaining shares. Completion, withdrawal and flat confirmation retire the price
+so it cannot leak into a later position cycle.
+
 ## 9. Hard stop-loss exits
 
 A regular-session trade at or below `active_stop_price` latches a mandatory

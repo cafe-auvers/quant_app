@@ -965,3 +965,38 @@ def test_legacy_and_kanban_destructive_paths_both_reference_shared_workflow():
     assert "request_submit" in kanban_runtime
     assert "request_exit_submit" in kanban_runtime
     assert "request_cancel_intent" in kanban_runtime
+
+
+@pytest.mark.parametrize("quantity", [30, 100])
+def test_priced_partial_exit_preserves_floor_even_for_full_quantity(tmp_path, quantity):
+    engine = _engine(tmp_path)
+    card = _seed(engine)
+    projection = _projection(engine, card, readiness_generation=7)
+    result = workflow.request_board_action(
+        engine,
+        _command(RequestPartialSell, projection, quantity=quantity, limit_price=125.0),
+        context=_ready(),
+    )
+    assert result.card.board_status == BoardStatus.PARTIAL_SELL
+    assert not result.card.exit_all_required
+    stored = card_repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert stored.pending_partial_sell_price == 125.0
+    assert stored.pending_partial_sell_quantity == quantity
+    withdrawn = workflow.request_board_action(
+        engine, _command(CancelPartialSell, _projection(engine, stored, readiness_generation=7)),
+        context=_ready(),
+    )
+    assert withdrawn.card.pending_partial_sell_price is None
+    assert withdrawn.card.board_status == BoardStatus.OPEN_POSITION
+
+
+def test_priced_partial_exit_cannot_exceed_orderable_shares(tmp_path):
+    engine = _engine(tmp_path)
+    card = _seed(engine)
+    with pytest.raises(workflow.BoardCommandRejectedError, match="exceeds"):
+        workflow.request_board_action(
+            engine,
+            _command(RequestPartialSell, _projection(engine, card, readiness_generation=7),
+                     quantity=101, limit_price=125.0),
+            context=_ready(),
+        )

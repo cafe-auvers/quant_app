@@ -1483,6 +1483,7 @@ def _project_exact_order_to_card(
             return
         remaining = holding.quantity if holding is not None else 0
         card.pending_partial_sell_quantity = 0
+        card.pending_partial_sell_price = None
         _clear_exit_card_tracking(card, retire_attempt_group=True)
         if remaining <= 0:
             card.broker_quantity = 0

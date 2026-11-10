@@ -8,6 +8,7 @@ from types import SimpleNamespace
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
+from pathlib import Path
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
     QApplication,
@@ -1089,8 +1090,8 @@ def test_dragging_sell_all_to_partial_sell_prompts_and_dispatches_reduction(
     )
     monkeypatch.setattr(
         board_module.dialogs,
-        "prompt_partial_sell_quantity",
-        lambda *_args: 100,
+        "prompt_partial_sell",
+        lambda *_args: (100, None),
     )
     monkeypatch.setattr(board_module, "is_buyboard_engine_enabled", lambda: True)
 
@@ -1263,3 +1264,32 @@ def test_pending_card_shows_saving_state_and_disables_repeat_drag():
     assert widget._pending is False
     assert widget._pending_label.isHidden() is True
     assert bool(item.flags() & Qt.ItemIsDragEnabled)
+
+
+@pytest.mark.parametrize("limit_price", [None, 3.5])
+def test_partial_sell_dialog_returns_optional_price(tmp_path, monkeypatch, limit_price):
+    from PyQt5.QtGui import QFont, QFontDatabase
+    from PyQt5.QtWidgets import QCheckBox, QDoubleSpinBox, QSpinBox
+
+    _ensure_app()
+    card = _card(board_status=BoardStatus.OPEN_POSITION, broker_quantity=100,
+                 orderable_quantity=100, average_entry_price=3.0)
+
+    def fill(dialog):
+        QFontDatabase.addApplicationFont("C:/Windows/Fonts/segoeui.ttf")
+        dialog.setFont(QFont("Segoe UI", 10))
+        dialog.findChild(QSpinBox, "partial_sell_quantity").setValue(30)
+        price = dialog.findChild(QDoubleSpinBox, "partial_sell_limit_price")
+        assert not price.isEnabled()
+        if limit_price is not None:
+            dialog.findChild(QCheckBox, "partial_sell_use_limit").setChecked(True)
+            assert price.isEnabled()
+            price.setValue(limit_price)
+            dialog.adjustSize()
+            screenshot = Path(__file__).resolve().parents[1] / "tmp" / "partial_sell_desktop.png"
+            screenshot.parent.mkdir(exist_ok=True)
+            assert dialog.grab().save(str(screenshot))
+        return QDialog.Accepted
+
+    monkeypatch.setattr(QDialog, "exec_", fill)
+    assert board_dialogs.prompt_partial_sell(None, card) == (30, limit_price)

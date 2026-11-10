@@ -308,6 +308,7 @@ _SNAPSHOT_FIELDS = (
     "average_entry_price",
     "position_runtime_status",
     "pending_partial_sell_quantity",
+    "pending_partial_sell_price",
     "reserved_sell_quantity",
     "exit_all_required",
     "sell_all_at_market_open",
