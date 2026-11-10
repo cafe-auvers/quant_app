@@ -120,6 +120,36 @@ def test_application_order_with_unknown_intent_still_requires_review():
     assert classify_execution_order(order, None) == ReconciliationCategory.UNRECOGNIZED
 
 
+def test_manual_repurchase_reopens_closed_card_without_inventing_stop_or_orders():
+    card = _card(board_status=BoardStatus.CLOSED, broker_quantity=350,
+                 position_runtime_status=PositionRuntimeStatus.CLOSED,
+                 entry_runtime_status=None, stop_type=None)
+    plan = reduce_account_reconciliation(
+        _snapshot(holdings=(_holding(quantity=350, sellable_quantity=340),)),
+        AccountLocalState(cards=(card,)))
+    reopened = plan.card_updates[0]
+    assert reopened.board_status == BoardStatus.OPEN_POSITION
+    assert reopened.position_runtime_status == PositionRuntimeStatus.OPEN
+    assert reopened.broker_quantity == 350
+    assert reopened.orderable_quantity == 340
+    assert reopened.stop_type is None
+    assert reopened.active_stop_price is None
+    assert "STOP_REQUIRED" in reopened.warnings
+    assert reopened.entry_block_reason == "broker_position_requires_stop"
+    assert not plan.commands
+    assert not plan.order_updates
+    assert card.board_status == BoardStatus.CLOSED
+
+
+@pytest.mark.parametrize("status", [BoardStatus.PARTIAL_SELL, BoardStatus.SELL_ALL])
+def test_manual_repurchase_visibility_does_not_override_existing_exit_intent(status):
+    card = _card(board_status=status, broker_quantity=10)
+    plan = reduce_account_reconciliation(
+        _snapshot(holdings=(_holding(quantity=12, sellable_quantity=12),)),
+        AccountLocalState(cards=(card,)))
+    assert plan.card_updates[0].board_status == status
+
+
 @pytest.mark.parametrize('status', [OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.EXPIRED])
 def test_exact_terminal_snapshot_clears_remaining_open_quantity(status):
     order = _order(status=ExecutionOrderStatus.CANCEL_PENDING if status == OrderStatus.CANCELLED

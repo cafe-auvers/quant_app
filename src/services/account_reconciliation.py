@@ -1975,6 +1975,7 @@ def reduce_account_reconciliation(
                     BoardStatus.BUYLIST,
                     BoardStatus.BUY_TODAY,
                     BoardStatus.ENTRY_PENDING,
+                    BoardStatus.CLOSED,
                 ):
                     card.board_status = BoardStatus.OPEN_POSITION
                     card.position_runtime_status = PositionRuntimeStatus.OPEN
