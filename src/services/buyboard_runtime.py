@@ -132,6 +132,7 @@ from src.core.exit_execution_command import (
     build_exit_execution_command,
     exit_execution_policy,
     marketable_exit_limit_price,
+    validate_user_exit_limit_price,
 )
 from src.core.order_state import (
     REGULAR_LIMIT_EXECUTION,
@@ -1921,12 +1922,12 @@ def build_buyboard_runtime(
         requires ``side``/``intent``/``limit_price``, which were never
         supplied here before. This builds all three from what actually
         arrives: side is always SELL, intent comes from the reason
-        (``_SELL_REASON_TO_INTENT``), and limit_price comes from the live
-        quote (falling back to a small discount off the last trade when no
-        bid is cached yet).
+        (``_SELL_REASON_TO_INTENT``). A user-priced partial exit keeps its
+        canonical limit; other exits use the shared marketable pricing policy.
         """
         submit_kwargs = dict(kwargs)
         supplied_card = submit_kwargs.pop("trade_card", None)
+        requested_limit = submit_kwargs.pop("limit_price", None)
         reason = submit_kwargs.pop("reason", "sell_all")
         intent = _SELL_REASON_TO_INTENT.get(reason, OrderIntent.MANUAL_EXIT)
         symbol = submit_kwargs["symbol"]
@@ -1941,6 +1942,12 @@ def build_buyboard_runtime(
             card is not None
             and (card.exit_all_required or card.board_status == BoardStatus.SELL_ALL)
         )
+        if intent == OrderIntent.PARTIAL_EXIT and not mandatory_liquidation and card is not None:
+            canonical_limit = card.pending_partial_sell_price
+            if canonical_limit is not None:
+                if requested_limit is not None and requested_limit != canonical_limit:
+                    raise ValueError("Partial-sell limit differs from the durable position request")
+                requested_limit = canonical_limit
         exchange = _execution_exchange_for_card(
             card,
             resolved_market_data,
@@ -1949,12 +1956,20 @@ def build_buyboard_runtime(
         # Use the engine's exact session oracle so a board decision and the
         # shared exit command cannot disagree at the same boundary.
         regular_session_open = trading_engine._market_is_open()
+        if requested_limit is not None and not mandatory_liquidation:
+            if intent != OrderIntent.PARTIAL_EXIT:
+                raise ValueError("A user limit price is only supported for partial exits")
+            requested_limit = validate_user_exit_limit_price(requested_limit)
+            if not regular_session_open:
+                raise RuntimeError("A priced partial sell waits for the regular session")
         execution_policy = exit_execution_policy(
             environment=submit_kwargs.get("environment", ""),
             intent=intent,
             regular_session_open=regular_session_open,
         )
-        if execution_policy == REGULAR_LIMIT_EXECUTION:
+        if requested_limit is not None and not mandatory_liquidation:
+            limit_price = requested_limit
+        elif execution_policy == REGULAR_LIMIT_EXECUTION:
             quote = resolved_market_data.latest_quote(symbol)
             quote_ready = resolved_market_data.is_symbol_execution_ready(
                 symbol, require_trade=False, require_quote=True

@@ -756,3 +756,43 @@ def test_mobile_orb_settings_api_round_trip_is_revision_safe(
         assert ss.pull_state(engine, ss.SETTINGS_KEY).state.payload[
             "orb_settings"
         ]["capital_max_percent"] == 35.0
+
+
+@pytest.mark.parametrize("same_executor", [True, False])
+def test_mobile_partial_sell_price_survives_executor_queue_and_board_projection(
+    web_config, tmp_path, monkeypatch, same_executor
+):
+    engine, role, service = _service(web_config, tmp_path, same_executor=same_executor)
+    monkeypatch.setattr(trade_card_repository, "LOCAL_TRADE_CARDS_FILE", tmp_path / "cards.json")
+    card = trade_card_repository.create_trade_card(engine, TradeCardState(
+        environment="PROD", account_no="account-a", symbol="AAPL",
+        board_status=BoardStatus.OPEN_POSITION, broker_quantity=100, orderable_quantity=100,
+        position_runtime_status=PositionRuntimeStatus.OPEN,
+    ))
+    result = service.apply_board_action(
+        command_id=str(uuid.uuid4()), action="request_partial_sell", symbol="AAPL",
+        expected_revision=card.version, quantity=30, price=3.5,
+    )
+    assert result["queued"] is not same_executor
+    if not same_executor:
+        outcome = process_next_board_operator_command(engine, LocalDeviceRole("executor-pc", "EXECUTOR", True))
+        assert outcome.status == OperatorCommandStatus.COMPLETED, outcome.error_message
+    stored = trade_card_repository.get_trade_card(engine, "PROD", "account-a", "AAPL")
+    assert stored.pending_partial_sell_price == 3.5
+    assert stored.pending_partial_sell_quantity == 30
+    assert service.board_snapshot(force=True)["rows"][0]["pending_partial_sell_price"] == 3.5
+
+
+@pytest.mark.parametrize("price", [0, -1, float("inf"), 3.505])
+def test_mobile_partial_sell_rejects_invalid_prices(web_config, tmp_path, monkeypatch, price):
+    from src.web.store import ValidationError
+
+    engine, _role, service = _service(web_config, tmp_path)
+    monkeypatch.setattr(trade_card_repository, "LOCAL_TRADE_CARDS_FILE", tmp_path / "cards.json")
+    card = trade_card_repository.create_trade_card(engine, TradeCardState(
+        environment="PROD", account_no="account-a", symbol="AAPL",
+        board_status=BoardStatus.OPEN_POSITION, broker_quantity=100, orderable_quantity=100,
+    ))
+    with pytest.raises(ValidationError):
+        service.apply_board_action(command_id=str(uuid.uuid4()), action="request_partial_sell",
+                                   symbol="AAPL", expected_revision=card.version, quantity=30, price=price)

@@ -344,6 +344,7 @@ class PositionManager:
                 card, working_partial_sell_client_order_id, scope="EXIT"
             )  # step 3
         card.pending_partial_sell_quantity = 0
+        card.pending_partial_sell_price = None
         card.board_status = BoardStatus.SELL_ALL
         card.position_runtime_status = PositionRuntimeStatus.LIQUIDATING
         return card
@@ -366,6 +367,8 @@ class PositionManager:
         why submission does not happen inline here (P1-4).
         """
         card.exit_all_required = True
+        card.pending_partial_sell_quantity = 0
+        card.pending_partial_sell_price = None
         if working_buy_client_order_id:
             callbacks.request_cancel(card, working_buy_client_order_id, scope="ENTRY")  # step 3
         card.board_status = BoardStatus.SELL_ALL
@@ -387,6 +390,8 @@ class PositionManager:
                 f"Cannot close {card.symbol}: broker_quantity is {card.broker_quantity}, not zero"
             )
         card.board_status = BoardStatus.CLOSED
+        card.pending_partial_sell_quantity = 0
+        card.pending_partial_sell_price = None
         card.position_runtime_status = PositionRuntimeStatus.CLOSED
         card.stop_type = None
         card.active_stop_price = None

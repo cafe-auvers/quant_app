@@ -1264,6 +1264,7 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
         card.stop_loss_triggered = False
         card.sell_all_at_market_open = False
         card.pending_partial_sell_quantity = 0
+        card.pending_partial_sell_price = None
         card.reserved_sell_quantity = 0
         card.next_exit_retry_at = None
         card.exit_attempt_count = 0
@@ -1397,11 +1398,14 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
         orderable = card.orderable_quantity or card.broker_quantity
         if orderable <= 0:
             raise BoardCommandRejectedError("No broker-confirmed orderable quantity to sell")
-        if command.quantity >= orderable:
+        if command.limit_price is not None and command.quantity > orderable:
+            raise BoardCommandRejectedError("Limit-sell quantity exceeds broker-confirmed orderable shares")
+        if command.quantity >= orderable and command.limit_price is None:
             if source_status != BoardStatus.SELL_ALL:
                 _move_board_card(card, BoardStatus.SELL_ALL)
             card.exit_all_required = True
             card.pending_partial_sell_quantity = 0
+            card.pending_partial_sell_price = None
         else:
             if source_status == BoardStatus.SELL_ALL:
                 # Retire the old liquidation objective before creating the
@@ -1423,6 +1427,7 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
                 card.exit_cancel_command_id = ""
             _move_board_card(card, BoardStatus.PARTIAL_SELL)
             card.pending_partial_sell_quantity = command.quantity
+            card.pending_partial_sell_price = command.limit_price
             card.position_runtime_status = PositionRuntimeStatus.PARTIAL_EXIT_PENDING
         return
 
@@ -1440,6 +1445,7 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
         # known working order must stay visibly pending until cancellation
         # and broker reconciliation establish the remaining position.
         card.pending_partial_sell_quantity = 0
+        card.pending_partial_sell_price = None
         card.next_exit_retry_at = None
         card.last_exit_error = ""
         if durable_exit_started:
@@ -1502,6 +1508,7 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
         card.exit_all_required = False
         card.stop_loss_triggered = False
         card.pending_partial_sell_quantity = 0
+        card.pending_partial_sell_price = None
         card.position_runtime_status = PositionRuntimeStatus.OPEN
         card.next_exit_retry_at = None
         card.exit_attempt_count = 0
@@ -1587,6 +1594,7 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
         # alone may eventually project CLOSED.
         card.exit_all_required = True
         card.pending_partial_sell_quantity = 0
+        card.pending_partial_sell_price = None
         card.position_runtime_status = PositionRuntimeStatus.LIQUIDATING
         if context is not None and context.regular_session_open is False:
             card.sell_all_at_market_open = True

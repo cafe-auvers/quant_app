@@ -402,6 +402,9 @@ def _card_metric_rows(
             0, int(card.pending_partial_sell_quantity or 0)
         )
         rows.append(("Selling", f"{selling:,} sh" if selling else "--"))
+        if card.pending_partial_sell_price is not None:
+            price = card.pending_partial_sell_price
+            rows.append(("Sell Limit", f"${price:,.4f} or higher" if price < 1 else f"${price:,.2f} or higher"))
     elif status == BoardStatus.SELL_ALL:
         selling = max(0, int(card.reserved_sell_quantity or 0)) or max(
             0,

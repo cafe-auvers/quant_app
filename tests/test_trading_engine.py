@@ -3051,3 +3051,96 @@ def test_supervised_hold_only_cannot_disable_unattended_ceiling(
     engine.run_heartbeat([card])
 
     assert card.exit_all_required
+
+
+def test_limit_partial_sell_keeps_price_and_waits_for_regular_session(tmp_path):
+    submitted = []
+    engine = _make_engine(tmp_path)
+    engine._market_is_open_fn = lambda: False
+    engine._position_callbacks = PositionActionCallbacks(
+        cancel_order=lambda *a: None, submit_sell_order=lambda **kw: submitted.append(kw),
+        refresh_orderable_quantity=lambda *a: 100,
+    )
+    card = _open_card(board_status=BoardStatus.PARTIAL_SELL,
+                      pending_partial_sell_quantity=30, pending_partial_sell_price=125.0)
+    engine._process_partial_sell_requests([card])
+    assert submitted == []
+    engine._market_is_open_fn = lambda: True
+    engine._process_partial_sell_requests([card])
+    assert len(submitted) == 1
+    assert submitted[0]["limit_price"] == 125.0
+    assert submitted[0]["attempt_deadline_at"] is None
+
+
+def test_limit_partial_sell_ignores_ttl_but_user_cancel_still_works(tmp_path):
+    tracker = _StatefulOrderTracker(_working_sell_order(intent=OrderIntent.PARTIAL_EXIT))
+    engine = _make_engine(tmp_path)
+    engine._position_callbacks = PositionActionCallbacks(
+        cancel_order=tracker.cancel_order, submit_sell_order=lambda **kw: pytest.fail("duplicate sell"),
+        refresh_orderable_quantity=lambda *a: 100, find_open_sell_order=tracker.find,
+        reconcile_sell_order=tracker.reconcile,
+    )
+    card = _open_card(board_status=BoardStatus.PARTIAL_SELL,
+                      pending_partial_sell_quantity=30, pending_partial_sell_price=125.0)
+    engine._reconcile_partial_sell_fills([card])
+    assert tracker.cancel_calls == []
+    card.pending_partial_sell_quantity = 0
+    engine._reconcile_partial_sell_fills([card])
+    assert tracker.cancel_calls == [tracker.order.client_order_id]
+
+
+def test_stop_preempts_limit_partial_sell_and_waits_for_cancel_confirmation(tmp_path):
+    tracker = _StatefulOrderTracker(_working_sell_order(intent=OrderIntent.PARTIAL_EXIT))
+    submitted = []
+    engine = _make_engine(tmp_path)
+    engine._market_is_open_fn = lambda: True
+    engine._position_callbacks = PositionActionCallbacks(
+        cancel_order=tracker.cancel_order, submit_sell_order=lambda **kw: submitted.append(kw),
+        refresh_orderable_quantity=lambda *a: 70, find_open_sell_order=tracker.find,
+        reconcile_sell_order=tracker.reconcile,
+    )
+    card = _open_card(board_status=BoardStatus.PARTIAL_SELL,
+                      pending_partial_sell_quantity=30, pending_partial_sell_price=125.0)
+    engine.evaluate_quote([card], QuoteSnapshot(symbol="AAPL", last_price=90.0))
+    assert card.board_status == BoardStatus.SELL_ALL
+    assert card.pending_partial_sell_price is None
+    assert tracker.cancel_calls == [tracker.order.client_order_id]
+    engine._retry_incomplete_sell_alls([card])
+    assert submitted == []
+    tracker.resolve(OrderStatus.CANCELLED, filled=30)
+    engine._reconcile_sell_all_orders([card])
+    engine._position_callbacks.find_open_sell_order = lambda card: None
+    engine._retry_incomplete_sell_alls([card])
+    assert len(submitted) == 1
+    assert submitted[0]["quantity"] == 70
+    assert "limit_price" not in submitted[0]
+
+
+def test_full_quantity_limit_fill_closes_and_retires_limit(tmp_path):
+    engine = _make_engine(tmp_path)
+    card = _open_card(board_status=BoardStatus.PARTIAL_SELL,
+                      pending_partial_sell_quantity=100, pending_partial_sell_price=125.0)
+    engine._complete_partial_exit(card, 0)
+    assert card.board_status == BoardStatus.CLOSED
+    assert card.pending_partial_sell_price is None
+    assert card.pending_partial_sell_quantity == 0
+
+
+@pytest.mark.parametrize("status", [OrderStatus.EXPIRED, OrderStatus.REJECTED, OrderStatus.CANCELLED])
+def test_terminal_limit_partial_sell_ends_request_without_renewal(tmp_path, status):
+    tracker = _StatefulOrderTracker(_working_sell_order(intent=OrderIntent.PARTIAL_EXIT))
+    tracker.resolve(status, filled=0)
+    engine = _make_engine(tmp_path)
+    engine._market_is_open_fn = lambda: True
+    engine._position_callbacks = PositionActionCallbacks(
+        cancel_order=lambda *a: pytest.fail("terminal order"),
+        submit_sell_order=lambda **kw: pytest.fail("must not renew a terminal limit"),
+        refresh_orderable_quantity=lambda *a: 100, find_open_sell_order=tracker.find,
+        reconcile_sell_order=tracker.reconcile,
+    )
+    card = _open_card(board_status=BoardStatus.PARTIAL_SELL,
+                      pending_partial_sell_quantity=30, pending_partial_sell_price=125.0)
+    engine._reconcile_partial_sell_fills([card])
+    assert card.board_status == BoardStatus.OPEN_POSITION
+    assert card.pending_partial_sell_price is None
+    engine._process_partial_sell_requests([card])

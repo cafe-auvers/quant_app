@@ -15,6 +15,7 @@ from uuid import uuid4
 from src.core.discovered_external_order import DiscoveredExternalOrder
 from src.core.execution_order_record import ExecutionOrderRecord, ExecutionOrderStatus
 from src.core.trade_card_state import TradeCardState
+from src.core.exit_execution_command import validate_user_exit_limit_price
 
 
 def _utc_now() -> datetime:
@@ -110,10 +111,13 @@ class CancelEntry(BoardCommand):
 @dataclass(frozen=True)
 class RequestPartialSell(BoardCommand):
     quantity: int = 0
+    limit_price: Optional[float] = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
         object.__setattr__(self, "quantity", int(self.quantity or 0))
+        if self.limit_price is not None:
+            object.__setattr__(self, "limit_price", validate_user_exit_limit_price(self.limit_price))
 
 
 @dataclass(frozen=True)

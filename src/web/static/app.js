@@ -850,6 +850,8 @@
         `${boardMoney(row.pending_stop_price)} · ${boardShares(row.pending_stop_quantity)}`]);
       if (row.board_status === 'PARTIAL_SELL') {
         facts.push(['Sell requested', boardShares(row.pending_partial_sell_quantity)]);
+        facts.push(['Sell price', row.pending_partial_sell_price
+          ? `${boardMoney(row.pending_partial_sell_price)} or higher` : 'Immediate']);
       }
       if (['PARTIAL_SELL', 'SELL_ALL'].includes(row.board_status)) {
         facts.push(['Working sell', row.exit_order_pending
@@ -1099,6 +1101,12 @@
         input.step = options.input.step;
         input.min = options.input.min;
         input.value = options.input.value || '';
+        input.setCustomValidity('');
+        const pricedPartial = action === 'request_partial_sell';
+        wrapper.classList.toggle('has-limit', pricedPartial);
+        byId('buy-board-partial-price-fields').hidden = !pricedPartial;
+        byId('buy-board-partial-price').value = '';
+        byId('buy-board-partial-price').setCustomValidity('');
         requestAnimationFrame(() => input.focus({preventScroll: true}));
         return;
       }
@@ -1210,10 +1218,15 @@
     if (action === 'cancel_entry' && row.board_status === 'BUY_TODAY') next.board_status = 'BUYLIST';
     if (action === 'cancel_entry' && row.board_status === 'ENTRY_PENDING') next.entry_cancel_in_flight = true;
     if (action === 'cancel_partial_sell') {
+      next.pending_partial_sell_quantity = 0;
+      next.pending_partial_sell_price = null;
       if (!row.exit_order_pending) next.board_status = 'OPEN_POSITION';
       else next.exit_cancel_in_flight = true;
     }
-    if (action === 'request_partial_sell') next.pending_partial_sell_quantity = Number(payload.quantity || 0);
+    if (action === 'request_partial_sell') {
+      next.pending_partial_sell_quantity = Number(payload.quantity || 0);
+      next.pending_partial_sell_price = payload.price == null ? null : Number(payload.price);
+    }
     if (action === 'request_sell_all') next.exit_all_required = true;
     if (action === 'reorder_card') next.kanban_priority = Number(payload.target_priority || 0);
     if (action === 'set_orb_stop') {
@@ -1268,7 +1281,11 @@
     }
     const confirmations = {
       activate_buy_today: [`Activate ${symbol} for Buy Today?`, 'This publishes executable entry intent. No order is placed now; the Execution Owner still enforces every runtime, risk, market-data, and broker gate.', 'Activate'],
-      request_partial_sell: [`Request a partial sell for ${symbol}?`, `Request ${payload.quantity} share${Number(payload.quantity) === 1 ? '' : 's'} as durable exit intent.`, 'Request partial sell'],
+      request_partial_sell: [`Request a partial sell for ${symbol}?`,
+        `Sell ${payload.quantity} share${Number(payload.quantity) === 1 ? '' : 's'} ${payload.price == null
+          ? 'immediately using the current execution price.'
+          : `at ${boardMoney(payload.price)} or higher. The limit can fill now if the market is already there; otherwise it waits until filled, cancelled or expired by KIS. Outside the regular session, submission waits for the open. Stops take priority.`}`,
+        payload.price == null ? 'Request partial sell' : 'Request limit sell'],
       request_sell_all: [`Sell all of ${symbol}?`, 'This records durable liquidation intent. The Execution Owner may submit it only after the workflow gates pass.', 'Request Sell All'],
     };
     if (action === 'activate_buy_today') {
@@ -4436,10 +4453,24 @@
         return;
       }
       input.setCustomValidity('');
+      const payload = action === 'request_partial_sell' ? {quantity: value} : {price: value};
+      const limitInput = byId('buy-board-partial-price');
+      if (action === 'request_partial_sell' && limitInput.value.trim() !== '') {
+        const price = Number(limitInput.value);
+        const scale = price < 1 ? 10000 : 100;
+        if (!Number.isFinite(price) || price <= 0 || Math.abs(price * scale - Math.round(price * scale)) > 1e-6) {
+          limitInput.setCustomValidity('Enter a positive price with 2 decimals, or 4 below $1.');
+          limitInput.reportValidity();
+          return;
+        }
+        limitInput.setCustomValidity('');
+        payload.price = price;
+      }
       wrapper.hidden = true;
-      void applyBuyBoardAction(action, action === 'request_partial_sell' ? {quantity: value} : {price: value});
+      void applyBuyBoardAction(action, payload);
     });
     byId('buy-board-action-value').addEventListener('input', event => event.target.setCustomValidity(''));
+    byId('buy-board-partial-price').addEventListener('input', event => event.target.setCustomValidity(''));
     byId('operator-confirm-cancel').addEventListener('click', () => closeOperatorConfirm(false));
     byId('desktop-orb-settings').addEventListener('click', () => {
       setMobilePage('settings');

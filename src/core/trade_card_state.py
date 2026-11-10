@@ -328,6 +328,7 @@ class TradeCardState:
     # position/exit engine (which owns the actual sell submission) has the
     # user's requested size without the board layer submitting orders itself.
     pending_partial_sell_quantity: int = 0
+    pending_partial_sell_price: Optional[float] = None
     # Shares "spoken for" by a currently-working exit order (partial sell or
     # sell-all), set once the order is actually submitted. Review finding
     # P1-3: broker_quantity/orderable_quantity must stay broker-authoritative
@@ -500,6 +501,10 @@ class TradeCardState:
         self.stop_loss_triggered = bool(self.stop_loss_triggered)
         self.sell_all_at_market_open = bool(self.sell_all_at_market_open)
         self.pending_partial_sell_quantity = int(self.pending_partial_sell_quantity or 0)
+        if self.pending_partial_sell_price is not None:
+            from src.core.exit_execution_command import validate_user_exit_limit_price
+
+            self.pending_partial_sell_price = validate_user_exit_limit_price(self.pending_partial_sell_price)
         self.reserved_sell_quantity = int(self.reserved_sell_quantity or 0)
         self.next_exit_retry_at = (
             _parse_timestamp(self.next_exit_retry_at) if self.next_exit_retry_at else None
@@ -691,6 +696,7 @@ class TradeCardState:
             "stop_loss_triggered": self.stop_loss_triggered,
             "sell_all_at_market_open": self.sell_all_at_market_open,
             "pending_partial_sell_quantity": self.pending_partial_sell_quantity,
+            "pending_partial_sell_price": self.pending_partial_sell_price,
             "reserved_sell_quantity": self.reserved_sell_quantity,
             "next_exit_retry_at": self.next_exit_retry_at.isoformat() if self.next_exit_retry_at else None,
             "exit_attempt_count": self.exit_attempt_count,
@@ -821,6 +827,7 @@ class TradeCardState:
             pending_partial_sell_quantity=int(
                 data.get("pending_partial_sell_quantity", 0) or 0
             ),
+            pending_partial_sell_price=data.get("pending_partial_sell_price"),
             reserved_sell_quantity=int(data.get("reserved_sell_quantity", 0) or 0),
             next_exit_retry_at=data.get("next_exit_retry_at"),
             exit_attempt_count=int(data.get("exit_attempt_count", 0) or 0),

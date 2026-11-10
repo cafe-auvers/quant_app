@@ -555,13 +555,8 @@ def _format_optional_price(value) -> str:
         return "-"
 
 
-def prompt_partial_sell_quantity(parent, card: TradeCardState) -> Optional[int]:
-    """Returns the requested quantity, or ``None`` if the user cancelled.
-
-    A quantity equal to the full orderable size is allowed through here --
-    the controller (``apply_board_command``) is what actually converts it to
-    a Sell All, so the message shown here is informational only.
-    """
+def prompt_partial_sell(parent, card: TradeCardState) -> Optional[tuple[int, Optional[float]]]:
+    """Return quantity and an optional SELL limit, or None on cancellation."""
     orderable = card.orderable_quantity or card.broker_quantity
     if orderable <= 0:
         QMessageBox.warning(parent, "Partial Sell", "No orderable quantity to sell.")
@@ -569,6 +564,7 @@ def prompt_partial_sell_quantity(parent, card: TradeCardState) -> Optional[int]:
 
     dialog = QDialog(parent)
     dialog.setWindowTitle(f"Partial Sell — {card.symbol}")
+    dialog.setMinimumWidth(440)
     layout = QVBoxLayout(dialog)
 
     layout.addWidget(QLabel(f"Current quantity: {orderable}"))
@@ -578,6 +574,7 @@ def prompt_partial_sell_quantity(parent, card: TradeCardState) -> Optional[int]:
     slider.setRange(1, orderable)
     slider.setValue(max(1, orderable // 2))
     spin = QSpinBox()
+    spin.setObjectName("partial_sell_quantity")
     spin.setRange(1, orderable)
     spin.setValue(slider.value())
     slider.valueChanged.connect(spin.setValue)
@@ -586,28 +583,63 @@ def prompt_partial_sell_quantity(parent, card: TradeCardState) -> Optional[int]:
     row.addWidget(spin)
     layout.addLayout(row)
 
+    use_limit = QCheckBox("Sell at a limit price")
+    use_limit.setObjectName("partial_sell_use_limit")
+    layout.addWidget(use_limit)
+    price = QDoubleSpinBox()
+    price.setObjectName("partial_sell_limit_price")
+    price.setPrefix("$ ")
+    price.setDecimals(4)
+    price.setRange(0.0001, 1_000_000.0)
+    price.setValue(card.market_data_last_trusted_price or card.average_entry_price or 1.0)
+    price.setEnabled(False)
+    use_limit.toggled.connect(price.setEnabled)
+    layout.addWidget(price)
+    explanation = QLabel(
+        "A limit sells at your price or higher and can fill immediately if the market "
+        "is already there. It waits until filled, cancelled or expired by KIS. "
+        "Outside the regular session, submission waits for the open. Stops take priority."
+    )
+    explanation.setWordWrap(True)
+    layout.addWidget(explanation)
+
     hint = QLabel("")
     hint.setStyleSheet("color: #888; font-size: 11px;")
     layout.addWidget(hint)
 
     def _update_hint(value: int) -> None:
         pct = value / orderable * 100.0
-        if value >= orderable:
+        if value >= orderable and use_limit.isChecked():
+            hint.setText(f"{pct:.0f}% of position at the limit price")
+        elif value >= orderable:
             hint.setText(f"{pct:.0f}% of position — this will submit a Sell All.")
         else:
             hint.setText(f"{pct:.0f}% of position")
 
     spin.valueChanged.connect(_update_hint)
+    use_limit.toggled.connect(lambda _checked: _update_hint(spin.value()))
     _update_hint(spin.value())
 
     buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-    buttons.accepted.connect(dialog.accept)
+
+    def accept() -> None:
+        if use_limit.isChecked():
+            from src.core.exit_execution_command import validate_user_exit_limit_price
+
+            try:
+                validate_user_exit_limit_price(price.value())
+            except ValueError as exc:
+                QMessageBox.warning(dialog, "Partial Sell", str(exc))
+                return
+        dialog.accept()
+
+    buttons.accepted.connect(accept)
     buttons.rejected.connect(dialog.reject)
     layout.addWidget(buttons)
 
     if dialog.exec_() != QDialog.Accepted:
         return None
-    return int(spin.value())
+    return int(spin.value()), float(price.value()) if use_limit.isChecked() else None
 
 
 def confirm_sell_all(parent, card: TradeCardState) -> bool:
