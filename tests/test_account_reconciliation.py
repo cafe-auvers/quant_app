@@ -22,6 +22,7 @@ from src.core.execution_order_record import (
     BrokerIdentityStatus,
     ExecutionOrderRecord,
     ExecutionOrderStatus,
+    OrderOrigin,
 )
 from src.core.order_recovery_state import OrderRecoveryState
 from src.core.order_state import (
@@ -55,6 +56,68 @@ from src.services import account_reconciliation as reconciliation_module
 
 
 NOW = datetime(2026, 8, 15, 14, 0, tzinfo=timezone.utc)
+
+
+def test_adopted_unknown_intent_order_is_observed_without_inventing_strategy_or_permission():
+    adopted = _order(origin=OrderOrigin.USER_ADOPTED, intent=OrderIntent.UNKNOWN,
+                     adopted_from_external_order_id="external-1",
+                     capital_reservation_id="", attempt_group_id="")
+    assert classify_execution_order(adopted, None) == ReconciliationCategory.ADOPTED_EXTERNAL_ORDER
+    plan = reduce_account_reconciliation(_snapshot(), AccountLocalState(execution_orders=(adopted,)))
+    assert not any(alert.code == "UNRECOGNIZED_LOCAL_ORDER_COMBINATION" for alert in plan.alerts)
+    assert not plan.commands
+    assert not plan.changed_cards
+    assert adopted.intent == OrderIntent.UNKNOWN
+    assert not adopted.adoption_permissions
+
+
+@pytest.mark.parametrize("side", [OrderSide.BUY, OrderSide.SELL])
+def test_revised_adopted_and_external_orders_retire_from_exact_history_in_one_pass(side):
+    original = BrokerOrderStatusSnapshot(
+        environment="PROD", account_no="1", symbol="AAPL", broker_order_id="B-1",
+        side=side, status=OrderStatus.PARTIALLY_FILLED, quantity_requested=10,
+        raw_response={"rvse_cncl_dvsn": "00", "ord_dt": "20260814", "ord_tmd": "233228"})
+    revised = deepcopy(original)
+    revised.broker_order_id = "B-2"
+    revised.status = OrderStatus.FILLED
+    revised.filled_quantity = 10
+    revised.raw_response = {"rvse_cncl_dvsn": "01", "orgn_odno": "B-1",
+                            "ord_dt": "20260814", "ord_tmd": "233342"}
+    snapshot = _snapshot(orders=(original, revised))
+    adopted = _order(side=side, origin=OrderOrigin.USER_ADOPTED, intent=OrderIntent.UNKNOWN,
+                     adopted_from_external_order_id="external-1",
+                     status=ExecutionOrderStatus.PARTIALLY_FILLED,
+                     capital_reservation_id="", attempt_group_id="")
+    plan = reduce_account_reconciliation(snapshot, AccountLocalState(execution_orders=(adopted,)))
+    assert plan.order_updates[0].status == ExecutionOrderStatus.CANCELLED
+    assert plan.order_updates[0].remaining_quantity == 0
+    assert plan.order_updates[0].filled_quantity == 0
+    assert not plan.commands
+    assert not plan.alerts
+
+    external = new_discovered_external_order(
+        environment="PROD", account_no="1", symbol="AAPL", side=side,
+        broker_order_id="B-1", quantity_requested=10,
+        broker_status=ExecutionOrderStatus.PARTIALLY_FILLED)
+    plan = reduce_account_reconciliation(snapshot, AccountLocalState(external_orders=(external,)))
+    assert plan.external_order_updates[0].disposition == ExternalOrderDisposition.DISMISSED_TERMINAL
+    assert plan.external_order_updates[0].broker_status == ExecutionOrderStatus.CANCELLED
+    assert not plan.alerts
+    assert not plan.commands
+
+
+def test_zero_holdings_alone_does_not_retire_unowned_working_order():
+    external = new_discovered_external_order(
+        environment="PROD", account_no="1", symbol="AAPL", side=OrderSide.BUY,
+        broker_order_id="B-1", quantity_requested=10, broker_status=ExecutionOrderStatus.WORKING)
+    plan = reduce_account_reconciliation(_snapshot(), AccountLocalState(external_orders=(external,)))
+    assert not plan.external_order_updates
+    assert any(alert.code == "DISCOVERED_UNOWNED_BROKER_ORDER" for alert in plan.alerts)
+
+
+def test_application_order_with_unknown_intent_still_requires_review():
+    order = _order(intent=OrderIntent.UNKNOWN)
+    assert classify_execution_order(order, None) == ReconciliationCategory.UNRECOGNIZED
 
 
 @pytest.mark.parametrize('status', [OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.EXPIRED])

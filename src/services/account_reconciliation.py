@@ -15,7 +15,7 @@ import math
 import threading
 import time
 import weakref
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 from enum import Enum
 from typing import Callable, Iterable, Mapping, Optional, Sequence, Tuple
@@ -181,6 +181,7 @@ class ReconciliationCategory(str, Enum):
     TERMINAL_ORDER = "TERMINAL_ORDER"
     MANUAL_BROKER_POSITION = "MANUAL_BROKER_POSITION"
     DISCOVERED_EXTERNAL_ORDER = "DISCOVERED_EXTERNAL_ORDER"
+    ADOPTED_EXTERNAL_ORDER = "ADOPTED_EXTERNAL_ORDER"
     ORPHAN_CAPITAL_RESERVATION = "ORPHAN_CAPITAL_RESERVATION"
     LIVE_ORDER_WITHOUT_RESERVATION = "LIVE_ORDER_WITHOUT_RESERVATION"
     UNRECOGNIZED = "UNRECOGNIZED"
@@ -459,6 +460,13 @@ def classify_execution_order(
         return ReconciliationCategory.UNKNOWN_SUBMISSION
     if order.status in _TERMINAL_EXECUTION_STATUSES:
         return ReconciliationCategory.TERMINAL_ORDER
+    if (
+        order.origin == OrderOrigin.USER_ADOPTED
+        and order.intent == OrderIntent.UNKNOWN
+        and order.broker_identity_status == BrokerIdentityStatus.EXACT
+        and order.broker_order_id
+    ):
+        return ReconciliationCategory.ADOPTED_EXTERNAL_ORDER
     if order.side == OrderSide.SELL and order.intent in (
         OrderIntent.PARTIAL_EXIT,
         OrderIntent.PARTIAL_TAKE_PROFIT,
@@ -1572,6 +1580,7 @@ def reduce_account_reconciliation(
     local_state: AccountLocalState,
 ) -> ReconciliationPlan:
     """Pure reducer: no broker, database, filesystem, or clock calls."""
+    snapshot = replace(snapshot, orders=tuple(authoritative_order_history(snapshot.orders)))
     original_cards = tuple(local_state.cards)
     original_orders = tuple(local_state.execution_orders)
     original_reservations = tuple(local_state.capital_reservations)

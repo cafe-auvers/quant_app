@@ -1,6 +1,7 @@
-"""Resolve KIS original rows only when an exact zero-fill cancel proves retirement."""
+"""Resolve KIS originals using exact cancellation or revision evidence."""
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Sequence
 
@@ -60,14 +61,51 @@ def _cancel_code(row: BrokerOrderStatusSnapshot) -> str:
                or row.raw_response.get("rvse_cncl_dvsn_cd") or "")
 
 
+def _accepted_revision(
+    original: BrokerOrderStatusSnapshot,
+    rows: Sequence[BrokerOrderStatusSnapshot],
+) -> BrokerOrderStatusSnapshot | None:
+    revisions = [
+        row for row in rows
+        if _identity(row)[:-1] == _identity(original)[:-1]
+        and str(row.raw_response.get("orgn_odno") or "").strip()
+        == original.broker_order_id
+        and _cancel_code(row) == "01"
+    ]
+    if len(revisions) != 1:
+        return None
+    revised = revisions[0]
+    if (
+        not revised.broker_order_id
+        or revised.broker_order_id == original.broker_order_id
+        or revised.quantity_requested != original.quantity_requested
+        or revised.status not in {
+            OrderStatus.ACCEPTED, OrderStatus.WORKING, OrderStatus.PARTIALLY_FILLED,
+            OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.EXPIRED,
+        }
+        or min(revised.filled_quantity, revised.remaining_quantity) < 0
+        or revised.filled_quantity + revised.remaining_quantity > revised.quantity_requested
+        or (revised.status == OrderStatus.FILLED
+            and revised.filled_quantity != revised.quantity_requested)
+        or (revised.status in {OrderStatus.CANCELLED, OrderStatus.EXPIRED}
+            and revised.remaining_quantity != 0)
+        or not _cancel_is_later(original, revised)
+    ):
+        return None
+    return revised
+
+
 def authoritative_order_history(
     rows: Sequence[BrokerOrderStatusSnapshot],
 ) -> list[BrokerOrderStatusSnapshot]:
-    """Keep conflicting/ambiguous evidence; retire only a proved cancelled original.
+    """Keep ambiguous evidence and preserve each revised order's exact identity.
 
     KIS can label the original zero-fill, zero-open-quantity row PARTIALLY_FILLED
     after cancellation. A unique, later cancellation row for the same full
-    identity and quantity resolves that history. Neither row alone is enough.
+    identity and quantity resolves that history. An accepted revision can instead
+    have a new ID with an explicit original-ID link. Retain a terminal original
+    in that case so local/adopted records can reconcile; fills belong to the new
+    ID. Neither zero holdings nor a zero remaining quantity alone is proof.
     """
     retired: set[int] = set()
     for index, original in enumerate(rows):
@@ -91,4 +129,28 @@ def authoritative_order_history(
                 and cancel.quantity_requested == original.quantity_requested
                 and _cancel_is_later(original, cancel)):
             retired.add(index)
-    return [row for index, row in enumerate(rows) if index not in retired]
+    result = []
+    for index, original in enumerate(rows):
+        if index in retired:
+            continue
+        if (
+            original.broker_order_id
+            and original.quantity_requested > 0
+            and original.status == OrderStatus.PARTIALLY_FILLED
+            and original.filled_quantity == original.remaining_quantity == 0
+            and _cancel_code(original) in {"00", "01"}
+            and sum(_identity(row) == _identity(original) for row in rows) == 1
+        ):
+            revision = _accepted_revision(original, rows)
+            if revision is not None:
+                original = replace(
+                    original,
+                    status=OrderStatus.CANCELLED,
+                    raw_response={
+                        **original.raw_response,
+                        "broker_history_retirement": "REPLACED",
+                        "replacement_order_id": revision.broker_order_id,
+                    },
+                )
+        result.append(original)
+    return result

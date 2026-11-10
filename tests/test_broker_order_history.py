@@ -85,3 +85,75 @@ def test_earlier_or_incomplete_domestic_time_does_not_retire_original(proof):
     cancel.raw_response.update(proof)
     rows = [original, cancel]
     assert authoritative_order_history(rows) == rows
+
+
+def _revision_rows(status=OrderStatus.FILLED):
+    original, _ = _rows()
+    revised = replace(
+        original, broker_order_id="replacement", status=status,
+        filled_quantity=73 if status == OrderStatus.FILLED else 0,
+        remaining_quantity=73 if status == OrderStatus.WORKING else 0,
+        raw_response={"rvse_cncl_dvsn": "01", "orgn_odno": "exact",
+                      "ord_dt": "20261005", "ord_tmd": "000500"},
+    )
+    return original, revised
+
+
+@pytest.mark.parametrize("status", [OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.WORKING])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_revised_order_retires_old_identity_without_assigning_replacement_fills(status, reverse):
+    original, revised = _revision_rows(status)
+    before = original.to_dict()
+    rows = [revised, original] if reverse else [original, revised]
+    normalized = authoritative_order_history(rows)
+    retired = next(row for row in normalized if row.broker_order_id == "exact")
+    assert retired.status == OrderStatus.CANCELLED
+    assert retired.filled_quantity == retired.remaining_quantity == 0
+    assert retired.raw_response["replacement_order_id"] == "replacement"
+    assert next(row for row in normalized if row.broker_order_id == "replacement") == revised
+    assert original.to_dict() == before
+    assert authoritative_order_history(normalized) == normalized
+
+
+@pytest.mark.parametrize("field,value", [
+    ("environment", "PAPER"), ("account_no", "other"), ("symbol", "OTHER"),
+    ("side", OrderSide.SELL), ("quantity_requested", 72), ("broker_order_id", "exact"),
+    ("status", OrderStatus.REJECTED), ("status", OrderStatus.UNKNOWN),
+    ("remaining_quantity", 1), ("filled_quantity", 0), ("filled_quantity", -1),
+])
+def test_inconsistent_revision_keeps_original_unresolved(field, value):
+    original, revised = _revision_rows()
+    rows = [original, replace(revised, **{field: value})]
+    assert authoritative_order_history(rows) == rows
+
+
+@pytest.mark.parametrize("proof", [
+    {"orgn_odno": "other"}, {"orgn_odno": ""}, {"rvse_cncl_dvsn": "00"},
+    {"ord_dt": "20261004"}, {"ord_tmd": "000445"}, {"ord_tmd": ""},
+])
+def test_revision_needs_explicit_original_identity_and_later_broker_time(proof):
+    original, revised = _revision_rows()
+    revised = replace(revised, raw_response={**revised.raw_response, **proof})
+    rows = [original, revised]
+    assert authoritative_order_history(rows) == rows
+
+
+def test_duplicate_revision_or_conflicting_original_keeps_order_unresolved():
+    original, revised = _revision_rows()
+    for rows in ([original, revised, revised],
+                 [original, replace(original, filled_quantity=1), revised],
+                 [replace(original, remaining_quantity=1), revised]):
+        assert authoritative_order_history(rows) == rows
+
+
+def test_revision_chain_and_korean_midnight_preserve_each_order_identity():
+    original, revised = _revision_rows(OrderStatus.PARTIALLY_FILLED)
+    original.raw_response.update(ord_tmd="235900", dmst_ord_dt="20261005", thco_ord_tmd="235900")
+    revised.raw_response.update(ord_tmd="000100", dmst_ord_dt="20261006", thco_ord_tmd="000100")
+    final = replace(revised, broker_order_id="final", status=OrderStatus.FILLED, filled_quantity=73,
+                    raw_response={**revised.raw_response, "orgn_odno": "replacement",
+                                  "ord_tmd": "000200", "thco_ord_tmd": "000200"})
+    normalized = authoritative_order_history([final, original, revised])
+    assert {row.broker_order_id: row.status for row in normalized} == {
+        "exact": OrderStatus.CANCELLED, "replacement": OrderStatus.CANCELLED, "final": OrderStatus.FILLED,
+    }
