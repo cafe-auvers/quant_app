@@ -476,6 +476,16 @@ def test_unknown_submission_keeps_one_second_order_read_cadence(
     runtime, broker, _gateway, engine, market_data = _make_runtime(
         tmp_path, monkeypatch
     )
+    # This tests order-read cadence, not how quickly the CI host reaches a
+    # three-second quote deadline. Keep the existing injected clocks aligned.
+    observed_at = datetime.now(timezone.utc)
+    runtime.entry_attempt_manager._clock = lambda: observed_at
+    runtime.trading_engine._clock = lambda: observed_at
+    market_data._clock = lambda: observed_at
+    market_data._quote_fetcher = lambda symbol: QuoteSnapshot(
+        symbol=symbol, last_price=101.0, bid=100.9, ask=101.1,
+        received_at=observed_at, broker_event_at=observed_at, processed_at=observed_at,
+    )
     card = _persist_owned_card(engine, _card())
     broker.queue_timeout()
     market_data.subscribe([card.symbol])

@@ -117,6 +117,8 @@ def test_narrow_cards_resize_to_fit_wrapped_content():
     item = column.item(0)
     widget = column.itemWidget(item)
     assert widget.heightForWidth(widget.width()) <= item.sizeHint().height()
-    for label in widget.findChildren(QLabel):
+    visible_labels = [label for label in widget.findChildren(QLabel) if label.isVisibleTo(widget)]
+    assert widget._metrics_label in visible_labels
+    for label in visible_labels:
         assert label.geometry().bottom() < widget.height()
     column.close()
