@@ -910,6 +910,19 @@
       covered ? `All held shares @ ${boardMoney(row.active_stop_price)}` : 'Stop does not cover all held shares');
     if (!covered) stopFact[1] = 'Not fully covered';
     facts.push(stopFact);
+    const auto = row.nav_profit_exit || {};
+    const target = boardMoney(auto.target_profit_usd);
+    const status = auto.status || 'WAITING';
+    const labels = {
+      ARMED: Number(row.broker_quantity) >= 2 ? 'Sell ' + Math.floor(Number(row.broker_quantity) / 2) + ' shares at +' + target : 'Needs at least 2 shares',
+      SELLING: boardShares(auto.filled_quantity || 0) + ' / ' + boardShares(auto.target_quantity || 0) + ' sold',
+      DONE: 'Completed · no repeat', OVERRIDDEN: 'Manual exit override',
+      WAITING: 'Waiting for fresh account NAV', BLOCKED: 'Saved state needs review',
+    };
+    const basis = status === 'ARMED' || status === 'SELLING'
+      ? '2% NAV gross profit target · breakeven after the half-sale fills'
+      : status === 'DONE' ? 'Remaining shares follow your active stop and manual exits' : '';
+    facts.push(['Auto take-profit', labels[status] || labels.BLOCKED, {basis}]);
     return facts;
   }
 

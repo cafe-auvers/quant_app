@@ -522,6 +522,13 @@ class CanonicalPlanningSource:
             "average_entry_price": float(card.average_entry_price or 0.0),
             "stop_type": self._enum_value(card.stop_type),
             "active_stop_price": card.active_stop_price,
+            "nav_profit_exit": {
+                "status": card.nav_profit_exit.status,
+                "nav_usd": card.nav_profit_exit.nav_usd,
+                "target_profit_usd": card.nav_profit_exit.target_profit_usd,
+                "target_quantity": card.nav_profit_exit.target_quantity,
+                "filled_quantity": card.nav_profit_exit.filled_quantity,
+            },
             "stop_quantity": max(0, int(card.stop_quantity or 0)),
             "pending_stop_type": self._enum_value(card.pending_stop_type),
             "pending_stop_price": card.pending_stop_price,

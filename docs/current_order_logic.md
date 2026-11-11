@@ -435,3 +435,5 @@ Related operator documentation:
 - [Wiki Order Lifecycle](wiki/Order-Lifecycle.md)
 
 Current release reference: [Opening liquidity and mobile workflow (2026-10-08)](opening_liquidity_mobile_release_2026-10-08.md). Dated reports and archived plans retain their original scope.
+
+All held positions now use the [automatic NAV profit exit](nav_profit_exit_2026-11-11.md): one half-sale at 2% NAV gross position profit, then cost-adjusted breakeven after confirmed completion. Manual positions alone receive the default NAV safety stop; automated entries retain their strategy stop.
