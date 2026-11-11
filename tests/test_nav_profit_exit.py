@@ -31,6 +31,9 @@ from src.ui.buyboard.runtime_worker import BuyboardRuntimeWorker
 def isolate(monkeypatch, tmp_path):
     monkeypatch.setattr(repo, "LOCAL_TRADE_CARDS_FILE", tmp_path / "cards.json")
     monkeypatch.setattr(execution_config, "is_buyboard_engine_enabled", lambda: True)
+    monkeypatch.setattr("src.services.trading_state.is_trading_locked_disabled", lambda: False)
+    monkeypatch.setattr("src.services.trading_state._trading_enabled", True)
+    monkeypatch.setattr("src.services.trading_state._authoritative_provider", None)
     monkeypatch.setattr("src.ui.buyboard.runtime_worker.is_regular_session_open", lambda: True)
 
 
@@ -312,3 +315,22 @@ def test_automatic_fill_completion_uses_total_holdings_and_preserves_reserved_ru
     assert final.board_status == BoardStatus.OPEN_POSITION
     assert final.nav_profit_exit.status == "DONE"
     assert final.active_stop_price == 10.02
+
+
+@pytest.mark.parametrize("control", ["off", "shared_off", "unavailable"])
+def test_profit_threshold_does_not_queue_an_exit_while_live_control_is_disabled_or_unavailable(tmp_path, monkeypatch, control):
+    def unavailable():
+        raise RuntimeError("Canonical control unavailable")
+    if control == "off":
+        monkeypatch.setattr("src.services.trading_state._trading_enabled", False)
+    else:
+        monkeypatch.setattr("src.services.trading_state._authoritative_provider",
+                            unavailable if control == "unavailable" else lambda: False)
+    engine = create_engine(f"sqlite:///{tmp_path / 'state.db'}")
+    card = repo.create_trade_card(engine, card_for())
+    worker = worker_for(engine, QuoteSnapshot(symbol="AAPL", last_price=12.2))
+    assert not BuyboardRuntimeWorker._ensure_nav_profit_taking(worker, [card])
+    saved = repo.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert saved.nav_profit_exit.status == "ARMED"
+    assert saved.pending_partial_sell_quantity == 0
+    assert saved.board_status == BoardStatus.OPEN_POSITION

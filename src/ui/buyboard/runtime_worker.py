@@ -2160,6 +2160,7 @@ class BuyboardRuntimeWorker(QThread):
         """Latch one half-sale through the normal version/ownership fences."""
         from src.core.board_workflow import RequestPartialSell
         from src.core.nav_profit_exit import nav_profit_sell_quantity
+        from src.services.trading_state import TradingDisabledError, require_trading_enabled
         from src.services.execution_workflow_service import BoardCommandRejectedError, request_board_action
         from src.services.trade_card_repository import TradeCardNotFoundError, TradeCardVersionConflictError
 
@@ -2198,6 +2199,7 @@ class BuyboardRuntimeWorker(QThread):
                 regular_session_open=True,
             )
             try:
+                require_trading_enabled(card.environment, card.symbol)
                 request_board_action(
                     self._db_engine,
                     RequestPartialSell(
@@ -2209,7 +2211,7 @@ class BuyboardRuntimeWorker(QThread):
                     ),
                     context=context, claim_kanban_ownership=True,
                 )
-            except (BoardCommandRejectedError, TradeCardNotFoundError, TradeCardVersionConflictError):
+            except (TradingDisabledError, BoardCommandRejectedError, TradeCardNotFoundError, TradeCardVersionConflictError):
                 continue  # An operator edit or reconciliation wins; retry fresh truth.
             changed = True
             logger.info("Requested NAV profit half-sale for %s: %s shares", card.symbol, quantity)
