@@ -130,3 +130,21 @@ def test_missing_and_stale_prices_never_appear_as_fresh_profit(list_browser, sta
         assert "stale" not in pnl.nth(1).inner_text()
     assert not state["posts"] and not state["errors"]
     page.close()
+
+
+def test_poll_closes_an_exit_draft_when_the_position_enters_another_stage(list_browser):
+    page = list_browser.new_page(viewport={"width": 390, "height": 844}, is_mobile=True)
+    state = open_board(page)
+    page.get_by_role("tab", name=re.compile(r"^Open ")).click()
+    page.locator(".mobile-kanban-card").click()
+    page.get_by_role("button", name="Partial Sell", exact=True).click()
+    page.locator("#buy-board-action-value").fill("25")
+    page.locator("#buy-board-partial-price").fill("12")
+    state["rows"][0].update(board_status="PARTIAL_SELL", version=2)
+    page.clock.install()
+    page.clock.fast_forward(65_000)
+    page.wait_for_function("document.querySelector('#buy-board-action-stage').textContent === 'Partial Sell'")
+    assert page.locator("#buy-board-action-input").is_hidden()
+    assert page.locator("#buy-board-exit-preview").is_hidden()
+    assert not state["posts"] and not state["errors"]
+    page.close()

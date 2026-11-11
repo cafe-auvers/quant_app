@@ -1212,6 +1212,13 @@
       return;
     }
     const stage = kanbanColumn(row.board_status);
+    const editor = byId('buy-board-action-input');
+    if (!editor.hidden) {
+      const stillEditable = editor.dataset.action === 'request_partial_sell'
+        ? row.board_status === 'OPEN_POSITION'
+        : ['OPEN_POSITION', 'PARTIAL_SELL'].includes(row.board_status);
+      if (!stillEditable) editor.hidden = true;
+    }
     byId('buy-board-action-stage').textContent = stage.title;
     byId('buy-board-action-symbol').textContent = row.symbol;
     byId('buy-board-action-name').textContent = row.name || row.symbol;
