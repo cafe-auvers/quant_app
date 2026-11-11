@@ -1158,11 +1158,11 @@ def test_discovered_manual_default_is_enrolled_installed_and_triggers_full_exit(
     worker._run_one_cycle()
 
     saved = repo.get_trade_card(engine, "PROD", "1", "AAPL")
-    assert saved.active_stop_price == 98
+    assert saved.active_stop_price == 99
     assert saved.stop_quantity == 10
     assert saved.pending_stop_command_id == ""
     assert "AUTO_MANUAL_STOP_PENDING" not in saved.warnings
-    assert worker._market_stop_signatures[saved.card_key] == ("MANUAL_PRICE", 98.0, 10)
+    assert worker._market_stop_signatures[saved.card_key] == ("MANUAL_PRICE", 99.0, 10)
 
     initiations = []
     real_initiate = worker.runtime.trading_engine._initiate_sell_all
@@ -1172,12 +1172,12 @@ def test_discovered_manual_default_is_enrolled_installed_and_triggers_full_exit(
         return real_initiate(current, **kwargs)
 
     monkeypatch.setattr(worker.runtime.trading_engine, "_initiate_sell_all", record_initiation)
-    for price in (99.0, 98.01, 98.0, 94.0):
+    for price in (100.0, 99.01, 99.0, 94.0):
         worker.runtime.trading_engine.evaluate_quote([saved], QuoteSnapshot(
             symbol="AAPL", last_price=price, regular_session=True,
             broker_event_at=now, received_at=now, processed_at=now,
         ))
-        if price > 98 and not initiations:
+        if price > 99 and not initiations:
             assert saved.board_status == BoardStatus.OPEN_POSITION
     assert initiations == [saved.card_key]
     assert saved.board_status == BoardStatus.SELL_ALL

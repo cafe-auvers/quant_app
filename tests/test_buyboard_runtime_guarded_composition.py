@@ -1526,7 +1526,7 @@ def test_automatic_manual_default_can_submit_guarded_stop_loss_without_user_acti
     assert card.acknowledge_pending_stop_change()
     trade_card_repository.update_trade_card(engine, card, expected_version=card.version)
     market_data.subscribe([card.symbol])
-    market_data._quote_fetcher = lambda symbol: QuoteSnapshot(symbol=symbol, last_price=98.01)
+    market_data._quote_fetcher = lambda symbol: QuoteSnapshot(symbol=symbol, last_price=99.01)
     market_data.poll_once()
     runtime.trading_engine.evaluate_quote([card], market_data.latest_quote(card.symbol))
     runtime.trading_engine.run_heartbeat([card])
