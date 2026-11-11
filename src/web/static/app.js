@@ -986,7 +986,7 @@
     grid.className = 'mobile-kanban-card-details';
     const position = ['OPEN_POSITION', 'PARTIAL_SELL', 'SELL_ALL'].includes(row.board_status);
     const visibleFacts = position ? details.facts.filter(([label, _value, options]) =>
-      options?.pnl || ['Price', 'Active stop', 'To stop'].includes(label)) : details.facts;
+      options?.pnl || ['Price', 'Active stop', 'To stop', 'Auto take-profit'].includes(label)) : details.facts;
     grid.append(...visibleFacts.map(([label, value, options]) => boardFact(label, value, options)));
     const priceNote = document.createElement('span');
     priceNote.className = 'mobile-kanban-price-note';

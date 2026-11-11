@@ -35,6 +35,7 @@ def test_mobile_projection_exposes_target_progress_without_private_order_identit
     from src.web.canonical_planning import CanonicalPlanningSource
 
     source = object.__new__(CanonicalPlanningSource)
+    source.engine = None
     state = NavProfitExitState(cycle_id="private-cycle", nav_usd=11000, target_profit_usd=220,
         status="SELLING", target_quantity=50, fills={"private-order": 20})
     card = TradeCardState(environment="PROD", account_no="private-account", symbol="AAPL", nav_profit_exit=state)
