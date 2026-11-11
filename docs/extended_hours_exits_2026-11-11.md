@@ -29,6 +29,12 @@ upgrade/withdrawal requires it. Replacement waits for confirmed cancellation and
 fresh holdings. Unknown identities, conflicting external orders and unresolved
 cancellations continue to fence duplicate sells.
 
+After a manual KIS sale closes a position, a later complete reconciliation also
+withdraws any remaining exact app-owned sell reservation. It requires the prior
+durable closed state, current zero holdings, complete order/history evidence and
+no new working buy. Adopted or ambiguous orders and pending cancellations remain
+under their existing permission and recovery rules.
+
 App stops require Live Trading ON, the active PC and a functioning live feed.
 The 2% NAV amount sets the initial manual stop level, not a guaranteed maximum
 loss. Limit orders, gaps, liquidity and fees can change realized P&L.
