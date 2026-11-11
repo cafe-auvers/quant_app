@@ -200,6 +200,7 @@ def _capture_real_kanban_exit_command(
         market_data=market_data,
     )
     runtime.trading_engine._market_is_open_fn = lambda: regular_session_open
+    runtime.trading_engine._exit_market_is_open_fn = lambda: regular_session_open
     result = runtime.trading_engine._position_callbacks.submit_sell_order(
         environment=card.environment,
         account_no=card.account_no,
@@ -430,7 +431,7 @@ def test_l3_stop_change_produces_the_same_protective_domain_state(
     )
 
 
-def test_l3_premarket_sell_all_produces_the_same_next_open_intent(
+def test_l3_closed_session_sell_all_produces_the_same_next_open_intent(
     tmp_path, monkeypatch
 ):
     legacy_commands = []
@@ -525,6 +526,7 @@ def test_l3_premarket_sell_all_produces_the_same_next_open_intent(
         market_data=market_data,
     )
     runtime.trading_engine._market_is_open_fn = lambda: False
+    runtime.trading_engine._exit_market_is_open_fn = lambda: False
     runtime.trading_engine.run_heartbeat([kanban])
 
     assert len(legacy_commands) == len(kanban_commands) == 1
