@@ -2197,11 +2197,7 @@ class TradingEngine:
                         # has reached its terminal reconciliation boundary.
                         # Refresh holdings before returning to Open so a
                         # fill that raced the cancel is never hidden.
-                        if card.nav_profit_exit.status == "SELLING":
-                    # The account reducer has complete holdings and cumulative fills;
-                    # orderable shares alone cannot establish the remaining position.
-                    continue
-                remaining = self._position_callbacks.refresh_orderable_quantity(
+                        remaining = self._position_callbacks.refresh_orderable_quantity(
                             card.environment, card.account_no, card.symbol
                         )
                         self._complete_partial_exit(card, remaining)
@@ -2227,6 +2223,10 @@ class TradingEngine:
                         force=card.pending_partial_sell_quantity <= 0,
                     ):
                         changed.append(card)
+                    continue
+                if card.nav_profit_exit.status == "SELLING":
+                    # Complete account holdings, rather than free shares, establish
+                    # the runner and retire automatic attempts in the reducer.
                     continue
                 remaining = self._position_callbacks.refresh_orderable_quantity(
                     card.environment, card.account_no, card.symbol
