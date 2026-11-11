@@ -682,6 +682,63 @@ def test_repeated_account_generations_do_not_cancel_a_full_working_sell():
             execution_orders=plan.order_updates or state.execution_orders)
 
 
+@pytest.mark.parametrize("policy", ["REGULAR_LIMIT", RESERVED_MOO_EXECUTION])
+def test_manually_flat_position_cancels_only_its_leftover_app_exit(policy):
+    card = _card(board_status=BoardStatus.CLOSED, broker_quantity=0,
+                 position_runtime_status=PositionRuntimeStatus.CLOSED)
+    sell = _order(side=OrderSide.SELL, intent=OrderIntent.MANUAL_EXIT,
+                  execution_policy=policy, status=ExecutionOrderStatus.ACKNOWLEDGED,
+                  capital_reservation_id="")
+    broker = BrokerOrderStatusSnapshot(environment="PROD", account_no="1", symbol="AAPL",
+        broker_order_id="B-1", side=OrderSide.SELL, status=OrderStatus.ACCEPTED,
+        quantity_requested=10, remaining_quantity=10)
+    plan = reduce_account_reconciliation(_snapshot(orders=(broker,)),
+        AccountLocalState(cards=(card,), execution_orders=(sell,)))
+    assert len(plan.commands) == 1
+    assert plan.commands[0].command_type == ReconciliationCommandType.CANCEL_KNOWN_ORDER
+    assert plan.commands[0].client_order_id == sell.client_order_id
+    assert plan.commands[0].quantity == 0
+
+
+@pytest.mark.parametrize("change", ["first_empty", "holdings_incomplete", "history_incomplete",
+    "orders_incomplete", "reservations_incomplete", "cancel_pending", "recovery_pending", "new_buy", "adopted", "ambiguous"])
+def test_orphan_exit_cancel_waits_for_unambiguous_complete_flat_evidence(change):
+    card = _card(board_status=BoardStatus.CLOSED, broker_quantity=0,
+                 position_runtime_status=PositionRuntimeStatus.CLOSED)
+    sell = _order(side=OrderSide.SELL, intent=OrderIntent.MANUAL_EXIT,
+        execution_policy=RESERVED_MOO_EXECUTION, status=ExecutionOrderStatus.ACKNOWLEDGED,
+        capital_reservation_id="")
+    broker = BrokerOrderStatusSnapshot(environment="PROD", account_no="1", symbol="AAPL",
+        broker_order_id="B-1", side=OrderSide.SELL, status=OrderStatus.ACCEPTED,
+        quantity_requested=10, remaining_quantity=10)
+    complete = _completeness(**{
+        "holdings_incomplete":{"holdings_complete":False},
+        "history_incomplete":{"history_complete":False},
+        "orders_incomplete":{"open_orders_complete":False},
+        "reservations_incomplete":{"reserved_orders_complete":False},
+    }.get(change, {}))
+    snapshots = [broker]
+    if change == "first_empty":
+        card.board_status = BoardStatus.OPEN_POSITION
+        card.position_runtime_status = PositionRuntimeStatus.OPEN
+        card.broker_quantity = 10
+    elif change == "cancel_pending":
+        sell.status = ExecutionOrderStatus.CANCEL_PENDING
+    elif change == "recovery_pending":
+        sell.recovery_state = OrderRecoveryState.DISCOVERING
+    elif change == "adopted":
+        sell.origin = OrderOrigin.USER_ADOPTED
+        sell.adopted_from_external_order_id = "user-adopted-order"
+    elif change == "ambiguous":
+        sell.broker_identity_status = BrokerIdentityStatus.AMBIGUOUS
+    elif change == "new_buy":
+        snapshots.append(BrokerOrderStatusSnapshot(environment="PROD", account_no="1", symbol="AAPL",
+            broker_order_id="NEW-BUY", side=OrderSide.BUY, status=OrderStatus.WORKING, quantity_requested=10))
+    plan = reduce_account_reconciliation(_snapshot(orders=tuple(snapshots), completeness=complete),
+        AccountLocalState(cards=(card,), execution_orders=(sell,)))
+    assert not any(c.command_type == ReconciliationCommandType.CANCEL_KNOWN_ORDER for c in plan.commands)
+
+
 def test_emergency_sell_all_uses_broker_sellable_quantity_when_outstanding_is_uncertain():
     snapshot = _snapshot(
         holdings=(_holding(sellable_quantity=7),),

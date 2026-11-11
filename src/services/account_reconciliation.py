@@ -489,7 +489,12 @@ def classify_execution_order(
     if order.side == OrderSide.SELL:
         if order.intent == OrderIntent.STOP_LOSS:
             return ReconciliationCategory.STOP_LOSS_SELL
-        if card is not None and card.board_status == BoardStatus.SELL_ALL:
+        if card is not None and (
+            card.board_status == BoardStatus.SELL_ALL
+            or (order.intent == OrderIntent.MANUAL_EXIT
+                and card.position_runtime_status == PositionRuntimeStatus.CLOSED
+                and card.broker_quantity == 0)
+        ):
             return ReconciliationCategory.SELL_ALL
     return ReconciliationCategory.UNRECOGNIZED
 
@@ -2132,6 +2137,45 @@ def reduce_account_reconciliation(
 
     # Capital mismatches are explicit categories, never silent repairs.
     live_orders = [order for order in orders if order.status in _OPEN_EXECUTION_STATUSES]
+    # A manual KIS sale can flatten the position while an app reservation is
+    # still accepted. Require the prior durable closed state plus a fresh,
+    # complete broker snapshot; never leave that old exit attached to a later buy.
+    previously_closed = {
+        card.symbol for card in original_cards
+        if card.position_runtime_status == PositionRuntimeStatus.CLOSED
+        and card.broker_quantity == 0
+    }
+    pending_exit_mutations = {
+        order.client_order_id for order in original_orders
+        if order.status == ExecutionOrderStatus.CANCEL_PENDING
+        or order.recovery_state != OrderRecoveryState.NONE
+    }
+    for order in live_orders:
+        if (
+            order.symbol not in previously_closed
+            or snapshot.holding_for(order.symbol) is not None
+            or not snapshot.completeness.allows(ReconciliationAction.TERMINAL_ORDER_CONCLUSION)
+            or (order.execution_policy == RESERVED_MOO_EXECUTION and not snapshot.completeness.reserved_orders_complete)
+            or order.side != OrderSide.SELL
+            or order.origin != OrderOrigin.APPLICATION
+            or order.broker_identity_status != BrokerIdentityStatus.EXACT
+            or order.status == ExecutionOrderStatus.CANCEL_PENDING
+            or order.recovery_state != OrderRecoveryState.NONE
+            or order.client_order_id in pending_exit_mutations
+            or any(row.symbol == order.symbol and row.side == OrderSide.BUY
+                   and is_open_status(row.status) for row in snapshot.orders)
+        ):
+            continue
+        broker_row = snapshot.order_for_broker_id(order.broker_order_id)
+        if (broker_row is None or broker_row.symbol != order.symbol
+                or broker_row.side != OrderSide.SELL or not is_open_status(broker_row.status)):
+            continue
+        commands.append(ReconciliationCommand(
+            ReconciliationCommandType.CANCEL_KNOWN_ORDER,
+            snapshot.environment, snapshot.account_no, order.symbol,
+            client_order_id=order.client_order_id,
+            reason="Withdraw app-owned exit after prior and current broker truth confirm flat",
+        ))
     referenced_reservations = {
         order.capital_reservation_id
         for order in orders
