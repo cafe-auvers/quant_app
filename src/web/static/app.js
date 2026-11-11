@@ -68,6 +68,7 @@
     monitorLoading: false,
     monitorError: '',
     monitorPositionError: '',
+    monitorHistoryError: '',
     monitorAsOf: null,
     monitorEnabled: null,
     monitorTimer: null,
@@ -3048,6 +3049,11 @@
   }
 
   function listEmptyMessage() {
+    if (state.listMode === 'monitor' && state.monitorFilter === 'strong_today') {
+      return state.monitorRows.some(row => row.condition_history?.reconstruction?.status === 'CHECKING')
+        ? 'Checking the earlier session for Strong conditions. Live observations remain available.'
+        : 'No matching Strong readings found in the available live and reconstructed history.';
+    }
     if (state.listMode !== 'history') return 'No stocks in this list.';
     if (state.historyLoading) return 'Loading watchlist history...';
     if (state.historyError) return state.historyError;
@@ -3084,8 +3090,9 @@
   }
 
   function monitoringRows() {
+    const historyDay = new Intl.DateTimeFormat('en-CA', {timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit'}).format(new Date());
     const cached = new Map(state.monitorRows.map(row => [row.symbol, row]));
-    const members = new Map();
+    const members = new Map(state.monitorRows.filter(row => row.historical_watchlist_member).map(row => [row.symbol, {...row}]));
     state.planningRows.forEach(row => {
       if (row.watchlist_member || row.buylist_member || row.buy_today_member) members.set(row.symbol, {...row});
     });
@@ -3094,16 +3101,20 @@
       const quote = cached.get(card.symbol) || {};
       const changedLevel = normalizeBreakoutPrice(quote.breakout_price) !== normalizeBreakoutPrice(card.breakout_price);
       const result = {...quote, ...card};
+      if (result.condition_history?.session_date !== historyDay) result.condition_history = {};
       const active = ['REGULAR', 'PRE_MARKET', 'AFTER_HOURS'].includes(state.session?.market_status?.phase);
       const age = quote.quote_as_of ? (Date.now() - new Date(quote.quote_as_of).getTime()) / 1000 : Infinity;
       const stale = Boolean(state.monitorError) || quote.quote_status === 'STALE' || (active && age > state.monitorStaleSeconds);
       if (stale) result.quote_status = quote.current_price ? 'STALE' : 'UNAVAILABLE';
       if (changedLevel) {
+        result.early_review = {active: false};
+        result.condition_history = {};
         result.breakout_status = normalizeBreakoutPrice(card.breakout_price) === null ? 'NO_LEVEL' : 'UNKNOWN';
         result.broke_out_today = null;
         result.orb = [];
         result.momentum = {status: 'UNAVAILABLE', reason: 'Breakout level changed; waiting for a refreshed rank'};
       } else if (stale) {
+        result.early_review = {...result.early_review, active: false};
         result.breakout_status = normalizeBreakoutPrice(card.breakout_price) === null ? 'NO_LEVEL' : 'UNKNOWN';
         result.broke_out_today = null;
         const sessionDay = new Intl.DateTimeFormat('en-CA', {timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit'}).format(new Date());
@@ -3112,12 +3123,16 @@
       }
       return result;
     }).filter(row => {
+      if (normalizeBreakoutPrice(row.breakout_price) === null) return false;
       if (state.monitorQuery && !`${row.symbol} ${row.name || ''}`.toLowerCase().includes(state.monitorQuery)) return false;
-      if (state.monitorFilter === 'breakouts') return row.broke_out_today === true;
-      if (state.monitorFilter === 'orb') return Boolean(bestMonitorOrb(row));
+      if (state.monitorFilter === 'breakouts') return monitorBrokeOut(row);
+      if (state.monitorFilter === 'orb') return monitorBrokeOut(row) && Boolean(bestMonitorOrb(row));
+      if (state.monitorFilter === 'early') return Boolean(row.early_review?.active || row.condition_history?.first_early);
+      if (state.monitorFilter === 'strong') return monitorBrokeOut(row) && Boolean(bestMonitorOrb(row)) && monitorCondition(monitorMomentum(row)).tone === 'GOOD';
+      if (state.monitorFilter === 'strong_today') return Boolean(monitorFirstStrong(row));
       if (state.monitorFilter === 'today') return Boolean(row.buy_today_member);
       return true;
-    }).sort((a, b) => (state.monitorFilter === 'orb' ? compareMonitorMomentum(a, b) : 0) || (
+    }).sort((a, b) => (state.monitorFilter === 'strong_today' ? new Date(monitorFirstStrong(a).observed_at) - new Date(monitorFirstStrong(b).observed_at) : 0) || (state.monitorFilter === 'early' ? Number(Boolean(b.early_review?.active)) - Number(Boolean(a.early_review?.active)) : 0) || Number(monitorCondition(monitorMomentum(b)).tone === 'GOOD') - Number(monitorCondition(monitorMomentum(a)).tone === 'GOOD') || compareMonitorMomentum(a, b) || (
       Number(Boolean(b.broke_out_today)) - Number(Boolean(a.broke_out_today))
       || Number(Boolean(bestMonitorOrb(b))) - Number(Boolean(bestMonitorOrb(a)))
       || (monitorNumber(b.change_percent) ?? -Infinity) - (monitorNumber(a.change_percent) ?? -Infinity)
@@ -3129,6 +3144,14 @@
     if (value === null || value === undefined || value === '') return null;
     const number = Number(value);
     return Number.isFinite(number) ? number : null;
+  }
+
+  function monitorFirstStrong(row) {
+    const history = row.condition_history;
+    const replay = history?.reconstruction;
+    return [history?.first_strong, replay?.status === 'COMPLETE' ? replay.first_strong : null]
+      .filter(event => event?.observed_at)
+      .sort((a, b) => new Date(a.observed_at) - new Date(b.observed_at))[0] || null;
   }
 
   function monitorMomentum(row) {
@@ -3166,10 +3189,22 @@
     return momentum.assessment || {label: 'Check data', tone: 'UNKNOWN', reasons: ['Waiting for condition assessment'], metrics: {}};
   }
 
+  function monitorEfficiency(momentum) {
+    const window = {
+      value: momentum.directional_efficiency, minutes: momentum.efficiency_minutes,
+      estimated: momentum.efficiency_estimated,
+      warming_up: momentum.efficiency_warming_up, reason: momentum.efficiency_reason,
+    };
+    const value = monitorNumber(momentum.score) === null ? null : monitorNumber(window.value);
+    return {...window, value, rating: value === null ? 'UNKNOWN' : value >= .4 ? 'GOOD' : value >= .2 ? 'NORMAL' : 'BAD',
+      prefix: window.estimated || window.warming_up ? '~' : '',
+      title: `${window.reason || 'Efficiency unavailable'}.${window.warming_up ? ` Actual window: ${window.minutes} completed minutes.` : ''} Green ≥ +0.40; white +0.20 to < +0.40; red < +0.20, including downward action.`};
+  }
+
   function renderMonitorMomentumDetail() {
     const panel = byId('mobile-momentum-detail');
     const row = state.visibleRows.find(item => item.symbol === state.monitorMomentumSymbol);
-    panel.hidden = state.listMode !== 'monitor' || state.monitorFilter !== 'orb' || !row;
+    panel.hidden = state.listMode !== 'monitor' || !row;
     if (panel.hidden) return;
     const momentum = monitorMomentum(row);
     const score = monitorNumber(momentum.score);
@@ -3185,14 +3220,28 @@
       const number = monitorNumber(value);
       return number === null ? '—' : `${signed && number >= 0 ? '+' : ''}${number.toFixed(2)}${suffix}`;
     };
+    const history = row.condition_history;
+    const time = event => event?.observed_at ? new Date(event.observed_at).toLocaleTimeString('en-US', {timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit'}) : 'not observed';
+    const firstStrong = monitorFirstStrong(row);
+    const replay = history?.reconstruction;
+    byId('mobile-momentum-history').textContent = history?.observed_from
+      ? `History: first ORB ${time(history.first_orb)} ET; first early review ${time(history.first_early)} ET; first Strong ${time(firstStrong)} ET${firstStrong?.kind === 'RECONSTRUCTED' ? ' (reconstructed)' : ''}; first Extended ${time(history.first_extended)} ET. First live Strong ${time(history.first_strong)} ET. Live recording began ${time({observed_at: history.observed_from})} ET. ${(history.events || []).map(event => `${time(event)} ${event.condition}${event.early ? ' (early review)' : ''}`).join(' → ')}`
+      : 'Live condition history starts when monitoring begins.';
+    if (replay?.status === 'CHECKING') byId('mobile-momentum-history').textContent += ' Checking earlier session bars in the background.';
+    else if (replay?.status === 'COMPLETE') {
+      byId('mobile-momentum-history').textContent += ` Historical replay: ${replay.strong_minutes} Strong minute readings through ${time({observed_at: replay.checked_through})} ET. ${(replay.intervals || []).map(window => `${time({observed_at: window.from})}–${time({observed_at: window.to})} ET`).join('; ')}. ${replay.first_strong ? `First reconstructed ER ${format(replay.first_strong.er)}; RVOL ${format(replay.first_strong.rvol, 'x')}. ` : ''}${replay.uncertain_candidates ? `${replay.uncertain_candidates} candidate minutes had incomplete or estimated data. ` : ''}${replay.assumptions || ''}`;
+    } else if (replay?.reason) byId('mobile-momentum-history').textContent += ` Historical replay: ${replay.reason}.`;
     const signals = byId('mobile-momentum-signals');
     signals.replaceChildren();
     signals.hidden = score === null;
     if (score !== null) {
+      const efficiency = monitorEfficiency(momentum);
       for (const [label, value, rating, title] of [
         [`Sector · ${momentum.sector_symbol || '?'}`, format(momentum.rs_sector_pp, ' pp', true), condition.metrics.sector, momentum.sector_reason || `${momentum.sector_name}: stock minus sector ETF, 09:30 ET to the identical completed minute`],
         ['Price vs VWAP', `${momentum.bar_coverage_percent < 100 ? '~' : ''}${format(momentum.vwap_distance_percent, '%', true)}`, condition.metrics.vwap, `Price ${format(momentum.signal_price, '')} / VWAP ${format(momentum.vwap, '')}; distance ${format(momentum.vwap_distance_adr, ' ADR', true)}`],
-        [`Efficiency · ${momentum.efficiency_minutes || 30}m`, `${momentum.efficiency_warming_up ? '~' : ''}${format(momentum.directional_efficiency, '', true)}`, condition.metrics.efficiency, momentum.efficiency_reason || 'Signed efficiency unavailable'],
+        [`Current ER · ${efficiency.minutes || 0}m since open`,
+          `${efficiency.value === null ? '' : efficiency.prefix}${format(efficiency.value, '', true)}`,
+          efficiency.rating, efficiency.title],
       ]) {
         const card = document.createElement('div');
         card.title = title;
@@ -3212,9 +3261,10 @@
       `Range position ${format(momentum.range_location_percent, '%')}`,
       `Entry ${format(momentum.entry_extension_adr, ' ADR', true)} (${momentum.entry_window})`,
       ...(momentum.bar_coverage_percent === undefined ? [] : [`Reported minutes ${format(momentum.bar_coverage_percent, '%')}`]),
+      ...(row.minute_repair ? [`Verified zero-volume minutes ${row.minute_repair.verified_zero_volume_minutes}; remaining checked gaps ${row.minute_repair.remaining_gaps}`] : []),
     ].join(' · ');
     byId('mobile-momentum-reason').textContent = [momentum.reason, momentum.sector_reason,
-      momentum.directional_efficiency === null || momentum.efficiency_warming_up ? momentum.efficiency_reason : '',
+      momentum.directional_efficiency === null || momentum.efficiency_warming_up || momentum.efficiency_estimated ? momentum.efficiency_reason : '',
       momentum.as_of ? `Completed bars through ${new Date(momentum.as_of).toLocaleTimeString('en-US', {timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit'})} ET` : '',
     ].filter(Boolean).join(' · ');
     const components = momentum.components;
@@ -3228,6 +3278,12 @@
       && orb.position_status === 'PASS' && orb.liquidity_status === 'PASS')
       .sort((a, b) => (monitorNumber(b.score) ?? 0) - (monitorNumber(a.score) ?? 0)
         || ['1m', '5m', '30m'].indexOf(a.window) - ['1m', '5m', '30m'].indexOf(b.window))[0] || null;
+  }
+
+  function monitorBrokeOut(row) {
+    return row.broke_out_today === true || (row.quote_status === 'STALE'
+      && row.orb_session_date === new Intl.DateTimeFormat('en-CA', {timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit'}).format(new Date(Date.now()))
+      && Boolean(bestMonitorOrb(row)));
   }
 
   function monitorOrbSummary(row) {
@@ -3283,7 +3339,7 @@
     stock.title = `${row.name || row.symbol} · ${row.current_price ? `$${row.current_price}` : 'Price unavailable'} · ${row.quote_status || 'UNAVAILABLE'}${row.quote_as_of ? ` · ${new Date(row.quote_as_of).toLocaleTimeString('en-US', {timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit'})} ET` : ''}`;
     stock.setAttribute('aria-label', `Open ${row.symbol} chart — ${row.name || row.symbol}`);
     identity.appendChild(stock);
-    if (state.monitorFilter === 'orb') {
+    {
       const momentum = monitorMomentum(row);
       const score = monitorNumber(momentum.score);
       const condition = monitorCondition(momentum);
@@ -3301,6 +3357,16 @@
         renderMobileStockList();
       });
       assessment.appendChild(badge);
+      const history = row.condition_history;
+      const clock = event => event?.observed_at ? new Date(event.observed_at).toLocaleTimeString('en-US', {timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit'}) : '—';
+      const first = cell('', 'mobile-monitor-history', history?.source || 'Live observation history starts when monitoring begins');
+      const firstStrong = monitorFirstStrong(row);
+      const firstCondition = document.createElement('div');
+      firstCondition.textContent = firstStrong ? `Strong ${clock(firstStrong)}` : `ORB ${clock(history?.first_orb)}`;
+      const firstEarly = document.createElement('div');
+      firstEarly.textContent = firstStrong?.kind === 'RECONSTRUCTED' ? 'Reconstructed' : `Early ${clock(history?.first_early)}${row.early_review?.active ? ' · now' : history?.first_early ? ' · earlier' : ''}`;
+      if (firstStrong?.kind === 'RECONSTRUCTED') first.title = history.reconstruction.assumptions || 'Reconstructed from historical bars; actual earlier screen labels were not recorded';
+      first.append(firstCondition, firstEarly);
       const rank = cell('', 'mobile-monitor-momentum', momentum.reason || '');
       rank.dataset.status = momentum.status;
       const inspect = document.createElement('button');
@@ -3338,8 +3404,11 @@
         momentum.sector_reason || `Stock minus ${momentum.sector_name} ETF ${momentum.sector_symbol}, same 09:30 ET open and completed minute as RS/SPY. Green ≥ +0.5 pp; white 0 to < +0.5; red < 0.`);
       extra('vwap_distance_percent', '%', 'mobile-monitor-vwap', 'vwap',
         'Completed stock price versus regular-session VWAP. Green above; white at VWAP; red below or > 0.5 ADR above VWAP.', momentum.bar_coverage_percent < 100 ? '~' : '');
-      extra('directional_efficiency', '', 'mobile-monitor-efficiency', 'efficiency',
-        `${momentum.efficiency_reason || 'Signed efficiency unavailable'}. Green ≥ +0.40; white +0.20 to < +0.40; red < +0.20, including negative/downward action.`, momentum.efficiency_warming_up ? '~' : '');
+      const efficiency = monitorEfficiency(momentum);
+      const efficiencyCell = cell(efficiency.value === null ? '—' : `${efficiency.prefix}${efficiency.value >= 0 ? '+' : ''}${efficiency.value.toFixed(2)}`,
+        'mobile-monitor-efficiency mobile-monitor-er-current', efficiency.title);
+      efficiencyCell.dataset.rating = efficiency.rating;
+      efficiencyCell.setAttribute('aria-label', `Current ER since open: ${efficiencyCell.textContent}, ${efficiency.rating}`);
     }
     const percent = (key, title) => {
       const value = monitorNumber(row[key]);
@@ -3382,7 +3451,8 @@
     });
     action.appendChild(addToday);
     stock.addEventListener('click', () => {
-      byId('mobile-list-popover').hidden = true;
+      if (compactLayout.matches) byId('mobile-list-popover').hidden = true;
+      else activateListMode('watchlist');
       byId('mobile-list-menu').setAttribute('aria-expanded', 'false');
       void selectSymbol(row.symbol);
     });
@@ -3390,7 +3460,7 @@
   }
 
   async function loadIntradayMonitor() {
-    if (state.monitorLoading || !state.session || !compactLayout.matches || document.hidden) return;
+    if (state.monitorLoading || !state.session || document.hidden) return;
     state.monitorLoading = true;
     if (state.monitorRetryTimer !== null) window.clearTimeout(state.monitorRetryTimer);
     state.monitorRetryTimer = null;
@@ -3404,6 +3474,7 @@
       state.monitorStaleSeconds = Number(result.stale_seconds || 180);
       state.monitorError = result.error || '';
       state.monitorPositionError = result.position_context_error || '';
+      state.monitorHistoryError = result.history_error || '';
     } catch (error) {
       state.monitorError = error.name === 'AbortError'
         ? 'Price check timed out · retrying on the next check'
@@ -3429,7 +3500,18 @@
 
   function renderMobileStockList() {
     const list = byId('mobile-list-items');
-    if (!compactLayout.matches) {
+    const panel = byId('desktop-monitor-panel');
+    const popover = byId('mobile-list-popover');
+    const desktopMonitor = !compactLayout.matches && state.listMode === 'monitor';
+    const parent = compactLayout.matches ? byId('mobile-list-menu').parentElement : panel;
+    if (popover.parentElement !== parent) {
+      parent.appendChild(popover);
+      popover.hidden = !desktopMonitor;
+    }
+    panel.hidden = !desktopMonitor;
+    byId('desktop-monitor-open').setAttribute('aria-expanded', String(desktopMonitor));
+    if (desktopMonitor) popover.hidden = false;
+    if (!compactLayout.matches && !desktopMonitor) {
       list.replaceChildren();
       return;
     }
@@ -3441,18 +3523,17 @@
     if (monitor) {
       const table = document.createElement('table');
       table.className = 'mobile-monitor-table';
-      const ranked = state.monitorFilter === 'orb';
-      table.classList.toggle('momentum-table', ranked);
+      table.classList.add('momentum-table');
       table.setAttribute('aria-label', 'Watchlist breakout monitor');
       const header = table.createTHead().insertRow();
-      const columns = ranked ? ['Stock', 'Condition', 'Momentum', 'RS/SPY pp', 'RVOL', 'Sector pp', 'vs VWAP', 'ER 30m', 'Today %', 'Breakout', 'Best ORB', '1M %', '3M %', '+']
-        : ['Stock', 'Today %', 'Breakout', 'Best ORB', '1M %', '3M %', '+'];
+      const columns = ['Stock', 'Condition', 'First seen · ET', 'Momentum', 'RS/SPY pp', 'RVOL', 'Sector pp', 'vs VWAP', 'Current ER', 'Today %', 'Breakout', 'Best ORB', '1M %', '3M %', '+'];
       columns.forEach((label, index) => {
         const cell = document.createElement('th');
         cell.scope = 'col';
         cell.textContent = label;
         if (label === 'Momentum') cell.title = 'Advisory score out of 100; Leading candidates first. Tap a score for its reasons.';
         if (label === 'Condition') cell.title = 'Absolute checks independent of rank. Even #1 can be Weak or Extended. Tap for reasons.';
+        if (label === 'Current ER') cell.title = 'Signed progress from the 09:30 ET open / total absolute minute-close changes through the latest completed minute.';
         if (index === columns.length - 1) cell.setAttribute('aria-label', 'Add to Buy Today');
         header.appendChild(cell);
       });
@@ -3474,21 +3555,30 @@
     byId('mobile-list-count').textContent = String(state.visibleRows.length);
     byId('mobile-monitor-controls').hidden = !monitor;
     byId('mobile-monitor-status').hidden = !monitor;
-    byId('mobile-momentum-help').hidden = !monitor || state.monitorFilter !== 'orb';
-    byId('mobile-momentum-legend').hidden = !monitor || state.monitorFilter !== 'orb';
+    byId('mobile-momentum-help').hidden = !monitor;
+    byId('mobile-momentum-legend').hidden = !monitor;
     renderMonitorMomentumDetail();
     const leadingCount = state.visibleRows.filter(row => monitorMomentum(row).candidate).length;
     const rankedCount = state.visibleRows.filter(row => monitorNumber(monitorMomentum(row).score) !== null).length;
     const sessionRanks = state.visibleRows.some(row => monitorMomentum(row).session_closed);
     const strongCount = state.visibleRows.filter(row => monitorCondition(monitorMomentum(row)).tone === 'GOOD').length;
-    byId('mobile-monitor-status').textContent = state.monitorError || (state.monitorEnabled === false
-      ? 'Sandbox · intraday quotes are available in Connected mode'
-      : state.monitorAsOf ? monitorMarketClosed()
-        ? 'Market closed · showing latest available prices. ORB checks resume next session.'
-        : state.monitorFilter === 'orb'
-          ? `${sessionRanks ? 'Session ended · closing conditions for review' : `${strongCount} Strong · ${leadingCount} Leading`}. ${rankedCount} ranked. ${strongCount ? 'Rank is relative; check Condition.' : 'No Strong setups in this view.'} * = estimated or partial data. Tap a condition for reasons. Yahoo data may be delayed. Swipe for all columns.`
-          : `All watchlists · checks every minute · Yahoo quotes may be delayed. 1M / 3M = months. Swipe for all columns. * = earlier pass, stale quote.${state.monitorPositionError ? ` ${state.monitorPositionError}` : ''}`
-      : 'Checking prices · Watchlist + Buylist + Buy Today');
+    const status = byId('mobile-monitor-status');
+    const lastUpdate = state.monitorAsOf ? new Date(state.monitorAsOf).toLocaleTimeString('en-US', {timeZone: 'America/New_York'}) : '';
+    status.textContent = state.monitorError || (state.monitorEnabled === false
+      ? 'Sandbox \u00b7 intraday quotes are available in Connected mode'
+      : !state.monitorAsOf ? 'Checking prices'
+        : monitorMarketClosed() ? 'Market closed \u00b7 showing latest available prices. ORB checks resume next session.'
+          : `${sessionRanks ? 'Session ended \u00b7 closing conditions for review' : `${strongCount} Strong \u00b7 ${leadingCount} Leading`}. ${rankedCount} ranked. ${strongCount ? 'Rank is relative; check Condition.' : 'No Strong setups in this view.'} * = estimated or partial data. Tap a condition for reasons. Yahoo data may be delayed. Swipe for all columns.`);
+    if (state.monitorFilter === 'strong_today' && !state.monitorError && state.monitorEnabled !== false && state.monitorAsOf) {
+      status.textContent = `${state.visibleRows.length} stocks qualified Strong today; ${strongCount} Strong now. Retains later Extended, Weak and stale conditions. First Strong times are shown in ET, earliest first. Historical calculations are labelled Reconstructed; live observations remain separate. Manual review only.`;
+    }
+    const checkingReplays = state.monitorRows.filter(row => row.condition_history?.reconstruction?.status === 'CHECKING').length;
+    if (checkingReplays) status.textContent += ` Checking earlier session history for ${checkingReplays} stocks in the background.`;
+    if (lastUpdate && !state.monitorError) status.textContent += ` Updated ${lastUpdate} ET \u00b7 checks every 60s during regular market hours, including with the browser closed; failures back off.`;
+    status.textContent += ' Historical + current Watchlist + Buylist with saved breakout prices.';
+    status.textContent += ` ${state.visibleRows.filter(row => row.early_review?.active).length} early ORB reviews now. Early today retains earlier observations. Manual review only.`;
+    if (state.monitorPositionError) status.textContent += ` ${state.monitorPositionError}`;
+    if (state.monitorHistoryError) status.textContent += ` ${state.monitorHistoryError}`;
   }
 
   function updateActiveStockRow() {
@@ -4573,6 +4663,11 @@
       setMobilePage('settings');
       void loadOrbSettings();
     });
+    byId('desktop-monitor-open').addEventListener('click', () => {
+      activateListMode('monitor');
+      void loadIntradayMonitor();
+    });
+    byId('desktop-monitor-close').addEventListener('click', () => activateListMode('watchlist'));
     byId('desktop-orb-settings-close').addEventListener('click', () => setMobilePage('chart'));
     byId('operator-confirm-submit').addEventListener('click', () => closeOperatorConfirm(true));
     byId('operator-confirm-ep').addEventListener('click', () => closeOperatorConfirm('ep'));
@@ -4614,6 +4709,8 @@
     }));
     document.querySelectorAll('[data-monitor-filter]').forEach(button => button.addEventListener('click', () => {
       state.monitorFilter = button.dataset.monitorFilter;
+      byId('mobile-momentum-help').open = false;
+      state.monitorMomentumSymbol = '';
       document.querySelectorAll('[data-monitor-filter]').forEach(filter => {
         const active = filter.dataset.monitorFilter === state.monitorFilter;
         filter.classList.toggle('active', active);
@@ -4641,7 +4738,7 @@
       );
     }));
     document.addEventListener('pointerdown', event => {
-      if (!mobileListPopover.hidden && !event.target.closest('.mobile-list-control')) closeMobileListPopover();
+      if (compactLayout.matches && !mobileListPopover.hidden && !event.target.closest('.mobile-list-control')) closeMobileListPopover();
       if (!mobileMenuPopover.hidden && !event.target.closest('#mobile-menu-popover, #settings-open-chart')) closeMobileMenuPopover();
       if (!navigationPopover.hidden && !event.target.closest('.mobile-navigation-control')) closeMobileNavigation();
       const breakoutPopup = byId('breakout-price-popup');
