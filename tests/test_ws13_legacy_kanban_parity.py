@@ -431,9 +431,10 @@ def test_l3_stop_change_produces_the_same_protective_domain_state(
     )
 
 
-def test_l3_closed_session_sell_all_produces_the_same_next_open_intent(
+def test_l3_premarket_sell_all_produces_the_same_next_open_intent(
     tmp_path, monkeypatch
 ):
+    """Before the supported premarket window, both paths reserve the next open."""
     legacy_commands = []
 
     class _Signal:
