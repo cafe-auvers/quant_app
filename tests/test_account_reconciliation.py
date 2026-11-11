@@ -125,7 +125,8 @@ def test_manual_repurchase_reopens_closed_card_with_default_stop_without_orders(
                  position_runtime_status=PositionRuntimeStatus.CLOSED,
                  entry_runtime_status=None, stop_type=None)
     plan = reduce_account_reconciliation(
-        _snapshot(holdings=(_holding(quantity=350, sellable_quantity=340),)),
+        _snapshot(holdings=(_holding(quantity=350, sellable_quantity=340),),
+                  account_equity=35000, account_balance_observed_at=NOW),
         AccountLocalState(cards=(card,)))
     reopened = plan.card_updates[0]
     assert reopened.board_status == BoardStatus.OPEN_POSITION
@@ -133,7 +134,7 @@ def test_manual_repurchase_reopens_closed_card_with_default_stop_without_orders(
     assert reopened.broker_quantity == 350
     assert reopened.orderable_quantity == 340
     assert reopened.stop_type == StopType.MANUAL_PRICE
-    assert reopened.active_stop_price == pytest.approx(_holding().average_price * 0.93)
+    assert reopened.active_stop_price == pytest.approx(98)
     assert "AUTO_MANUAL_STOP_PENDING" in reopened.warnings
     assert reopened.entry_block_reason == "auto_manual_stop_pending"
     assert not plan.commands
@@ -148,6 +149,51 @@ def test_manual_repurchase_visibility_does_not_override_existing_exit_intent(sta
         _snapshot(holdings=(_holding(quantity=12, sellable_quantity=12),)),
         AccountLocalState(cards=(card,)))
     assert plan.card_updates[0].board_status == status
+
+
+@pytest.mark.parametrize("overrides", [
+    {"account_equity": None}, {"account_equity": 0},
+    {"account_equity": float("nan")}, {"account_equity": float("inf")},
+    {"account_balance_observed_at": None},
+    {"account_balance_observed_at": NOW - timedelta(seconds=61)},
+    {"account_balance_observed_at": NOW + timedelta(seconds=1)},
+    {"completeness": SnapshotCompleteness(holdings_complete=True)},
+])
+def test_manual_nav_stop_waits_for_fresh_complete_account_equity_and_retries(overrides):
+    values = dict(holdings=(_holding(quantity=100, sellable_quantity=100),),
+                  account_equity=10000, account_buying_power=999999,
+                  account_balance_observed_at=NOW)
+    values.update(overrides)
+    plan = reduce_account_reconciliation(_snapshot(**values), AccountLocalState())
+    card = plan.card_creates[0]
+    assert card.active_stop_price is None
+    assert "STOP_REQUIRED" in card.warnings
+    assert "AUTO_MANUAL_STOP_NAV_REQUIRED" in card.warnings
+    assert not plan.commands
+    values.update(account_equity=10000, account_balance_observed_at=NOW,
+                  completeness=_completeness())
+    retry = reduce_account_reconciliation(_snapshot(**values), AccountLocalState(cards=(card,)))
+    assert retry.card_updates[0].active_stop_price == 98
+    assert retry.card_updates[0].stop_quantity == 100
+    assert "AUTO_MANUAL_STOP_NAV_REQUIRED" not in retry.card_updates[0].warnings
+    assert not retry.commands
+
+
+def test_manual_nav_stop_uses_only_the_reconciled_accounts_equity_and_freezes_after_discovery():
+    other = _card(account_no="other", board_status=BoardStatus.OPEN_POSITION,
+                  broker_quantity=100, active_stop_price=95, stop_type=StopType.MANUAL_PRICE)
+    snapshot = _snapshot(holdings=(_holding(quantity=100, sellable_quantity=100),),
+                         account_equity=10000, account_buying_power=999999,
+                         account_balance_observed_at=NOW)
+    plan = reduce_account_reconciliation(snapshot, AccountLocalState(cards=(other,)))
+    card = plan.card_creates[0]
+    assert card.active_stop_price == 98
+    assert not any(update.account_no == "other" for update in plan.card_updates)
+    snapshot = _snapshot(holdings=(_holding(quantity=100, sellable_quantity=100),),
+                         account_equity=20000, account_balance_observed_at=NOW)
+    retry = reduce_account_reconciliation(snapshot, AccountLocalState(cards=(card, other)))
+    assert not retry.card_updates
+    assert card.active_stop_price == 98
 
 
 @pytest.mark.parametrize('status', [OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.EXPIRED])
@@ -1487,14 +1533,14 @@ def test_one_ambiguous_local_submission_can_consume_only_one_broker_candidate():
 
 def test_existing_card_with_broker_holding_is_recovered_without_order_sweep():
     plan = reduce_account_reconciliation(
-        _snapshot(holdings=(_holding(10),)),
+        _snapshot(account_equity=1000, account_balance_observed_at=NOW, holdings=(_holding(10),)),
         AccountLocalState(cards=(_card(board_status=BoardStatus.WATCHLIST),)),
     )
     recovered = plan.card_updates[0]
     assert recovered.board_status == BoardStatus.OPEN_POSITION
     assert recovered.broker_quantity == 10
     assert "AUTO_MANUAL_STOP_PENDING" in recovered.warnings
-    assert recovered.active_stop_price == pytest.approx(_holding().average_price * 0.93)
+    assert recovered.active_stop_price == pytest.approx(98)
 
 
 def test_stale_entry_pending_without_a_durable_order_returns_to_buylist_only_on_complete_absence():

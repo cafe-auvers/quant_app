@@ -1510,7 +1510,7 @@ def test_automatic_manual_default_can_submit_guarded_stop_loss_without_user_acti
     card = trade_card_repository.create_trade_card(
         engine, PositionManager().discover_manual_position(
             None, environment="PROD", account_no="1", symbol="AAPL", name="Apple",
-            broker_quantity=12, average_entry_price=100,
+            broker_quantity=12, average_entry_price=100, account_nav=1200,
         ),
     )
     worker = SimpleNamespace(
@@ -1525,13 +1525,13 @@ def test_automatic_manual_default_can_submit_guarded_stop_loss_without_user_acti
     assert card.acknowledge_pending_stop_change()
     trade_card_repository.update_trade_card(engine, card, expected_version=card.version)
     market_data.subscribe([card.symbol])
-    market_data._quote_fetcher = lambda symbol: QuoteSnapshot(symbol=symbol, last_price=93.01)
+    market_data._quote_fetcher = lambda symbol: QuoteSnapshot(symbol=symbol, last_price=98.01)
     market_data.poll_once()
     runtime.trading_engine.evaluate_quote([card], market_data.latest_quote(card.symbol))
     runtime.trading_engine.run_heartbeat([card])
     assert broker.submit_calls == []
 
-    market_data._quote_fetcher = lambda symbol: QuoteSnapshot(symbol=symbol, last_price=92.0)
+    market_data._quote_fetcher = lambda symbol: QuoteSnapshot(symbol=symbol, last_price=97.0)
     market_data.poll_once()
     runtime.trading_engine.evaluate_quote([card], market_data.latest_quote(card.symbol))
     broker.queue_acceptance(broker_order_id="AUTO-DEFAULT-STOP")

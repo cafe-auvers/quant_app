@@ -1358,11 +1358,14 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
         card.pending_stop_requested_at = requested_at
         card.warnings = [
             item for item in card.warnings
-            if item not in {"AUTO_MANUAL_STOP_PENDING", "STOP_REQUIRED"}
+            if item not in {
+                "AUTO_MANUAL_STOP_PENDING", "AUTO_MANUAL_STOP_NAV_REQUIRED", "STOP_REQUIRED",
+            }
         ]
         if card.entry_block_reason in {
             "auto_manual_stop_pending", "manual_position_requires_stop",
             "broker_position_requires_stop",
+            "manual_position_requires_fresh_nav",
         }:
             card.entry_block_reason = ""
     if isinstance(command, types.CancelEntry):

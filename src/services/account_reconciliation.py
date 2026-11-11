@@ -1029,7 +1029,9 @@ def _recover_detached_working_entry(
         entries, net = candidate_fill_exposure(card, orders)
         if len(entries) != 1 or net != order.filled_quantity:
             return False
-        card.warnings = [item for item in card.warnings if item != 'STOP_REQUIRED']
+        card.warnings = [item for item in card.warnings if item not in {
+            'STOP_REQUIRED', 'AUTO_MANUAL_STOP_NAV_REQUIRED',
+        }]
     card.entry_client_order_id = order.client_order_id
     card.entry_attempt_group_id = order.attempt_group_id
     card.entry_attempt_count = order.attempt_number
@@ -1988,7 +1990,18 @@ def reduce_account_reconciliation(
             if card.entry_block_reason in (
                 "manual_position_requires_stop", "broker_position_requires_stop"
             ) or "STOP_REQUIRED" in card.warnings:
-                initialize_manual_position_stop(card)
+                nav_age = (
+                    (snapshot.observed_at - snapshot.account_balance_observed_at).total_seconds()
+                    if snapshot.account_balance_observed_at is not None else None
+                )
+                account_nav = (
+                    snapshot.account_equity
+                    if snapshot.completeness.account_balance_complete
+                    and nav_age is not None
+                    and 0 <= nav_age <= execution_config.FULL_RECONCILIATION_SECONDS
+                    else None
+                )
+                initialize_manual_position_stop(card, account_nav=account_nav)
             if card.stop_type == StopType.MANUAL_PRICE:
                 card.stop_quantity = holding.quantity
         for card in cards:

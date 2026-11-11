@@ -625,8 +625,8 @@ EOD_ENTRY_CLEANUP_SECONDS_BEFORE_CLOSE = _env_int(
 # commission -- must be reviewed against the real account's fee schedule
 # before any live breakeven stop is placed off of it.
 BREAKEVEN_BUFFER_BPS = _env_float("BREAKEVEN_BUFFER_BPS", 15.0, minimum=0.0)
-MANUAL_POSITION_DEFAULT_STOP_PERCENT = _env_float(
-    "MANUAL_POSITION_DEFAULT_STOP_PERCENT", 7.0, minimum=0.01, maximum=99.99
+MANUAL_POSITION_DEFAULT_NAV_RISK_PERCENT = _env_float(
+    "MANUAL_POSITION_DEFAULT_NAV_RISK_PERCENT", 2.0, minimum=0.01, maximum=99.99
 )
 
 

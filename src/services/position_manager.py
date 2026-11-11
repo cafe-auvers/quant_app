@@ -39,9 +39,36 @@ from src.services.execution_command_gateway import (
 logger = logging.getLogger(__name__)
 
 AUTO_MANUAL_STOP_PENDING = "AUTO_MANUAL_STOP_PENDING"
+AUTO_MANUAL_STOP_NAV_REQUIRED = "AUTO_MANUAL_STOP_NAV_REQUIRED"
 
 
-def initialize_manual_position_stop(card: TradeCardState) -> bool:
+def manual_position_nav_stop_price(
+    average: float, quantity: int, account_nav: Optional[float],
+) -> Optional[float]:
+    """Price limiting initial gross position loss to the configured NAV budget.
+
+    The caller must supply fresh, account-matched USD NAV. A position worth
+    less than the budget uses the minimum tradable price instead of zero.
+    """
+    if account_nav is None:
+        return None
+    if not all(math.isfinite(value) and value > 0 for value in (average, account_nav)):
+        return None
+    if quantity <= 0:
+        return None
+    risk_per_share = account_nav / quantity * (
+        execution_config.MANUAL_POSITION_DEFAULT_NAV_RISK_PERCENT / 100
+    )
+    try:
+        price = round_up_to_valid_tick(max(0.0001, average - risk_per_share))
+    except (OverflowError, ValueError):
+        return None
+    return price if 0 < price < average else None
+
+
+def initialize_manual_position_stop(
+    card: TradeCardState, *, account_nav: Optional[float] = None,
+) -> bool:
     """Freeze the user's default risk on discovery, preserving all chosen stops.
 
     The pending marker is cleared only by the normal guarded stop workflow,
@@ -62,17 +89,26 @@ def initialize_manual_position_stop(card: TradeCardState) -> bool:
     ):
         return False
     average = float(card.average_entry_price or 0.0)
-    percent = float(execution_config.MANUAL_POSITION_DEFAULT_STOP_PERCENT)
     if not math.isfinite(average) or average <= 0:
         return False
-    price = round_up_to_valid_tick(average * (1 - percent / 100))
-    if not 0 < price < average:
+    if account_nav is None or not math.isfinite(account_nav) or account_nav <= 0:
+        if AUTO_MANUAL_STOP_NAV_REQUIRED not in card.warnings:
+            card.warnings.append(AUTO_MANUAL_STOP_NAV_REQUIRED)
+        card.entry_block_reason = "manual_position_requires_fresh_nav"
+        return False
+    card.warnings = [item for item in card.warnings if item != AUTO_MANUAL_STOP_NAV_REQUIRED]
+    if card.entry_block_reason == "manual_position_requires_fresh_nav":
+        card.entry_block_reason = "manual_position_requires_stop"
+    price = manual_position_nav_stop_price(average, card.broker_quantity, account_nav)
+    if price is None:
         return False
     card.stop_type = StopType.MANUAL_PRICE
     card.active_stop_price = price
     card.stop_quantity = card.broker_quantity
     card.entry_block_reason = "auto_manual_stop_pending"
-    card.warnings = [item for item in card.warnings if item != "STOP_REQUIRED"]
+    card.warnings = [item for item in card.warnings if item not in {
+        "STOP_REQUIRED", AUTO_MANUAL_STOP_NAV_REQUIRED,
+    }]
     if AUTO_MANUAL_STOP_PENDING not in card.warnings:
         card.warnings.append(AUTO_MANUAL_STOP_PENDING)
     return True
@@ -192,8 +228,16 @@ def _prices_match(a: float, b: float, *, tolerance: float = 1e-6) -> bool:
 def minimum_manual_stop_price(card: TradeCardState) -> float:
     """Initial manual risk is editable; established profit protection tightens."""
     if (
-        card.stop_type == StopType.MANUAL_PRICE
-        and 0 < (card.active_stop_price or 0) < float(card.average_entry_price or 0)
+        (
+            card.stop_type == StopType.MANUAL_PRICE
+            and 0 < (card.active_stop_price or 0) < float(card.average_entry_price or 0)
+        )
+        or (
+            card.stop_type is None and card.active_stop_price is None
+            and not card.entry_client_order_id and not card.entry_submission_unresolved
+            and card.broker_quantity > 0
+            and card.board_status in {BoardStatus.OPEN_POSITION, BoardStatus.PARTIAL_SELL}
+        )
     ):
         return 0.0001
     breakeven = compute_breakeven_stop_price(card.average_entry_price)
@@ -335,11 +379,12 @@ class PositionManager:
         card.active_stop_price = requested_price
         card.stop_quantity = card.broker_quantity
         card.warnings = [item for item in card.warnings if item not in {
-            AUTO_MANUAL_STOP_PENDING, "STOP_REQUIRED",
+            AUTO_MANUAL_STOP_PENDING, AUTO_MANUAL_STOP_NAV_REQUIRED, "STOP_REQUIRED",
         }]
         if card.entry_block_reason in {
             "auto_manual_stop_pending", "manual_position_requires_stop",
             "broker_position_requires_stop",
+            "manual_position_requires_fresh_nav",
         }:
             card.entry_block_reason = ""
         return card
@@ -483,10 +528,12 @@ class PositionManager:
         card.last_exit_error = ""
         card.warnings = [w for w in card.warnings if w not in {
             "EXIT_CANCEL_STALLED", "STOP_REQUIRED", AUTO_MANUAL_STOP_PENDING,
+            AUTO_MANUAL_STOP_NAV_REQUIRED,
         }]
         if card.entry_block_reason in {
             "auto_manual_stop_pending", "manual_position_requires_stop",
             "broker_position_requires_stop",
+            "manual_position_requires_fresh_nav",
         }:
             card.entry_block_reason = ""
         return card
@@ -503,6 +550,7 @@ class PositionManager:
         name: str,
         broker_quantity: int,
         average_entry_price: float,
+        account_nav: Optional[float] = None,
     ) -> TradeCardState:
         """Section 534-562: broker position reconciliation is authoritative.
         Finds (or creates) the symbol's single card and moves it to Open
@@ -530,7 +578,7 @@ class PositionManager:
             card.entry_block_reason = "manual_position_requires_stop"
             if "STOP_REQUIRED" not in card.warnings:
                 card.warnings = [*card.warnings, "STOP_REQUIRED"]
-            initialize_manual_position_stop(card)
+            initialize_manual_position_stop(card, account_nav=account_nav)
         if card.stop_type == StopType.MANUAL_PRICE:
             card.stop_quantity = broker_quantity
         return card
@@ -553,6 +601,7 @@ class PositionManager:
         environment: str,
         account_no: str,
         symbol_name_lookup: Callable[[str], str] = lambda symbol: symbol,
+        account_nav: Optional[float] = None,
     ) -> List[TradeCardState]:
         """Cross-checks every broker-reported holding for this account
         against the current card set. This is the general-purpose version
@@ -605,6 +654,7 @@ class PositionManager:
                         name=symbol_name_lookup(symbol),
                         broker_quantity=holding.quantity,
                         average_entry_price=holding.average_price,
+                        account_nav=account_nav,
                     )
                 )
                 continue
@@ -621,13 +671,16 @@ class PositionManager:
                 if facts_changed:
                     card.broker_quantity = holding.quantity
                     card.average_entry_price = holding.average_price
+                previous_stop_state = (tuple(card.warnings), card.entry_block_reason)
                 initialized_stop = bool(
                     "STOP_REQUIRED" in card.warnings
-                    and initialize_manual_position_stop(card)
+                    and initialize_manual_position_stop(card, account_nav=account_nav)
                 )
                 if card.stop_type == StopType.MANUAL_PRICE:
                     card.stop_quantity = holding.quantity
-                if facts_changed or initialized_stop:
+                if facts_changed or initialized_stop or previous_stop_state != (
+                    tuple(card.warnings), card.entry_block_reason
+                ):
                     changed.append(card)
                 continue
 
@@ -648,6 +701,7 @@ class PositionManager:
                         name=card.name,
                         broker_quantity=holding.quantity,
                         average_entry_price=holding.average_price,
+                        account_nav=account_nav,
                     )
                 )
 

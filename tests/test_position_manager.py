@@ -294,7 +294,7 @@ def test_confirm_flat_closes_card_and_clears_stop():
 
 
 def test_discover_manual_position_creates_new_card_with_membership_preserved():
-    """The user-authorized default is 7% below broker cost, never breakeven."""
+    """The initial stop risks two percent of the supplied account NAV."""
     manager = PositionManager()
     card = manager.discover_manual_position(
         None,
@@ -304,6 +304,7 @@ def test_discover_manual_position_creates_new_card_with_membership_preserved():
         name="Tesla Inc.",
         broker_quantity=50,
         average_entry_price=250.0,
+        account_nav=100000,
     )
     assert card.board_status == BoardStatus.OPEN_POSITION
     assert card.watchlist_member is True
@@ -311,13 +312,13 @@ def test_discover_manual_position_creates_new_card_with_membership_preserved():
     assert card.return_to_buylist_after_close is True
     assert card.broker_quantity == 50
     assert card.stop_type == StopType.MANUAL_PRICE
-    assert card.active_stop_price == 232.5
+    assert card.active_stop_price == 210.0
     assert card.stop_quantity == 50
     assert card.entry_block_reason == "auto_manual_stop_pending"
     assert "AUTO_MANUAL_STOP_PENDING" in card.warnings
 
 
-def test_discover_manual_position_default_triggers_only_at_seven_percent_loss():
+def test_discover_manual_position_default_triggers_at_nav_risk_price():
     manager = PositionManager()
     card = manager.discover_manual_position(
         None,
@@ -327,10 +328,11 @@ def test_discover_manual_position_default_triggers_only_at_seven_percent_loss():
         name="Tesla Inc.",
         broker_quantity=50,
         average_entry_price=250.0,
+        account_nav=100000,
     )
     assert evaluate_stop_trigger(card, 249.0) is False
-    assert evaluate_stop_trigger(card, 232.51) is False
-    assert evaluate_stop_trigger(card, 232.5) is True
+    assert evaluate_stop_trigger(card, 210.01) is False
+    assert evaluate_stop_trigger(card, 210.0) is True
     assert evaluate_stop_trigger(card, 10.0) is True
 
 
