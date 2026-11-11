@@ -317,6 +317,7 @@ class TradingEngine:
         entry_replacement_callbacks: Optional[EntryReplacementCallbacks] = None,
         eod_service: Optional[EodTradingService] = None,
         market_is_open: Optional[Callable[[], bool]] = None,
+        exit_market_is_open: Optional[Callable[[], bool]] = None,
         eod_window_reached: Optional[Callable[[], bool]] = None,
         prepare_entry_attempt: Optional[Callable[[TradeCardState], None]] = None,
         account_equity_provider: Optional[Callable[[str, str], float]] = None,
@@ -344,6 +345,7 @@ class TradingEngine:
         # tests. Defaults preserve the old test-friendly behavior for any
         # caller that doesn't supply one.
         self._market_is_open_fn = market_is_open or (lambda: True)
+        self._exit_market_is_open_fn = exit_market_is_open
         self._eod_window_reached_fn = eod_window_reached or (lambda: False)
         self._prepare_entry_attempt = prepare_entry_attempt or (lambda card: None)
         self._account_equity_provider = account_equity_provider or (
@@ -382,7 +384,7 @@ class TradingEngine:
         """
         if not self.is_enabled():
             return []
-        if not quote.regular_session:
+        if not quote.exit_session:
             return []
         symbol = quote.symbol.upper()
         matching = [
@@ -520,7 +522,7 @@ class TradingEngine:
         no-op and the event can trigger at most once.
         """
 
-        if not self.is_enabled() or not quote.regular_session:
+        if not self.is_enabled() or not quote.exit_session:
             return []
         changed: List[TradeCardState] = []
         for card in cards:
@@ -2069,7 +2071,7 @@ class TradingEngine:
                 continue
             if card.pending_partial_sell_quantity <= 0:
                 continue
-            if card.pending_partial_sell_price is not None and not self._market_is_open():
+            if card.pending_partial_sell_price is not None and not self._exit_market_is_open():
                 continue  # A priced exit must never become a next-open market order.
             if card.exit_submission_unresolved:
                 continue
@@ -2287,7 +2289,7 @@ class TradingEngine:
         for card in cards:
             if card.board_status != BoardStatus.SELL_ALL or not card.sell_all_at_market_open:
                 continue
-            if not self._market_is_open():
+            if not self._exit_market_is_open():
                 continue
             try:
                 self._initiate_sell_all(card)
@@ -2492,7 +2494,7 @@ class TradingEngine:
                 # path (e.g. a stop hit while the market happens to be
                 # closed) must wait for the session, not fire a
                 # regular-hours order outside it.
-                market_open = self._market_is_open()
+                market_open = self._exit_market_is_open()
                 if not market_open and not card.sell_all_at_market_open:
                     continue
                 card.broker_quantity = remaining
@@ -2572,6 +2574,9 @@ class TradingEngine:
         """
         return self._market_is_open_fn()
 
+    def _exit_market_is_open(self) -> bool:
+        return self._exit_market_is_open_fn() if self._exit_market_is_open_fn else self._market_is_open()
+
     # -- EOD cleanup (review finding P1-14) -------------------------------
 
     def _run_eod_cleanup_if_due(self, cards: List[TradeCardState]) -> List[TradeCardState]:
@@ -2635,7 +2640,7 @@ class TradingEngine:
         illiquid symbols can be quiet without their feed being unavailable.
         """
         changed: List[TradeCardState] = []
-        if not self._market_is_open():
+        if not self._exit_market_is_open():
             # The regular-session feed is not a protection outage while the
             # exchange is closed. Existing stop/user liquidation stays sticky;
             # a new outage timer starts only during the next trading session.
@@ -2846,7 +2851,7 @@ class TradingEngine:
                     )
                     and not card.exit_all_required
                 ):
-                    if self._market_is_open():
+                    if self._exit_market_is_open():
                         self._initiate_sell_all(card)
                     else:
                         self._initiate_sell_all(

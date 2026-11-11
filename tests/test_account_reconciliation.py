@@ -645,6 +645,43 @@ def test_emergency_sell_all_subtracts_known_owned_outstanding_sell_quantity():
     assert decision.cancel_client_order_id == "SELL-1"
 
 
+@pytest.mark.parametrize("policy", ["REGULAR_LIMIT", RESERVED_MOO_EXECUTION])
+@pytest.mark.parametrize("intent", [OrderIntent.MANUAL_EXIT, OrderIntent.STOP_LOSS])
+def test_account_poll_preserves_one_full_owned_liquidation(policy, intent):
+    sell = _order(side=OrderSide.SELL, intent=intent, execution_policy=policy,
+                  remaining_quantity=10, capital_reservation_id="")
+    decision = decide_emergency_sell(_snapshot(holdings=(_holding(),)),
+        symbol="AAPL", execution_orders=(sell,))
+    assert not decision.cancel_client_order_id
+    assert decision.quantity == 0
+    assert not decision.manual_intervention_required
+
+
+def test_opening_reservation_is_replaced_once_supported_exit_session_opens():
+    sell = _order(side=OrderSide.SELL, intent=OrderIntent.MANUAL_EXIT,
+                  execution_policy=RESERVED_MOO_EXECUTION, capital_reservation_id="")
+    decision = decide_emergency_sell(_snapshot(holdings=(_holding(),)),
+        symbol="AAPL", execution_orders=(sell,), exit_session_open=True)
+    assert decision.cancel_client_order_id == sell.client_order_id
+    assert decision.quantity == 0
+
+
+def test_repeated_account_generations_do_not_cancel_a_full_working_sell():
+    card = _card(board_status=BoardStatus.SELL_ALL, exit_all_required=True)
+    sell = _order(side=OrderSide.SELL, intent=OrderIntent.MANUAL_EXIT,
+                  capital_reservation_id="")
+    broker = BrokerOrderStatusSnapshot(environment="PROD", account_no="1", symbol="AAPL",
+        broker_order_id="B-1", side=OrderSide.SELL, status=OrderStatus.WORKING,
+        quantity_requested=10, remaining_quantity=10)
+    state = AccountLocalState(cards=(card,), execution_orders=(sell,))
+    for n in range(3):
+        plan = reduce_account_reconciliation(_snapshot(orders=(broker,), holdings=(_holding(),),
+            observed_at=NOW + timedelta(seconds=20*n)), state)
+        assert not plan.commands
+        state = AccountLocalState(cards=plan.card_updates or state.cards,
+            execution_orders=plan.order_updates or state.execution_orders)
+
+
 def test_emergency_sell_all_uses_broker_sellable_quantity_when_outstanding_is_uncertain():
     snapshot = _snapshot(
         holdings=(_holding(sellable_quantity=7),),

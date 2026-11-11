@@ -74,7 +74,7 @@ from src.core.trade_card_state import (
     TradeCardState,
 )
 from src.services.position_manager import PositionManager, initialize_manual_position_stop
-from src.utils.market_calendar import US_MARKET_ZONE, previous_nyse_trading_day
+from src.utils.market_calendar import US_MARKET_ZONE, previous_nyse_trading_day, is_us_exit_session_open
 
 logger = logging.getLogger(__name__)
 
@@ -515,6 +515,7 @@ def decide_emergency_sell(
     *,
     symbol: str,
     execution_orders: Sequence[ExecutionOrderRecord],
+    exit_session_open: bool = False,
 ) -> EmergencySellDecision:
     """Return the only safe emergency action; never use raw holdings blindly."""
     if not snapshot.completeness.allows(ReconciliationAction.EMERGENCY_SELL_ALL):
@@ -597,6 +598,18 @@ def decide_emergency_sell(
                     "identity and do not issue another broker call"
                 ),
             )
+        if (
+            len(known_sells) == 1
+            and known_sells[0].intent in {OrderIntent.MANUAL_EXIT, OrderIntent.STOP_LOSS}
+            and known_sells[0].remaining_quantity == holding.quantity
+            and not (
+                known_sells[0].execution_policy == RESERVED_MOO_EXECUTION
+                and exit_session_open
+            )
+        ):
+            # The trading engine owns TTL/repricing. Account polling must not
+            # cancel a healthy full exit on every reconciliation generation.
+            return EmergencySellDecision(reason="Existing owned liquidation covers the holding")
         # Prefer controlling the exact existing order instead of creating
         # competing sell exposure.  ``quantity`` still exposes the maximum
         # safe additional amount for diagnostics/tests.
@@ -2185,7 +2198,8 @@ def reduce_account_reconciliation(
         if card.board_status != BoardStatus.SELL_ALL and not card.exit_all_required:
             continue
         decision = decide_emergency_sell(
-            snapshot, symbol=card.symbol, execution_orders=orders
+            snapshot, symbol=card.symbol, execution_orders=orders,
+            exit_session_open=is_us_exit_session_open(snapshot.observed_at),
         )
         if decision.cancel_client_order_id:
             commands.append(

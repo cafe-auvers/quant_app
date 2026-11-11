@@ -603,6 +603,15 @@ class TradeCardWidget(QFrame):
         self._metrics_label.setToolTip(
             "P&L estimates are in USD before fees; actual execution prices can differ."
         )
+        if card.board_status in {BoardStatus.OPEN_POSITION, BoardStatus.PARTIAL_SELL, BoardStatus.SELL_ALL}:
+            protection_hours = QLabel("App stop: includes supported premarket / after-hours")
+            protection_hours.setWordWrap(True)
+            protection_hours.setStyleSheet("color: #666; font-size: 11px;")
+            protection_hours.setToolTip(
+                "Requires Live Trading ON, the active PC and live KIS data. "
+                "Exits use limit orders; the stop price is not a guaranteed fill price."
+            )
+            layout.addWidget(protection_hours)
 
         # Watchlist and Buylist are planning-only columns.  Runtime ownership,
         # reconciliation, order, ORB, stop, and warning details only become

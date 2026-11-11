@@ -45,14 +45,15 @@ def validate_user_exit_limit_price(price: float) -> float:
 
 
 def exit_execution_policy(
-    *, environment: str, intent: OrderIntent, regular_session_open: bool
+    *, environment: str, intent: OrderIntent, regular_session_open: bool,
+    exit_session_open: bool | None = None,
 ) -> str:
     """Select the shared legacy/Kanban session policy."""
 
     if (
         str(environment or "").strip().upper() == "PROD"
         and intent in _MANUAL_SESSION_AWARE_INTENTS
-        and not regular_session_open
+        and not (regular_session_open if exit_session_open is None else exit_session_open)
     ):
         return RESERVED_MOO_EXECUTION
     return REGULAR_LIMIT_EXECUTION
@@ -152,6 +153,7 @@ def build_exit_execution_command(
     intent: OrderIntent,
     quantity: int,
     regular_session_open: bool,
+    exit_session_open: bool | None = None,
     limit_price: float | None = None,
     exchange: str = "NASD",
 ) -> ExitExecutionCommand:
@@ -159,6 +161,7 @@ def build_exit_execution_command(
         environment=environment,
         intent=intent,
         regular_session_open=regular_session_open,
+        exit_session_open=exit_session_open,
     )
     resolved_price = 0.0 if policy == RESERVED_MOO_EXECUTION else float(limit_price or 0.0)
     return ExitExecutionCommand(

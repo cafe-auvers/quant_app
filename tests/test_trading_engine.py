@@ -158,6 +158,30 @@ def _make_engine(
 # --- Disabled engine is a strict no-op --------------------------------------
 
 
+@pytest.mark.parametrize("hour", [13, 21])
+def test_extended_hours_stop_triggers_and_sells_without_enabling_entries(tmp_path, hour):
+    engine = _make_engine(tmp_path)
+    engine._market_is_open_fn = lambda: False
+    engine._exit_market_is_open_fn = lambda: True
+    submitted = []
+    engine._position_callbacks = PositionActionCallbacks(
+        cancel_order=lambda cid: None,
+        submit_sell_order=lambda **kw: submitted.append(kw),
+        refresh_orderable_quantity=lambda *args: 100,
+    )
+    card = _open_card()
+    stamp = dt.datetime(2026, 11, 11, hour, 30, tzinfo=dt.timezone.utc)
+    quote = QuoteSnapshot(symbol="AAPL", last_price=94,
+        received_at=stamp, regular_session=False)
+    assert engine.evaluate_quote([card], quote) == [card]
+    assert card.stop_loss_triggered
+    assert card.board_status == BoardStatus.SELL_ALL
+    assert engine.evaluate_entry_quote([_buy_today_card()], quote) == []
+    engine._retry_incomplete_sell_alls([card])
+    assert len(submitted) == 1
+    assert submitted[0]["reason"] == "stop_loss"
+
+
 def test_pre_broker_risk_rejection_is_visible_on_retrying_card(tmp_path):
     from src.risk.pre_trade import PreTradeRiskRejectedError
 

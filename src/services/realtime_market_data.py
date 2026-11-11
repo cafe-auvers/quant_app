@@ -75,6 +75,11 @@ class QuoteSnapshot:
         reference = now or _utc_now()
         return (reference - self.received_at).total_seconds()
 
+    @property
+    def exit_session(self) -> bool:
+        from src.utils.market_calendar import is_us_exit_session_open
+        return self.regular_session or is_us_exit_session_open(self.broker_event_at)
+
     def broker_age_seconds(self, *, now: Optional[datetime] = None) -> float:
         reference = now or _utc_now()
         return (reference - self.broker_event_at).total_seconds()

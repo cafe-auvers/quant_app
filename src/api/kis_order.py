@@ -529,6 +529,10 @@ def parse_broker_order_status_snapshot(
         _row_value(row, "sll_buy_dvsn_cd", "sll_buy_dvsn_cd_name", "side")
     )
     status = _status_from_order_row(row, source=source)
+    if source == "reservation" and status in {
+        OrderStatus.ACCEPTED, OrderStatus.WORKING, OrderStatus.PARTIALLY_FILLED,
+    } and not any(key in row for key in ("nccs_qty", "NCCS_QTY", "remaining_quantity", "remaining_qty")):
+        remaining = max(0, requested - filled)
 
     return BrokerOrderStatusSnapshot(
         environment=environment,

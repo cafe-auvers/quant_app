@@ -208,6 +208,7 @@ from src.services.trading_engine import (
 from src.utils.market_calendar import (
     is_nyse_trading_day,
     is_regular_session_open,
+    is_us_exit_session_open,
     seconds_until_regular_session_close,
 )
 
@@ -1956,16 +1957,18 @@ def build_buyboard_runtime(
         # Use the engine's exact session oracle so a board decision and the
         # shared exit command cannot disagree at the same boundary.
         regular_session_open = trading_engine._market_is_open()
+        exit_session_open = trading_engine._exit_market_is_open()
         if requested_limit is not None and not mandatory_liquidation:
             if intent != OrderIntent.PARTIAL_EXIT:
                 raise ValueError("A user limit price is only supported for partial exits")
             requested_limit = validate_user_exit_limit_price(requested_limit)
-            if not regular_session_open:
-                raise RuntimeError("A priced partial sell waits for the regular session")
+            if not exit_session_open:
+                raise RuntimeError("A priced partial sell waits for a supported US trading session")
         execution_policy = exit_execution_policy(
             environment=submit_kwargs.get("environment", ""),
             intent=intent,
             regular_session_open=regular_session_open,
+            exit_session_open=exit_session_open,
         )
         if requested_limit is not None and not mandatory_liquidation:
             limit_price = requested_limit
@@ -1977,6 +1980,10 @@ def build_buyboard_runtime(
             trade_ready = resolved_market_data.is_symbol_execution_ready(
                 symbol, require_trade=True, require_quote=False
             )
+            if not regular_session_open and exit_session_open and not (quote_ready or trade_ready):
+                raise ExecutionGradeDataUnavailableError(
+                    f"Waiting for a fresh KIS trade or bid to price an extended-hours SELL for {symbol}"
+                )
             if mandatory_liquidation and not quote_ready and not trade_ready:
                 # A disconnected feed must not leave exits priced from an
                 # old entry observation when fresh KIS holdings are available.
@@ -2033,6 +2040,7 @@ def build_buyboard_runtime(
             intent=intent,
             quantity=submit_kwargs.get("quantity", 0),
             regular_session_open=regular_session_open,
+            exit_session_open=exit_session_open,
             limit_price=limit_price,
             exchange=exchange,
         )
@@ -2165,6 +2173,7 @@ def build_buyboard_runtime(
         # a stop-triggered liquidation could attempt a regular-hours order
         # outside the session, and EOD cleanup never ran in production.
         market_is_open=is_regular_session_open,
+        exit_market_is_open=is_us_exit_session_open,
         eod_window_reached=_eod_window_reached,
         prepare_entry_attempt=prepare_entry_attempt if guarded_mode else None,
         account_equity_provider=account_equity_provider,

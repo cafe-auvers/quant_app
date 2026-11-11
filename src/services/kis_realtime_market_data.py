@@ -181,7 +181,7 @@ class PendingMarketState:
     def add_trade(self, quote: QuoteSnapshot, stop_rules: Mapping[str, StopRule]) -> None:
         price = float(quote.last_price)
         self.latest_trade = quote
-        if not quote.regular_session:
+        if not quote.exit_session:
             self._record_event(quote.received_at)
             return
         if (

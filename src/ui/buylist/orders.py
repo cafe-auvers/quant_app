@@ -37,6 +37,7 @@ from src.services.order_ledger import (
     update_order,
 )
 from src.ui.workers import KisOrderWorker, OrderReconciliationWorker
+from src.utils.market_calendar import is_us_exit_session_open
 
 from .constants import (
     KST_ZONE,
@@ -316,6 +317,7 @@ class BuylistOrdersMixin:
             environment=env,
             intent=OrderIntent.MANUAL_EXIT,
             regular_session_open=self._us_regular_market_is_open(now),
+            exit_session_open=is_us_exit_session_open(now),
         )
 
     def _submit_kis_buy_order(

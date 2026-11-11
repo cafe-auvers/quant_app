@@ -132,6 +132,24 @@ def nyse_regular_session_close_time(day: dt.date) -> dt.time:
     return US_MARKET_EARLY_CLOSE_TIME if early_close else US_MARKET_CLOSE_TIME
 
 
+def is_us_exit_session_open(now: Optional[dt.datetime] = None) -> bool:
+    """KIS US limit exits: 04:00 ET through the default 07:00 KST close.
+
+    The later account-opt-in after-hours extension and overnight/daytime
+    trading are deliberately excluded. Entries retain the regular calendar.
+    """
+    moment = now or dt.datetime.now(US_MARKET_ZONE)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=US_MARKET_ZONE)
+    moment = moment.astimezone(US_MARKET_ZONE)
+    if not is_nyse_trading_day(moment.date()):
+        return False
+    close_kst = dt.datetime.combine(
+        moment.date() + dt.timedelta(days=1), dt.time(7), tzinfo=KST_ZONE
+    )
+    return dt.time(4) <= moment.time() and moment < close_kst.astimezone(US_MARKET_ZONE)
+
+
 def is_regular_session_open(now: Optional[dt.datetime] = None) -> bool:
     """True during NYSE regular trading hours (9:30-16:00 America/New_York),
     Monday-Friday, excluding the holidays :func:`nyse_holidays` already

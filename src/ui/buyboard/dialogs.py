@@ -599,7 +599,7 @@ def prompt_partial_sell(parent, card: TradeCardState) -> Optional[tuple[int, Opt
     explanation = QLabel(
         "A limit sells at your price or higher and can fill immediately if the market "
         "is already there. It waits until filled, cancelled or expired by KIS. "
-        "Outside the regular session, submission waits for the open. Stops take priority."
+        "Supported premarket and after-hours sessions are included. Otherwise submission waits. Stops take priority."
     )
     explanation.setWordWrap(True)
     layout.addWidget(explanation)
@@ -677,7 +677,8 @@ def confirm_sell_all(parent, card: TradeCardState) -> bool:
     reply = QMessageBox.question(
         parent,
         "Sell All",
-        f"Submit a full liquidation for {card.symbol} ({quantity} shares)?" + estimate,
+        f"Submit a full liquidation for {card.symbol} ({quantity} shares)?"
+        "\nIncludes supported premarket / after-hours; otherwise waits for a trading session." + estimate,
         QMessageBox.Yes | QMessageBox.No,
         QMessageBox.No,
     )

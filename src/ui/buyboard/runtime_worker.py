@@ -136,7 +136,7 @@ from src.services.trade_card_orb_bridge import (
     queue_has_execution_order_lock,
 )
 from src.utils.device_identity import detect_local_device_kind
-from src.utils.market_calendar import is_regular_session_open
+from src.utils.market_calendar import is_regular_session_open, is_us_exit_session_open
 from src.utils.redaction import scrub_sensitive_text
 
 logger = logging.getLogger(__name__)
@@ -2167,7 +2167,7 @@ class BuyboardRuntimeWorker(QThread):
         if (
             not self._accepting_commands or not self._lease_current or self._standby_only
             or self.device_state != RuntimeDeviceState.ACTIVE
-            or not is_regular_session_open()
+            or not is_us_exit_session_open()
         ):
             return False
         changed = False
@@ -2181,7 +2181,7 @@ class BuyboardRuntimeWorker(QThread):
                 continue
             quote = self.runtime.market_data.latest_quote(card.symbol)
             if (
-                quote is None or not quote.regular_session
+                quote is None or not quote.exit_session
                 or not quote.entry_trigger_eligible
                 or quote.channel not in {"", "TRADE", "HDFSCNT0"}
                 or quote.breached_stop_versions

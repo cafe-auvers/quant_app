@@ -35,6 +35,7 @@ def isolate(monkeypatch, tmp_path):
     monkeypatch.setattr("src.services.trading_state._trading_enabled", True)
     monkeypatch.setattr("src.services.trading_state._authoritative_provider", None)
     monkeypatch.setattr("src.ui.buyboard.runtime_worker.is_regular_session_open", lambda: True)
+    monkeypatch.setattr("src.ui.buyboard.runtime_worker.is_us_exit_session_open", lambda: True)
 
 
 def card_for(*, quantity=100, stop_type=StopType.MANUAL_PRICE):
@@ -191,7 +192,7 @@ def test_worker_latches_one_durable_request_at_fresh_profit_threshold(tmp_path):
 
 
 @pytest.mark.parametrize("quote_kwargs", [
-    {"last_price": 12.19}, {"regular_session": False}, {"channel": "BOOK"},
+    {"last_price": 12.19}, {"regular_session": False, "broker_event_at": datetime(2026, 11, 8, 12, tzinfo=timezone.utc)}, {"channel": "BOOK"},
     {"entry_trigger_eligible": False},
     {"received_at": datetime.now(timezone.utc) - timedelta(minutes=5)},
     {"breached_stop_versions": (("PROD:1:AAPL", "v1"),)},
