@@ -219,8 +219,8 @@ def _account_result(value: float, account_equity: float | None) -> str:
     )
     color = "#2e7d32" if value >= 0 else "#c62828"
     return (
-        f"{percent}&nbsp;&nbsp;"
-        f"<span style='color:{color};'>{_fmt_money(value, signed=True)}</span>"
+        f"<span style='color:{color};'>{_fmt_money(value, signed=True)}</span> "
+        f"<span style='font-size:11px;'>{percent}</span>"
     )
 
 
@@ -234,8 +234,8 @@ def _price_pnl_result(card: TradeCardState, price, quantity) -> str:
         return "--"
     color = "#2e7d32" if pnl.dollars >= 0 else "#c62828"
     return (
-        f"<span style='color:{color};'>{pnl.percent:+.2f}%&nbsp;&nbsp;"
-        f"{_fmt_money(pnl.dollars, signed=True)}</span>"
+        f"<span style='color:{color};'>{_fmt_money(pnl.dollars, signed=True)} "
+        f"<span style='font-size:11px;'>{pnl.percent:+.2f}%</span></span>"
     )
 
 
@@ -482,6 +482,15 @@ def _card_metric_rows(
     )
     if stop_pnl is not None:
         rows.append(("Stop P&L", _account_result(stop_pnl, account_equity)))
+    stop = _positive_float(card.active_stop_price)
+    if stop is None:
+        stop_text = "<span style='color:#c62828;'>Not set</span>"
+    else:
+        covered = min(actual_quantity, max(0, int(card.stop_quantity or 0)))
+        coverage = (f"{covered:,} sh" if covered == actual_quantity
+                    else f"{covered:,} / {actual_quantity:,} sh covered")
+        stop_text = f"${_fmt_price(stop)} <span style='font-size:11px; color:#666;'>({coverage})</span>"
+    rows.insert(0, ("Stop loss", stop_text))
     return rows
 
 
@@ -490,7 +499,7 @@ def _metric_rows_html(rows: list[tuple[str, str]]) -> str:
         return ""
     body = "".join(
         ("<tr style='font-size:13px; font-weight:600;'>" if label in {
-            "P&L", "Partial P&L est.", "Sell All P&L est."
+            "Stop loss", "P&L", "Partial P&L est.", "Sell All P&L est."
         } else "<tr>")
         + f"<td width='40%' style='color:#666; padding:4px 8px 4px 0;'>{html.escape(label)}</td>"
         f"<td width='60%' style='padding:4px 0;'>{value}</td>"
@@ -591,11 +600,9 @@ class TradeCardWidget(QFrame):
         # single position-summary label directly.
         self._info_label = self._metrics_label
         layout.addWidget(self._metrics_label)
-        if card.board_status in {BoardStatus.OPEN_POSITION, BoardStatus.PARTIAL_SELL, BoardStatus.SELL_ALL}:
-            estimate_note = QLabel("Gross USD estimates before fees; execution price can differ.")
-            estimate_note.setWordWrap(True)
-            estimate_note.setStyleSheet("color: #666; font-size: 11px;")
-            layout.addWidget(estimate_note)
+        self._metrics_label.setToolTip(
+            "P&L estimates are in USD before fees; actual execution prices can differ."
+        )
 
         # Watchlist and Buylist are planning-only columns.  Runtime ownership,
         # reconciliation, order, ORB, stop, and warning details only become

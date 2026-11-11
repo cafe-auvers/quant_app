@@ -104,21 +104,59 @@ def test_partial_dialog_preview_updates_without_creating_a_command(monkeypatch):
     assert prompt_partial_sell(None, card()) is None
 
 
-def test_narrow_cards_resize_to_fit_wrapped_content():
+@pytest.mark.parametrize("width", [180, 240, 360])
+def test_narrow_cards_resize_to_fit_wrapped_content(width):
     from src.ui.buyboard.columns import BoardColumnList
     app = QApplication.instance() or QApplication([])
+    from pathlib import Path
+    from PyQt5.QtGui import QFont, QFontDatabase
+    font_path = Path("C:/Windows/Fonts/segoeui.ttf")
+    if font_path.is_file():
+        QFontDatabase.addApplicationFont(str(font_path))
     column = BoardColumnList(BoardStatus.OPEN_POSITION, lambda *_: None)
-    column.resize(240, 500)
-    position = card(name="A long company name with lots of readable information",
-                    warnings=["RECONCILIATION_REQUIRED_" * 8])
+    column.setFont(QFont("Segoe UI", 10))
+    column.resize(width, 500)
+    position = card(active_stop_price=9.3, stop_quantity=100,
+                    name="A long company name with lots of readable information")
     column.set_cards([position], quote_lookup=lambda _: 11)
     column.show()
     app.processEvents()
+    from PyQt5.QtTest import QTest
+    QTest.qWait(20)
+    position.warnings = ["RECONCILIATION_REQUIRED_" * 8]
+    column.set_cards([position], quote_lookup=lambda _: 11)
+    QTest.qWait(20)
     item = column.item(0)
     widget = column.itemWidget(item)
     assert widget.heightForWidth(widget.width()) <= item.sizeHint().height()
     visible_labels = [label for label in widget.findChildren(QLabel) if label.isVisibleTo(widget)]
     assert widget._metrics_label in visible_labels
+    assert "Stop loss" in widget._metrics_label.text() and "$9.30" in widget._metrics_label.text()
+    assert "before fees" in widget._metrics_label.toolTip()
+    assert not any("Gross USD estimates" in label.text() for label in visible_labels)
     for label in visible_labels:
         assert label.geometry().bottom() < widget.height()
+    from PyQt5.QtGui import QTextDocument
+    doc = QTextDocument()
+    doc.setDocumentMargin(0)
+    doc.setDefaultFont(widget._metrics_label.font())
+    doc.setHtml(widget._metrics_label.text())
+    doc.setTextWidth(widget._metrics_label.contentsRect().width())
+    assert doc.idealWidth() <= widget._metrics_label.width() + 1
+    assert doc.size().height() <= widget._metrics_label.height() + 1
     column.close()
+
+
+@pytest.mark.parametrize("status", [BoardStatus.OPEN_POSITION, BoardStatus.PARTIAL_SELL, BoardStatus.SELL_ALL])
+@pytest.mark.parametrize("stop,covered,pending,price,coverage", [
+    (9.3, 100, 8.5, "$9.30", "100 sh"),
+    (0.785, 25, 0.76, "$0.7850", "25 / 100 sh covered"),
+    (None, 0, 9.5, "Not set", ""),
+])
+def test_position_cards_lead_with_actual_stop_price_and_coverage(status, stop, covered, pending, price, coverage):
+    position = card(board_status=status, active_stop_price=stop, stop_quantity=covered,
+                    pending_stop_price=pending, pending_stop_command_id="pending-stop")
+    rows = _card_metric_rows(position, 11)
+    assert rows[0][0] == "Stop loss"
+    assert price in rows[0][1] and coverage in rows[0][1]
+    assert f"{pending:.2f}" not in rows[0][1]

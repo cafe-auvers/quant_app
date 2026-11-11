@@ -23,8 +23,12 @@ Partial-sell quantity and optional price edits update the P&L/proceeds preview
 without submitting an order. Polling preserves an open draft; confirmations also
 include the estimate.
 
-Desktop cards put P&L and the exit estimate first, wrap names and metrics, and
-size each list item from its actual width. The card border is scoped to the
+Desktop position cards lead with the active stop-loss price and covered share
+count, followed by P&L and the exit estimate. A pending stop edit is shown
+separately from the active price; a missing active stop says Not set. Dollar
+P&L comes before the percentage and wraps within narrow columns. The fees and
+execution-price note is a tooltip instead of a repeated card footer. Cards wrap
+names and metrics and size each list item from its actual width. The card border is scoped to the
 card itself so labels do not acquire repeated borders. Partial-sell dialogs
 show a reactive P&L/proceeds preview; Sell All confirmations show a reported-quote
 estimate when available.
