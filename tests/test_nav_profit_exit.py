@@ -72,6 +72,19 @@ def test_target_is_two_percent_of_nav_and_sells_half_once(quantity, price, expec
     assert card.nav_profit_exit.to_dict() == frozen
 
 
+def test_manual_safety_risks_one_percent_while_half_sale_keeps_two_percent_target():
+    card = PositionManager().discover_manual_position(
+        None, environment="PROD", account_no="1", symbol="AAPL", name="AAPL",
+        broker_quantity=100, average_entry_price=10, account_nav=11000,
+    )
+    assert card.active_stop_price == 8.9
+    assert card.stop_quantity == 100
+    assert initialize_nav_profit_exit(card, 11000)
+    assert card.nav_profit_exit.target_profit_usd == 220
+    assert nav_profit_sell_quantity(card, 12.19) == 0
+    assert nav_profit_sell_quantity(card, 12.2) == 50
+
+
 @pytest.mark.parametrize("nav", [None, 0, -1, float("nan"), float("inf")])
 def test_unavailable_nav_waits_without_a_price_percentage_fallback(nav):
     card = card_for()

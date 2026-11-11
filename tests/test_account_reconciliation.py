@@ -134,7 +134,7 @@ def test_manual_repurchase_reopens_closed_card_with_default_stop_without_orders(
     assert reopened.broker_quantity == 350
     assert reopened.orderable_quantity == 340
     assert reopened.stop_type == StopType.MANUAL_PRICE
-    assert reopened.active_stop_price == pytest.approx(98)
+    assert reopened.active_stop_price == pytest.approx(99)
     assert "AUTO_MANUAL_STOP_PENDING" in reopened.warnings
     assert reopened.entry_block_reason == "auto_manual_stop_pending"
     assert not plan.commands
@@ -173,7 +173,7 @@ def test_manual_nav_stop_waits_for_fresh_complete_account_equity_and_retries(ove
     values.update(account_equity=10000, account_balance_observed_at=NOW,
                   completeness=_completeness())
     retry = reduce_account_reconciliation(_snapshot(**values), AccountLocalState(cards=(card,)))
-    assert retry.card_updates[0].active_stop_price == 98
+    assert retry.card_updates[0].active_stop_price == 99
     assert retry.card_updates[0].stop_quantity == 100
     assert "AUTO_MANUAL_STOP_NAV_REQUIRED" not in retry.card_updates[0].warnings
     assert not retry.commands
@@ -187,13 +187,13 @@ def test_manual_nav_stop_uses_only_the_reconciled_accounts_equity_and_freezes_af
                          account_balance_observed_at=NOW)
     plan = reduce_account_reconciliation(snapshot, AccountLocalState(cards=(other,)))
     card = plan.card_creates[0]
-    assert card.active_stop_price == 98
+    assert card.active_stop_price == 99
     assert not any(update.account_no == "other" for update in plan.card_updates)
     snapshot = _snapshot(holdings=(_holding(quantity=100, sellable_quantity=100),),
                          account_equity=20000, account_balance_observed_at=NOW)
     retry = reduce_account_reconciliation(snapshot, AccountLocalState(cards=(card, other)))
     assert not retry.card_updates
-    assert card.active_stop_price == 98
+    assert card.active_stop_price == 99
 
 
 @pytest.mark.parametrize('status', [OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.EXPIRED])
@@ -1634,7 +1634,7 @@ def test_existing_card_with_broker_holding_is_recovered_without_order_sweep():
     assert recovered.board_status == BoardStatus.OPEN_POSITION
     assert recovered.broker_quantity == 10
     assert "AUTO_MANUAL_STOP_PENDING" in recovered.warnings
-    assert recovered.active_stop_price == pytest.approx(98)
+    assert recovered.active_stop_price == pytest.approx(99)
 
 
 def test_stale_entry_pending_without_a_durable_order_returns_to_buylist_only_on_complete_absence():

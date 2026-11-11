@@ -36,5 +36,6 @@ no new working buy. Adopted or ambiguous orders and pending cancellations remain
 under their existing permission and recovery rules.
 
 App stops require Live Trading ON, the active PC and a functioning live feed.
-The 2% NAV amount sets the initial manual stop level, not a guaranteed maximum
-loss. Limit orders, gaps, liquidity and fees can change realized P&L.
+The initial NAV stop budget is not a guaranteed maximum loss. The November 12
+policy reduces it to [1% NAV](manual_position_nav_risk_2026-11-12.md).
+Limit orders, gaps, liquidity and fees can change realized P&L.

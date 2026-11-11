@@ -27,7 +27,6 @@ from src.ui.buyboard.runtime_worker import BuyboardRuntimeWorker
 @pytest.fixture(autouse=True)
 def isolated_defaults(monkeypatch, tmp_path):
     monkeypatch.setattr(repo, "LOCAL_TRADE_CARDS_FILE", tmp_path / "cards.json")
-    monkeypatch.setattr(execution_config, "MANUAL_POSITION_DEFAULT_NAV_RISK_PERCENT", 2.0)
     monkeypatch.setattr(execution_config, "is_buyboard_engine_enabled", lambda: True)
 
 
@@ -55,14 +54,14 @@ def enroll(worker, cards):
 
 
 @pytest.mark.parametrize("average,quantity,nav,expected", [
-    (10, 100, 10000, 8), (100, 100, 10000, 98),
-    (3.5, 350, 1000, 3.45), (0.1234, 350, 100, 0.1177),
-    (1.01, 350, 1000, 0.9529), (3.5, 10, 10000, 0.0001),
+    (10, 100, 11000, 8.9), (100, 100, 10000, 99),
+    (3.5, 350, 1000, 3.48), (0.1234, 350, 100, 0.1206),
+    (1.01, 350, 1000, 0.9815), (3.5, 10, 10000, 0.0001),
 ])
 def test_default_price_rounds_up_without_exceeding_total_nav_budget(average, quantity, nav, expected):
     price = manual_position_nav_stop_price(average, quantity, nav)
     assert price == expected
-    assert (average - price) * quantity <= nav * 0.02 + 1e-10
+    assert (average - price) * quantity <= nav * 0.01 + 1e-10
 
 
 @pytest.mark.parametrize("nav", [None, 0, -1, float("nan"), float("inf")])
@@ -73,7 +72,7 @@ def test_missing_or_invalid_nav_never_falls_back_to_price_percentage(nav):
     assert AUTO_MANUAL_STOP_NAV_REQUIRED in card.warnings
     assert card.entry_block_reason == "manual_position_requires_fresh_nav"
     assert initialize_manual_position_stop(card, account_nav=35000)
-    assert card.active_stop_price == 98
+    assert card.active_stop_price == 99
     assert AUTO_MANUAL_STOP_NAV_REQUIRED not in card.warnings
 
 
@@ -138,7 +137,7 @@ def test_default_survives_restart_cost_changes_and_topups(tmp_path):
         environment="PROD", account_no="1",
     )
     assert changed == [restored]
-    assert restored.active_stop_price == 98
+    assert restored.active_stop_price == 99
     assert restored.average_entry_price == 105
     assert restored.stop_quantity == 400
     assert AUTO_MANUAL_STOP_PENDING in restored.warnings
@@ -153,7 +152,7 @@ def test_preexisting_stop_required_card_is_initialized_even_with_unchanged_facts
         account_nav=35000,
     )
     assert changed == [card]
-    assert card.active_stop_price == 98
+    assert card.active_stop_price == 99
 
 
 def test_flat_then_repurchase_gets_a_fresh_default():
@@ -165,7 +164,7 @@ def test_flat_then_repurchase_gets_a_fresh_default():
         card, environment="PROD", account_no="1", symbol="SMX", name="SMX",
         broker_quantity=100, average_entry_price=50, account_nav=10000,
     )
-    assert card.active_stop_price == 48
+    assert card.active_stop_price == 49
 
 
 def test_enrollment_claims_ownership_and_publishes_stop_once(tmp_path):
@@ -177,13 +176,13 @@ def test_enrollment_claims_ownership_and_publishes_stop_once(tmp_path):
     ownership = get_ownership(engine, environment="PROD", account_no="1", symbol="SMX")
     assert ownership.owner == ExecutionOwner.KANBAN
     assert ownership.strategy_instance_id == execution_config.KANBAN_STRATEGY_INSTANCE_ID
-    assert saved.pending_stop_price == 98
+    assert saved.pending_stop_price == 99
     assert saved.pending_stop_quantity == 350
     assert saved.pending_stop_command_id
     assert AUTO_MANUAL_STOP_PENDING not in saved.warnings
     assert saved.entry_block_reason == ""
     pending = stop_change_coordinator_for(engine).pending_for(saved.card_key)
-    assert pending.price == 98
+    assert pending.price == 99
     assert pending.quantity == 350
     assert not enroll(worker, [saved])
 
@@ -274,7 +273,7 @@ def test_default_enrollment_preserves_queued_partial_sell_and_its_price(tmp_path
     assert saved.board_status == BoardStatus.PARTIAL_SELL
     assert saved.pending_partial_sell_quantity == 50
     assert saved.pending_partial_sell_price == 110
-    assert saved.pending_stop_price == 98
+    assert saved.pending_stop_price == 99
 
 
 @pytest.mark.parametrize("field,value", [
