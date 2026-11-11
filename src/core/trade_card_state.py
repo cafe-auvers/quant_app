@@ -17,6 +17,8 @@ broker position actually exists (section 194).
 """
 from __future__ import annotations
 
+from src.core.nav_profit_exit import NavProfitExitState
+
 import copy
 import math
 from dataclasses import dataclass, field, replace
@@ -306,6 +308,7 @@ class TradeCardState:
     orderable_quantity: int = 0
     average_entry_price: float = 0.0
     entry_remaining_target_quantity: int = 0
+    nav_profit_exit: NavProfitExitState = field(default_factory=NavProfitExitState)
 
     # Stop-loss state (section 5.2)
     stop_type: Optional[StopType] = None
@@ -372,6 +375,7 @@ class TradeCardState:
     warnings: List[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        self.nav_profit_exit = NavProfitExitState.from_dict(self.nav_profit_exit)
         self.environment = _require_production_environment(self.environment)
         self.account_no = str(self.account_no or "").strip()
         self.symbol = str(self.symbol or "").strip().upper()
@@ -678,6 +682,7 @@ class TradeCardState:
             "entry_remaining_target_quantity": self.entry_remaining_target_quantity,
             "stop_type": self.stop_type.value if self.stop_type is not None else None,
             "active_stop_price": self.active_stop_price,
+            "nav_profit_exit": self.nav_profit_exit.to_dict(),
             "stop_quantity": self.stop_quantity,
             "pending_stop_type": (
                 self.pending_stop_type.value
@@ -815,6 +820,7 @@ class TradeCardState:
             ),
             stop_type=data.get("stop_type"),
             active_stop_price=data.get("active_stop_price"),
+            nav_profit_exit=NavProfitExitState.from_dict(data.get("nav_profit_exit")),
             stop_quantity=int(data.get("stop_quantity", 0) or 0),
             pending_stop_type=data.get("pending_stop_type"),
             pending_stop_price=data.get("pending_stop_price"),

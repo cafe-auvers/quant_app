@@ -2156,6 +2156,65 @@ class BuyboardRuntimeWorker(QThread):
             logger.info("Enrolled default manual stop for %s at %s", card.symbol, card.active_stop_price)
         return changed
 
+    def _ensure_nav_profit_taking(self, cards) -> bool:
+        """Latch one half-sale through the normal version/ownership fences."""
+        from src.core.board_workflow import RequestPartialSell
+        from src.core.nav_profit_exit import nav_profit_sell_quantity
+        from src.services.execution_workflow_service import BoardCommandRejectedError, request_board_action
+        from src.services.trade_card_repository import TradeCardNotFoundError, TradeCardVersionConflictError
+
+        if (
+            not self._accepting_commands or not self._lease_current or self._standby_only
+            or self.device_state != RuntimeDeviceState.ACTIVE
+            or not is_regular_session_open()
+        ):
+            return False
+        changed = False
+        now = datetime.now(timezone.utc)
+        for card in cards:
+            if (
+                card.nav_profit_exit.status != "ARMED"
+                or not self._account_reconciliation_is_fresh(card.account_no)
+                or card.account_no in self.reconciliation_accounts_in_progress
+            ):
+                continue
+            quote = self.runtime.market_data.latest_quote(card.symbol)
+            if (
+                quote is None or not quote.regular_session
+                or not quote.entry_trigger_eligible
+                or quote.channel not in {"", "TRADE", "HDFSCNT0"}
+                or quote.breached_stop_versions
+                or not quote.is_execution_fresh(now=now)
+            ):
+                continue
+            quantity = nav_profit_sell_quantity(card, quote.last_price)
+            if not quantity:
+                continue
+            context = BoardActionContext(
+                enforce_runtime_fences=True,
+                engine_enabled=execution_config.is_buyboard_engine_enabled(),
+                readiness_generation=int(self.readiness_generation or 0),
+                action_ready=self._card_action_ready(card), device_active=True,
+                regular_session_open=True,
+            )
+            try:
+                request_board_action(
+                    self._db_engine,
+                    RequestPartialSell(
+                        environment=card.environment, account_no=card.account_no,
+                        symbol=card.symbol, expected_card_version=card.version,
+                        expected_readiness_generation=context.readiness_generation,
+                        command_id="nav-profit-" + card.nav_profit_exit.cycle_id,
+                        quantity=quantity, nav_profit_trigger_price=quote.last_price,
+                    ),
+                    context=context, claim_kanban_ownership=True,
+                )
+            except (BoardCommandRejectedError, TradeCardNotFoundError, TradeCardVersionConflictError):
+                continue  # An operator edit or reconciliation wins; retry fresh truth.
+            changed = True
+            logger.info("Requested NAV profit half-sale for %s: %s shares", card.symbol, quantity)
+        return changed
+
     def _run_one_cycle(self, *, allow_mutations: bool = True) -> None:
         assert self.runtime is not None
         cycle_timings_ms = {}
@@ -2201,8 +2260,13 @@ class BuyboardRuntimeWorker(QThread):
         record_phase("account_refresh_and_reconciliation")
 
         if canonical_available and allow_mutations:
-            if self._ensure_manual_position_stop_protection(cards):
+            protection_changed = self._ensure_manual_position_stop_protection(cards)
+            if protection_changed:
                 cards = self._load_cards_if_changed(force=True)
+            profit_changed = self._ensure_nav_profit_taking(cards)
+            if profit_changed:
+                cards = self._load_cards_if_changed(force=True)
+            if protection_changed or profit_changed:
                 self._configure_verified_mutation_budgets(cards)
                 self._cache_emergency_ownership_proofs(cards)
         record_phase("manual_position_stop_protection")

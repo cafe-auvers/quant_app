@@ -21,6 +21,7 @@ from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
 
 from src.core import execution_config
+from src.core.nav_profit_exit import NavProfitExitState, NAV_PROFIT_NAV_REQUIRED
 from src.core.execution_mode import ExecutionSource
 from src.core.execution_request import CancelIntent
 from src.core.execution_result import ExecutionSubmissionResult
@@ -397,6 +398,8 @@ class PositionManager:
         breakeven when necessary. An already-higher active stop and its type
         remain unchanged so partial-exit reconciliation can never widen risk.
         """
+        if card.nav_profit_exit.status == "ARMED":
+            card.nav_profit_exit.status = "OVERRIDDEN"
         card.broker_quantity = refreshed_broker_quantity
         card.orderable_quantity = refreshed_broker_quantity
         self.apply_breakeven_stop(card)
@@ -435,6 +438,7 @@ class PositionManager:
         confirms it). Step 8 ("continue until flat") is likewise the
         caller's heartbeat re-invoking the retry stage, not a loop here.
         """
+        card.nav_profit_exit.status = "OVERRIDDEN"
         card.exit_all_required = True
         if working_partial_sell_client_order_id:
             callbacks.request_cancel(
@@ -463,6 +467,7 @@ class PositionManager:
         :meth:`handle_stop_triggered_during_partial_sell`'s docstring for
         why submission does not happen inline here (P1-4).
         """
+        card.nav_profit_exit.status = "OVERRIDDEN"
         card.exit_all_required = True
         card.pending_partial_sell_quantity = 0
         card.pending_partial_sell_price = None
@@ -486,6 +491,8 @@ class PositionManager:
             raise ValueError(
                 f"Cannot close {card.symbol}: broker_quantity is {card.broker_quantity}, not zero"
             )
+        card.nav_profit_exit = NavProfitExitState()
+        card.warnings = [w for w in card.warnings if w != NAV_PROFIT_NAV_REQUIRED]
         card.board_status = BoardStatus.CLOSED
         card.pending_partial_sell_quantity = 0
         card.pending_partial_sell_price = None

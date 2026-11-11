@@ -112,6 +112,8 @@ class CancelEntry(BoardCommand):
 class RequestPartialSell(BoardCommand):
     quantity: int = 0
     limit_price: Optional[float] = None
+    # Internal runtime trigger; web/manual constructors leave this unset.
+    nav_profit_trigger_price: Optional[float] = None
 
     def __post_init__(self) -> None:
         super().__post_init__()

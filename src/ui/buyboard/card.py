@@ -426,6 +426,18 @@ def _card_metric_rows(
         if exit_quantity > 0 else "Sell quantity syncing"
     )
     rows.insert(2, ("Exit estimate", exit_basis))
+    auto = card.nav_profit_exit
+    auto_text = {
+        "WAITING": "Waiting for fresh account NAV",
+        "ARMED": f"Sell {card.broker_quantity // 2:,} sh at +{_fmt_money(auto.target_profit_usd)} position profit",
+        "SELLING": f"{auto.filled_quantity:,} / {auto.target_quantity:,} shares sold; breakeven after fill",
+        "DONE": "Completed; no repeat for this position",
+        "OVERRIDDEN": "Manual exit override",
+        "BLOCKED": "Saved state needs review",
+    }.get(auto.status, "Saved state needs review")
+    if auto.status == "ARMED" and card.broker_quantity < 2:
+        auto_text = "Needs at least 2 shares"
+    rows.insert(3, ("Auto Take Profit", "Full exit takes priority" if full_exit else auto_text))
     rows.extend(
         [
             ("Avg Entry", f"${_fmt_price(card.average_entry_price)}"),

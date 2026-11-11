@@ -2082,6 +2082,11 @@ class TradingEngine:
                     card.environment, card.account_no, card.symbol
                 )
                 quantity = min(card.pending_partial_sell_quantity, remaining)
+                if card.nav_profit_exit.status == "SELLING" and card.pending_partial_sell_quantity >= remaining:
+                    if "AUTO_NAV_PROFIT_POSITION_CHANGED" not in card.warnings:
+                        card.warnings.append("AUTO_NAV_PROFIT_POSITION_CHANGED")
+                        changed.append(card)
+                    continue  # Never turn a half-sale into liquidation after an outside reduction.
                 if quantity <= 0:
                     continue
                 deadline = (
@@ -2198,6 +2203,14 @@ class TradingEngine:
                         changed.append(card)
                     continue
                 refreshed = self._position_callbacks.reconcile_sell_order(order)
+                if card.nav_profit_exit.status == "SELLING":
+                    from src.core.nav_profit_exit import record_nav_profit_fill
+                    previous = dict(card.nav_profit_exit.fills)
+                    record_nav_profit_fill(card, order.client_order_id, refreshed.filled_quantity)
+                    reserved_before = card.reserved_sell_quantity
+                    card.reserved_sell_quantity = max(0, refreshed.remaining_quantity)
+                    if previous != card.nav_profit_exit.fills or reserved_before != card.reserved_sell_quantity:
+                        changed.append(card)
                 if refreshed.status.value not in ("FILLED", "CANCELLED", "REJECTED", "EXPIRED"):
                     if self._escalate_exit_cancel_if_due(
                         card,
@@ -2210,17 +2223,28 @@ class TradingEngine:
                 remaining = self._position_callbacks.refresh_orderable_quantity(
                     card.environment, card.account_no, card.symbol
                 )
-                self._complete_partial_exit(card, remaining)
+                self._complete_partial_exit(card, remaining, terminal_order=refreshed)
                 changed.append(card)
             except Exception:
                 logger.exception("_reconcile_partial_sell_fills failed for %s", card.symbol)
         return changed
 
     def _complete_partial_exit(
-        self, card: TradeCardState, remaining: int
+        self, card: TradeCardState, remaining: int, *, terminal_order=None,
     ) -> None:
         """Project terminal partial-exit truth and retire its correlation."""
         self._clear_exit_cancel_tracking(card)
+        was_automatic = card.nav_profit_exit.status == "SELLING"
+        if was_automatic and terminal_order is not None:
+            from src.core.nav_profit_exit import record_nav_profit_fill, retire_nav_profit_order
+            record_nav_profit_fill(card, terminal_order.client_order_id, terminal_order.filled_quantity)
+            retire_nav_profit_order(card, terminal_order.client_order_id)
+        if was_automatic and remaining > 0:
+            from src.core.nav_profit_exit import continue_nav_profit_exit
+            self._consume_exit_attempt(card)
+            if continue_nav_profit_exit(card, remaining):
+                card.next_exit_retry_at = self._clock() + timedelta(seconds=execution_config.EXIT_RETRY_COOLDOWN_SECONDS)
+                return
         # A rejected or zero-fill cancellation leaves the existing stop
         # untouched. Any broker-confirmed quantity decrease, including a
         # fill racing a user cancel, receives breakeven protection.
@@ -2228,7 +2252,7 @@ class TradingEngine:
             card.broker_quantity = 0
             card.orderable_quantity = 0
             self._position_manager.confirm_flat(card)
-        elif remaining < card.broker_quantity:
+        elif was_automatic or remaining < card.broker_quantity:
             self._position_manager.on_partial_exit_filled(
                 card, refreshed_broker_quantity=remaining
             )

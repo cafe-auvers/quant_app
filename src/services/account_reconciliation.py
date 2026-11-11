@@ -25,6 +25,10 @@ from sqlalchemy import event
 from sqlalchemy.engine import Engine
 
 from src.core import execution_config
+from src.core.nav_profit_exit import (
+    continue_nav_profit_exit, initialize_nav_profit_exit, record_nav_profit_fill,
+    retire_nav_profit_order,
+)
 from src.core.account_broker_snapshot import (
     AccountBrokerSnapshot,
     AccountHoldingSnapshot,
@@ -1459,6 +1463,13 @@ def _project_exact_order_to_card(
         return
 
     if operational == ReconciliationCategory.PARTIAL_SELL:
+        automatic = card.nav_profit_exit.status == "SELLING"
+        if automatic:
+            if terminal and order.client_order_id in card.nav_profit_exit.retired_orders and (
+                broker_snapshot.filled_quantity <= card.nav_profit_exit.fills.get(order.client_order_id, 0)
+            ):
+                return
+            record_nav_profit_fill(card, order.client_order_id, broker_snapshot.filled_quantity)
         liquidating = bool(
             card.exit_all_required
             or card.stop_loss_triggered
@@ -1493,6 +1504,15 @@ def _project_exact_order_to_card(
             )
             return
         remaining = holding.quantity if holding is not None else 0
+        if automatic and remaining > 0 and not liquidating:
+            retire_nav_profit_order(card, order.client_order_id)
+            _consume_exit_card_attempt(card, order)
+            _clear_exit_card_tracking(card)
+            if continue_nav_profit_exit(card, remaining):
+                card.next_exit_retry_at = account_snapshot.observed_at + timedelta(
+                    seconds=execution_config.EXIT_RETRY_COOLDOWN_SECONDS
+                )
+                return
         card.pending_partial_sell_quantity = 0
         card.pending_partial_sell_price = None
         _clear_exit_card_tracking(card, retire_attempt_group=True)
@@ -1500,7 +1520,7 @@ def _project_exact_order_to_card(
             card.broker_quantity = 0
             card.orderable_quantity = 0
             position_manager.confirm_flat(card)
-        elif broker_snapshot.filled_quantity > 0:
+        elif automatic or broker_snapshot.filled_quantity > 0:
             position_manager.on_partial_exit_filled(
                 card, refreshed_broker_quantity=remaining
             )
@@ -1987,21 +2007,22 @@ def reduce_account_reconciliation(
                         if "STOP_REQUIRED" not in card.warnings:
                             card.warnings = [*card.warnings, "STOP_REQUIRED"]
                         card.entry_block_reason = "broker_position_requires_stop"
+            nav_age = (
+                (snapshot.observed_at - snapshot.account_balance_observed_at).total_seconds()
+                if snapshot.account_balance_observed_at is not None else None
+            )
+            account_nav = (
+                snapshot.account_equity
+                if snapshot.completeness.account_balance_complete
+                and nav_age is not None
+                and 0 <= nav_age <= execution_config.FULL_RECONCILIATION_SECONDS
+                else None
+            )
             if card.entry_block_reason in (
                 "manual_position_requires_stop", "broker_position_requires_stop"
             ) or "STOP_REQUIRED" in card.warnings:
-                nav_age = (
-                    (snapshot.observed_at - snapshot.account_balance_observed_at).total_seconds()
-                    if snapshot.account_balance_observed_at is not None else None
-                )
-                account_nav = (
-                    snapshot.account_equity
-                    if snapshot.completeness.account_balance_complete
-                    and nav_age is not None
-                    and 0 <= nav_age <= execution_config.FULL_RECONCILIATION_SECONDS
-                    else None
-                )
                 initialize_manual_position_stop(card, account_nav=account_nav)
+            initialize_nav_profit_exit(card, account_nav)
             if card.stop_type == StopType.MANUAL_PRICE:
                 card.stop_quantity = holding.quantity
         for card in cards:

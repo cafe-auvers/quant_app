@@ -1398,6 +1398,18 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
         return
 
     if isinstance(command, types.RequestPartialSell):
+        from src.core.nav_profit_exit import nav_profit_sell_quantity
+        if command.nav_profit_trigger_price is not None:
+            quantity = nav_profit_sell_quantity(card, command.nav_profit_trigger_price)
+            if not quantity or command.quantity != quantity or command.limit_price is not None:
+                raise BoardCommandRejectedError("NAV profit trigger is no longer eligible")
+            if any(order.side == OrderSide.BUY for order in active_orders):
+                raise BoardCommandRejectedError("NAV profit exit waits for working entries to finish")
+            card.nav_profit_exit.status = "SELLING"
+            card.nav_profit_exit.target_quantity = quantity
+            card.nav_profit_exit.fills = {}
+        else:
+            card.nav_profit_exit.status = "OVERRIDDEN"
         if card.stop_loss_triggered:
             raise BoardCommandRejectedError("A triggered stop loss must liquidate the full position")
         source_status = card.board_status
@@ -1444,6 +1456,7 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
         return
 
     if isinstance(command, types.CancelPartialSell):
+        card.nav_profit_exit.status = "OVERRIDDEN"
         if card.board_status != BoardStatus.PARTIAL_SELL:
             raise BoardCommandRejectedError("No Partial Sell objective to withdraw")
         active_sell = any(order.side == OrderSide.SELL for order in active_orders)
@@ -1601,6 +1614,7 @@ def _apply_board_mutation(command, card, *, context=None, active_orders=()) -> N
         card.entry_runtime_status = EntryRuntimeStatus.ORB_FORMING
         card.entry_block_reason = ""
     elif isinstance(command, types.RequestSellAll):
+        card.nav_profit_exit.status = "OVERRIDDEN"
         # This is durable liquidation intent only.  The engine cancels a
         # conflicting BUY, refreshes quantity, submits, and reconciliation
         # alone may eventually project CLOSED.
