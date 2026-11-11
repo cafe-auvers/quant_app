@@ -13,6 +13,7 @@ from src.core.board_workflow import BoardCardProjection
 from src.core.discovered_external_order import DiscoveredExternalOrder
 from src.core.execution_order_record import ExecutionOrderRecord
 from src.core.buy_today_feedback import buy_today_feedback_is_current
+from src.core.position_pnl import estimate_position_pnl
 from src.core.trade_card_state import BoardStatus, PositionRuntimeStatus, TradeCardState
 
 # Colors follow the existing Buy Dashboard convention (view.py row coloring):
@@ -33,7 +34,9 @@ _BOARD_STATUS_ACCENT = {
 
 
 def _fmt_price(value) -> str:
-    return f"{value:,.2f}" if value else "--"
+    if not value:
+        return "--"
+    return f"{value:,.4f}" if 0 < value < 1 else f"{value:,.2f}"
 
 
 def _fmt_money(value: float, *, signed: bool = False) -> str:
@@ -222,17 +225,17 @@ def _account_result(value: float, account_equity: float | None) -> str:
 
 
 def _pnl_result(card: TradeCardState, current_price: float | None) -> str:
-    current = _positive_float(current_price)
-    entry = _positive_float(card.average_entry_price)
-    quantity = max(0, int(card.broker_quantity or 0))
-    if current is None or entry is None or quantity <= 0:
+    return _price_pnl_result(card, current_price, card.broker_quantity)
+
+
+def _price_pnl_result(card: TradeCardState, price, quantity) -> str:
+    pnl = estimate_position_pnl(card.average_entry_price, price, quantity)
+    if pnl is None:
         return "--"
-    percent = _pnl_percent(card, current)
-    dollars = (current - entry) * quantity
-    color = "#2e7d32" if dollars >= 0 else "#c62828"
+    color = "#2e7d32" if pnl.dollars >= 0 else "#c62828"
     return (
-        f"<span style='color:{color};'>{percent:+.2f}%&nbsp;&nbsp;"
-        f"{_fmt_money(dollars, signed=True)}</span>"
+        f"<span style='color:{color};'>{pnl.percent:+.2f}%&nbsp;&nbsp;"
+        f"{_fmt_money(pnl.dollars, signed=True)}</span>"
     )
 
 
@@ -391,6 +394,38 @@ def _card_metric_rows(
             rows.append(("Stop P&L", _account_result(stop_pnl, account_equity)))
         return rows
 
+    current_pnl = _pnl_result(card, effective_current_price)
+    if current_price is None and effective_current_price is not None:
+        current_pnl += " (reported quote)"
+    rows.insert(0, ("P&L", current_pnl))
+    full_exit = (
+        card.board_status == BoardStatus.SELL_ALL
+        or card.exit_all_required
+        or card.stop_loss_triggered
+    )
+    partial = card.board_status == BoardStatus.PARTIAL_SELL and not full_exit
+    if partial:
+        pending = bool(
+            card.exit_client_order_id
+            or card.exit_pending_attempt_number
+            or card.exit_submission_unresolved
+        )
+        exit_quantity = max(0, int(card.reserved_sell_quantity if pending else card.pending_partial_sell_quantity))
+        if exit_quantity > max(0, int(card.broker_quantity)):
+            exit_quantity = 0
+        exit_price = _positive_float(card.pending_partial_sell_price) or effective_current_price
+        basis = "limit floor" if card.pending_partial_sell_price else "current price estimate"
+    else:
+        exit_quantity = max(0, int(card.broker_quantity))
+        exit_price = effective_current_price
+        basis = "current price estimate"
+    rows.insert(1, ("Partial P&L est." if partial else "Sell All P&L est.",
+                    _price_pnl_result(card, exit_price, exit_quantity)))
+    exit_basis = (
+        f"{exit_quantity:,} sh @ ${_fmt_price(exit_price)} ({basis})"
+        if exit_quantity > 0 else "Sell quantity syncing"
+    )
+    rows.insert(2, ("Exit estimate", exit_basis))
     rows.extend(
         [
             ("Avg Entry", f"${_fmt_price(card.average_entry_price)}"),
@@ -412,7 +447,6 @@ def _card_metric_rows(
             int(card.broker_quantity or 0),
         )
         rows.append(("Selling All", f"{selling:,} sh" if selling else "--"))
-    rows.append(("P&L", _pnl_result(card, current_price)))
     actual_stop = _positive_float(card.entry_orb_low)
     actual_entry = _positive_float(card.average_entry_price)
     actual_quantity = max(0, int(card.broker_quantity or 0))
@@ -443,13 +477,15 @@ def _metric_rows_html(rows: list[tuple[str, str]]) -> str:
     if not rows:
         return ""
     body = "".join(
-        "<tr>"
-        f"<td style='color:#666; padding-right:10px;'>{html.escape(label)}</td>"
-        f"<td align='right'>{value}</td>"
+        ("<tr style='font-size:13px; font-weight:600;'>" if label in {
+            "P&L", "Partial P&L est.", "Sell All P&L est."
+        } else "<tr>")
+        + f"<td width='40%' style='color:#666; padding:4px 8px 4px 0;'>{html.escape(label)}</td>"
+        f"<td width='60%' style='padding:4px 0;'>{value}</td>"
         "</tr>"
         for label, value in rows
     )
-    return f"<table cellspacing='0' cellpadding='1'>{body}</table>"
+    return f"<table width='100%' cellspacing='0' cellpadding='1'>{body}</table>"
 
 
 def _visible_restrictions(projection: BoardCardProjection | None) -> tuple[str, ...]:
@@ -496,9 +532,10 @@ class TradeCardWidget(QFrame):
         projection: BoardCardProjection | None = None,
     ) -> None:
         accent = _BOARD_STATUS_ACCENT.get(card.board_status, "#607d8b")
+        self.setObjectName("tradeCard")
         self.setFrameShape(QFrame.StyledPanel)
         self.setStyleSheet(
-            f"QFrame {{ border-left: 4px solid {accent}; border-radius: 4px; "
+            f"QFrame#tradeCard {{ border: 1px solid #bfc8c3; border-left: 4px solid {accent}; border-radius: 6px; "
             f"background-color: palette(base); padding: 2px; }}"
         )
         layout = QVBoxLayout(self)
@@ -510,6 +547,7 @@ class TradeCardWidget(QFrame):
             + ("<b style='color:#b8860b;'>EP</b>  " if card.is_ep else "")
             + f"<span style='color:#888;'>{html.escape(card.name)}</span>"
         )
+        header.setWordWrap(True)
         layout.addWidget(header)
 
         self.card_key = card.card_key
@@ -534,10 +572,18 @@ class TradeCardWidget(QFrame):
             _card_metric_rows(card, current_price, account_equity)
         )
         self._metrics_label = QLabel(self._metrics_html)
+        self._metrics_label.setWordWrap(True)
+        self._metrics_label.setMinimumWidth(0)
+        self._metrics_label.setStyleSheet("font-size: 12px;")
         # Compatibility for extensions/tests that inspected the former
         # single position-summary label directly.
         self._info_label = self._metrics_label
         layout.addWidget(self._metrics_label)
+        if card.board_status in {BoardStatus.OPEN_POSITION, BoardStatus.PARTIAL_SELL, BoardStatus.SELL_ALL}:
+            estimate_note = QLabel("Gross USD estimates before fees; execution price can differ.")
+            estimate_note.setWordWrap(True)
+            estimate_note.setStyleSheet("color: #666; font-size: 11px;")
+            layout.addWidget(estimate_note)
 
         # Watchlist and Buylist are planning-only columns.  Runtime ownership,
         # reconciliation, order, ORB, stop, and warning details only become

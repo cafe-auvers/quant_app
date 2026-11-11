@@ -34,6 +34,7 @@ from PyQt5.QtCore import Qt
 from src.core.execution_queue import OrbCandidateStatus, SUPPORTED_ORB_WINDOWS
 from src.core.orb_combinations import OrbPositionCombination
 from src.core.trade_card_state import TradeCardState
+from src.core.position_pnl import estimate_position_pnl
 
 
 _RISK_VALID_ORB_STATUSES = {
@@ -606,6 +607,11 @@ def prompt_partial_sell(parent, card: TradeCardState) -> Optional[tuple[int, Opt
     hint = QLabel("")
     hint.setStyleSheet("color: #888; font-size: 11px;")
     layout.addWidget(hint)
+    pnl_preview = QLabel()
+    pnl_preview.setObjectName("partial_sell_pnl_preview")
+    pnl_preview.setWordWrap(True)
+    pnl_preview.setStyleSheet("padding: 10px; background: palette(alternate-base); font-size: 13px;")
+    layout.addWidget(pnl_preview)
 
     def _update_hint(value: int) -> None:
         pct = value / orderable * 100.0
@@ -615,9 +621,22 @@ def prompt_partial_sell(parent, card: TradeCardState) -> Optional[tuple[int, Opt
             hint.setText(f"{pct:.0f}% of position — this will submit a Sell All.")
         else:
             hint.setText(f"{pct:.0f}% of position")
+        mark = price.value() if use_limit.isChecked() else card.market_data_last_trusted_price
+        pnl = estimate_position_pnl(card.average_entry_price, mark, value)
+        if pnl is None:
+            pnl_preview.setText("Estimated P&L unavailable until a price and average cost are reported.")
+        else:
+            sign = "-" if pnl.dollars < 0 else "+"
+            basis = "limit floor" if use_limit.isChecked() else "reported quote; may be stale"
+            pnl_preview.setText(
+                f"Estimated P&L: {sign}${abs(pnl.dollars):,.2f} ({pnl.percent:+.2f}%)\n"
+                f"{value:,} shares @ ${mark:,.4f} ({basis})\n"
+                f"Estimated proceeds: ${pnl.proceeds:,.2f}. Gross USD before fees."
+            )
 
     spin.valueChanged.connect(_update_hint)
     use_limit.toggled.connect(lambda _checked: _update_hint(spin.value()))
+    price.valueChanged.connect(lambda _price: _update_hint(spin.value()))
     _update_hint(spin.value())
 
     buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -644,10 +663,21 @@ def prompt_partial_sell(parent, card: TradeCardState) -> Optional[tuple[int, Opt
 
 def confirm_sell_all(parent, card: TradeCardState) -> bool:
     quantity = card.orderable_quantity or card.broker_quantity
+    pnl = estimate_position_pnl(
+        card.average_entry_price, card.market_data_last_trusted_price, card.broker_quantity
+    )
+    estimate = "\nEstimated P&L unavailable until a price and average cost are reported."
+    if pnl is not None:
+        sign = "-" if pnl.dollars < 0 else "+"
+        estimate = (
+            f"\nEstimated P&L on all {card.broker_quantity:,} held shares: "
+            f"{sign}${abs(pnl.dollars):,.2f} ({pnl.percent:+.2f}%).\n"
+            "Based on the reported quote, which may be stale. Gross USD before fees; fill price can differ."
+        )
     reply = QMessageBox.question(
         parent,
         "Sell All",
-        f"Submit a full liquidation for {card.symbol} ({quantity} shares)?",
+        f"Submit a full liquidation for {card.symbol} ({quantity} shares)?" + estimate,
         QMessageBox.Yes | QMessageBox.No,
         QMessageBox.No,
     )

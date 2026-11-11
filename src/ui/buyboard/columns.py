@@ -122,6 +122,8 @@ class BoardColumnList(QListWidget):
         size = widget.sizeHint()
         available_width = max(120, self.viewport().width() - 4)
         size.setWidth(available_width)
+        if widget.hasHeightForWidth():
+            size.setHeight(max(78, widget.heightForWidth(available_width)))
         item.setSizeHint(size)
 
     def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override

@@ -836,13 +836,7 @@
           && Number(row.stop_quantity || 0) >= held
           ? average !== null ? boardNavMetric(Math.max(0, average - stop) * held) : 'Unavailable'
           : 'Not fully covered']);
-      if (price.price !== null && average !== null && held > 0) {
-        const pnl = (price.price - average) * held;
-        const percent = (price.price / average - 1) * 100;
-        facts.push(['Est. P&L', `${pnl >= 0 ? '+' : '−'}$${Math.abs(pnl).toFixed(2)} (${percent >= 0 ? '+' : ''}${percent.toFixed(2)}%)${price.fresh ? '' : ' · stale'}`]);
-      } else {
-        facts.push(['Est. P&L', '—']);
-      }
+      facts.unshift(...boardPnlFacts(row, price));
       if (price.price !== null && stop !== null) {
         facts.push(['To stop', `${((price.price - stop) / price.price * 100).toFixed(2)}%${price.fresh ? '' : ' · stale'}`]);
       }
@@ -866,12 +860,87 @@
     return {facts, price};
   }
 
+  function boardPnl(average, price, quantity) {
+    const cost = boardNumber(average), mark = boardNumber(price), shares = boardNumber(quantity);
+    if (cost === null || mark === null || shares === null || !Number.isInteger(shares)) return null;
+    const dollars = (mark - cost) * shares, percent = (mark / cost - 1) * 100;
+    const proceeds = mark * shares;
+    return [dollars, percent, proceeds].every(Number.isFinite) ? {dollars, percent, proceeds} : null;
+  }
+
+  function boardPnlText(pnl, stale = false) {
+    if (!pnl) return 'Unavailable';
+    const amount = Math.abs(pnl.dollars) < .005 ? 0 : pnl.dollars;
+    return `${amount < 0 ? '−' : '+'}$${Math.abs(amount).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})} (${pnl.percent >= 0 ? '+' : ''}${pnl.percent.toFixed(2)}%)${stale ? ' · stale' : ''}`;
+  }
+
+  function boardExitEstimate(row, price, quantity = null, limit = null) {
+    const held = Math.max(0, Math.trunc(Number(row.broker_quantity) || 0));
+    const liquidating = row.board_status === 'SELL_ALL' || row.exit_all_required;
+    const partial = !liquidating && (quantity !== null || row.board_status === 'PARTIAL_SELL');
+    let shares = held, at = price.price, usesLimit = false;
+    if (partial) {
+      shares = quantity !== null ? Number(quantity) : Number(row.exit_order_pending
+        ? row.reserved_sell_quantity : row.pending_partial_sell_quantity);
+      const floor = boardNumber(quantity !== null ? limit : row.pending_partial_sell_price);
+      if (floor !== null) { at = floor; usesLimit = true; }
+    }
+    const valid = Number.isInteger(shares) && shares > 0 && shares <= held
+      && (!partial || quantity === null || shares <= Number(row.orderable_quantity || 0));
+    const pnl = valid ? boardPnl(row.average_entry_price, at, shares) : null;
+    return {pnl, shares, at, partial, usesLimit,
+      stale: !usesLimit && !price.fresh,
+      label: partial ? 'Partial sell P&L · est.' : 'Sell all P&L · est.',
+      basis: !valid ? 'Sell quantity unavailable'
+        : `${boardShares(shares)} @ ${boardMoney(at)} · ${usesLimit ? 'limit floor' : 'current price estimate'}`};
+  }
+
+  function boardPnlFacts(row, price) {
+    const current = boardPnl(row.average_entry_price, price.price, row.broker_quantity);
+    const exit = boardExitEstimate(row, price);
+    const fact = (label, pnl, stale, basis) => [label, boardPnlText(pnl, stale),
+      {pnl: true, tone: !pnl ? 'unknown' : pnl.dollars > 0 ? 'gain' : pnl.dollars < 0 ? 'loss' : 'flat', basis}];
+    const facts = [fact('Current P&L', current, !price.fresh,
+      `${boardShares(row.broker_quantity)} held · unrealized`),
+    fact(exit.label, exit.pnl, exit.stale, exit.basis)];
+    const covered = Number(row.stop_quantity || 0) >= Number(row.broker_quantity || 0);
+    const atStop = covered ? boardPnl(row.average_entry_price, row.active_stop_price, row.broker_quantity) : null;
+    const stopFact = fact('At active stop · est.', atStop, false,
+      covered ? `All held shares @ ${boardMoney(row.active_stop_price)}` : 'Stop does not cover all held shares');
+    if (!covered) stopFact[1] = 'Not fully covered';
+    facts.push(stopFact);
+    return facts;
+  }
+
+  function updateBoardExitPreview() {
+    const preview = byId('buy-board-exit-preview');
+    const wrapper = byId('buy-board-action-input');
+    const row = state.buyBoardRows.find(item => item.symbol === state.buyBoardSelectedSymbol);
+    preview.hidden = !row || wrapper.hidden || wrapper.dataset.action !== 'request_partial_sell';
+    if (preview.hidden) return;
+    const quantity = Number(byId('buy-board-action-value').value);
+    const raw = byId('buy-board-partial-price').value.trim();
+    const limit = raw === '' ? null : Number(raw);
+    const scale = Number(limit) < 1 ? 10000 : 100;
+    if (raw !== '' && (boardNumber(limit) === null
+      || Math.abs(limit * scale - Math.round(limit * scale)) > 1e-6)) {
+      preview.textContent = 'Enter a valid sell price to estimate P&L.';
+      return;
+    }
+    const exit = boardExitEstimate(row, boardPrice(row), quantity, limit);
+    preview.dataset.tone = !exit.pnl ? 'unknown' : exit.pnl.dollars >= 0 ? 'gain' : 'loss';
+    preview.textContent = exit.pnl
+      ? `${exit.label}: ${boardPnlText(exit.pnl, exit.stale)}\n${exit.basis}\nEstimated proceeds: ${boardMoney(exit.pnl.proceeds)} · before fees`
+      : 'Enter a whole share quantity within the sellable balance. A reported price is needed for an immediate-sell estimate.';
+  }
+
   function boardWarning(row) {
     const reason = ['PARTIAL_SELL', 'SELL_ALL'].includes(row.board_status)
       ? row.last_exit_error
       : ['BUY_TODAY', 'ENTRY_PENDING'].includes(row.board_status) ? row.entry_block_reason
         : row.board_status === 'BUYLIST' ? row.buy_today_note : '';
-    return [reason, ...(row.warnings || [])].find(value => String(value || '').trim()) || '';
+    return [...new Set([reason, ...(row.warnings || [])]
+      .map(value => String(value || '').trim()).filter(value => value && value.toLowerCase() !== 'migrated_from_buylist'))].join(' · ');
   }
 
   function mobileKanbanCard(row) {
@@ -902,12 +971,21 @@
     const details = boardDetails(row);
     const grid = document.createElement('span');
     grid.className = 'mobile-kanban-card-details';
-    grid.append(...details.facts.map(([label, value]) => boardFact(label, value)));
+    const position = ['OPEN_POSITION', 'PARTIAL_SELL', 'SELL_ALL'].includes(row.board_status);
+    const visibleFacts = position ? details.facts.filter(([label, _value, options]) =>
+      options?.pnl || ['Price', 'Active stop', 'To stop'].includes(label)) : details.facts;
+    grid.append(...visibleFacts.map(([label, value, options]) => boardFact(label, value, options)));
     const priceNote = document.createElement('span');
     priceNote.className = 'mobile-kanban-price-note';
     priceNote.dataset.stale = String(!details.price.fresh);
     priceNote.textContent = details.price.note;
     button.append(grid, priceNote);
+    if (position) {
+      const hint = document.createElement('span');
+      hint.className = 'mobile-kanban-price-note';
+      hint.textContent = 'Gross USD · estimates before fees. Tap for full position details and actions.';
+      button.append(hint);
+    }
     const warning = boardWarning(row);
     if (warning) {
       const alert = document.createElement('span');
@@ -1073,13 +1151,20 @@
     state.buyBoardSelectedSymbol = '';
   }
 
-  function boardFact(label, value) {
+  function boardFact(label, value, options = {}) {
     const item = document.createElement('span');
     const name = document.createElement('small');
     name.textContent = label;
     const result = document.createElement('b');
     result.textContent = value;
     item.append(name, result);
+    if (options.pnl) {
+      item.className = 'board-pnl-fact';
+      item.dataset.tone = options.tone;
+      const basis = document.createElement('em');
+      basis.textContent = options.basis;
+      item.append(basis);
+    }
     return item;
   }
 
@@ -1107,7 +1192,11 @@
         byId('buy-board-partial-price-fields').hidden = !pricedPartial;
         byId('buy-board-partial-price').value = '';
         byId('buy-board-partial-price').setCustomValidity('');
-        requestAnimationFrame(() => input.focus({preventScroll: true}));
+        updateBoardExitPreview();
+        requestAnimationFrame(() => {
+          wrapper.scrollIntoView({block: 'nearest'});
+          input.focus({preventScroll: true});
+        });
         return;
       }
       void applyBuyBoardAction(action, options.payload || {});
@@ -1128,7 +1217,7 @@
     const facts = byId('buy-board-action-facts');
     const details = boardDetails(row);
     const factRows = [boardFact('Status', boardStatusLabel(row)),
-      ...details.facts.map(([label, value]) => boardFact(label, value))];
+      ...details.facts.map(([label, value, options]) => boardFact(label, value, options))];
     facts.replaceChildren(...factRows);
     byId('buy-board-action-price-note').textContent = details.price.note;
     byId('buy-board-action-warning').textContent = boardWarning(row);
@@ -1191,7 +1280,7 @@
       }),
     );
     actions.replaceChildren(fragment);
-    byId('buy-board-action-input').hidden = true;
+    updateBoardExitPreview();
     const feedback = state.buyBoardActionFeedback.get(row.symbol);
     byId('buy-board-action-status').textContent = pending
       ? 'Saving…' : feedback?.message || '';
@@ -1199,6 +1288,7 @@
   }
 
   function openBuyBoardActionSheet(symbol) {
+    byId('buy-board-action-input').hidden = true;
     state.buyBoardSelectedSymbol = symbol;
     renderBuyBoardActionSheet();
     byId('buy-board-action-sheet').hidden = false;
@@ -1288,6 +1378,11 @@
         payload.price == null ? 'Request partial sell' : 'Request limit sell'],
       request_sell_all: [`Sell all of ${symbol}?`, 'This records durable liquidation intent. The Execution Owner may submit it only after the workflow gates pass.', 'Request Sell All'],
     };
+    if (['request_partial_sell', 'request_sell_all'].includes(action)) {
+      const exit = boardExitEstimate(row, boardPrice(row),
+        action === 'request_partial_sell' ? payload.quantity : null, payload.price);
+      confirmations[action][1] += `\nEstimated gross P&L: ${boardPnlText(exit.pnl, exit.stale)}. ${exit.basis}. Before fees; fill price can differ.`;
+    }
     if (action === 'activate_buy_today') {
       const choice = await confirmBuyTodayPublication(symbol, confirmations[action][1]);
       if (!choice) return;
@@ -4469,8 +4564,10 @@
       wrapper.hidden = true;
       void applyBuyBoardAction(action, payload);
     });
-    byId('buy-board-action-value').addEventListener('input', event => event.target.setCustomValidity(''));
-    byId('buy-board-partial-price').addEventListener('input', event => event.target.setCustomValidity(''));
+    ['buy-board-action-value', 'buy-board-partial-price'].forEach(id => byId(id).addEventListener('input', event => {
+      event.target.setCustomValidity('');
+      updateBoardExitPreview();
+    }));
     byId('operator-confirm-cancel').addEventListener('click', () => closeOperatorConfirm(false));
     byId('desktop-orb-settings').addEventListener('click', () => {
       setMobilePage('settings');

@@ -296,6 +296,11 @@ still-later candidate strictly beats its active score.
 
 ## 7. Fill and stop behavior
 
+Position cards show current unrealized gross P&L and a separate estimate for
+the proposed exit quantity and price. Partial limits use their floor; immediate
+and full exits use the reported quote. Fees and actual fills can change the
+result. See [position P&L and readable cards](position_pnl_cards_2026-11-11.md).
+
 Manual KIS purchases discovered without an existing or pending stop receive a
 default stop 7% below the first reported average cost, rounded up to a supported
 tick and covering the full holding. Syncs and restarts preserve that price;
