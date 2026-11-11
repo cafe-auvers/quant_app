@@ -10,7 +10,7 @@ from src.web.assets import ReleaseAssets
 from .test_mobile_list_addition import list_browser
 
 
-def open_board(page, *, stale=False, missing=False):
+def open_board(page, *, stale=False, missing=False, nav_status="ARMED"):
     root = Path(__file__).resolve().parents[2]
     static = root / "src/web/static"
     assets = ReleaseAssets(static, root / "src/ui/static/vendor")
@@ -25,7 +25,8 @@ def open_board(page, *, stale=False, missing=False):
                          active_stop_price=9.3, stop_quantity=100,
                          pending_partial_sell_quantity=25, pending_partial_sell_price=12,
                          warnings=["A long warning that should wrap and remain readable on a narrow screen"],
-                         exit_order_pending=False))
+                         exit_order_pending=False, nav_profit_exit=dict(status=nav_status, nav_usd=11000,
+                             target_profit_usd=220, target_quantity=50, filled_quantity=20)))
     session = dict(mode="CONNECTED", csrf_token="test",
                    operator={"delegated": True, "operations": ["request_partial_sell", "request_sell_all"]},
                    market_status={"state": "OPEN", "phase": "REGULAR"})
@@ -146,5 +147,27 @@ def test_poll_closes_an_exit_draft_when_the_position_enters_another_stage(list_b
     page.wait_for_function("document.querySelector('#buy-board-action-stage').textContent === 'Partial Sell'")
     assert page.locator("#buy-board-action-input").is_hidden()
     assert page.locator("#buy-board-exit-preview").is_hidden()
+    assert not state["posts"] and not state["errors"]
+    page.close()
+
+
+@pytest.mark.parametrize("status,text", [
+    ("ARMED", "Sell 50 shares at +$220.00"),
+    ("SELLING", "20 sh / 50 sh sold"),
+    ("DONE", "Completed · no repeat"),
+    ("OVERRIDDEN", "Manual exit override"),
+    ("WAITING", "Waiting for fresh account NAV"),
+    ("BLOCKED", "Saved state needs review"),
+])
+def test_nav_profit_target_and_fill_progress_are_visible_on_mobile(list_browser, status, text):
+    page = list_browser.new_page(viewport={"width": 320, "height": 568}, is_mobile=True)
+    state = open_board(page, nav_status=status)
+    page.get_by_role("tab", name=re.compile(r"^Open ")).click()
+    card = page.locator(".mobile-kanban-card")
+    assert "Auto take-profit" in card.inner_text()
+    assert text in card.inner_text()
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+    card.click()
+    assert text in page.locator("#buy-board-action-sheet").inner_text()
     assert not state["posts"] and not state["errors"]
     page.close()
