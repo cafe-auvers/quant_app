@@ -92,7 +92,12 @@ def test_buyboard_stage_details_and_stale_prices(width, tmp_path, browser_event_
                 page.get_by_role("tab", name=re.compile(rf"^{tab} ")).click()
                 card = page.locator(".mobile-kanban-card").filter(has_text=re.compile(rf"^{symbol}"))
                 card.wait_for()
+                position = symbol in ("OPEN", "PARTIAL", "SELL")
+                if position:
+                    card.click()
                 text = card.inner_text()
+                if position:
+                    text += "\n" + page.locator("#buy-board-action-facts").inner_text()
                 for value in expected:
                     assert value in text, (symbol, value, text)
                 if symbol in ("TODAY", "ENTRY"):
@@ -109,7 +114,8 @@ def test_buyboard_stage_details_and_stale_prices(width, tmp_path, browser_event_
                     page.screenshot(path=str(tmp_path / f"stale-price-{width}.png"))
                 if symbol == "TODAY":
                     assert page.locator("#buy-board-column-summary").inner_text() == "2 stocks · 100 target shares · 1 not sized"
-                card.click()
+                if not position:
+                    card.click()
                 sheet = page.locator("#buy-board-action-facts").inner_text().lower()
                 assert "price" in sheet
                 if symbol == "SELL":
@@ -122,6 +128,12 @@ def test_buyboard_stage_details_and_stale_prices(width, tmp_path, browser_event_
                 if symbol == "TODAY":
                     assert "Waiting for fresh quote" in page.locator("#buy-board-action-warning").inner_text()
                 page.locator("#buy-board-action-close").click()
+            def full_details(card):
+                card.click()
+                text = page.locator("#buy-board-action-facts").inner_text()
+                page.locator("#buy-board-action-close").click()
+                return text
+
             # The normal minute poll replaces the stale estimate without a reload.
             monitor[1].update(current_price=11.4, quote_as_of=(now + timedelta(seconds=60)).isoformat(),
                               quote_status="CURRENT")
@@ -153,7 +165,7 @@ def test_buyboard_stage_details_and_stale_prices(width, tmp_path, browser_event_
             page.evaluate(f"Date.now = () => {int(now.timestamp() * 1000) + 1_000_000}")
             page.get_by_role("tab", name=re.compile(r"^Open ")).click()
             opened = page.locator(".mobile-kanban-card").filter(has_text=re.compile(r"^OPEN"))
-            assert "NAV unavailable · $1,000.00" in opened.inner_text()
+            assert "NAV unavailable · $1,000.00" in full_details(opened)
             assert "+$100.00 (+10.00%) · stale" in opened.inner_text()
             assert "13.64% · stale" in opened.inner_text()
             assert "10.00% NAV" not in opened.inner_text()
@@ -167,8 +179,8 @@ def test_buyboard_stage_details_and_stale_prices(width, tmp_path, browser_event_
             page.get_by_role("button", name="Buy Board", exact=True).click()
             page.get_by_role("tab", name=re.compile(r"^Partial ")).click()
             partial_card = page.locator(".mobile-kanban-card").filter(has_text=re.compile(r"^PARTIAL"))
-            assert "7.50% NAV · $750.00" in partial_card.inner_text()
-            assert "0.38% NAV · $37.50" in partial_card.inner_text()
+            assert "7.50% NAV · $750.00" in full_details(partial_card)
+            assert "0.38% NAV · $37.50" in full_details(partial_card)
             page.get_by_role("tab", name=re.compile(r"^Open ")).click()
             assert "Not fully covered" in opened.inner_text()
             assert not errors and not mutations
