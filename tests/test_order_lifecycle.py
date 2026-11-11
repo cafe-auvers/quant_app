@@ -1016,7 +1016,7 @@ def test_guarded_reserved_moo_sell_is_durable_and_does_not_call_regular_order(
     assert persisted.status == OrderStatus.ACCEPTED
 
 
-def test_manual_prod_sell_uses_reserved_moo_before_open_and_limit_during_session():
+def test_manual_prod_sell_uses_limits_in_supported_sessions_and_reserves_when_closed():
     window = MainWindow.__new__(MainWindow)
     before_open_kst = dt.datetime(
         2026, 7, 27, 17, 0, tzinfo=buylist_constants.KST_ZONE
@@ -1024,12 +1024,14 @@ def test_manual_prod_sell_uses_reserved_moo_before_open_and_limit_during_session
     during_session_kst = dt.datetime(
         2026, 7, 27, 23, 0, tzinfo=buylist_constants.KST_ZONE
     )
+    before_supported_window = before_open_kst.replace(hour=16)
+    assert MainWindow._manual_sell_execution_policy(window, "PROD", before_supported_window) == RESERVED_MOO_EXECUTION
 
     assert (
         MainWindow._manual_sell_execution_policy(
             window, "PROD", before_open_kst
         )
-        == RESERVED_MOO_EXECUTION
+        == REGULAR_LIMIT_EXECUTION
     )
     assert (
         MainWindow._manual_sell_execution_policy(

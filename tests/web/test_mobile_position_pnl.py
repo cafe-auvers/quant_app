@@ -66,6 +66,7 @@ def test_position_pnl_and_exit_scenarios_are_prominent_and_scrollable(list_brows
         page.get_by_role("tab", name=re.compile(rf"^{tab} ")).click()
         card = page.locator(".mobile-kanban-card")
         pnl = card.locator(".board-pnl-fact")
+        pnl.first.wait_for(state="visible")
         assert pnl.count() == 3
         assert "+$100.00 (+10.00%)" in pnl.nth(0).inner_text()
         assert amount in pnl.nth(1).inner_text()
