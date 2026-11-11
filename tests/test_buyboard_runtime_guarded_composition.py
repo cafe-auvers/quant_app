@@ -264,6 +264,7 @@ def _enable_guarded(monkeypatch) -> None:
         trading_engine_module, "is_buyboard_engine_enabled", lambda: True
     )
     monkeypatch.setattr(buyboard_runtime, "is_regular_session_open", lambda: True)
+    monkeypatch.setattr(buyboard_runtime, "is_us_exit_session_open", lambda: True)
     monkeypatch.setattr(buyboard_runtime, "_eod_window_reached", lambda: False)
 
 
@@ -1735,7 +1736,8 @@ def test_priced_partial_sell_adapter_never_converts_off_hours_to_market_open(tmp
         pending_partial_sell_price=125.0, broker_quantity=10, orderable_quantity=10,
     ))
     runtime.trading_engine._market_is_open_fn = lambda: False
-    with pytest.raises(RuntimeError, match="regular session"):
+    runtime.trading_engine._exit_market_is_open_fn = lambda: False
+    with pytest.raises(RuntimeError, match="supported US trading session"):
         runtime.trading_engine._position_callbacks.submit_sell_order(
             environment="PROD", account_no="1", symbol="AAPL", quantity=2,
             reason="partial_sell", limit_price=125.0, trade_card=card,

@@ -700,7 +700,7 @@
       return row.exit_order_pending ? 'Order pending' : 'Partial sell requested';
     }
     if (row.board_status === 'SELL_ALL') {
-      if (row.sell_all_at_market_open) return 'Queued for market open';
+      if (row.sell_all_at_market_open) return 'Waiting for supported trading session';
       if (row.exit_cancel_in_flight) return 'Cancelling / repricing';
       return row.exit_order_pending ? 'Order pending' : 'Sell all requested';
     }
@@ -907,7 +907,7 @@
     const covered = Number(row.stop_quantity || 0) >= Number(row.broker_quantity || 0);
     const atStop = covered ? boardPnl(row.average_entry_price, row.active_stop_price, row.broker_quantity) : null;
     const stopFact = fact('At active stop · est.', atStop, false,
-      covered ? `All held shares @ ${boardMoney(row.active_stop_price)}` : 'Stop does not cover all held shares');
+      covered ? `All held shares @ ${boardMoney(row.active_stop_price)} · App stop includes supported premarket / after-hours` : 'Stop does not cover all held shares');
     if (!covered) stopFact[1] = 'Not fully covered';
     facts.push(stopFact);
     const auto = row.nav_profit_exit || {};
@@ -1395,9 +1395,9 @@
       request_partial_sell: [`Request a partial sell for ${symbol}?`,
         `Sell ${payload.quantity} share${Number(payload.quantity) === 1 ? '' : 's'} ${payload.price == null
           ? 'immediately using the current execution price.'
-          : `at ${boardMoney(payload.price)} or higher. The limit can fill now if the market is already there; otherwise it waits until filled, cancelled or expired by KIS. Outside the regular session, submission waits for the open. Stops take priority.`}`,
+          : `at ${boardMoney(payload.price)} or higher. The limit can fill now if the market is already there; otherwise it waits until filled, cancelled or expired by KIS. Supported premarket and after-hours sessions are included; otherwise submission waits. Stops take priority.`}`,
         payload.price == null ? 'Request partial sell' : 'Request limit sell'],
-      request_sell_all: [`Sell all of ${symbol}?`, 'This records durable liquidation intent. The Execution Owner may submit it only after the workflow gates pass.', 'Request Sell All'],
+      request_sell_all: [`Sell all of ${symbol}?`, 'Sell during supported premarket, regular or after-hours sessions after execution checks pass. Otherwise reserve for the next opening.', 'Request Sell All'],
     };
     if (['request_partial_sell', 'request_sell_all'].includes(action)) {
       const exit = boardExitEstimate(row, boardPrice(row),

@@ -33,6 +33,7 @@ from src.risk.pre_trade import PreTradeRiskRejectedError
 
 @pytest.fixture(autouse=True)
 def _legacy_mode_by_default(monkeypatch):
+    monkeypatch.setattr(runtime_module, "is_us_exit_session_open", lambda: True)
     monkeypatch.setattr(
         runtime_module.execution_config,
         "is_buyboard_engine_enabled",
@@ -998,6 +999,37 @@ def test_emergency_sell_without_fresh_bid_uses_bounded_reprice_collars():
         last_trusted_price=reference,
         emergency_reprice_attempt=100,
     ) == pytest.approx(95.0)
+
+
+@pytest.mark.parametrize("fresh", [True, False])
+def test_extended_sell_all_uses_fresh_data_or_waits_without_sending(monkeypatch, fresh):
+    captured = []
+    def submit(**kwargs):
+        captured.append(kwargs)
+        return BrokerOrder.create(environment="PROD", account_no="1", symbol="AAPL",
+            side=OrderSide.SELL, intent=OrderIntent.MANUAL_EXIT, quantity_requested=100,
+            limit_price=kwargs["limit_price"], status=OrderStatus.ACCEPTED)
+    monkeypatch.setattr(workflow_module, "submit_guarded_overseas_order", submit)
+    data = _market_data_with_quote("AAPL", last_price=27.35, bid=27.30)
+    monkeypatch.setattr(data, "is_symbol_execution_ready", lambda *a, **k: fresh)
+    card = _card(board_status=BoardStatus.SELL_ALL, broker_quantity=100,
+                 exit_all_required=True, market_data_last_trusted_price=62.09)
+    runtime = runtime_module.build_buyboard_runtime(
+        buying_power_provider=lambda *a: 100000, card_lookup=lambda *a: card,
+        broker=_FakeBroker(), market_data=data)
+    runtime.trading_engine._market_is_open_fn = lambda: False
+    runtime.trading_engine._exit_market_is_open_fn = lambda: True
+    if fresh:
+        runtime.trading_engine._position_callbacks.submit_sell_order(
+            environment="PROD", account_no="1", symbol="AAPL", quantity=100, reason="sell_all")
+        assert len(captured) == 1
+        assert captured[0]["execution_policy"] == "REGULAR_LIMIT"
+        assert captured[0]["limit_price"] < 27.30
+    else:
+        with pytest.raises(runtime_module.ExecutionGradeDataUnavailableError, match="fresh KIS"):
+            runtime.trading_engine._position_callbacks.submit_sell_order(
+                environment="PROD", account_no="1", symbol="AAPL", quantity=100, reason="sell_all")
+        assert not captured
 
 
 def test_submit_sell_order_maps_sell_all_reasons_to_manual_exit_and_discounts_last_price(monkeypatch):

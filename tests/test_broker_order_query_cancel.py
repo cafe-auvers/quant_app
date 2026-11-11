@@ -58,6 +58,16 @@ def test_reconciliation_does_not_fall_back_when_known_broker_id_is_missing():
     assert _select_snapshot_for_order(order, [other]) is None
 
 
+def test_kis_accepted_reservation_retains_outstanding_shares_without_nccs_field():
+    snapshot = kis_order.parse_broker_order_status_snapshot(
+        {"pdno":"OMH", "ovrs_rsvn_odno":"1", "ft_ord_qty":"150",
+         "ft_ccld_qty":"0", "sll_buy_dvsn_cd":"01", "cncl_yn":"N",
+         "ovrs_rsvn_ord_stat_cd_name":"접수"},
+        environment="PROD", account_no="1", source="reservation")
+    assert snapshot.status == OrderStatus.ACCEPTED
+    assert snapshot.quantity_requested == snapshot.remaining_quantity == 150
+
+
 def _snapshot(
     status: OrderStatus,
     *,
