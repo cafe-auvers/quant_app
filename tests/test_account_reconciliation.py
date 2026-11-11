@@ -22,6 +22,7 @@ from src.core.execution_order_record import (
     BrokerIdentityStatus,
     ExecutionOrderRecord,
     ExecutionOrderStatus,
+    OrderOrigin,
 )
 from src.core.order_recovery_state import OrderRecoveryState
 from src.core.order_state import (
