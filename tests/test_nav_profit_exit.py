@@ -276,3 +276,39 @@ def test_partial_fills_retry_only_unfilled_half_and_breakeven_follows_completion
     assert finished.board_status == BoardStatus.OPEN_POSITION
     assert finished.active_stop_price == 10.02
     assert nav_profit_sell_quantity(finished, 100) == 0
+
+
+@pytest.mark.parametrize("sellable", [0, 10])
+def test_automatic_fill_completion_uses_total_holdings_and_preserves_reserved_runner(sellable):
+    from dataclasses import replace
+    from src.services.trading_engine import TradingEngine
+
+    card = card_for()
+    card.board_status = BoardStatus.PARTIAL_SELL
+    card.nav_profit_exit.status = "SELLING"
+    card.nav_profit_exit.target_quantity = 50
+    card.pending_partial_sell_quantity = 50
+    card.exit_client_order_id = "C1"
+    card.exit_attempt_group_id = "EXIT-G"
+    terminal = SimpleNamespace(status=OrderStatus.FILLED, client_order_id="C1",
+                               filled_quantity=50, remaining_quantity=0)
+    def unavailable_balance(*args):
+        raise AssertionError("Free shares cannot establish total holdings")
+    runtime = SimpleNamespace(_clock=lambda: datetime.now(timezone.utc),
+        _position_callbacks=SimpleNamespace(find_open_sell_order=lambda _: terminal,
+            reconcile_sell_order=lambda _: terminal, refresh_orderable_quantity=unavailable_balance))
+    assert TradingEngine._reconcile_partial_sell_fills(runtime, [card]) == [card]
+    assert card.nav_profit_exit.filled_quantity == 50
+    assert card.nav_profit_exit.status == "SELLING"
+    assert card.broker_quantity == 100 and card.active_stop_price == 9
+    assert TradingEngine._process_partial_sell_requests(runtime, [card]) == []
+    snapshot = replace(snapshot_for(50, [broker_order(status=OrderStatus.FILLED, filled=50)]),
+                       holdings=(AccountHoldingSnapshot("AAPL", 50, 10, sellable),))
+    result = reduce_account_reconciliation(snapshot,
+                 AccountLocalState(cards=(card,), execution_orders=(order_for(),)))
+    final = result.card_updates[0]
+    assert final.broker_quantity == final.stop_quantity == 50
+    assert final.orderable_quantity == sellable
+    assert final.board_status == BoardStatus.OPEN_POSITION
+    assert final.nav_profit_exit.status == "DONE"
+    assert final.active_stop_price == 10.02

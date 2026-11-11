@@ -1509,6 +1509,8 @@ def _project_exact_order_to_card(
             _consume_exit_card_attempt(card, order)
             _clear_exit_card_tracking(card)
             if continue_nav_profit_exit(card, remaining):
+                card.orderable_quantity = (holding.sellable_quantity
+                    if holding is not None and holding.sellable_quantity is not None else remaining)
                 card.next_exit_retry_at = account_snapshot.observed_at + timedelta(
                     seconds=execution_config.EXIT_RETRY_COOLDOWN_SECONDS
                 )
@@ -1533,6 +1535,9 @@ def _project_exact_order_to_card(
             )
             card.board_status = BoardStatus.OPEN_POSITION
             card.position_runtime_status = PositionRuntimeStatus.OPEN
+        if automatic and remaining > 0:
+            card.orderable_quantity = (holding.sellable_quantity
+                if holding is not None and holding.sellable_quantity is not None else remaining)
         if remaining > 0 and liquidating:
             # A working partial order may have been superseded by a stop or
             # explicit Sell All. Its terminal result cannot withdraw that exit.

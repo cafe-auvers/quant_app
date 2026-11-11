@@ -16,7 +16,10 @@ manual and application-entered positions, on the PC executor and mobile web UI.
   split and show that limitation. At $11,000 NAV, the trigger is $220 of whole
   position profit; an exactly half sale at that price realizes $110 before costs.
 - Only after broker-confirmed fills complete the intended half-sale, move the
-  remaining stop to cost-adjusted breakeven. Preserve any tighter active stop.
+  remaining stop to cost-adjusted breakeven. Complete account holdings establish
+  the runner quantity; a zero free/orderable balance never proves the stock is flat.
+  This completion waits for the next full account reconciliation (normally within
+  one minute). Preserve any tighter active stop.
   The remaining shares continue under the active stop and manual exit controls;
   the new policy adds no further profit-sale or time-based partial exit.
 

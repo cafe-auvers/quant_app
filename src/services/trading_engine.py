@@ -2073,6 +2073,8 @@ class TradingEngine:
                 continue  # A priced exit must never become a next-open market order.
             if card.exit_submission_unresolved:
                 continue
+            if card.nav_profit_exit.status == "SELLING" and card.exit_client_order_id:
+                continue  # Complete holdings reconciliation retires automatic attempts.
             if card.next_exit_retry_at is not None and now < card.next_exit_retry_at:
                 continue  # P1-4: back off after a rejected/errored submission
             try:
@@ -2188,12 +2190,18 @@ class TradingEngine:
             try:
                 order = self._position_callbacks.find_open_sell_order(card)
                 if order is None:
+                    if card.nav_profit_exit.status == "SELLING":
+                        continue  # Never infer held shares from a free/orderable balance.
                     if card.pending_partial_sell_quantity <= 0:
                         # A user withdrawal whose known order is now absent
                         # has reached its terminal reconciliation boundary.
                         # Refresh holdings before returning to Open so a
                         # fill that raced the cancel is never hidden.
-                        remaining = self._position_callbacks.refresh_orderable_quantity(
+                        if card.nav_profit_exit.status == "SELLING":
+                    # The account reducer has complete holdings and cumulative fills;
+                    # orderable shares alone cannot establish the remaining position.
+                    continue
+                remaining = self._position_callbacks.refresh_orderable_quantity(
                             card.environment, card.account_no, card.symbol
                         )
                         self._complete_partial_exit(card, remaining)
