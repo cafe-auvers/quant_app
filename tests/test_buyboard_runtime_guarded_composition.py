@@ -1853,3 +1853,54 @@ def test_stop_liquidation_cannot_inherit_a_partial_sell_limit(tmp_path, monkeypa
     assert len(broker.submit_calls) == 1
     assert broker.submit_calls[0]["limit_price"] < 125.0
     assert fetch_execution_order(engine, card.exit_client_order_id).intent == OrderIntent.STOP_LOSS
+
+
+@pytest.mark.usefixtures("trading_enabled")
+@pytest.mark.parametrize("stop_breach", [False, True])
+def test_nav_profit_half_sale_uses_guarded_broker_once_and_stop_has_priority(tmp_path, monkeypatch, stop_breach):
+    from types import SimpleNamespace
+    from src.core.nav_profit_exit import initialize_nav_profit_exit
+    from src.core.runtime_readiness import RuntimeDeviceState
+    from src.ui.buyboard.runtime_worker import BuyboardRuntimeWorker
+
+    runtime, broker, _gateway, engine, market_data = _make_runtime(tmp_path, monkeypatch)
+    monkeypatch.setattr(execution_config, "KANBAN_STRATEGY_INSTANCE_ID", STRATEGY_ID)
+    monkeypatch.setattr("src.ui.buyboard.runtime_worker.is_regular_session_open", lambda: True)
+    monkeypatch.setattr(broker, "get_positions", lambda **kwargs: {
+        "overseas": {"holdings": [{"symbol": "AAPL", "quantity": 100, "orderable_quantity": 100}]},
+    })
+    card = _card(board_status=BoardStatus.OPEN_POSITION,
+                 position_runtime_status=PositionRuntimeStatus.OPEN,
+                 broker_quantity=100, orderable_quantity=100,
+                 average_entry_price=10, active_stop_price=9, stop_quantity=100,
+                 entry_remaining_target_quantity=0)
+    assert initialize_nav_profit_exit(card, 11000)
+    card = _persist_owned_card(engine, card)
+    market_data.subscribe([card.symbol])
+    market_data._quote_fetcher = lambda symbol: QuoteSnapshot(symbol=symbol, last_price=12.2, bid=12.19, ask=12.21)
+    market_data.poll_once()
+    worker = SimpleNamespace(
+        _accepting_commands=True, _lease_current=True, _standby_only=False,
+        device_state=RuntimeDeviceState.ACTIVE, _db_engine=engine,
+        readiness_generation=1, reconciliation_accounts_in_progress=set(),
+        _account_reconciliation_is_fresh=lambda account: True,
+        _card_action_ready=lambda card: True, runtime=runtime,
+    )
+    assert BuyboardRuntimeWorker._ensure_nav_profit_taking(worker, [card])
+    card = trade_card_repository.get_trade_card(engine, "PROD", "1", "AAPL")
+    assert not BuyboardRuntimeWorker._ensure_nav_profit_taking(worker, [card])
+    assert card.active_stop_price == 9
+    if stop_breach:
+        market_data._quote_fetcher = lambda symbol: QuoteSnapshot(symbol=symbol, last_price=8, bid=7.99, ask=8.01)
+        market_data.poll_once()
+        runtime.trading_engine.evaluate_quote([card], market_data.latest_quote(card.symbol))
+    broker.queue_acceptance(broker_order_id="NAV-PROFIT-OR-STOP")
+    runtime.trading_engine.run_heartbeat([card])
+    assert len(broker.submit_calls) == 1
+    assert broker.submit_calls[0]["side"] == OrderSide.SELL
+    assert broker.submit_calls[0]["quantity"] == (100 if stop_breach else 50)
+    record = fetch_execution_order(engine, card.exit_client_order_id)
+    assert record.intent == (OrderIntent.STOP_LOSS if stop_breach else OrderIntent.PARTIAL_EXIT)
+    assert card.active_stop_price == 9
+    runtime.trading_engine.run_heartbeat([card])
+    assert len(broker.submit_calls) == 1
