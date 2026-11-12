@@ -346,6 +346,39 @@ def test_kis_pagination_fails_closed_on_continuation_without_cursor():
         )
 
 
+def test_busy_account_history_continues_beyond_ten_pages(monkeypatch):
+    monkeypatch.setattr(kis_order.time, "sleep", lambda _: None)
+    class BusyClient:
+        pages = 0
+        def _get_with_headers(self, endpoint, tr_id, params, tr_cont=""):
+            self.pages += 1
+            assert params["CTX_AREA_NK200"] == (str(self.pages - 1) if self.pages > 1 else "")
+            return {"output": [{"page": self.pages}], "ctx_area_nk200": str(self.pages)}, {"tr_cont": "F" if self.pages < 13 else "D"}
+    client = BusyClient()
+    pages = kis_order._query_pages(client, endpoint="/history", tr_id="TEST", params={})
+    assert client.pages == len(pages) == 13
+
+
+def test_history_repeated_cursor_stays_incomplete(monkeypatch):
+    monkeypatch.setattr(kis_order.time, "sleep", lambda _: None)
+    class StuckClient:
+        def _get_with_headers(self, endpoint, tr_id, params, tr_cont=""):
+            return {"output": [], "ctx_area_nk200": "same"}, {"tr_cont": "F"}
+    with pytest.raises(RuntimeError, match="already visited cursor"):
+        kis_order._query_pages(StuckClient(), endpoint="/history", tr_id="TEST", params={})
+
+
+def test_history_page_budget_stays_fail_closed(monkeypatch):
+    monkeypatch.setattr(kis_order.time, "sleep", lambda _: None)
+    class EndlessClient:
+        page = 0
+        def _get_with_headers(self, endpoint, tr_id, params, tr_cont=""):
+            self.page += 1
+            return {"output": [], "ctx_area_nk200": str(self.page)}, {"tr_cont": "F"}
+    with pytest.raises(RuntimeError, match="more than 3 pages"):
+        kis_order._query_pages(EndlessClient(), endpoint="/history", tr_id="TEST", params={}, max_pages=3)
+
+
 def test_kis_reserved_order_query_parses_broker_reservation_fill(monkeypatch):
     captured_params = []
 

@@ -69,6 +69,16 @@ def test_exact_terminal_snapshot_clears_remaining_open_quantity(status):
     assert order.remaining_quantity == 0
 
 
+def test_late_exchange_rejection_retires_a_pending_cancel_without_losing_identity():
+    order = _order(status=ExecutionOrderStatus.CANCEL_PENDING)
+    snapshot = BrokerOrderStatusSnapshot(environment="PROD", account_no="1", symbol="AAPL",
+        broker_order_id="B-1", quantity_requested=10, status=OrderStatus.REJECTED,
+        filled_quantity=0, remaining_quantity=0, raw_response={"nprc_rson_text": "price outside allowed range"})
+    assert reconciliation_module._apply_exact_order_snapshot(order, snapshot) is None
+    assert order.status == ExecutionOrderStatus.REJECTED and order.remaining_quantity == 0
+    assert order.broker_order_id == "B-1" and order.broker_identity_status == BrokerIdentityStatus.EXACT
+
+
 def test_prefetched_snapshot_is_account_scoped_and_cannot_be_applied_elsewhere(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'snapshot-account.db'}", future=True)
     snapshot = AccountBrokerSnapshot(environment="PROD", account_no="other",

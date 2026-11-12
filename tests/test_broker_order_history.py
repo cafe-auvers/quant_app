@@ -17,8 +17,10 @@ def _rows():
 
 
 @pytest.mark.parametrize("reverse", [False, True])
-def test_exact_zero_fill_cancel_retires_original_independent_of_row_order(reverse):
+@pytest.mark.parametrize("original_code", ["00", "01"])
+def test_exact_zero_fill_cancel_retires_original_independent_of_row_order(reverse, original_code):
     original, cancel = _rows()
+    original.raw_response["rvse_cncl_dvsn"] = original_code
     rows = [original,cancel]
     assert authoritative_order_history(list(reversed(rows)) if reverse else rows) == [cancel]
 

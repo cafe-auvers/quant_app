@@ -144,6 +144,9 @@ _ALLOWED_STATUS_TRANSITIONS: Dict[ExecutionOrderStatus, FrozenSet[ExecutionOrder
         {
             ExecutionOrderStatus.CANCELLED,
             ExecutionOrderStatus.FILLED,
+            # An exchange rejection of the original accepted order can
+            # arrive after our cancellation was queued.
+            ExecutionOrderStatus.REJECTED,
             ExecutionOrderStatus.PARTIALLY_FILLED,
             # revision 3.2: the broker can explicitly reject the cancel
             # request itself (the order simply keeps working), or a
