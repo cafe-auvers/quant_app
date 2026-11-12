@@ -740,6 +740,10 @@ def _apply_exact_order_snapshot(
         _set_recovery_state(order, OrderRecoveryState.MANUAL_INTERVENTION_REQUIRED)
         _stamp_exact_order_observation_if_due(order, before, snapshot.checked_at)
         return f"Broker returned unrecognized order status {snapshot.status.value}"
+    if target == ExecutionOrderStatus.REJECTED and order.filled_quantity > 0:
+        _set_recovery_state(order, OrderRecoveryState.MANUAL_INTERVENTION_REQUIRED)
+        _stamp_exact_order_observation_if_due(order, before, snapshot.checked_at)
+        return "Broker rejection contradicts confirmed fills; preserve the existing lifecycle"
     preserve_ambiguous_cancel = bool(
         order.status == ExecutionOrderStatus.CANCEL_PENDING
         and order.recovery_state == OrderRecoveryState.DISCOVERING

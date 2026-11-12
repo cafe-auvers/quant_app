@@ -112,11 +112,11 @@ def authoritative_order_history(
         if not (original.broker_order_id and original.quantity_requested > 0
                 and original.status == OrderStatus.PARTIALLY_FILLED
                 and original.filled_quantity == original.remaining_quantity == 0
-                and _cancel_code(original) == "00"):
+                and _cancel_code(original) in {"00", "01"}):
             continue
         identity = _identity(original)
         same = [row for row in rows if _identity(row) == identity]
-        originals = [row for row in same if _cancel_code(row) == "00"]
+        originals = [row for row in same if _cancel_code(row) in {"00", "01"}]
         cancellations = [row for row in same if _cancel_code(row) == "02"]
         if len(originals) != 1 or len(cancellations) != 1:
             continue

@@ -2284,6 +2284,38 @@ def test_sell_all_rejection_backs_off_instead_of_retrying_every_tick(tmp_path):
     assert card.exit_attempt_count == 2
 
 
+@pytest.mark.parametrize("blocker", ["ownership", "external"])
+def test_pre_broker_exit_fence_preserves_attempt_identity_and_price_collar(tmp_path, blocker):
+    from src.services.execution_command_gateway import ExecutionOwnershipMismatchError
+    from src.services.discovered_external_order_repository import ActiveExternalOrderFenceError
+    from src.core.exit_execution_command import marketable_exit_limit_price
+    error = ExecutionOwnershipMismatchError if blocker == "ownership" else ActiveExternalOrderFenceError
+    engine = _make_engine(tmp_path)
+    now = [dt.datetime.now(dt.timezone.utc)]
+    engine._clock = lambda: now[0]
+    card = _open_card(board_status=BoardStatus.SELL_ALL, exit_all_required=True,
+        stop_loss_triggered=True, exit_attempt_group_id="waiting")
+    prepared_ids = []
+    def submit(**kwargs):
+        card.exit_pending_attempt_number = card.exit_attempt_count + 1
+        card.exit_client_order_id = f"{card.exit_attempt_group_id}-{card.exit_pending_attempt_number}"
+        prepared_ids.append(card.exit_client_order_id)
+        raise error("authority is pending; no broker call occurred")
+    engine._position_callbacks = PositionActionCallbacks(
+        cancel_order=lambda _: None, submit_sell_order=submit,
+        refresh_orderable_quantity=lambda *args: 100, find_open_sell_order=lambda _: None)
+    for _ in range(20):
+        engine.run_heartbeat([card])
+        assert card.exit_attempt_count == 0
+        assert card.exit_client_order_id == "" and card.exit_pending_attempt_number == 0
+        assert card.exit_attempt_group_id == "waiting"
+        assert card.exit_all_required and card.stop_loss_triggered
+        assert marketable_exit_limit_price(last_trusted_price=100,
+            emergency_reprice_attempt=card.exit_attempt_count, hard_stop=True) > 99
+        now[0] += dt.timedelta(seconds=execution_config.EXIT_RETRY_COOLDOWN_SECONDS + 1)
+    assert prepared_ids == ["waiting-1"] * 20
+
+
 def test_partial_sell_rejection_backs_off_instead_of_retrying_every_tick(tmp_path):
     attempts = []
 

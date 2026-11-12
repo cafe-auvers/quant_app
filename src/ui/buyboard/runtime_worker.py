@@ -2107,12 +2107,16 @@ class BuyboardRuntimeWorker(QThread):
         self._manual_stop_enrollment_failures = failures
         changed = False
         for card in cards:
+            pending_stop_liquidation = (
+                card.board_status == BoardStatus.SELL_ALL
+                and card.stop_loss_triggered and card.exit_all_required
+            )
             if (
                 AUTO_MANUAL_STOP_PENDING not in card.warnings
                 or card.entry_block_reason != "auto_manual_stop_pending"
-                or card.board_status not in {
+                or (card.board_status not in {
                     BoardStatus.OPEN_POSITION, BoardStatus.PARTIAL_SELL,
-                }
+                } and not pending_stop_liquidation)
                 or card.broker_quantity <= 0
                 or not card.active_stop_price
                 or card.pending_stop_command_id

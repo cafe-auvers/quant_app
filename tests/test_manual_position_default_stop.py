@@ -11,7 +11,7 @@ from src.core.discovered_external_order import new_discovered_external_order
 from src.core.execution_order_record import ExecutionOrderStatus
 from src.core.order_state import OrderSide
 from src.core.runtime_readiness import RuntimeDeviceState
-from src.core.trade_card_state import BoardStatus, StopType, TradeCardState
+from src.core.trade_card_state import BoardStatus, PositionRuntimeStatus, StopType, TradeCardState
 from src.services import trade_card_repository as repo
 from src.services.execution_ownership_repository import assign_ownership, get_ownership
 from src.services.execution_workflow_service import request_board_action
@@ -274,6 +274,23 @@ def test_default_enrollment_preserves_queued_partial_sell_and_its_price(tmp_path
     assert saved.pending_partial_sell_quantity == 50
     assert saved.pending_partial_sell_price == 110
     assert saved.pending_stop_price == 99
+
+
+def test_default_triggered_before_enrollment_keeps_liquidating_and_claims_ownership(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'latched.db'}")
+    card = discovered()
+    card.board_status = BoardStatus.SELL_ALL
+    card.position_runtime_status = PositionRuntimeStatus.LIQUIDATING
+    card.exit_all_required = card.stop_loss_triggered = True
+    card = repo.create_trade_card(engine, card)
+    assert enroll(worker_for(engine), [card])
+    saved = repo.get_trade_card(engine, "PROD", "1", "SMX")
+    assert saved.board_status == BoardStatus.SELL_ALL
+    assert saved.position_runtime_status == PositionRuntimeStatus.LIQUIDATING
+    assert saved.exit_all_required and saved.stop_loss_triggered
+    assert saved.active_stop_price == saved.pending_stop_price == 99
+    assert get_ownership(engine, environment="PROD", account_no="1", symbol="SMX").owner == ExecutionOwner.KANBAN
+    assert AUTO_MANUAL_STOP_PENDING not in saved.warnings
 
 
 @pytest.mark.parametrize("field,value", [

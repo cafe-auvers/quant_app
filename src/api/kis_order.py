@@ -599,12 +599,13 @@ def _query_pages(
     endpoint: str,
     tr_id: str,
     params: Dict[str, str],
-    max_pages: int = 10,
+    max_pages: int = 100,
 ) -> List[Dict[str, Any]]:
     pages: List[Dict[str, Any]] = []
     fk200 = params.get("CTX_AREA_FK200", "")
     nk200 = params.get("CTX_AREA_NK200", "")
     tr_cont = ""
+    seen_cursors = {(fk200, nk200)}
     for page_index in range(max(1, max_pages)):
         page_params = dict(params)
         page_params["CTX_AREA_FK200"] = fk200
@@ -628,6 +629,13 @@ def _query_pages(
                 f"KIS pagination was incomplete for {endpoint}: "
                 "continuation was requested without a cursor"
             )
+        next_cursor = (next_fk200, next_nk200)
+        if next_cursor in seen_cursors:
+            raise RuntimeError(
+                f"KIS pagination was incomplete for {endpoint}: "
+                "continuation repeated an already visited cursor"
+            )
+        seen_cursors.add(next_cursor)
         if page_index + 1 >= max(1, max_pages):
             raise RuntimeError(
                 f"KIS pagination was incomplete for {endpoint}: "

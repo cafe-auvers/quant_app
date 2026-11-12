@@ -81,7 +81,9 @@ from src.services.execution_command_gateway import (
     GuardedSubmissionAmbiguousError,
     ReplacementCancelConfirmationPendingError,
     ReplaceNotSafeError,
+    ExecutionOwnershipMismatchError,
 )
+from src.services.discovered_external_order_repository import ActiveExternalOrderFenceError
 from src.services.execution_command_repository import DuplicateCommandError
 from src.services.eod_trading_service import EodTradingService
 from src.services.intraday_data_service import ExecutionGradeDataUnavailableError
@@ -2136,15 +2138,23 @@ class TradingEngine:
                 changed.append(card)
             except Exception as exc:
                 logger.exception("_process_partial_sell_requests failed for %s", card.symbol)
-                self._back_off_exit_retry(card, str(exc))
+                self._back_off_exit_retry(card, exc)
                 changed.append(card)
         return changed
 
-    def _back_off_exit_retry(self, card: TradeCardState, error: str) -> None:
+    def _back_off_exit_retry(self, card: TradeCardState, error: object) -> None:
         """Review finding P1-4: a rejected/erroring Sell All or Partial Sell
         submission must not be resubmitted on literally every 1-second
         heartbeat tick."""
-        self._consume_exit_attempt(card)
+        pre_broker_block = isinstance(
+            error, (ExecutionOwnershipMismatchError, ActiveExternalOrderFenceError)
+        )
+        # These fences run before an order exists or a broker call is made.
+        # Repeated authority checks must not widen the stop's price collar.
+        if not pre_broker_block:
+            self._consume_exit_attempt(card)
+        # The group and unchanged counter derive the same unused ID after
+        # a pre-broker wait. Do not let the heartbeat retire it as an order.
         card.exit_client_order_id = ""
         card.exit_pending_attempt_number = 0
         card.exit_submission_unresolved = False
@@ -2560,7 +2570,7 @@ class TradingEngine:
                     changed.append(card)
             except Exception as exc:
                 logger.exception("_retry_incomplete_sell_alls failed for %s", card.symbol)
-                self._back_off_exit_retry(card, str(exc))
+                self._back_off_exit_retry(card, exc)
                 changed.append(card)
         return changed
 
