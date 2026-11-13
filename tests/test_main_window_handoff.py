@@ -604,6 +604,19 @@ def test_state_sync_projects_shared_live_trading_on_and_off():
     assert window._shared_live_trading_revision == 8
 
 
+def test_delayed_state_sync_does_not_undo_newer_live_control():
+    window = _sync_completed_window(auto_claim_enabled=False)
+    window._start_state_sync = lambda **_kwargs: None
+    window._shared_live_trading_revision = 12
+    trading_state.set_trading_enabled(True)
+    MainWindow._on_state_sync_completed(window, StateReconcileResult(
+        is_main_device=False, local_role=window.state_sync_role,
+        live_trading_enabled=False, live_trading_revision=11,
+    ), 0)
+    assert trading_state.is_trading_enabled()
+    assert window._shared_live_trading_revision == 12
+
+
 def test_state_sync_watchlist_reload_refreshes_lightweight_sidebar():
     window = _sync_completed_window(auto_claim_enabled=False)
     window._start_state_sync = lambda **_kwargs: None

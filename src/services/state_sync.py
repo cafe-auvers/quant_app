@@ -609,6 +609,7 @@ def set_live_trading_control(
     session_date: Optional[date] = None,
     runtime_commit_sha: Optional[str] = None,
     persist_across_sessions: bool = True,
+    expected_revision: Optional[int] = None,
 ) -> LiveTradingControlResult:
     """Atomically set the global kill switch from either registered device.
 
@@ -637,6 +638,11 @@ def set_live_trading_control(
                 LIVE_TRADING_CONTROL_KEY,
                 for_update=True,
             )
+            observed_revision = int(row.revision or 0) if row is not None else 0
+            if expected_revision is not None and observed_revision != expected_revision:
+                return LiveTradingControlResult(
+                    False, error="Live Trading changed; refresh the shared control."
+                )
             previous_enabled = False
             if row is not None:
                 previous_enabled = bool(
@@ -702,6 +708,17 @@ def set_live_trading_control(
                 error="Shared live-trading control was not persisted.",
             )
         state = _remote_state_from_row(written_row, LIVE_TRADING_CONTROL_KEY)
+        # A supervisor/CLI is a different process from the dashboard. Notify
+        # its existing local-file pulse as well as the normal SQL observers.
+        try:
+            from src.services.coordination_change_pulse import record_external_change_pulses
+
+            record_external_change_pulses(
+                DATA_DIR, f"live-{state.revision}-{uuid.uuid4().hex}",
+                tables=("app_state_sync",),
+            )
+        except OSError:
+            logger.warning("Live Trading saved; immediate display notification failed")
         return LiveTradingControlResult(
             True,
             _live_trading_control_from_state(state),

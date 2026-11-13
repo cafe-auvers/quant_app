@@ -39,6 +39,29 @@ def test_set_trading_enabled_toggles_state():
     assert trading_state.is_trading_enabled() is False
 
 
+def test_shared_on_is_not_displayed_as_off_for_different_local_release(monkeypatch):
+    from datetime import datetime, timezone
+    from src.services import state_sync
+
+    window, module = _make_window_with_trading_button()
+    window.operational_db_engine = object()
+    window._shared_live_trading_available = True
+    window._shared_live_trading_control = state_sync.LiveTradingControl(
+        enabled=True, revision=123, updated_at=datetime.now(timezone.utc),
+        runtime_commit_sha="a" * 40, persist_across_sessions=True,
+    )
+    monkeypatch.setattr(state_sync, "get_env_value", lambda *args: "b" * 40)
+    trading_state.set_trading_enabled(False)
+    module.MainWindow._refresh_trading_enabled_widget(window)
+    assert window.trading_enabled_button.isChecked()
+    assert "ON (BLOCKED HERE)" in window.trading_enabled_button.text()
+    assert "different release" in window.trading_enabled_button.toolTip()
+    assert not trading_state.is_trading_enabled()
+    trading_state.set_authoritative_provider(lambda: state_sync.live_trading_control_is_effective(window._shared_live_trading_control))
+    with pytest.raises(trading_state.TradingDisabledError):
+        trading_state.require_trading_enabled("PROD", "VERIFY")
+
+
 def test_env_lock_forces_disabled_even_when_toggled_on(monkeypatch):
     monkeypatch.setattr(trading_state, "get_env_value", lambda key, default=None: "false")
 

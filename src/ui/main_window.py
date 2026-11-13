@@ -348,6 +348,7 @@ class MainWindow(
         self._last_successful_reconcile_at: Optional[dt.datetime] = None
         self._shared_live_trading_available = False
         self._shared_live_trading_revision = 0
+        self._shared_live_trading_control = None
         # Broker-boundary checks re-read canonical state. A database outage
         # therefore blocks ordinary commands immediately even if the toolbar
         # still displays the last confirmed state.
@@ -1405,8 +1406,13 @@ class MainWindow(
         execution_engine = self._execution_state_engine()
         live_trading_error = str(getattr(result, "live_trading_error", "") or "")
         live_trading_enabled = getattr(result, "live_trading_enabled", None)
-        if not live_trading_error and live_trading_enabled is not None:
+        live_revision = int(getattr(result, "live_trading_revision", 0) or 0)
+        if live_revision < self.__dict__.get("_shared_live_trading_revision", 0):
+            # A delayed sync must not undo a newer ON/OFF observation.
+            live_notice = self.__dict__.get("_last_live_trading_notice", "")
+        elif not live_trading_error and live_trading_enabled is not None:
             trading_state.set_trading_enabled(bool(live_trading_enabled))
+            self._shared_live_trading_control = getattr(result, "live_trading_control", None)
             self._shared_live_trading_available = True
             self._shared_live_trading_revision = int(
                 getattr(result, "live_trading_revision", 0) or 0
@@ -3744,12 +3750,18 @@ class MainWindow(
 
         engine = self._execution_state_engine()
         if engine is None or not self._execution_state_ready():
+            self._shared_live_trading_available = False
             raise RuntimeError("Kanban operational store is unavailable")
         result = get_live_trading_control(engine)
         if not result.success or result.control is None:
+            self._shared_live_trading_available = False
             raise RuntimeError(
                 result.error or "Kanban live-trading control is unavailable"
             )
+        if result.control.revision >= self.__dict__.get("_shared_live_trading_revision", 0):
+            self._shared_live_trading_control = result.control
+            self._shared_live_trading_revision = result.control.revision
+            self._shared_live_trading_available = True
         return live_trading_control_is_effective(result.control)
 
     def _refresh_trading_enabled_widget(self) -> None:
@@ -3759,6 +3771,9 @@ class MainWindow(
             return
         locked = trading_state.is_trading_locked_disabled()
         enabled = trading_state.is_trading_enabled()
+        control = self.__dict__.get("_shared_live_trading_control")
+        saved_enabled = control.enabled if control is not None else enabled
+        block_reason = live_trading_control_block_reason(control) if control is not None else ""
         control_configured = bool(
             "operational_db_engine" in self.__dict__ or "pc_db_engine" in self.__dict__
         )
@@ -3769,7 +3784,7 @@ class MainWindow(
         update_running = self._background_worker_running(update_worker)
         button.blockSignals(True)
         try:
-            button.setChecked(enabled)
+            button.setChecked(saved_enabled)
             if update_running:
                 button.setText("LIVE TRADING ● UPDATING KANBAN CONTROL...")
                 button.setToolTip(
@@ -3807,12 +3822,18 @@ class MainWindow(
                     "QPushButton { background-color: #6b4f00; color: white; "
                     "font-weight: bold; padding: 4px 10px; border-radius: 4px; }"
                 )
-            elif enabled:
-                button.setText("LIVE TRADING ● ON (KANBAN)")
+            elif saved_enabled:
+                button.setText(
+                    "LIVE TRADING ● ON (BLOCKED HERE)" if block_reason
+                    else "LIVE TRADING ● ON (KANBAN)"
+                )
                 button.setToolTip(
                     "The durable broker gate is ON in this Kanban operational "
                     "store. Only its current Execution Owner can execute. Click to "
                     "turn it OFF."
+                    + (f" This copy cannot execute: {block_reason}." if block_reason else "")
+                    + (f" Shared revision {control.revision}; ON persists until switched OFF."
+                       if control is not None and control.persist_across_sessions else "")
                 )
                 button.setEnabled(True)
                 button.setStyleSheet(
@@ -3894,6 +3915,10 @@ class MainWindow(
             return
 
         effective = live_trading_control_is_effective(result.control)
+        if result.control.revision < self.__dict__.get("_shared_live_trading_revision", 0):
+            self._refresh_trading_enabled_widget()
+            return
+        self._shared_live_trading_control = result.control
         trading_state.set_trading_enabled(effective)
         self._record_gate4_manual_control(effective)
         self._shared_live_trading_available = bool(
@@ -4056,6 +4081,7 @@ class MainWindow(
         self.coordination_change_timer.timeout.connect(
             self._process_internal_coordination_pulse
         )
+        self.coordination_change_timer.timeout.connect(self._refresh_trading_enabled_widget)
         self.coordination_change_timer.start()
 
         # Cross-process signal for the PC's guarded-sleep automation (see

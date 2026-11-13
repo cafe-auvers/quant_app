@@ -986,6 +986,7 @@ class StateReconcileResult:
     live_trading_enabled: bool | None = None
     live_trading_revision: int = 0
     live_trading_error: str = ""
+    live_trading_control: Any = None
     operator_control: Any = None
     operator_control_error: str = ""
     runtime_devices: list[Any] = field(default_factory=list)
