@@ -67,8 +67,8 @@ def initialize_default_live_trading_control(engine, role):
     if is_trading_locked_disabled():
         return LiveTradingControlResult(False, error="Administrative lock preserves OFF.")
     try:
-        identity = require_approved_release_identity()
         owner, commit = _approved_owner(engine, require_ready=True)
+        identity = require_approved_release_identity()
         if owner.device_id != role.device_id or commit != identity.repository_head:
             raise ValueError("Only the approved, ready execution owner may initialize Live Trading.")
     except SQLAlchemyError:
