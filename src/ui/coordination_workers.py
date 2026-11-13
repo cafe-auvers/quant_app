@@ -24,7 +24,6 @@ from src.services.state_sync import (
     LocalDeviceRole,
     get_coordination_status_snapshot,
     live_trading_control_is_effective,
-    set_live_trading_control,
     set_operator_control,
 )
 from src.utils.device_identity import runtime_device_kind
@@ -102,6 +101,7 @@ class StateSyncWorker(QThread):
         coordination_status = get_coordination_status_snapshot(self.engine)
         control_result = coordination_status.live_trading
         if control_result.success and control_result.control is not None:
+            result.live_trading_control = control_result.control
             result.live_trading_enabled = live_trading_control_is_effective(
                 control_result.control
             )
@@ -148,8 +148,10 @@ class LiveTradingControlWorker(QThread):
         self.enabled = bool(enabled)
 
     def run(self) -> None:
+        from src.services.live_trading_control import set_operator_live_trading_control
+
         self.completed.emit(
-            set_live_trading_control(
+            set_operator_live_trading_control(
                 self.engine,
                 self.role,
                 self.enabled,

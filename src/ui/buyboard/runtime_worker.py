@@ -426,6 +426,8 @@ class BuyboardRuntimeWorker(QThread):
         # historical default. ``run`` closes this gate before startup and
         # only reopens it at ACTIVE.
         self._accepting_commands = True
+        self._live_trading_default_checked = False
+        self._live_trading_default_retry_at = None
         self.shutdown_prepared = False
         self.shutdown_errors: List[str] = []
         self.runtime: Optional[buyboard_runtime_module.BuyboardRuntime] = None
@@ -2221,6 +2223,25 @@ class BuyboardRuntimeWorker(QThread):
             logger.info("Requested NAV profit half-sale for %s: %s shares", card.symbol, quantity)
         return changed
 
+    def _ensure_default_live_trading_control(self) -> None:
+        if getattr(self, "_live_trading_default_checked", True) or self.device_state != RuntimeDeviceState.ACTIVE:
+            return
+        now = datetime.now(timezone.utc)
+        retry = self._live_trading_default_retry_at
+        if retry is not None and now < retry:
+            return
+        from src.services.live_trading_control import initialize_default_live_trading_control
+
+        self._live_trading_default_retry_at = now + timedelta(seconds=30)
+        result = initialize_default_live_trading_control(
+            self._db_engine, LocalDeviceRole(self._device_id, self._hostname, True),
+        )
+        if result.success:
+            self._live_trading_default_checked = True
+            self.board_changed.emit()
+        else:
+            logger.warning("Live Trading default is waiting: %s", result.error)
+
     def _run_one_cycle(self, *, allow_mutations: bool = True) -> None:
         assert self.runtime is not None
         cycle_timings_ms = {}
@@ -2248,6 +2269,7 @@ class BuyboardRuntimeWorker(QThread):
         allow_mutations = bool(allow_mutations and self._accepting_commands)
         operator_commands_changed = False
         if canonical_available and allow_mutations:
+            self._ensure_default_live_trading_control()
             operator_commands_changed = self._process_operator_commands()
             if operator_commands_changed:
                 cards = self._load_cards_if_changed(force=True)

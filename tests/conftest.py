@@ -44,6 +44,11 @@ from src.web.windows_asyncio import install_web_event_loop_policy  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
+def _isolate_live_control_notifications(monkeypatch, tmp_path):
+    monkeypatch.setattr(state_sync, "DATA_DIR", tmp_path / "control-notifications")
+
+
+@pytest.fixture(autouse=True)
 def _isolate_monitor_equity(monkeypatch, tmp_path):
     from src.services import monitor_equity
 
